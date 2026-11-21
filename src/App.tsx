@@ -6,6 +6,7 @@ import { EpisodeWorkspace } from './components/EpisodeWorkspace';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
+import { apiFetch, isNativeAndroidApp } from './lib/apiClient';
 import {
   buildFavoriteBaseline,
   detectNewFavoriteEpisodes,
@@ -151,6 +152,7 @@ export default function App() {
   );
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
   const [toast, setToast] = useState<string>('');
+  const [apkDownloadUrl, setApkDownloadUrl] = useState<string | null>(null);
 
   const favoritesRef = useRef(favorites);
   const baselinesRef = useRef(baselines);
@@ -228,7 +230,7 @@ export default function App() {
 
         if (seriesUrls.length > 0 && navigator.onLine) {
           try {
-            const res = await fetch('/api/favorites/check', {
+            const res = await apiFetch('/api/favorites/check', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ urls: seriesUrls }),
@@ -280,8 +282,8 @@ export default function App() {
     setCatalogError('');
     try {
       const [homeRes, epRes] = await Promise.all([
-        fetch('/api/home'),
-        fetch('/api/episodes?page=1').catch(() => null),
+        apiFetch('/api/home'),
+        apiFetch('/api/episodes?page=1').catch(() => null),
       ]);
       const data = await homeRes.json();
       if (!homeRes.ok) throw new Error(data.error || 'Erro ao carregar catálogo');
@@ -326,6 +328,14 @@ export default function App() {
 
   useEffect(() => {
     fetchCatalog();
+    if (!isNativeAndroidApp()) {
+      apiFetch('/api/apk-info')
+        .then((r) => (r.ok ? r.json() : null))
+        .then((data: { available?: boolean; url?: string } | null) => {
+          if (data?.available && data.url) setApkDownloadUrl(data.url);
+        })
+        .catch(() => {});
+    }
   }, [fetchCatalog]);
 
   useEffect(() => {
@@ -345,7 +355,7 @@ export default function App() {
       }));
 
       try {
-        const res = await fetch(
+        const res = await apiFetch(
           `/api/catalog?category=${encodeURIComponent(category)}&page=${page}`
         );
         const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
@@ -397,7 +407,7 @@ export default function App() {
         if (opts.genre) params.set('genre', opts.genre);
         else if (opts.year) params.set('year', opts.year);
 
-        const res = await fetch(`/api/catalog?${params.toString()}`);
+        const res = await apiFetch(`/api/catalog?${params.toString()}`);
         const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
         if (!res.ok) throw new Error(data.error || 'Erro ao aplicar filtro');
 
@@ -439,7 +449,7 @@ export default function App() {
     const nextPage = releasesPage + 1;
     setLoadingMoreReleases(true);
     try {
-      const res = await fetch(`/api/episodes?page=${nextPage}`);
+      const res = await apiFetch(`/api/episodes?page=${nextPage}`);
       const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
       if (!res.ok) throw new Error(data.error || 'Erro ao carregar mais episódios');
       setReleases((prev) => dedupeMediaItems([...prev, ...(data.items || [])]));
@@ -525,7 +535,7 @@ export default function App() {
       setSearchPage(1);
       setSearchTotalPages(1);
       try {
-        const res = await fetch(`/api/search?q=${encodeURIComponent(query)}&page=1`);
+        const res = await apiFetch(`/api/search?q=${encodeURIComponent(query)}&page=1`);
         const data = (await res.json()) as PaginatedSearchResponse & { error?: string };
         if (!res.ok) throw new Error(data.error || 'Erro na busca');
         setSearchResults(Array.isArray(data.results) ? data.results : []);
@@ -546,7 +556,7 @@ export default function App() {
     const nextPage = searchPage + 1;
     setLoadingMoreSearch(true);
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/search?q=${encodeURIComponent(searchQuery)}&page=${nextPage}`
       );
       const data = (await res.json()) as PaginatedSearchResponse & { error?: string };
@@ -580,7 +590,7 @@ export default function App() {
         setRoute({ view: 'anime', url });
         setAnimeDetails(null);
         try {
-          const res = await fetch(`/api/anime?url=${encodeURIComponent(url)}`);
+          const res = await apiFetch(`/api/anime?url=${encodeURIComponent(url)}`);
           const data = await res.json();
           if (!res.ok) throw new Error(data.error || 'Erro ao carregar anime');
           setAnimeDetails(data as AnimeDetails);
@@ -597,7 +607,7 @@ export default function App() {
       setRoute({ view: 'episode', url });
       setEpisodeDetails(null);
       try {
-        const res = await fetch(`/api/episode?url=${encodeURIComponent(url)}`);
+        const res = await apiFetch(`/api/episode?url=${encodeURIComponent(url)}`);
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Erro ao carregar episódio');
         const ep = data as EpisodeDetails;
@@ -728,7 +738,7 @@ export default function App() {
     if (loadingRandom) return;
     setLoadingRandom(true);
     try {
-      const res = await fetch('/api/random');
+      const res = await apiFetch('/api/random');
       const data = (await res.json()) as { url?: string; kind?: MediaKind; error?: string };
       if (!res.ok || !data.url) {
         throw new Error(data.error || 'Não foi possível sortear um anime.');
@@ -755,6 +765,7 @@ export default function App() {
         onMarkAllRead={handleMarkAllAlertsRead}
         onOpenAlert={handleOpenAlert}
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
+        apkDownloadUrl={apkDownloadUrl}
       />
 
       {!isOnline && (

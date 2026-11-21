@@ -28,6 +28,7 @@ import {
   parseSubtitleContent,
   type ParsedSubtitleScript,
 } from '../lib/subtitleParser';
+import { getStreamProxyUrl } from '../lib/apiClient';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
 import { MediaPoster } from './MediaPoster';
 
@@ -130,11 +131,7 @@ export function AnimePlayer({
 
   const proxiedStreamUrl = useMemo(() => {
     if (!activeStream) return '';
-    const params = new URLSearchParams({
-      url: activeStream.url,
-      referer: referer || 'https://topanimes.net/',
-    });
-    return `/api/stream-proxy?${params.toString()}`;
+    return getStreamProxyUrl(activeStream.url, referer || 'https://topanimes.net/');
   }, [activeStream, referer]);
 
   const activeMediaUrl = useMemo(() => {
@@ -266,12 +263,9 @@ export function AnimePlayer({
     if (!entry.url) return;
 
     let cancelled = false;
-    const params = new URLSearchParams({
-      url: entry.url,
-      referer: referer || 'https://topanimes.net/',
-    });
+    const subProxyUrl = getStreamProxyUrl(entry.url, referer || 'https://topanimes.net/');
 
-    fetch(`/api/stream-proxy?${params.toString()}`)
+    fetch(subProxyUrl)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.arrayBuffer();

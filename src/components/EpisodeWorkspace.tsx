@@ -7,6 +7,7 @@ import {
   Keyboard,
   Server,
 } from 'lucide-react';
+import { apiFetch } from '../lib/apiClient';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
 import type {
   CatalogMediaItem,
@@ -73,7 +74,7 @@ export function EpisodeWorkspace({
     setLoadingEmbed(true);
     setResolved(null);
 
-    fetch(`/api/resolve-embed?url=${encodeURIComponent(selectedOption.embedUrl)}`)
+    apiFetch(`/api/resolve-embed?url=${encodeURIComponent(selectedOption.embedUrl)}`)
       .then((res) => res.json())
       .then((data: ResolvedEmbed) => {
         if (cancelled) return;

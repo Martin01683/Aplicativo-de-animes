@@ -372,6 +372,32 @@ async function createAppServer(): Promise<void> {
     res.json({ ok: true, service: 'topvlc' });
   });
 
+  const apkPath = path.join(__dirname, 'downloads/TopAnimes.apk');
+
+  app.get('/api/apk-info', (_req: Request, res: Response) => {
+    if (fs.existsSync(apkPath)) {
+      const stat = fs.statSync(apkPath);
+      res.json({
+        available: true,
+        url: '/downloads/TopAnimes.apk',
+        filename: 'TopAnimes.apk',
+        sizeBytes: stat.size,
+      });
+      return;
+    }
+    res.json({ available: false });
+  });
+
+  app.get('/downloads/TopAnimes.apk', (_req: Request, res: Response) => {
+    if (!fs.existsSync(apkPath)) {
+      res.status(404).send('APK ainda não foi gerado.');
+      return;
+    }
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', 'attachment; filename="TopAnimes.apk"');
+    res.sendFile(apkPath);
+  });
+
   app.get('/api/home', async (_req: Request, res: Response) => {
     try {
       const catalog = await getHomeCatalog();
