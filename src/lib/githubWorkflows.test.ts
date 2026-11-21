@@ -17,6 +17,7 @@ interface WorkflowStep {
 
 interface WorkflowJob {
   uses?: string;
+  if?: string;
   needs?: string | string[];
   with?: Record<string, unknown>;
   permissions?: Record<string, string>;
@@ -68,6 +69,7 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
   const workflow = loadWorkflow('test.yml');
   const validateJob = workflow.jobs['validate-and-test'];
   const buildApkJob = workflow.jobs['build-apk'];
+  const publishJob = workflow.jobs['publish-release'];
 
   it('triggers on push/pull_request for main and dev, plus workflow_dispatch and workflow_call', () => {
     const on = workflow.on as {
@@ -105,9 +107,26 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
     const stepNames = (buildApkJob.steps ?? []).map((s) => s.name ?? '');
     assert.ok(stepNames.includes('Build Debug APK'));
     assert.ok(stepNames.includes('Upload APK artifact'));
+  });
 
-    const publishStep = (buildApkJob.steps ?? []).find((s) => s.name === 'Publish APK Release');
-    assert.ok(publishStep);
-    assert.match(publishStep.if ?? '', /inputs\.publish/);
+  it('publishes the APK release only when requested, after the APK build', () => {
+    assert.ok(publishJob);
+    assert.equal(publishJob.needs, 'build-apk');
+    assert.match(publishJob.if ?? '', /inputs\.publish/);
+
+    const stepNames = (publishJob.steps ?? []).map((s) => s.name ?? '');
+    assert.ok(stepNames.includes('Download APK artifact'));
+    assert.ok(stepNames.includes('Publish APK Release'));
+  });
+
+  // Regression: `gh release create` failed with a read-only GITHUB_TOKEN. The top-level
+  // `contents: read` also applies inside a reusable workflow (a called workflow can only
+  // restrict the caller's token, never elevate it), so the job that publishes the release
+  // must ask for `contents: write` itself. No other job should have write access.
+  it('grants contents: write only to the publish job', () => {
+    assert.deepEqual(workflow.permissions, { contents: 'read' });
+    assert.deepEqual(publishJob.permissions, { contents: 'write' });
+    assert.equal(validateJob.permissions, undefined);
+    assert.equal(buildApkJob.permissions, undefined);
   });
 });
