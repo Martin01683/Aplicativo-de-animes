@@ -1,0 +1,16 @@
+name: Build and Publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: Run CI and Publish APK
+    uses: ./.github/workflows/test.yml
+    with:
+      publish: true
+    permissions:
+      contents: write

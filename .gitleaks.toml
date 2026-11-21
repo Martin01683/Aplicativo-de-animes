@@ -1,0 +1,15 @@
+title = "TopAnimes Gitleaks Configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Allowlist scraped public TopAnimes HTML snapshots and generated build outputs"
+paths = [
+  '''^public/assets/aistudio/.*\.html$''',
+  '''^dist/''',
+  '''^dev-dist/''',
+  '''^downloads/''',
+  '''^android/app/build/''',
+  '''^android/app/src/main/assets/public/''',
+]

@@ -50,7 +50,7 @@ const ITAG_HEIGHT: Record<number, number> = {
   78: 480,
 };
 
-const AD_HOST_RE = /(?:^|[\/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker)(?:[\/._?-]|$)/i;
+const AD_HOST_RE = /(?:^|[/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker)(?:[/._?-]|$)/i;
 
 function cleanText(val: string | undefined): string {
   return String(val || '').replace(/\s+/g, ' ').trim();

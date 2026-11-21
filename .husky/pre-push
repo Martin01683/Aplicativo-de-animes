@@ -1,0 +1,2 @@
+npm run validate || exit 1
+echo "✅ All checks passed! Proceeding with push..."

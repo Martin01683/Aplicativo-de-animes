@@ -287,7 +287,7 @@ export class SubtitleCanvasRenderer {
               : vr.y + vr.h - mv;
       }
 
-      let bx = hAlign === 0 ? ax : hAlign === 2 ? ax - blockW : ax - blockW / 2;
+      const bx = hAlign === 0 ? ax : hAlign === 2 ? ax - blockW : ax - blockW / 2;
       let by = vAlign === 0 ? ay : vAlign === 1 ? ay - blockH / 2 : ay - blockH;
 
       if (!parsed.pos && !parsed.move) {

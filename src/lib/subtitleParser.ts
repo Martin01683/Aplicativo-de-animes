@@ -720,7 +720,7 @@ export function parseAssEventRuns(
       const name = tagNames.find((tn) => block.startsWith(tn, i));
       if (!name) continue;
       i += name.length;
-      let arg = '';
+      let arg: string;
       if (block[i] === '(') {
         let depth = 1;
         let k = i + 1;

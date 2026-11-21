@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: ['main', 'dev']
+    paths-ignore:
+      - 'downloads/**'
+      - '*.md'
+  pull_request:
+    branches: ['main', 'dev']
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      publish:
+        description: 'Publishes TopAnimes-debug.apk to a GitHub Release after CI and Android build succeed'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-test:
+    name: Validate, Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      # Runs on GitHub's server, outside of any local Husky hook — so even if
+      # someone committed or pushed with --no-verify, this step still scans the
+      # repository history and fails the workflow if any secret is detected.
+      - name: Scan for leaked secrets (gitleaks)
+        run: npx gitleaks detect --redact -v
+
+      - name: Check Types
+        run: npm run typecheck
+
+      - name: Run Linter
+        run: npm run lint
+
+      - name: Run Unit Tests
+        run: npm run test
+
+      - name: Build Web Bundle
+        run: npm run build
+
+  build-apk:
+    name: Build TopAnimes APK
+    needs: validate-and-test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Build web bundle and sync Capacitor Android
+        run: npm run apk:sync
+
+      - name: Build Debug APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK output
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk TopAnimes-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TopAnimes-debug-apk
+          path: TopAnimes-debug.apk
+          retention-days: 30
+
+      - name: Publish APK Release
+        if: ${{ inputs.publish == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="latest-apk"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" TopAnimes-debug.apk --clobber
+          else
+            gh release create "$TAG" TopAnimes-debug.apk \
+              --title "TopAnimes Android APK" \
+              --notes "Build automático gerado após validação de segurança, lint, testes unitários e compilação Android (${{ github.sha }})."
+          fi
