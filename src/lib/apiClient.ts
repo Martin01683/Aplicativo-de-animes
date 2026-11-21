@@ -1,4 +1,10 @@
-import { Capacitor, registerPlugin } from '@capacitor/core';
+import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core';
+import {
+  GITHUB_RELEASES_API_URL,
+  GITHUB_RELEASES_LIST_API_URL,
+  isAllowedGitHubDownloadUrl,
+  parseGitHubReleasePayload,
+} from './appUpdater';
 import {
   normalizeTopAnimesUrl,
   pickLatestAnimeEpisode,
@@ -37,10 +43,32 @@ export interface NativeFetchPageResult {
   body: string;
 }
 
+export interface ApkDownloadProgressEvent {
+  status: 'downloading' | 'installing' | 'error';
+  percent: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  message?: string;
+}
+
+export interface NativeAppBuildInfoResult {
+  versionName: string;
+  versionCode: number;
+}
+
 export interface LocalProxyPlugin {
   getProxyBaseUrl(): Promise<{ baseUrl: string }>;
   fetchPage(options: NativeFetchPageOptions): Promise<NativeFetchPageResult>;
   openExternalUrl(options: { url: string }): Promise<{ opened: boolean }>;
+  getAppBuildInfo(): Promise<NativeAppBuildInfoResult>;
+  downloadAndInstallApk(options: {
+    url: string;
+    filename?: string;
+  }): Promise<{ started: boolean; installerOpened?: boolean }>;
+  addListener(
+    eventName: 'apkDownloadProgress',
+    listenerFunc: (event: ApkDownloadProgressEvent) => void
+  ): Promise<PluginListenerHandle>;
 }
 
 const LocalProxy = registerPlugin<LocalProxyPlugin>('LocalProxy');
@@ -123,6 +151,60 @@ export async function openExternalOrVlcUrl(url: string): Promise<boolean> {
   }
   window.location.href = url;
   return true;
+}
+
+export async function getNativeAppBuildInfo(): Promise<NativeAppBuildInfoResult | null> {
+  if (!isNativeAndroidApp()) return null;
+  try {
+    return await LocalProxy.getAppBuildInfo();
+  } catch {
+    return null;
+  }
+}
+
+export async function addApkDownloadProgressListener(
+  listener: (event: ApkDownloadProgressEvent) => void
+): Promise<PluginListenerHandle | null> {
+  if (!isNativeAndroidApp()) return null;
+  try {
+    return await LocalProxy.addListener('apkDownloadProgress', listener);
+  } catch {
+    return null;
+  }
+}
+
+export async function downloadAppUpdateApk(
+  downloadUrl: string,
+  filename = 'TopAnimes.apk'
+): Promise<{ mode: 'native-installer' | 'browser-download' }> {
+  if (!isAllowedGitHubDownloadUrl(downloadUrl)) {
+    throw new Error('URL de download do GitHub inválida ou não permitida.');
+  }
+  if (isNativeAndroidApp()) {
+    try {
+      const res = await LocalProxy.downloadAndInstallApk({ url: downloadUrl, filename });
+      if (res?.started) {
+        return { mode: 'native-installer' };
+      }
+    } catch {
+      // Fallback to external browser download if native plugin is older
+      const opened = await openExternalOrVlcUrl(downloadUrl);
+      if (opened) {
+        return { mode: 'browser-download' };
+      }
+      throw new Error('Não foi possível baixar ou abrir a atualização no Android.');
+    }
+  }
+
+  const anchor = document.createElement('a');
+  anchor.href = downloadUrl;
+  anchor.download = filename;
+  anchor.rel = 'noopener noreferrer';
+  anchor.target = '_blank';
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  return { mode: 'browser-download' };
 }
 
 export interface ApiJsonResponse {
@@ -352,6 +434,54 @@ export async function routeNativeApiRequest(
 
   if (pathname === '/api/apk-info') {
     return { status: 200, body: { available: false } };
+  }
+
+  if (pathname === '/api/app-update/check') {
+    try {
+      let response = await fetchPage(GITHUB_RELEASES_API_URL, {
+        accept: 'application/vnd.github+json',
+        timeoutMs: 10000,
+      });
+
+      let payload: unknown = null;
+      if (response.ok) {
+        payload = JSON.parse(response.body);
+      } else if (response.status === 404) {
+        response = await fetchPage(GITHUB_RELEASES_LIST_API_URL, {
+          accept: 'application/vnd.github+json',
+          timeoutMs: 10000,
+        });
+        if (response.ok) {
+          const list = JSON.parse(response.body) as unknown[];
+          payload = Array.isArray(list) ? list[0] : null;
+        }
+      }
+
+      if (!response.ok && response.status !== 404) {
+        return {
+          status: 502,
+          body: { error: `GitHub retornou HTTP ${response.status} ao verificar atualizações.` },
+        };
+      }
+
+      return {
+        status: 200,
+        body: {
+          checkedAt: new Date().toISOString(),
+          release: parseGitHubReleasePayload(payload),
+        },
+      };
+    } catch (err) {
+      return {
+        status: 502,
+        body: {
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível consultar atualizações no GitHub agora.',
+        },
+      };
+    }
   }
 
   if (pathname === '/api/home') {

@@ -1,3 +1,4 @@
+import { execSync } from 'node:child_process';
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import fs from 'fs';
@@ -5,8 +6,59 @@ import path from 'path';
 import {defineConfig} from 'vite';
 import {VitePWA} from 'vite-plugin-pwa';
 
-export default defineConfig(() => {
+function readBuildInfo() {
+  let pkgVersion = '1.0.0';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'package.json'), 'utf8')) as {
+      version?: string;
+    };
+    if (pkg.version && pkg.version !== '0.0.0') {
+      pkgVersion = pkg.version;
+    }
+  } catch {
+    // fallback
+  }
+
+  let commitSha = (process.env.GITHUB_SHA || '').trim();
+  if (!commitSha) {
+    try {
+      commitSha = execSync('git rev-parse HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString()
+        .trim();
+    } catch {
+      commitSha = '';
+    }
+  }
+
+  let builtAt = '';
+  if (commitSha) {
+    try {
+      builtAt = execSync('git log -1 --format=%cI', { stdio: ['ignore', 'pipe', 'ignore'] })
+        .toString()
+        .trim();
+    } catch {
+      builtAt = '';
+    }
+  }
+  if (!builtAt) {
+    builtAt = new Date().toISOString();
+  }
+
+  const version = (process.env.APP_VERSION_NAME || '').trim() || pkgVersion;
   return {
+    version,
+    commitSha,
+    builtAt,
+    repository: 'Martin01683/Aplicativo-de-animes',
+  };
+}
+
+export default defineConfig(() => {
+  const buildInfo = readBuildInfo();
+  return {
+    define: {
+      __APP_BUILD_INFO__: JSON.stringify(buildInfo),
+    },
     plugins: [
       react(),
       tailwindcss(),

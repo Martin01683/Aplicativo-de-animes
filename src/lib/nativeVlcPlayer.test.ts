@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { shouldEnableDesktopShortcuts } from './nativeVlcPlayer.ts';
+import {
+  isSameEpisodeUrl,
+  resolveSeriesPrevNext,
+  shouldEnableDesktopShortcuts,
+} from './nativeVlcPlayer.ts';
+import type { AnimeEpisodeLink } from './types.ts';
 
 describe('nativeVlcPlayer & platform guards', () => {
   it('disables desktop keyboard shortcuts inside the native Android APK', () => {
@@ -42,5 +47,42 @@ describe('nativeVlcPlayer & platform guards', () => {
       ),
       true
     );
+  });
+
+  it('matches episode URLs across trailing slashes and http/https variants', () => {
+    assert.equal(
+      isSameEpisodeUrl(
+        'https://topanimes.net/episodio/frieren-episodio-5/',
+        'http://www.topanimes.net/episodio/frieren-episodio-5'
+      ),
+      true
+    );
+    assert.equal(
+      isSameEpisodeUrl(
+        'https://topanimes.net/episodio/frieren-episodio-5/',
+        'https://topanimes.net/episodio/frieren-episodio-6/'
+      ),
+      false
+    );
+  });
+
+  it('resolves adjacent prev/next episodes for both ascending and descending episode lists', () => {
+    const asc: AnimeEpisodeLink[] = [
+      { numberLabel: '1', episodeNumber: 1, title: 'Ep 1', url: 'https://topanimes.net/episodio/a-ep-1/' },
+      { numberLabel: '2', episodeNumber: 2, title: 'Ep 2', url: 'https://topanimes.net/episodio/a-ep-2/' },
+      { numberLabel: '3', episodeNumber: 3, title: 'Ep 3', url: 'https://topanimes.net/episodio/a-ep-3/' },
+    ];
+    assert.deepEqual(resolveSeriesPrevNext(asc, 'https://topanimes.net/episodio/a-ep-2'), {
+      currentIndex: 1,
+      prevUrl: 'https://topanimes.net/episodio/a-ep-1/',
+      nextUrl: 'https://topanimes.net/episodio/a-ep-3/',
+    });
+
+    const desc: AnimeEpisodeLink[] = [...asc].reverse();
+    assert.deepEqual(resolveSeriesPrevNext(desc, 'https://topanimes.net/episodio/a-ep-2/'), {
+      currentIndex: 1,
+      prevUrl: 'https://topanimes.net/episodio/a-ep-1/',
+      nextUrl: 'https://topanimes.net/episodio/a-ep-3/',
+    });
   });
 });

@@ -50,3 +50,40 @@ test('routeNativeApiRequest returns health check and safe fallback on /api/apk-i
   assert.equal(apkInfo.status, 200);
   assert.equal((apkInfo.body as { available: boolean }).available, false);
 });
+
+test('routeNativeApiRequest parses GitHub Releases on /api/app-update/check', async () => {
+  const res = await routeNativeApiRequest('/api/app-update/check', undefined, {
+    fetchPage: async () => ({
+      status: 200,
+      ok: true,
+      finalUrl: 'https://api.github.com/repos/Martin01683/Aplicativo-de-animes/releases/latest',
+      body: JSON.stringify({
+        id: 453376005,
+        tag_name: 'latest-apk',
+        name: 'TopAnimes Android APK',
+        html_url: 'https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/latest-apk',
+        published_at: '2026-11-21T02:11:00Z',
+        updated_at: '2026-11-21T02:42:12Z',
+        body: 'Build automático (7ea7c809c1317142fa6c3aa4818e9716afbfe30c).',
+        assets: [
+          {
+            name: 'TopAnimes.apk',
+            size: 92044913,
+            updated_at: '2026-11-21T02:42:11Z',
+            browser_download_url:
+              'https://github.com/Martin01683/Aplicativo-de-animes/releases/download/latest-apk/TopAnimes.apk',
+          },
+        ],
+      }),
+    }),
+  });
+
+  assert.equal(res.status, 200);
+  const body = res.body as {
+    release: { tagName: string; commitSha: string; apkAsset: { name: string } | null } | null;
+  };
+  assert.equal(body.release?.tagName, 'latest-apk');
+  assert.equal(body.release?.commitSha, '7ea7c809c1317142fa6c3aa4818e9716afbfe30c');
+  assert.equal(body.release?.apkAsset?.name, 'TopAnimes.apk');
+});
+

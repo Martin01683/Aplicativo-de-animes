@@ -1,8 +1,12 @@
 package com.topanimes.player;
 
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.net.Uri;
+import android.os.Build;
 import android.util.Log;
+
+import androidx.core.content.FileProvider;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -12,6 +16,8 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -184,6 +190,134 @@ public class LocalProxyPlugin extends Plugin {
             JSObject ret = new JSObject();
             ret.put("opened", false);
             call.resolve(ret);
+        }
+    }
+
+    @PluginMethod
+    public void getAppBuildInfo(PluginCall call) {
+        try {
+            PackageInfo info = getContext().getPackageManager().getPackageInfo(getContext().getPackageName(), 0);
+            long versionCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                ? info.getLongVersionCode()
+                : info.versionCode;
+            JSObject ret = new JSObject();
+            ret.put("versionName", info.versionName != null ? info.versionName : "1.0");
+            ret.put("versionCode", versionCode);
+            call.resolve(ret);
+        } catch (Exception e) {
+            JSObject ret = new JSObject();
+            ret.put("versionName", "1.0");
+            ret.put("versionCode", 1);
+            call.resolve(ret);
+        }
+    }
+
+    @PluginMethod
+    public void downloadAndInstallApk(PluginCall call) {
+        String rawUrl = call.getString("url", "");
+        if (!isAllowedGitHubApkUrl(rawUrl)) {
+            call.reject("URL de atualização inválida ou não permitida.");
+            return;
+        }
+        String rawName = call.getString("filename", "TopAnimes.apk");
+        final String safeName = (rawName != null && rawName.endsWith(".apk"))
+            ? rawName.replaceAll("[^a-zA-Z0-9._-]", "_")
+            : "TopAnimes.apk";
+
+        if (executor == null || executor.isShutdown()) {
+            startProxyServer();
+        }
+
+        executor.execute(() -> {
+            HttpURLConnection conn = null;
+            try {
+                File updatesDir = new File(getContext().getCacheDir(), "updates");
+                if (!updatesDir.exists() && !updatesDir.mkdirs()) {
+                    throw new IOException("Não foi possível preparar pasta de atualização.");
+                }
+                File apkFile = new File(updatesDir, safeName);
+
+                RedirectResult res = openWithRedirects(rawUrl, "https://github.com/", "application/octet-stream", null, 30000);
+                conn = res.connection;
+                int status = conn.getResponseCode();
+                if (status < 200 || status >= 300) {
+                    throw new IOException("GitHub retornou HTTP " + status + " ao baixar APK.");
+                }
+
+                long totalBytes = -1;
+                try {
+                    String cl = conn.getHeaderField("Content-Length");
+                    if (cl != null) totalBytes = Long.parseLong(cl.trim());
+                } catch (NumberFormatException ignored) {
+                }
+
+                try (InputStream in = new BufferedInputStream(conn.getInputStream());
+                     FileOutputStream out = new FileOutputStream(apkFile)) {
+                    byte[] buf = new byte[32768];
+                    long downloaded = 0;
+                    int read;
+                    int lastPercent = -1;
+                    while ((read = in.read(buf)) != -1) {
+                        out.write(buf, 0, read);
+                        downloaded += read;
+                        int percent = totalBytes > 0 ? (int) Math.min(100, (downloaded * 100L) / totalBytes) : -1;
+                        if (percent != lastPercent && (percent < 0 || percent == 100 || percent - lastPercent >= 2)) {
+                            lastPercent = percent;
+                            emitDownloadProgress("downloading", percent, downloaded, totalBytes, null);
+                        }
+                    }
+                    out.flush();
+                    emitDownloadProgress("installing", 100, downloaded, totalBytes > 0 ? totalBytes : downloaded, null);
+                }
+
+                Uri apkUri = FileProvider.getUriForFile(
+                    getContext(),
+                    getContext().getPackageName() + ".fileprovider",
+                    apkFile
+                );
+                Intent installIntent = new Intent(Intent.ACTION_VIEW);
+                installIntent.setDataAndType(apkUri, "application/vnd.android.package-archive");
+                installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+                getContext().startActivity(installIntent);
+
+                JSObject ret = new JSObject();
+                ret.put("started", true);
+                ret.put("installerOpened", true);
+                call.resolve(ret);
+            } catch (Exception e) {
+                String msg = e.getMessage() != null ? e.getMessage() : "Falha ao baixar atualização.";
+                emitDownloadProgress("error", 0, 0, 0, msg);
+                call.reject(msg);
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        });
+    }
+
+    private void emitDownloadProgress(String status, int percent, long downloadedBytes, long totalBytes, String message) {
+        JSObject data = new JSObject();
+        data.put("status", status);
+        data.put("percent", percent);
+        data.put("downloadedBytes", downloadedBytes);
+        data.put("totalBytes", totalBytes);
+        if (message != null) {
+            data.put("message", message);
+        }
+        notifyListeners("apkDownloadProgress", data);
+    }
+
+    private static boolean isAllowedGitHubApkUrl(String rawUrl) {
+        if (!isSafeHttpUrl(rawUrl)) return false;
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            if (!"https".equalsIgnoreCase(uri.getScheme())) return false;
+            String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            return host.equals("github.com")
+                || host.endsWith(".github.com")
+                || host.equals("githubusercontent.com")
+                || host.endsWith(".githubusercontent.com");
+        } catch (Exception e) {
+            return false;
         }
     }
 

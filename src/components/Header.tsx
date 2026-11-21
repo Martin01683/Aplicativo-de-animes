@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bell, BellRing, CheckCheck, Loader2, PlayCircle, RefreshCw } from 'lucide-react';
+import { Bell, BellRing, CheckCheck, Loader2, PlayCircle, RefreshCw, Settings } from 'lucide-react';
 import type { FavoriteAlertEntry } from '../lib/types';
 
 export type NavSection = 'releases' | 'calendar' | 'catalog' | 'library';
@@ -16,6 +16,8 @@ interface HeaderProps {
   onMarkAllRead: () => void;
   onOpenAlert: (alert: FavoriteAlertEntry) => void;
   onRequestPushNotifications: () => void;
+  hasAppUpdate: boolean;
+  onOpenSettings: () => void;
 }
 
 const NAV_ITEMS: Array<{ id: NavSection; label: string }> = [
@@ -37,6 +39,8 @@ export function Header({
   onMarkAllRead,
   onOpenAlert,
   onRequestPushNotifications,
+  hasAppUpdate,
+  onOpenSettings,
 }: HeaderProps) {
   const [openPopover, setOpenPopover] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -104,29 +108,30 @@ export function Header({
           })}
         </nav>
 
-        <div ref={popoverRef} className="relative">
-          <button
-            type="button"
-            onClick={() => setOpenPopover((prev) => !prev)}
-            aria-expanded={openPopover}
-            aria-label={
-              unreadCount > 0
-                ? `Notificações (${unreadCount} novos episódios)`
-                : 'Notificações de novos episódios'
-            }
-            className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-[#151921] text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
-          >
-            {unreadCount > 0 ? (
-              <BellRing className="h-4.5 w-4.5 text-[#f97316]" />
-            ) : (
-              <Bell className="h-4.5 w-4.5" />
-            )}
-            {unreadCount > 0 && (
-              <span className="absolute -right-1 -top-1 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#f97316] px-1 text-[10px] font-bold leading-none text-[#0d0f12] tabular-nums">
-                {unreadCount > 9 ? '9+' : unreadCount}
-              </span>
-            )}
-          </button>
+        <div className="flex shrink-0 items-center gap-2">
+          <div ref={popoverRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setOpenPopover((prev) => !prev)}
+              aria-expanded={openPopover}
+              aria-label={
+                unreadCount > 0
+                  ? `Notificações (${unreadCount} novos episódios)`
+                  : 'Notificações de novos episódios'
+              }
+              className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-[#151921] text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+            >
+              {unreadCount > 0 ? (
+                <BellRing className="h-4.5 w-4.5 text-[#f97316]" />
+              ) : (
+                <Bell className="h-4.5 w-4.5" />
+              )}
+              {unreadCount > 0 && (
+                <span className="absolute -right-1 -top-1 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#f97316] px-1 text-[10px] font-bold leading-none text-[#0d0f12] tabular-nums">
+                  {unreadCount > 9 ? '9+' : unreadCount}
+                </span>
+              )}
+            </button>
 
           {openPopover && (
             <div className="absolute right-0 mt-2 w-[320px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border border-white/15 bg-[#151921] shadow-2xl sm:w-[360px]">
@@ -252,8 +257,31 @@ export function Header({
                   Ver tudo em Minha Lista
                 </button>
               </div>
-            </div>
-          )}
+              </div>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              setOpenPopover(false);
+              onOpenSettings();
+            }}
+            aria-label={
+              hasAppUpdate
+                ? 'Abrir configurações do aplicativo (nova atualização disponível)'
+                : 'Abrir configurações do aplicativo'
+            }
+            className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-[#151921] text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+          >
+            <Settings className="h-4.5 w-4.5" />
+            {hasAppUpdate && (
+              <span
+                aria-hidden="true"
+                className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#0d0f12] bg-[#f97316]"
+              />
+            )}
+          </button>
         </div>
       </div>
     </header>

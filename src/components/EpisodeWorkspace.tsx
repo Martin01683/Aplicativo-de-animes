@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ChevronLeft,
@@ -9,8 +9,15 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
-import { isDesktopShortcutsEnabled } from '../lib/nativeVlcPlayer';
+import {
+  isDesktopShortcutsEnabled,
+  isSameEpisodeUrl,
+  resolveSeriesPrevNext,
+  type NativeVlcPlayResult,
+} from '../lib/nativeVlcPlayer';
 import type {
+  AnimeDetails,
+  AnimeEpisodeLink,
   CatalogMediaItem,
   EpisodeDetails,
   FavoriteLatestInfo,
@@ -23,23 +30,39 @@ import { MediaPoster } from './MediaPoster';
 interface EpisodeWorkspaceProps {
   episode: EpisodeDetails;
   isFavorite: boolean;
+  watchedUrls?: Set<string>;
+  initialSeriesEpisodes?: AnimeEpisodeLink[];
+  loadingEpisode?: boolean;
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
   onBack: () => void;
   onNavigateUrl: (url: string, kind: 'episode' | 'anime' | 'movie') => void;
+  onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
   onToast: (message: string) => void;
+  skipIntroSeconds?: number;
+  autoPlayNextEpisode?: boolean;
 }
 
 export function EpisodeWorkspace({
   episode,
   isFavorite,
+  watchedUrls,
+  initialSeriesEpisodes,
+  loadingEpisode = false,
   onToggleFavorite,
   onBack,
   onNavigateUrl,
+  onNativeSessionSync,
   onToast,
+  skipIntroSeconds = 85,
+  autoPlayNextEpisode = false,
 }: EpisodeWorkspaceProps) {
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
-  const playableOptions = episode.options.filter(
-    (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
+  const playableOptions = useMemo(
+    () =>
+      episode.options.filter(
+        (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
+      ),
+    [episode.options]
   );
 
   const [selectedOption, setSelectedOption] = useState<PlayerOption | null>(() => {
@@ -53,6 +76,17 @@ export function EpisodeWorkspace({
   });
   const [resolved, setResolved] = useState<ResolvedEmbed | null>(null);
   const [loadingEmbed, setLoadingEmbed] = useState(false);
+
+  const seriesCacheRef = useRef<Map<string, AnimeEpisodeLink[]>>(new Map());
+  const [seriesEpisodes, setSeriesEpisodes] = useState<AnimeEpisodeLink[]>(
+    initialSeriesEpisodes || []
+  );
+
+  // Remember whether the player has mounted at least once in this session so fullscreen stays intact during episode switches
+  const hasMountedPlayerRef = useRef(false);
+  if (resolved?.status === 'resolved' && resolved.streams.length > 0) {
+    hasMountedPlayerRef.current = true;
+  }
 
   // Reset selected server whenever episode changes
   useEffect(() => {
@@ -69,12 +103,48 @@ export function EpisodeWorkspace({
     setResolved(null);
   }, [episode]);
 
+  // Fetch and cache the series episode list so in-fullscreen episode selection is always populated
+  useEffect(() => {
+    if (episode.isMovie || !episode.seriesUrl) {
+      setSeriesEpisodes([]);
+      return;
+    }
+
+    const seriesKey = normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl;
+    if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
+      seriesCacheRef.current.set(seriesKey, initialSeriesEpisodes);
+      setSeriesEpisodes(initialSeriesEpisodes);
+      return;
+    }
+
+    const cached = seriesCacheRef.current.get(seriesKey);
+    if (cached && cached.length > 0) {
+      setSeriesEpisodes(cached);
+      return;
+    }
+
+    let cancelled = false;
+    apiFetch(`/api/anime?url=${encodeURIComponent(episode.seriesUrl)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: AnimeDetails | null) => {
+        if (cancelled || !data || !Array.isArray(data.episodes)) return;
+        seriesCacheRef.current.set(seriesKey, data.episodes);
+        setSeriesEpisodes(data.episodes);
+      })
+      .catch(() => {
+        // Ignore silent series fetch failures
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [episode.isMovie, episode.seriesUrl, initialSeriesEpisodes]);
+
   // Resolve chosen server via backend
   useEffect(() => {
     if (!selectedOption) return;
     let cancelled = false;
     setLoadingEmbed(true);
-    setResolved(null);
 
     apiFetch(`/api/resolve-embed?url=${encodeURIComponent(selectedOption.embedUrl)}`)
       .then((res) => res.json())
@@ -102,6 +172,19 @@ export function EpisodeWorkspace({
       cancelled = true;
     };
   }, [selectedOption]);
+
+  const adjacent = useMemo(
+    () => resolveSeriesPrevNext(seriesEpisodes, episode.url),
+    [seriesEpisodes, episode.url]
+  );
+
+  const effectivePrevUrl = episode.prevUrl || adjacent.prevUrl;
+  const effectiveNextUrl = episode.nextUrl || adjacent.nextUrl;
+
+  const isTransitioning = loadingEpisode || loadingEmbed;
+  const hasResolvedStreams =
+    resolved?.status === 'resolved' && resolved.streams.length > 0;
+  const showPlayer = hasResolvedStreams || hasMountedPlayerRef.current;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
@@ -139,8 +222,8 @@ export function EpisodeWorkspace({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            disabled={!episode.prevUrl}
-            onClick={() => episode.prevUrl && onNavigateUrl(episode.prevUrl, 'episode')}
+            disabled={!effectivePrevUrl || isTransitioning}
+            onClick={() => effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')}
             className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <ChevronLeft className="h-4 w-4" />
@@ -148,8 +231,8 @@ export function EpisodeWorkspace({
           </button>
           <button
             type="button"
-            disabled={!episode.nextUrl}
-            onClick={() => episode.nextUrl && onNavigateUrl(episode.nextUrl, 'episode')}
+            disabled={!effectiveNextUrl || isTransitioning}
+            onClick={() => effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')}
             className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
           >
             <span>Próximo</span>
@@ -161,28 +244,59 @@ export function EpisodeWorkspace({
       {/* Main Cinema Player + Metadata Layout */}
       <div className="grid gap-6 lg:grid-cols-[1fr_320px] lg:gap-8">
         <div className="min-w-0 space-y-5">
-          {/* Custom Script AnimePlayer */}
-          {loadingEmbed ? (
+          {showPlayer ? (
+            <AnimePlayer
+              title={episode.title}
+              episodeUrl={episode.url}
+              seriesUrl={episode.seriesUrl}
+              seriesTitle={episode.seriesTitle}
+              seriesEpisodes={seriesEpisodes}
+              watchedUrls={watchedUrls}
+              playerOptions={playableOptions}
+              selectedServerNume={selectedOption?.nume}
+              streams={hasResolvedStreams ? resolved.streams : []}
+              referer={resolved?.referer || 'https://topanimes.net/'}
+              preferDirect={resolved?.preferDirect}
+              poster={episode.backdrop || episode.poster}
+              subtitles={hasResolvedStreams ? resolved.subtitles : []}
+              hasPrev={Boolean(effectivePrevUrl)}
+              hasNext={Boolean(effectiveNextUrl)}
+              prevUrl={effectivePrevUrl}
+              nextUrl={effectiveNextUrl}
+              loadingEpisode={isTransitioning}
+              errorMessage={
+                !isTransitioning && !hasResolvedStreams
+                  ? resolved?.errorMessage ||
+                    'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou ruplay) para assistir no player.'
+                  : ''
+              }
+              skipIntroSeconds={skipIntroSeconds}
+              autoPlayNextEpisode={autoPlayNextEpisode}
+              onPrevEpisode={() =>
+                effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')
+              }
+              onNextEpisode={() =>
+                effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')
+              }
+              onSelectEpisode={(epUrl) => {
+                if (!isSameEpisodeUrl(epUrl, episode.url)) {
+                  onNavigateUrl(epUrl, 'episode');
+                }
+              }}
+              onSelectServer={(nume) => {
+                const match = playableOptions.find((o) => o.nume === nume);
+                if (match) setSelectedOption(match);
+              }}
+              onNativeSessionSync={onNativeSessionSync}
+              onToast={onToast}
+            />
+          ) : isTransitioning ? (
             <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
               <div className="h-10 w-10 animate-spin rounded-full border-3 border-white/15 border-t-[#f97316]" />
               <p className="mt-3 text-sm font-medium text-slate-300">
                 Extraindo vídeo e legendas...
               </p>
             </div>
-          ) : resolved?.status === 'resolved' && resolved.streams.length > 0 ? (
-            <AnimePlayer
-              title={episode.title}
-              streams={resolved.streams}
-              referer={resolved.referer}
-              preferDirect={resolved.preferDirect}
-              poster={episode.backdrop || episode.poster}
-              subtitles={resolved.subtitles}
-              hasPrev={Boolean(episode.prevUrl)}
-              hasNext={Boolean(episode.nextUrl)}
-              onPrevEpisode={() => episode.prevUrl && onNavigateUrl(episode.prevUrl, 'episode')}
-              onNextEpisode={() => episode.nextUrl && onNavigateUrl(episode.nextUrl, 'episode')}
-              onToast={onToast}
-            />
           ) : (
             <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
               <p className="max-w-md text-sm leading-relaxed text-slate-300">
@@ -293,11 +407,11 @@ export function EpisodeWorkspace({
               <Keyboard className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#f97316]" />
               {desktopShortcutsEnabled ? (
                 <span>
-                  <strong className="text-slate-200">Gestos &amp; Atalhos:</strong> toque duplo nas laterais para ±5s, segure na tela ou Espaço para 2×, botão <strong className="text-slate-200">+85s</strong> pula abertura, e arraste arquivos <span className="font-mono">.ass/.srt/.vtt</span> para carregar legendas locais.
+                  <strong className="text-slate-200">Gestos &amp; Atalhos:</strong> toque duplo nas laterais para ±5s, segure na tela ou Espaço para 2×, botão <strong className="text-slate-200">+{skipIntroSeconds}s</strong> pula abertura, e arraste arquivos <span className="font-mono">.ass/.srt/.vtt</span> para carregar legendas locais.
                 </span>
               ) : (
                 <span>
-                  <strong className="text-slate-200">Controles Touch (LibVLC):</strong> toque duplo nas laterais para ±5s, segure no vídeo para 2×, botão <strong className="text-slate-200">+85s</strong> pula abertura e gerencie áudio, legendas e qualidade diretamente no player.
+                  <strong className="text-slate-200">Controles Touch (LibVLC):</strong> toque duplo nas laterais para ±5s, segure no vídeo para 2×, botão <strong className="text-slate-200">+{skipIntroSeconds}s</strong> pula abertura e troque de episódio diretamente em tela cheia.
                 </span>
               )}
             </div>

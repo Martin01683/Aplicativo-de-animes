@@ -35,6 +35,11 @@ import {
   isTopAnimesUrl,
   unwrapAvisoUrl,
 } from './src/lib/urlSafety.ts';
+import {
+  GITHUB_RELEASES_API_URL,
+  GITHUB_RELEASES_LIST_API_URL,
+  parseGitHubReleasePayload,
+} from './src/lib/appUpdater.ts';
 import { buildM3uPlaylist, DEFAULT_BROWSER_UA, sanitizeFilename } from './src/lib/vlc.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -397,6 +402,49 @@ async function createAppServer(): Promise<void> {
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', 'attachment; filename="TopAnimes.apk"');
     res.sendFile(apkPath);
+  });
+
+  app.get('/api/app-update/check', async (_req: Request, res: Response) => {
+    try {
+      let response = await safeFetch(GITHUB_RELEASES_API_URL, {
+        accept: 'application/vnd.github+json',
+        timeoutMs: 10000,
+      });
+
+      let payload: unknown = null;
+      if (response.ok) {
+        payload = await response.json();
+      } else if (response.status === 404) {
+        response = await safeFetch(GITHUB_RELEASES_LIST_API_URL, {
+          accept: 'application/vnd.github+json',
+          timeoutMs: 10000,
+        });
+        if (response.ok) {
+          const list = (await response.json()) as unknown[];
+          payload = Array.isArray(list) ? list[0] : null;
+        }
+      }
+
+      if (!response.ok && response.status !== 404) {
+        res.status(502).json({
+          error: `GitHub retornou HTTP ${response.status} ao verificar atualizações.`,
+        });
+        return;
+      }
+
+      const release = parseGitHubReleasePayload(payload);
+      res.json({
+        checkedAt: new Date().toISOString(),
+        release,
+      });
+    } catch (err) {
+      res.status(502).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Não foi possível consultar atualizações no GitHub agora.',
+      });
+    }
   });
 
   app.get('/api/home', async (_req: Request, res: Response) => {

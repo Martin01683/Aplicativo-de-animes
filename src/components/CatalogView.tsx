@@ -88,6 +88,7 @@ interface CatalogViewProps {
   onRequestPushNotifications: () => void;
   onClearHistory: () => void;
   onSelectSection: (section: NavSection) => void;
+  defaultAudioFilter: 'ALL' | 'DUB' | 'LEG';
 }
 
 const ARCHIVE_TABS: Array<{ id: CatalogArchiveCategory; label: string }> = [
@@ -149,9 +150,14 @@ export function CatalogView({
   onRequestPushNotifications,
   onClearHistory,
   onSelectSection,
+  defaultAudioFilter,
 }: CatalogViewProps) {
   const [searchInput, setSearchInput] = useState(searchQuery);
-  const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>('ALL');
+  const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>(defaultAudioFilter);
+
+  useEffect(() => {
+    setAudioFilter(defaultAudioFilter);
+  }, [defaultAudioFilter]);
 
   useEffect(() => {
     setSearchInput(searchQuery);

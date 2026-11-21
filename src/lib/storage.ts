@@ -1,3 +1,10 @@
+import {
+  DEFAULT_APP_SETTINGS,
+  DEFAULT_APP_SETTINGS_META,
+  sanitizeAppSettings,
+  type AppSettings,
+  type AppSettingsMeta,
+} from './settings';
 import type {
   CatalogMediaItem,
   FavoriteAlertEntry,
@@ -9,6 +16,9 @@ const FAVORITES_KEY = 'topvlc:favorites:v1';
 const HISTORY_KEY = 'topvlc:history:v1';
 const ALERTS_KEY = 'topvlc:alerts:v1';
 const BASELINES_KEY = 'topvlc:fav_baselines:v1';
+const SETTINGS_KEY = 'topvlc:settings:v1';
+const SETTINGS_META_KEY = 'topvlc:settings_meta:v1';
+const ACK_RELEASE_KEY = 'topvlc:ack_release:v1';
 
 export function loadFavorites(): CatalogMediaItem[] {
   try {
@@ -78,6 +88,14 @@ export function saveFavoriteAlerts(alerts: FavoriteAlertEntry[]): void {
   }
 }
 
+export function clearFavoriteAlerts(): void {
+  try {
+    localStorage.removeItem(ALERTS_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export function loadFavoriteBaselines(): FavoriteBaselineMap {
   try {
     const raw = localStorage.getItem(BASELINES_KEY);
@@ -96,4 +114,67 @@ export function saveFavoriteBaselines(baselines: FavoriteBaselineMap): void {
     // ignore
   }
 }
+
+export function loadAppSettings(): AppSettings {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_APP_SETTINGS };
+    return sanitizeAppSettings(JSON.parse(raw));
+  } catch {
+    return { ...DEFAULT_APP_SETTINGS };
+  }
+}
+
+export function saveAppSettings(settings: AppSettings): void {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(sanitizeAppSettings(settings)));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadAppSettingsMeta(): AppSettingsMeta {
+  try {
+    const raw = localStorage.getItem(SETTINGS_META_KEY);
+    if (!raw) return { ...DEFAULT_APP_SETTINGS_META };
+    const parsed = JSON.parse(raw) as Partial<AppSettingsMeta>;
+    return {
+      lastEpisodeCheckAt:
+        typeof parsed?.lastEpisodeCheckAt === 'string' ? parsed.lastEpisodeCheckAt : null,
+      lastAppUpdateCheckAt:
+        typeof parsed?.lastAppUpdateCheckAt === 'string' ? parsed.lastAppUpdateCheckAt : null,
+    };
+  } catch {
+    return { ...DEFAULT_APP_SETTINGS_META };
+  }
+}
+
+export function saveAppSettingsMeta(meta: AppSettingsMeta): void {
+  try {
+    localStorage.setItem(SETTINGS_META_KEY, JSON.stringify(meta));
+  } catch {
+    // ignore
+  }
+}
+
+export function loadAcknowledgedReleaseKey(): string | null {
+  try {
+    return localStorage.getItem(ACK_RELEASE_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveAcknowledgedReleaseKey(key: string | null): void {
+  try {
+    if (!key) {
+      localStorage.removeItem(ACK_RELEASE_KEY);
+    } else {
+      localStorage.setItem(ACK_RELEASE_KEY, key);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 

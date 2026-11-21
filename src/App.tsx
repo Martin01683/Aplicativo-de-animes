@@ -5,8 +5,24 @@ import { CatalogView } from './components/CatalogView';
 import { EpisodeWorkspace } from './components/EpisodeWorkspace';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
+import { SettingsModal } from './components/SettingsModal';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
-import { apiFetch } from './lib/apiClient';
+import {
+  addApkDownloadProgressListener,
+  apiFetch,
+  downloadAppUpdateApk,
+  getNativeAppBuildInfo,
+  isNativeAndroidApp,
+  type ApkDownloadProgressEvent,
+} from './lib/apiClient';
+import {
+  buildReleaseIdentityKey,
+  evaluateUpdateStatus,
+  getAppBuildInfo,
+  type AppBuildInfo,
+  type AppUpdateCheckResult,
+  type RemoteAppRelease,
+} from './lib/appUpdater';
 import {
   buildFavoriteBaseline,
   detectNewFavoriteEpisodes,
@@ -15,13 +31,28 @@ import {
   normalizeTopAnimesUrl,
   toSeriesFavoriteItem,
 } from './lib/favoriteAlerts';
+import { isSameEpisodeUrl } from './lib/nativeVlcPlayer';
 import {
+  DEFAULT_APP_SETTINGS,
+  getEpisodeCheckIntervalMs,
+  shouldRunScheduledAppUpdateCheck,
+  type AppSettings,
+  type AppSettingsMeta,
+} from './lib/settings';
+import {
+  clearFavoriteAlerts,
   clearHistory,
+  loadAcknowledgedReleaseKey,
+  loadAppSettings,
+  loadAppSettingsMeta,
   loadFavoriteAlerts,
   loadFavoriteBaselines,
   loadFavorites,
   loadHistory,
   pushHistoryEntry,
+  saveAcknowledgedReleaseKey,
+  saveAppSettings,
+  saveAppSettingsMeta,
   saveFavoriteAlerts,
   saveFavoriteBaselines,
   saveFavorites,
@@ -89,8 +120,15 @@ function dedupeSearchItems(list: SearchResultItem[]): SearchResultItem[] {
 
 export default function App() {
   const isOnline = useOnlineStatus();
+  const [settings, setSettings] = useState<AppSettings>(() => loadAppSettings());
+  const [settingsMeta, setSettingsMeta] = useState<AppSettingsMeta>(() => loadAppSettingsMeta());
+  const [acknowledgedReleaseKey, setAcknowledgedReleaseKey] = useState<string | null>(() =>
+    loadAcknowledgedReleaseKey()
+  );
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
   const [route, setRoute] = useState<ActiveRoute>({ view: 'catalog' });
-  const [activeSection, setActiveSection] = useState<NavSection>('releases');
+  const [activeSection, setActiveSection] = useState<NavSection>(() => loadAppSettings().defaultSection);
 
   const [catalog, setCatalog] = useState<HomeCatalog | null>(null);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
@@ -153,16 +191,38 @@ export default function App() {
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
   const [toast, setToast] = useState<string>('');
 
+  const [buildInfo, setBuildInfo] = useState<AppBuildInfo>(() => getAppBuildInfo());
+  const [appUpdateResult, setAppUpdateResult] = useState<AppUpdateCheckResult | null>(null);
+  const [checkingAppUpdate, setCheckingAppUpdate] = useState(false);
+  const [appUpdateError, setAppUpdateError] = useState('');
+  const [downloadingAppUpdate, setDownloadingAppUpdate] = useState(false);
+  const [apkDownloadProgress, setApkDownloadProgress] = useState<ApkDownloadProgressEvent | null>(
+    null
+  );
+  const [swUpdateAvailable, setSwUpdateAvailable] = useState(false);
+  const waitingSwRef = useRef<ServiceWorker | null>(null);
+
   const favoritesRef = useRef(favorites);
   const baselinesRef = useRef(baselines);
   const alertsRef = useRef(alerts);
   const releasesRef = useRef(releases);
+  const settingsRef = useRef(settings);
+  const settingsMetaRef = useRef(settingsMeta);
+  const buildInfoRef = useRef(buildInfo);
+  const acknowledgedReleaseKeyRef = useRef(acknowledgedReleaseKey);
+  const routeRef = useRef(route);
   const initialCheckDoneRef = useRef(false);
+  const autoDownloadTriggeredForRef = useRef<string | null>(null);
 
   favoritesRef.current = favorites;
   baselinesRef.current = baselines;
   alertsRef.current = alerts;
   releasesRef.current = releases;
+  settingsRef.current = settings;
+  settingsMetaRef.current = settingsMeta;
+  buildInfoRef.current = buildInfo;
+  acknowledgedReleaseKeyRef.current = acknowledgedReleaseKey;
+  routeRef.current = route;
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -171,7 +231,23 @@ export default function App() {
     }, 3500);
   }, []);
 
+  const updateSettings = useCallback((patch: Partial<AppSettings>) => {
+    setSettings((prev) => {
+      const next = { ...prev, ...patch };
+      saveAppSettings(next);
+      return next;
+    });
+  }, []);
+
+  const resetSettings = useCallback(() => {
+    const defaults = { ...DEFAULT_APP_SETTINGS };
+    setSettings(defaults);
+    saveAppSettings(defaults);
+    showToast('Configurações restauradas para o padrão.');
+  }, [showToast]);
+
   const dispatchDeviceNotifications = useCallback(async (newAlerts: FavoriteAlertEntry[]) => {
+    if (!settingsRef.current.notifyNewEpisodes) return;
     if (!newAlerts.length) return;
     if (typeof window === 'undefined' || !('Notification' in window)) return;
     if (Notification.permission !== 'granted') return;
@@ -258,6 +334,13 @@ export default function App() {
         setAlerts(detection.nextAlerts);
         saveFavoriteAlerts(detection.nextAlerts);
 
+        const checkedAt = new Date().toISOString();
+        setSettingsMeta((prev) => {
+          const next = { ...prev, lastEpisodeCheckAt: checkedAt };
+          saveAppSettingsMeta(next);
+          return next;
+        });
+
         if (detection.newAlerts.length > 0) {
           const first = detection.newAlerts[0];
           showToast(
@@ -274,6 +357,113 @@ export default function App() {
       }
     },
     [dispatchDeviceNotifications, showToast]
+  );
+
+  const handleDownloadAppUpdate = useCallback(
+    async (explicitRelease?: RemoteAppRelease | null) => {
+      const targetRelease = explicitRelease || appUpdateResult?.latestRelease;
+      const asset = targetRelease?.apkAsset;
+      if (!asset?.downloadUrl) {
+        showToast('Nenhum arquivo de atualização encontrado nesta release.');
+        return;
+      }
+      setDownloadingAppUpdate(true);
+      setApkDownloadProgress({
+        status: 'downloading',
+        percent: 0,
+        downloadedBytes: 0,
+        totalBytes: asset.sizeBytes,
+      });
+      try {
+        const res = await downloadAppUpdateApk(asset.downloadUrl, asset.name || 'TopAnimes.apk');
+        if (targetRelease) {
+          const key = buildReleaseIdentityKey(targetRelease);
+          setAcknowledgedReleaseKey(key);
+          saveAcknowledgedReleaseKey(key);
+          setAppUpdateResult((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  hasUpdate: false,
+                  reason: 'up-to-date',
+                }
+              : prev
+          );
+        }
+        if (res.mode === 'native-installer') {
+          showToast('Atualização baixada! Conclua a instalação no Android.');
+        } else {
+          showToast(`Download iniciado: ${asset.name}`);
+        }
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : 'Falha ao baixar atualização.');
+      } finally {
+        setDownloadingAppUpdate(false);
+      }
+    },
+    [appUpdateResult, showToast]
+  );
+
+  const checkForAppUpdates = useCallback(
+    async (options: { manual?: boolean; triggerAutoDownload?: boolean } = {}) => {
+      setCheckingAppUpdate(true);
+      setAppUpdateError('');
+      try {
+        const res = await apiFetch('/api/app-update/check');
+        const data = (await res.json()) as {
+          checkedAt?: string;
+          release?: RemoteAppRelease | null;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(data.error || 'Erro ao verificar atualizações no GitHub.');
+        }
+
+        const checkedAt = data.checkedAt || new Date().toISOString();
+        const evaluated = evaluateUpdateStatus({
+          currentBuild: buildInfoRef.current,
+          remoteRelease: data.release || null,
+          acknowledgedReleaseKey: acknowledgedReleaseKeyRef.current,
+          checkedAt,
+        });
+
+        setAppUpdateResult(evaluated);
+        setSettingsMeta((prev) => {
+          const next = { ...prev, lastAppUpdateCheckAt: checkedAt };
+          saveAppSettingsMeta(next);
+          return next;
+        });
+
+        if (evaluated.hasUpdate && evaluated.latestRelease) {
+          const key = buildReleaseIdentityKey(evaluated.latestRelease);
+          if (
+            options.triggerAutoDownload &&
+            settingsRef.current.autoDownloadAppUpdates &&
+            evaluated.latestRelease.apkAsset &&
+            autoDownloadTriggeredForRef.current !== key
+          ) {
+            autoDownloadTriggeredForRef.current = key;
+            void handleDownloadAppUpdate(evaluated.latestRelease);
+          } else if (options.manual) {
+            showToast(`Nova atualização encontrada: ${evaluated.latestRelease.releaseName}`);
+          } else {
+            showToast('Nova versão do TopAnimes disponível nas Configurações.');
+          }
+        } else if (options.manual) {
+          showToast('Você já está na versão mais recente.');
+        }
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : 'Não foi possível verificar atualizações agora.';
+        setAppUpdateError(msg);
+        if (options.manual) {
+          showToast(msg);
+        }
+      } finally {
+        setCheckingAppUpdate(false);
+      }
+    },
+    [handleDownloadAppUpdate, showToast]
   );
 
   const fetchCatalog = useCallback(async () => {
@@ -312,7 +502,11 @@ export default function App() {
           : { ...prev.movies, items: home.movies },
       }));
 
-      if (!initialCheckDoneRef.current && favoritesRef.current.length > 0) {
+      if (
+        !initialCheckDoneRef.current &&
+        settingsRef.current.checkEpisodesOnStartup &&
+        favoritesRef.current.length > 0
+      ) {
         initialCheckDoneRef.current = true;
         void checkFavoriteUpdates({ currentReleases: loadedReleases });
       }
@@ -329,14 +523,128 @@ export default function App() {
     fetchCatalog();
   }, [fetchCatalog]);
 
+  // Dynamic episode/news check interval configured in Settings
   useEffect(() => {
+    const intervalMs = getEpisodeCheckIntervalMs(settings.episodeCheckIntervalMinutes);
+    if (!intervalMs) return;
+
     const interval = window.setInterval(() => {
       if (document.visibilityState === 'visible' && favoritesRef.current.length > 0) {
         void checkFavoriteUpdates();
       }
-    }, 5 * 60 * 1000);
+    }, intervalMs);
     return () => window.clearInterval(interval);
-  }, [checkFavoriteUpdates]);
+  }, [checkFavoriteUpdates, settings.episodeCheckIntervalMinutes]);
+
+  // Load native Android version info + download progress listener, and run scheduled GitHub update check
+  useEffect(() => {
+    let cancelled = false;
+    let progressHandle: { remove: () => Promise<void> } | null = null;
+
+    const initUpdates = async () => {
+      if (isNativeAndroidApp()) {
+        const nativeInfo = await getNativeAppBuildInfo();
+        if (!cancelled && nativeInfo) {
+          setBuildInfo((prev) => ({
+            ...prev,
+            androidVersionName: nativeInfo.versionName,
+            androidVersionCode: nativeInfo.versionCode,
+          }));
+        }
+        progressHandle = await addApkDownloadProgressListener((evt) => {
+          if (!cancelled) {
+            setApkDownloadProgress(evt);
+            if (evt.status === 'error') {
+              setDownloadingAppUpdate(false);
+              if (evt.message) showToast(evt.message);
+            }
+          }
+        });
+      }
+
+      if (
+        !cancelled &&
+        shouldRunScheduledAppUpdateCheck(
+          settingsRef.current,
+          settingsMetaRef.current.lastAppUpdateCheckAt
+        )
+      ) {
+        void checkForAppUpdates({ manual: false, triggerAutoDownload: true });
+      }
+    };
+
+    const startupTimer = window.setTimeout(() => {
+      void initUpdates();
+    }, 1200);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(startupTimer);
+      if (progressHandle) {
+        void progressHandle.remove();
+      }
+    };
+  }, [checkForAppUpdates, showToast]);
+
+  // Periodic background check for GitHub app updates when interval > 0
+  useEffect(() => {
+    if (!settings.autoCheckAppUpdates || settings.appUpdateIntervalHours <= 0) return;
+    const pollMs = Math.min(settings.appUpdateIntervalHours * 60 * 60 * 1000, 60 * 60 * 1000);
+    const interval = window.setInterval(() => {
+      if (
+        document.visibilityState === 'visible' &&
+        shouldRunScheduledAppUpdateCheck(
+          settingsRef.current,
+          settingsMetaRef.current.lastAppUpdateCheckAt
+        )
+      ) {
+        void checkForAppUpdates({ manual: false, triggerAutoDownload: true });
+      }
+    }, pollMs);
+    return () => window.clearInterval(interval);
+  }, [checkForAppUpdates, settings.appUpdateIntervalHours, settings.autoCheckAppUpdates]);
+
+  // Detect waiting PWA Service Worker updates on Web
+  useEffect(() => {
+    if (isNativeAndroidApp() || typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+      return;
+    }
+    let mounted = true;
+    navigator.serviceWorker
+      .getRegistration()
+      .then((reg) => {
+        if (!mounted || !reg) return;
+        if (reg.waiting) {
+          waitingSwRef.current = reg.waiting;
+          setSwUpdateAvailable(true);
+        }
+        reg.addEventListener('updatefound', () => {
+          const nextWorker = reg.installing;
+          if (!nextWorker) return;
+          nextWorker.addEventListener('statechange', () => {
+            if (nextWorker.state === 'installed' && navigator.serviceWorker.controller) {
+              waitingSwRef.current = nextWorker;
+              setSwUpdateAvailable(true);
+            }
+          });
+        });
+      })
+      .catch(() => {
+        // Ignore service worker registration restrictions
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const handleApplySwUpdate = useCallback(() => {
+    const waiting = waitingSwRef.current;
+    if (waiting) {
+      waiting.postMessage({ type: 'SKIP_WAITING' });
+    }
+    window.location.reload();
+  }, []);
 
   const fetchArchivePage = useCallback(
     async (category: CatalogArchiveCategory, page: number, append: boolean) => {
@@ -595,8 +903,11 @@ export default function App() {
         return;
       }
 
+      const preserveExistingEpisode = routeRef.current.view === 'episode';
       setRoute({ view: 'episode', url });
-      setEpisodeDetails(null);
+      if (!preserveExistingEpisode) {
+        setEpisodeDetails(null);
+      }
       try {
         const res = await apiFetch(`/api/episode?url=${encodeURIComponent(url)}`);
         const data = await res.json();
@@ -756,6 +1067,8 @@ export default function App() {
         onMarkAllRead={handleMarkAllAlertsRead}
         onOpenAlert={handleOpenAlert}
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
+        hasAppUpdate={Boolean(appUpdateResult?.hasUpdate)}
+        onOpenSettings={() => setSettingsOpen(true)}
       />
 
       {!isOnline && (
@@ -827,6 +1140,7 @@ export default function App() {
               showToast('Histórico limpo.');
             }}
             onSelectSection={handleSelectSection}
+            defaultAudioFilter={settings.defaultAudioFilter}
           />
         )}
 
@@ -890,10 +1204,49 @@ export default function App() {
                   episodeDetails.seriesUrl || episodeDetails.url,
                   favorites
                 )}
+                watchedUrls={watchedUrls}
+                initialSeriesEpisodes={
+                  animeDetails &&
+                  episodeDetails.seriesUrl &&
+                  isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
+                    ? animeDetails.episodes
+                    : undefined
+                }
+                loadingEpisode={loadingDetail}
                 onToggleFavorite={toggleFavorite}
                 onBack={() => setRoute({ view: 'catalog' })}
                 onNavigateUrl={openMediaUrl}
+                onNativeSessionSync={(result) => {
+                  if (Array.isArray(result.visitedEpisodes) && result.visitedEpisodes.length > 0) {
+                    let nextHist = history;
+                    for (const visited of result.visitedEpisodes) {
+                      if (!visited?.url) continue;
+                      nextHist = pushHistoryEntry({
+                        url: visited.url,
+                        title: visited.title || episodeDetails.title,
+                        seriesTitle: episodeDetails.seriesTitle,
+                        seriesUrl: episodeDetails.seriesUrl,
+                        poster: episodeDetails.backdrop || episodeDetails.poster,
+                        kind: episodeDetails.isMovie ? 'movie' : 'episode',
+                        watchedAt: new Date().toISOString(),
+                      });
+                    }
+                    setHistory(nextHist);
+                  }
+                  if (
+                    result.episodeUrl &&
+                    !isSameEpisodeUrl(result.episodeUrl, episodeDetails.url)
+                  ) {
+                    void openMediaUrl(result.episodeUrl, 'episode');
+                  } else if (result.action === 'prev' && episodeDetails.prevUrl) {
+                    void openMediaUrl(episodeDetails.prevUrl, 'episode');
+                  } else if (result.action === 'next' && episodeDetails.nextUrl) {
+                    void openMediaUrl(episodeDetails.nextUrl, 'episode');
+                  }
+                }}
                 onToast={showToast}
+                skipIntroSeconds={settings.skipIntroSeconds}
+                autoPlayNextEpisode={settings.autoPlayNextEpisode}
               />
             ) : null}
           </>
@@ -904,6 +1257,46 @@ export default function App() {
         activeSection={activeSection}
         unreadCount={unreadAlertCount}
         onSelectSection={handleSelectSection}
+      />
+
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        settings={settings}
+        settingsMeta={settingsMeta}
+        onUpdateSettings={updateSettings}
+        onResetSettings={resetSettings}
+        favoritesCount={favorites.length}
+        checkingEpisodes={checkingAlerts}
+        notificationPermission={notificationPermission}
+        onCheckEpisodesNow={() => {
+          void fetchCatalog();
+          void checkFavoriteUpdates({ manual: true });
+        }}
+        onRequestPushNotifications={() => void handleRequestPushNotifications()}
+        buildInfo={buildInfo}
+        isNativeAndroid={isNativeAndroidApp()}
+        appUpdateResult={appUpdateResult}
+        checkingAppUpdate={checkingAppUpdate}
+        appUpdateError={appUpdateError}
+        downloadingAppUpdate={downloadingAppUpdate}
+        apkDownloadProgress={apkDownloadProgress}
+        swUpdateAvailable={swUpdateAvailable}
+        onCheckAppUpdateNow={() => void checkForAppUpdates({ manual: true })}
+        onDownloadAppUpdate={() => void handleDownloadAppUpdate()}
+        onApplySwUpdate={handleApplySwUpdate}
+        historyCount={history.length}
+        alertsCount={alerts.length}
+        onClearHistory={() => {
+          clearHistory();
+          setHistory([]);
+          showToast('Histórico limpo.');
+        }}
+        onClearAlerts={() => {
+          clearFavoriteAlerts();
+          setAlerts([]);
+          showToast('Avisos limpos.');
+        }}
       />
 
       {toast && (

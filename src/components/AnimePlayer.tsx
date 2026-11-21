@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type DragEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ChangeEvent,
+  type DragEvent,
+} from 'react';
 import Hls from 'hls.js';
 import {
   Camera,
@@ -7,6 +15,7 @@ import {
   ChevronRight,
   Download,
   FastForward,
+  ListVideo,
   Maximize,
   Minimize,
   Pause,
@@ -15,13 +24,22 @@ import {
   Repeat,
   RotateCcw,
   RotateCw,
+  Server,
   Settings,
+  SkipBack,
+  SkipForward,
   Subtitles,
   Upload,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
-import type { StreamQuality, SubtitleTrack } from '../lib/types';
+import type {
+  AnimeEpisodeLink,
+  PlayerOption,
+  StreamQuality,
+  SubtitleTrack,
+} from '../lib/types';
 import {
   decodeSubtitleBuffer,
   hexToRgb,
@@ -32,13 +50,22 @@ import { getStreamProxyUrl } from '../lib/apiClient';
 import {
   isAndroidNativeVlcSupported,
   isDesktopShortcutsEnabled,
+  isSameEpisodeUrl,
   playWithNativeVlc,
+  type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
 import { MediaPoster } from './MediaPoster';
 
 interface AnimePlayerProps {
   title: string;
+  episodeUrl?: string;
+  seriesUrl?: string;
+  seriesTitle?: string;
+  seriesEpisodes?: AnimeEpisodeLink[];
+  watchedUrls?: Set<string>;
+  playerOptions?: PlayerOption[];
+  selectedServerNume?: string;
   streams: StreamQuality[];
   referer: string;
   preferDirect?: boolean;
@@ -46,8 +73,17 @@ interface AnimePlayerProps {
   subtitles: SubtitleTrack[];
   hasPrev?: boolean;
   hasNext?: boolean;
+  prevUrl?: string;
+  nextUrl?: string;
+  loadingEpisode?: boolean;
+  errorMessage?: string;
+  skipIntroSeconds?: number;
+  autoPlayNextEpisode?: boolean;
   onPrevEpisode?: () => void;
   onNextEpisode?: () => void;
+  onSelectEpisode?: (episodeUrl: string) => void;
+  onSelectServer?: (nume: string) => void;
+  onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
   onToast: (message: string) => void;
 }
 
@@ -72,7 +108,7 @@ interface LoadedSubtitleEntry {
   isLocal?: boolean;
 }
 
-type SettingsTab = 'main' | 'quality' | 'speed' | 'subs';
+type SettingsTab = 'main' | 'quality' | 'speed' | 'subs' | 'servers';
 
 const PREFS_KEY = 'topanimes:player:v1';
 const SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
@@ -87,8 +123,12 @@ function loadPrefs(): PersistedPlayerPrefs {
     return {
       volume: typeof parsed.volume === 'number' ? Math.max(0, Math.min(1, parsed.volume)) : 1,
       muted: Boolean(parsed.muted),
-      capScale: typeof parsed.capScale === 'number' ? Math.max(0.5, Math.min(2, parsed.capScale)) : 1,
-      capColor: typeof parsed.capColor === 'string' && hexToRgb(parsed.capColor) ? parsed.capColor : '#ffff00',
+      capScale:
+        typeof parsed.capScale === 'number' ? Math.max(0.5, Math.min(2, parsed.capScale)) : 1,
+      capColor:
+        typeof parsed.capColor === 'string' && hexToRgb(parsed.capColor)
+          ? parsed.capColor
+          : '#ffff00',
     };
   } catch {
     return { volume: 1, muted: false, capScale: 1, capColor: '#ffff00' };
@@ -115,6 +155,13 @@ function formatTime(sec: number): string {
 
 export function AnimePlayer({
   title,
+  episodeUrl,
+  seriesUrl,
+  seriesTitle,
+  seriesEpisodes = [],
+  watchedUrls,
+  playerOptions = [],
+  selectedServerNume,
   streams,
   referer,
   preferDirect = false,
@@ -122,14 +169,24 @@ export function AnimePlayer({
   subtitles,
   hasPrev = false,
   hasNext = false,
+  prevUrl,
+  nextUrl,
+  loadingEpisode = false,
+  errorMessage: externalErrorMessage = '',
+  skipIntroSeconds = 85,
+  autoPlayNextEpisode = false,
   onPrevEpisode,
   onNextEpisode,
+  onSelectEpisode,
+  onSelectServer,
+  onNativeSessionSync,
   onToast,
 }: AnimePlayerProps) {
   const initialPrefs = useMemo(() => loadPrefs(), []);
   const useNativeVlc = isAndroidNativeVlcSupported();
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
   const [nativeResumeMs, setNativeResumeMs] = useState(0);
+  const [nativeDurationMs, setNativeDurationMs] = useState(0);
   const [nativeLaunching, setNativeLaunching] = useState(false);
 
   // Sort streams by highest height first so highest quality is auto-selected
@@ -164,10 +221,12 @@ export function AnimePlayer({
   const rendererRef = useRef<SubtitleCanvasRenderer | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const activeEpItemRef = useRef<HTMLButtonElement | null>(null);
   const hideTimerRef = useRef<number | null>(null);
   const holdTimerRef = useRef<number | null>(null);
   const holdActiveRef = useRef(false);
   const preHoldSpeedRef = useRef(1);
+  const autoStartNextRef = useRef(false);
   const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
     time: 0,
     side: 'center',
@@ -195,11 +254,12 @@ export function AnimePlayer({
   const [hlsLevels, setHlsLevels] = useState<HlsQualityLevel[]>([]);
   const [activeHlsLevel, setActiveHlsLevel] = useState<number>(-1);
 
-  // Settings menu
+  // Settings menu & In-Player Episodes Drawer
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuTab, setMenuTab] = useState<SettingsTab>('main');
+  const [episodesOpen, setEpisodesOpen] = useState(false);
 
-  // Subtitles state (ported from userscript)
+  // Subtitles state
   const [subEntries, setSubEntries] = useState<LoadedSubtitleEntry[]>([]);
   const [activeSubId, setActiveSubId] = useState<string>('off');
   const [activeSubScript, setActiveSubScript] = useState<ParsedSubtitleScript | null>(null);
@@ -217,24 +277,35 @@ export function AnimePlayer({
   useEffect(() => {
     setSelectedStreamIdx(0);
     setNativeResumeMs(0);
-  }, [streams]);
+    setNativeDurationMs(0);
+  }, [streams, episodeUrl]);
 
   // Reset playback mode whenever stream or preferDirect changes
   useEffect(() => {
     setPlaybackMode(preferDirect ? 'direct-cors' : 'proxy');
   }, [activeStream?.url, preferDirect]);
 
-  // Reset speed per video just like the userscript
+  // Reset speed per video
   useEffect(() => {
     setSpeed(1);
     setHasVideoFrame(false);
     setErrorMsg('');
     setPlaying(false);
     setWaiting(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setBufferedEnd(0);
     if (videoRef.current) {
       videoRef.current.playbackRate = 1;
     }
   }, [activeStream?.url, retryToken]);
+
+  // Auto-scroll active episode into view when episodes drawer opens
+  useEffect(() => {
+    if (episodesOpen && activeEpItemRef.current) {
+      activeEpItemRef.current.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, [episodesOpen, episodeUrl]);
 
   // Sync incoming remote subtitle tracks
   useEffect(() => {
@@ -308,7 +379,7 @@ export function AnimePlayer({
     return () => {
       cancelled = true;
     };
-  }, [activeSubId, subEntries, referer, capColor, onToast]);
+  }, [activeSubId, subEntries, referer, capColor, onToast, useNativeVlc]);
 
   const advanceFallbackOrFail = useCallback(() => {
     if (!activeStream) return;
@@ -328,7 +399,7 @@ export function AnimePlayer({
     setPlaying(false);
     setWaiting(false);
     setErrorMsg(
-      'Não foi possível reproduzir este servidor. Tente novamente ou escolha outro servidor abaixo.'
+      'Não foi possível reproduzir este servidor. Tente novamente ou escolha outro servidor.'
     );
   }, [activeStream, playbackMode]);
 
@@ -338,7 +409,19 @@ export function AnimePlayer({
   useEffect(() => {
     if (useNativeVlc) return;
     const video = videoRef.current;
-    if (!video || !activeMediaUrl || !activeStream) return;
+    if (!video) return;
+
+    if (hlsRef.current) {
+      hlsRef.current.destroy();
+      hlsRef.current = null;
+    }
+
+    if (!activeMediaUrl || !activeStream || loadingEpisode) {
+      disposedEffectRef.current = true;
+      video.removeAttribute('src');
+      video.load();
+      return;
+    }
 
     let disposed = false;
     disposedEffectRef.current = false;
@@ -346,10 +429,7 @@ export function AnimePlayer({
     setHlsLevels([]);
     setActiveHlsLevel(-1);
 
-    if (hlsRef.current) {
-      hlsRef.current.destroy();
-      hlsRef.current = null;
-    }
+    const shouldAutoPlay = autoStartNextRef.current;
 
     const useHls =
       activeStream.format === 'hls' || /\.m3u8(?:$|\?)/i.test(activeStream.url);
@@ -386,7 +466,6 @@ export function AnimePlayer({
             }))
             .sort((a, b) => b.height - a.height);
           setHlsLevels(lvls);
-          // Userscript behavior: auto-select highest quality by default
           const highest = lvls[0];
           if (highest && lvls.length > 1) {
             hls.currentLevel = highest.index;
@@ -394,6 +473,10 @@ export function AnimePlayer({
           } else {
             setActiveHlsLevel(-1);
           }
+        }
+        if (shouldAutoPlay) {
+          autoStartNextRef.current = false;
+          video.play().catch(() => {});
         }
       });
 
@@ -422,13 +505,25 @@ export function AnimePlayer({
     }
 
     video.src = activeMediaUrl;
+    if (shouldAutoPlay) {
+      autoStartNextRef.current = false;
+      video.play().catch(() => {});
+    }
     return () => {
       disposed = true;
       disposedEffectRef.current = true;
       video.removeAttribute('src');
       video.load();
     };
-  }, [activeMediaUrl, activeStream, useCorsAttr, retryToken, advanceFallbackOrFail]);
+  }, [
+    activeMediaUrl,
+    activeStream,
+    advanceFallbackOrFail,
+    loadingEpisode,
+    useCorsAttr,
+    retryToken,
+    useNativeVlc,
+  ]);
 
   // Keep video properties synced
   useEffect(() => {
@@ -519,7 +614,7 @@ export function AnimePlayer({
       video.removeEventListener('timeupdate', drawOnce);
       video.removeEventListener('loadedmetadata', drawOnce);
     };
-  }, [activeSubScript, activeSubId, capDelay, capScale, capColor]);
+  }, [activeSubScript, activeSubId, capDelay, capScale, capColor, useNativeVlc]);
 
   // Track fullscreen changes + try orientation unlock
   useEffect(() => {
@@ -541,14 +636,102 @@ export function AnimePlayer({
   const showControlsTemporarily = useCallback(() => {
     setControlsVisible(true);
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
-    if (videoRef.current && !videoRef.current.paused && !menuOpen) {
+    if (videoRef.current && !videoRef.current.paused && !menuOpen && !episodesOpen) {
       hideTimerRef.current = window.setTimeout(() => {
         setControlsVisible(false);
       }, 2800);
     }
-  }, [menuOpen]);
+  }, [episodesOpen, menuOpen]);
+
+  const launchNativeVlc = useCallback(
+    async (startMs?: number) => {
+      if (!sortedStreams.length || nativeLaunching) return;
+      setNativeLaunching(true);
+      try {
+        const res = await playWithNativeVlc({
+          title,
+          episodeUrl,
+          seriesUrl,
+          seriesTitle,
+          streams: sortedStreams,
+          subtitles,
+          episodes: seriesEpisodes,
+          watchedUrls: watchedUrls ? Array.from(watchedUrls) : [],
+          options: playerOptions,
+          selectedServerNume,
+          referer: referer || 'https://topanimes.net/',
+          preferDirect,
+          startPositionMs: typeof startMs === 'number' ? startMs : nativeResumeMs,
+          streamIndex: selectedStreamIdx,
+          hasPrev,
+          hasNext,
+          prevUrl,
+          nextUrl,
+          skipIntroSeconds,
+          autoPlayNextEpisode,
+        });
+
+        if (typeof res?.streamIndex === 'number' && sortedStreams[res.streamIndex]) {
+          setSelectedStreamIdx(res.streamIndex);
+        }
+        if (typeof res?.durationMs === 'number' && res.durationMs > 0) {
+          setNativeDurationMs(res.durationMs);
+        }
+        if (typeof res?.positionMs === 'number' && res.positionMs > 0) {
+          const nearEnd =
+            typeof res.durationMs === 'number' &&
+            res.durationMs > 0 &&
+            res.positionMs >= res.durationMs - 4000;
+          setNativeResumeMs(nearEnd ? 0 : res.positionMs);
+        }
+
+        if (onNativeSessionSync && res) {
+          onNativeSessionSync(res);
+        } else if (res?.action === 'prev') {
+          onPrevEpisode?.();
+        } else if (res?.action === 'next') {
+          onNextEpisode?.();
+        }
+      } catch {
+        onToast('Não foi possível abrir o player LibVLC.');
+      } finally {
+        setNativeLaunching(false);
+      }
+    },
+    [
+      autoPlayNextEpisode,
+      episodeUrl,
+      hasNext,
+      hasPrev,
+      nativeLaunching,
+      nativeResumeMs,
+      nextUrl,
+      onNativeSessionSync,
+      onNextEpisode,
+      onPrevEpisode,
+      onToast,
+      playerOptions,
+      preferDirect,
+      prevUrl,
+      referer,
+      selectedServerNume,
+      selectedStreamIdx,
+      seriesEpisodes,
+      seriesTitle,
+      seriesUrl,
+      skipIntroSeconds,
+      sortedStreams,
+      subtitles,
+      title,
+      watchedUrls,
+    ]
+  );
 
   const togglePlay = useCallback(() => {
+    if (useNativeVlc) {
+      void launchNativeVlc();
+      return;
+    }
     const video = videoRef.current;
     if (!video) return;
     if (video.paused || video.ended) {
@@ -559,23 +742,29 @@ export function AnimePlayer({
       video.pause();
     }
     showControlsTemporarily();
-  }, [onToast, showControlsTemporarily]);
+  }, [launchNativeVlc, onToast, showControlsTemporarily, useNativeVlc]);
 
   const seekBy = useCallback(
     (deltaSeconds: number, label?: string) => {
+      if (useNativeVlc) {
+        const nextMs = Math.max(0, nativeResumeMs + deltaSeconds * 1000);
+        void launchNativeVlc(nextMs);
+        return;
+      }
       const video = videoRef.current;
       if (!video) return;
-      const cap = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : Number.MAX_SAFE_INTEGER;
+      const cap =
+        Number.isFinite(video.duration) && video.duration > 0
+          ? video.duration
+          : Number.MAX_SAFE_INTEGER;
       const next = Math.max(0, Math.min(cap, video.currentTime + deltaSeconds));
       video.currentTime = next;
       setCurrentTime(next);
-      const text =
-        label ||
-        `${deltaSeconds > 0 ? '+' : ''}${Math.round(deltaSeconds)}s`;
+      const text = label || `${deltaSeconds > 0 ? '+' : ''}${Math.round(deltaSeconds)}s`;
       setSeekBadge({ label: text, key: Date.now() });
       showControlsTemporarily();
     },
-    [showControlsTemporarily]
+    [launchNativeVlc, nativeResumeMs, showControlsTemporarily, useNativeVlc]
   );
 
   const toggleMute = useCallback(() => {
@@ -588,6 +777,10 @@ export function AnimePlayer({
   }, [volume, showControlsTemporarily]);
 
   const toggleFullscreen = useCallback(async () => {
+    if (useNativeVlc) {
+      void launchNativeVlc();
+      return;
+    }
     const stage = stageRef.current;
     const video = videoRef.current as
       | (HTMLVideoElement & { webkitEnterFullscreen?: () => void })
@@ -621,7 +814,7 @@ export function AnimePlayer({
         // ignore
       }
     }
-  }, []);
+  }, [launchNativeVlc, useNativeVlc]);
 
   const togglePip = useCallback(async () => {
     const video = videoRef.current;
@@ -732,6 +925,7 @@ export function AnimePlayer({
 
   // Hold-to-2x pointer handlers on the video stage
   const startHoldSpeed = () => {
+    if (useNativeVlc) return;
     if (holdTimerRef.current) window.clearTimeout(holdTimerRef.current);
     holdActiveRef.current = false;
     holdTimerRef.current = window.setTimeout(() => {
@@ -755,12 +949,28 @@ export function AnimePlayer({
   };
 
   const handleStageTap = (clientX: number) => {
+    if (useNativeVlc) {
+      if (menuOpen) {
+        setMenuOpen(false);
+        return;
+      }
+      if (episodesOpen) {
+        setEpisodesOpen(false);
+        return;
+      }
+      void launchNativeVlc();
+      return;
+    }
     if (holdActiveRef.current) {
       cancelHoldSpeed();
       return;
     }
     if (menuOpen) {
       setMenuOpen(false);
+      return;
+    }
+    if (episodesOpen) {
+      setEpisodesOpen(false);
       return;
     }
     const stage = stageRef.current;
@@ -788,6 +998,33 @@ export function AnimePlayer({
       showControlsTemporarily();
     }
   };
+
+  const triggerPrevEpisode = useCallback(() => {
+    if (!hasPrev || !onPrevEpisode) return;
+    autoStartNextRef.current = true;
+    setEpisodesOpen(false);
+    setMenuOpen(false);
+    onPrevEpisode();
+  }, [hasPrev, onPrevEpisode]);
+
+  const triggerNextEpisode = useCallback(() => {
+    if (!hasNext || !onNextEpisode) return;
+    autoStartNextRef.current = true;
+    setEpisodesOpen(false);
+    setMenuOpen(false);
+    onNextEpisode();
+  }, [hasNext, onNextEpisode]);
+
+  const triggerSelectEpisode = useCallback(
+    (url: string) => {
+      if (!onSelectEpisode) return;
+      autoStartNextRef.current = true;
+      setEpisodesOpen(false);
+      setMenuOpen(false);
+      onSelectEpisode(url);
+    },
+    [onSelectEpisode]
+  );
 
   // Desktop keyboard shortcuts (disabled on Android APK and Android browsers)
   useEffect(() => {
@@ -917,153 +1154,25 @@ export function AnimePlayer({
     return subEntries.find((s) => s.id === activeSubId)?.label || 'Ativa';
   }, [activeSubId, subEntries]);
 
-  const launchNativeVlc = useCallback(
-    async (startMs?: number) => {
-      if (!sortedStreams.length || nativeLaunching) return;
-      setNativeLaunching(true);
-      try {
-        const res = await playWithNativeVlc({
-          title,
-          streams: sortedStreams,
-          subtitles,
-          referer: referer || 'https://topanimes.net/',
-          preferDirect,
-          startPositionMs: typeof startMs === 'number' ? startMs : nativeResumeMs,
-          streamIndex: selectedStreamIdx,
-          hasPrev,
-          hasNext,
-        });
-        if (typeof res?.streamIndex === 'number' && sortedStreams[res.streamIndex]) {
-          setSelectedStreamIdx(res.streamIndex);
-        }
-        if (typeof res?.positionMs === 'number' && res.positionMs > 0) {
-          const nearEnd =
-            typeof res.durationMs === 'number' &&
-            res.durationMs > 0 &&
-            res.positionMs >= res.durationMs - 4000;
-          setNativeResumeMs(nearEnd ? 0 : res.positionMs);
-        }
-        if (res?.action === 'prev') {
-          onPrevEpisode?.();
-        } else if (res?.action === 'next') {
-          onNextEpisode?.();
-        }
-      } catch {
-        onToast('Não foi possível abrir o player LibVLC.');
-      } finally {
-        setNativeLaunching(false);
-      }
-    },
-    [
-      hasNext,
-      hasPrev,
-      nativeLaunching,
-      nativeResumeMs,
-      onNextEpisode,
-      onPrevEpisode,
-      onToast,
-      preferDirect,
-      referer,
-      selectedStreamIdx,
-      sortedStreams,
-      subtitles,
-      title,
-    ]
-  );
-
-  const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
-  const bufferedPct = duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0;
-
-  if (useNativeVlc) {
+  const activeServerLabel = useMemo(() => {
     return (
-      <div className="relative aspect-video w-full select-none overflow-hidden rounded-xl border border-white/10 bg-black shadow-2xl">
-        {poster && (
-          <div className="pointer-events-none absolute inset-0">
-            <MediaPoster
-              src={poster}
-              alt={title}
-              aspect="landscape"
-              className="h-full w-full opacity-55"
-            />
-          </div>
-        )}
-        <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/45 to-black/60" />
-
-        <div className="relative z-10 flex h-full flex-col justify-between p-3 sm:p-5">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="inline-flex items-center gap-1.5 rounded-md border border-[#f97316]/40 bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c] backdrop-blur-sm">
-              LibVLC Embutido
-            </span>
-
-            <div className="flex flex-wrap items-center gap-1.5">
-              {subtitles.length > 0 && (
-                <span className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-black/70 px-2 py-1 text-[11px] text-slate-200 backdrop-blur-sm">
-                  <Subtitles className="h-3 w-3 text-[#f97316]" />
-                  <span>{subtitles.length} legenda{subtitles.length > 1 ? 's' : ''}</span>
-                </span>
-              )}
-              <button
-                type="button"
-                onClick={handleDownloadVideo}
-                className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-black/70 px-2.5 py-1 text-[11px] font-medium text-slate-200 backdrop-blur-sm hover:border-white/30"
-              >
-                <Download className="h-3 w-3 text-[#f97316]" />
-                <span>{activeStream?.format === 'hls' ? 'Copiar .m3u8' : 'Baixar MP4'}</span>
-              </button>
-            </div>
-          </div>
-
-          <div className="flex flex-col items-center gap-2.5 text-center">
-            <button
-              type="button"
-              disabled={nativeLaunching || !activeStream}
-              onClick={() => launchNativeVlc()}
-              aria-label="Reproduzir episódio no LibVLC"
-              className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px]"
-            >
-              <Play className="ml-1 h-7 w-7 fill-current sm:h-8 sm:w-8" />
-            </button>
-            <span className="text-xs font-semibold text-white drop-shadow sm:text-sm">
-              {nativeLaunching
-                ? 'Abrindo LibVLC...'
-                : nativeResumeMs > 3000
-                  ? `Continuar de ${formatTime(nativeResumeMs / 1000)}`
-                  : 'Assistir no Player LibVLC'}
-            </span>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex flex-wrap items-center gap-1.5">
-              {sortedStreams.map((stream, idx) => (
-                <button
-                  key={stream.url}
-                  type="button"
-                  onClick={() => setSelectedStreamIdx(idx)}
-                  className={`rounded-md border px-2.5 py-1 font-mono text-[11px] font-medium transition-colors ${
-                    selectedStreamIdx === idx
-                      ? 'border-[#f97316] bg-[#f97316]/25 text-white'
-                      : 'border-white/15 bg-black/65 text-slate-300 hover:border-white/30'
-                  }`}
-                >
-                  {stream.label}
-                </button>
-              ))}
-            </div>
-
-            {nativeResumeMs > 3000 && (
-              <button
-                type="button"
-                onClick={() => launchNativeVlc(0)}
-                className="rounded-md border border-white/15 bg-black/65 px-2.5 py-1 text-[11px] text-slate-300 hover:text-white"
-              >
-                Reiniciar do início
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
+      playerOptions.find((o) => o.nume === selectedServerNume)?.label ||
+      playerOptions[0]?.label ||
+      'Padrão'
     );
-  }
+  }, [playerOptions, selectedServerNume]);
+
+  const displayCurrentSec = useNativeVlc ? nativeResumeMs / 1000 : currentTime;
+  const displayDurationSec = useNativeVlc ? nativeDurationMs / 1000 : duration;
+  const progressPct =
+    displayDurationSec > 0
+      ? Math.min(100, (displayCurrentSec / displayDurationSec) * 100)
+      : 0;
+  const bufferedPct =
+    !useNativeVlc && duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0;
+
+  const effectiveErrorMsg = externalErrorMessage || errorMsg;
+  const showEpisodeNav = Boolean(onPrevEpisode || onNextEpisode || seriesEpisodes.length > 0);
 
   return (
     <div
@@ -1084,64 +1193,76 @@ export function AnimePlayer({
       }`}
     >
       {/* Visual backdrop poster behind video so video element stays CORS-clean */}
-      {poster && !hasVideoFrame && (
+      {poster && (!hasVideoFrame || useNativeVlc || loadingEpisode) && (
         <div className="pointer-events-none absolute inset-0">
-          <MediaPoster src={poster} alt={title} aspect="landscape" className="h-full w-full opacity-55" />
+          <MediaPoster
+            src={poster}
+            alt={title}
+            aspect="landscape"
+            className="h-full w-full opacity-55"
+          />
         </div>
       )}
 
-      {/* HTML5 Video (direct CDN when CORS-ready, or /api/stream-proxy with 4MB chunked range) */}
-      <video
-        ref={videoRef}
-        playsInline
-        preload="metadata"
-        crossOrigin={useCorsAttr ? 'anonymous' : undefined}
-        className="h-full w-full object-contain"
-        onPlay={() => {
-          setPlaying(true);
-          showControlsTemporarily();
-        }}
-        onPause={() => {
-          setPlaying(false);
-          setControlsVisible(true);
-        }}
-        onEnded={() => {
-          setPlaying(false);
-          setControlsVisible(true);
-        }}
-        onWaiting={() => setWaiting(true)}
-        onPlaying={() => {
-          setWaiting(false);
-          setHasVideoFrame(true);
-          setErrorMsg('');
-        }}
-        onLoadedData={() => setHasVideoFrame(true)}
-        onTimeUpdate={() => {
-          const v = videoRef.current;
-          if (!v) return;
-          setCurrentTime(v.currentTime);
-          if (v.buffered.length > 0) {
-            setBufferedEnd(v.buffered.end(v.buffered.length - 1));
-          }
-        }}
-        onDurationChange={() => {
-          if (videoRef.current && Number.isFinite(videoRef.current.duration)) {
-            setDuration(videoRef.current.duration);
-          }
-        }}
-        onError={() => {
-          const v = videoRef.current;
-          if (disposedEffectRef.current || !v || !v.getAttribute('src') || !v.error) return;
-          if (hlsRef.current) return; // Hls.js handles its own fatal fallback
-          advanceFallbackOrFail();
-        }}
-      />
+      {/* HTML5 Video (Web player; Android uses native LibVLC fullscreen engine with identical HUD) */}
+      {!useNativeVlc && (
+        <>
+          <video
+            ref={videoRef}
+            playsInline
+            preload="metadata"
+            crossOrigin={useCorsAttr ? 'anonymous' : undefined}
+            className="h-full w-full object-contain"
+            onPlay={() => {
+              setPlaying(true);
+              showControlsTemporarily();
+            }}
+            onPause={() => {
+              setPlaying(false);
+              setControlsVisible(true);
+            }}
+            onEnded={() => {
+              setPlaying(false);
+              setControlsVisible(true);
+              if (autoPlayNextEpisode && hasNext && onNextEpisode) {
+                onToast('Carregando próximo episódio...');
+                triggerNextEpisode();
+              }
+            }}
+            onWaiting={() => setWaiting(true)}
+            onPlaying={() => {
+              setWaiting(false);
+              setHasVideoFrame(true);
+              setErrorMsg('');
+            }}
+            onLoadedData={() => setHasVideoFrame(true)}
+            onTimeUpdate={() => {
+              const v = videoRef.current;
+              if (!v) return;
+              setCurrentTime(v.currentTime);
+              if (v.buffered.length > 0) {
+                setBufferedEnd(v.buffered.end(v.buffered.length - 1));
+              }
+            }}
+            onDurationChange={() => {
+              if (videoRef.current && Number.isFinite(videoRef.current.duration)) {
+                setDuration(videoRef.current.duration);
+              }
+            }}
+            onError={() => {
+              const v = videoRef.current;
+              if (disposedEffectRef.current || !v || !v.getAttribute('src') || !v.error) return;
+              if (hlsRef.current) return;
+              advanceFallbackOrFail();
+            }}
+          />
 
-      {/* Canvas Subtitle Overlay */}
-      <canvas
-        ref={canvasRef}
-        className="pointer-events-none absolute inset-0 z-10 h-full w-full"
-      />
+          <canvas
+            ref={canvasRef}
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full"
+          />
+        </>
+      )}
 
       {/* Interactive Gesture Surface (Tap, Double-Tap Seek, Hold 2x) */}
       <div
@@ -1160,6 +1281,39 @@ export function AnimePlayer({
         className="hidden"
         onChange={handleFileChange}
       />
+
+      {/* Top Bar Overlay (shown in Fullscreen when HUD is visible) */}
+      {isFullscreen && (
+        <div
+          className={`pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center justify-between gap-3 bg-gradient-to-b from-black/85 via-black/40 to-transparent px-4 pb-8 pt-3 transition-opacity duration-200 sm:px-5 ${
+            controlsVisible || !playing || menuOpen || episodesOpen || loadingEpisode
+              ? 'opacity-100'
+              : 'opacity-0'
+          }`}
+        >
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold text-white drop-shadow sm:text-base">
+              {title}
+            </h2>
+            {seriesTitle && seriesTitle !== title && (
+              <p className="truncate text-[11px] text-slate-300/80">{seriesTitle}</p>
+            )}
+          </div>
+          {seriesEpisodes.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                setMenuOpen(false);
+                setEpisodesOpen((o) => !o);
+              }}
+              className="pointer-events-auto inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/15 bg-black/55 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-sm hover:border-[#f97316]/60 hover:bg-black/75"
+            >
+              <ListVideo className="h-3.5 w-3.5 text-[#f97316]" />
+              <span>Episódios ({seriesEpisodes.length})</span>
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Hold 2x Speed Indicator */}
       {holdSpeedActive && (
@@ -1189,29 +1343,35 @@ export function AnimePlayer({
         </div>
       )}
 
-      {/* Buffering Spinner */}
-      {waiting && !errorMsg && (
-        <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center">
+      {/* Buffering or Episode Transition Spinner */}
+      {(waiting || loadingEpisode || nativeLaunching) && !effectiveErrorMsg && (
+        <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-2.5 bg-black/35">
           <div className="h-11 w-11 animate-spin rounded-full border-3 border-white/25 border-t-[#f97316]" />
+          {(loadingEpisode || nativeLaunching) && (
+            <span className="rounded-full bg-black/75 px-3 py-1 text-xs font-medium text-slate-200 backdrop-blur-sm">
+              {nativeLaunching ? 'Abrindo player...' : 'Carregando episódio...'}
+            </span>
+          )}
         </div>
       )}
 
-      {/* Center Play Button when Paused */}
-      {!playing && !errorMsg && !waiting && (
+      {/* Center Play Button when Paused (same appearance on Web and Android) */}
+      {!playing && !effectiveErrorMsg && !waiting && !loadingEpisode && !nativeLaunching && (
         <button
           type="button"
           onClick={togglePlay}
+          disabled={!activeStream}
           aria-label="Reproduzir episódio"
-          className="absolute left-1/2 top-1/2 z-30 flex h-16 w-16 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 sm:h-[72px] sm:w-[72px]"
+          className="absolute left-1/2 top-1/2 z-30 flex h-16 w-16 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px]"
         >
           <Play className="ml-1 h-7 w-7 fill-current sm:h-8 sm:w-8" />
         </button>
       )}
 
       {/* Playback Error State */}
-      {errorMsg && (
+      {effectiveErrorMsg && !loadingEpisode && (
         <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center">
-          <p className="max-w-md text-sm text-red-200">{errorMsg}</p>
+          <p className="max-w-md text-sm text-red-200">{effectiveErrorMsg}</p>
           <button
             type="button"
             onClick={() => {
@@ -1229,7 +1389,9 @@ export function AnimePlayer({
       {/* Bottom Controls HUD */}
       <div
         className={`absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/95 via-black/65 to-transparent px-3 pb-2.5 pt-10 transition-opacity duration-200 sm:px-4 sm:pb-3 ${
-          controlsVisible || !playing || menuOpen ? 'opacity-100' : 'pointer-events-none opacity-0'
+          controlsVisible || !playing || menuOpen || episodesOpen || useNativeVlc
+            ? 'opacity-100'
+            : 'pointer-events-none opacity-0'
         }`}
         onClick={(e) => e.stopPropagation()}
       >
@@ -1239,11 +1401,11 @@ export function AnimePlayer({
           onMouseMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
             const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-            setHoverSeek({ pct: pct * 100, time: pct * (duration || 0) });
+            setHoverSeek({ pct: pct * 100, time: pct * (displayDurationSec || 0) });
           }}
           onMouseLeave={() => setHoverSeek(null)}
         >
-          {hoverSeek && duration > 0 && (
+          {hoverSeek && displayDurationSec > 0 && (
             <div
               className="pointer-events-none absolute -top-7 -translate-x-1/2 rounded bg-black/90 px-2 py-0.5 font-mono text-[11px] tabular-nums text-white"
               style={{ left: `${hoverSeek.pct}%` }}
@@ -1265,11 +1427,15 @@ export function AnimePlayer({
             type="range"
             aria-label="Progresso do vídeo"
             min={0}
-            max={duration || 100}
+            max={displayDurationSec || 100}
             step={0.1}
-            value={Math.min(currentTime, duration || 100)}
+            value={Math.min(displayCurrentSec, displayDurationSec || 100)}
             onChange={(e) => {
               const target = Number(e.target.value);
+              if (useNativeVlc) {
+                void launchNativeVlc(target * 1000);
+                return;
+              }
               if (videoRef.current) videoRef.current.currentTime = target;
               setCurrentTime(target);
             }}
@@ -1285,16 +1451,20 @@ export function AnimePlayer({
               type="button"
               onClick={togglePlay}
               aria-label={playing ? 'Pausar' : 'Reproduzir'}
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
             >
-              {playing ? <Pause className="h-4 w-4" /> : <Play className="h-4 w-4 fill-current" />}
+              {playing ? (
+                <Pause className="h-4 w-4" />
+              ) : (
+                <Play className="h-4 w-4 fill-current" />
+              )}
             </button>
 
             <button
               type="button"
               onClick={toggleMute}
               aria-label={muted ? 'Ativar som' : 'Silenciar'}
-              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
             >
               {muted || volume === 0 ? (
                 <VolumeX className="h-4 w-4" />
@@ -1303,23 +1473,27 @@ export function AnimePlayer({
               )}
             </button>
 
-            <input
-              type="range"
-              aria-label="Volume"
-              min={0}
-              max={1}
-              step={0.02}
-              value={muted ? 0 : volume}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                setVolume(v);
-                if (v > 0 && muted) setMuted(false);
-              }}
-              className="hidden h-1 w-16 cursor-pointer accent-[#f97316] md:block"
-            />
+            {!useNativeVlc && (
+              <input
+                type="range"
+                aria-label="Volume"
+                min={0}
+                max={1}
+                step={0.02}
+                value={muted ? 0 : volume}
+                onChange={(e) => {
+                  const v = Number(e.target.value);
+                  setVolume(v);
+                  if (v > 0 && muted) setMuted(false);
+                }}
+                className="hidden h-1 w-16 cursor-pointer accent-[#f97316] md:block"
+              />
+            )}
 
-            <span className="whitespace-nowrap px-1 font-mono text-[11px] tabular-nums text-slate-200 sm:px-1.5 sm:text-xs">
-              {formatTime(currentTime)} <span className="text-slate-500">/</span> {formatTime(duration)}
+            <span className="whitespace-nowrap px-0.5 font-mono text-[10px] tabular-nums text-slate-200 sm:px-1.5 sm:text-xs">
+              {formatTime(displayCurrentSec)}{' '}
+              <span className="text-slate-500">/</span>{' '}
+              {formatTime(displayDurationSec)}
             </span>
 
             <button
@@ -1344,19 +1518,70 @@ export function AnimePlayer({
 
             <button
               type="button"
-              onClick={() => seekBy(85, '+85s Abertura')}
-              title="Pular abertura (+85s)"
-              className="ml-0.5 inline-flex h-7 shrink-0 items-center rounded-md border border-[#f97316]/40 bg-[#f97316]/15 px-2 font-mono text-[11px] font-semibold tabular-nums text-[#fb923c] hover:bg-[#f97316]/25 sm:h-8 sm:px-2.5 sm:text-xs"
+              onClick={() => seekBy(skipIntroSeconds, `+${skipIntroSeconds}s Abertura`)}
+              title={`Pular abertura (+${skipIntroSeconds}s)`}
+              className="ml-0.5 inline-flex h-6 shrink-0 items-center rounded-md border border-[#f97316]/40 bg-[#f97316]/15 px-1.5 font-mono text-[10px] font-semibold tabular-nums text-[#fb923c] hover:bg-[#f97316]/25 sm:h-8 sm:px-2.5 sm:text-xs"
             >
-              +85s
+              +{skipIntroSeconds}s
             </button>
           </div>
 
-          {/* Right Side: Quality, CC, Settings, PiP, Fullscreen */}
+          {/* Right Side: Prev/Episodes/Next, Quality, CC, Settings, PiP, Fullscreen */}
           <div className="relative flex shrink-0 items-center gap-0.5 sm:gap-1">
+            {showEpisodeNav && (
+              <div className="flex items-center gap-0.5 sm:mr-1">
+                {onPrevEpisode && (
+                  <button
+                    type="button"
+                    disabled={!hasPrev || loadingEpisode}
+                    onClick={triggerPrevEpisode}
+                    aria-label="Episódio anterior"
+                    title="Episódio anterior"
+                    className="flex h-7 w-7 items-center justify-center rounded-lg text-white hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-35 sm:h-9 sm:w-9"
+                  >
+                    <SkipBack className="h-4 w-4" />
+                  </button>
+                )}
+
+                {(seriesEpisodes.length > 0 || onSelectEpisode) && (
+                  <button
+                    type="button"
+                    disabled={seriesEpisodes.length === 0}
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setEpisodesOpen((o) => !o);
+                    }}
+                    aria-label="Selecionar episódio"
+                    aria-expanded={episodesOpen}
+                    title="Selecionar episódio"
+                    className={`inline-flex h-7 items-center gap-1 rounded-lg px-1.5 text-xs font-medium transition-colors hover:bg-white/10 disabled:opacity-40 sm:h-9 sm:px-2 ${
+                      episodesOpen ? 'bg-[#f97316]/20 text-[#fb923c]' : 'text-white'
+                    }`}
+                  >
+                    <ListVideo className="h-4 w-4 text-[#f97316]" />
+                    <span className="hidden md:inline">Episódios</span>
+                  </button>
+                )}
+
+                {onNextEpisode && (
+                  <button
+                    type="button"
+                    disabled={!hasNext || loadingEpisode}
+                    onClick={triggerNextEpisode}
+                    aria-label="Próximo episódio"
+                    title="Próximo episódio"
+                    className="flex h-7 w-7 items-center justify-center rounded-lg text-white hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-35 sm:h-9 sm:w-9"
+                  >
+                    <SkipForward className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+            )}
+
             <button
               type="button"
               onClick={() => {
+                setEpisodesOpen(false);
                 setMenuTab('quality');
                 setMenuOpen((o) => (menuTab === 'quality' ? !o : true));
               }}
@@ -1368,11 +1593,12 @@ export function AnimePlayer({
             <button
               type="button"
               onClick={() => {
+                setEpisodesOpen(false);
                 setMenuTab('subs');
                 setMenuOpen((o) => (menuTab === 'subs' ? !o : true));
               }}
               aria-label="Legendas"
-              className={`relative flex h-8 w-8 items-center justify-center rounded-lg hover:bg-white/10 sm:h-9 sm:w-9 ${
+              className={`relative hidden h-8 w-8 items-center justify-center rounded-lg hover:bg-white/10 sm:flex sm:h-9 sm:w-9 ${
                 activeSubId !== 'off' ? 'text-[#f97316]' : 'text-slate-300'
               }`}
             >
@@ -1382,351 +1608,521 @@ export function AnimePlayer({
             <button
               type="button"
               onClick={() => {
+                setEpisodesOpen(false);
                 setMenuTab('main');
                 setMenuOpen((o) => !o);
               }}
               aria-label="Configurações do player"
-              className="flex h-8 w-8 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
             >
               <Settings className="h-4 w-4" />
             </button>
 
-            <button
-              type="button"
-              onClick={togglePip}
-              aria-label="Picture-in-Picture"
-              className="hidden h-9 w-9 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:flex"
-            >
-              <PictureInPicture2 className="h-4 w-4" />
-            </button>
+            {!useNativeVlc && (
+              <button
+                type="button"
+                onClick={togglePip}
+                aria-label="Picture-in-Picture"
+                className="hidden h-9 w-9 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:flex"
+              >
+                <PictureInPicture2 className="h-4 w-4" />
+              </button>
+            )}
 
             <button
               type="button"
               onClick={toggleFullscreen}
               aria-label={isFullscreen ? 'Sair da tela cheia' : 'Tela cheia'}
-              className="flex h-8 w-8 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-white hover:bg-white/10 sm:h-9 sm:w-9"
             >
-              {isFullscreen ? <Minimize className="h-4 w-4" /> : <Maximize className="h-4 w-4" />}
+              {isFullscreen ? (
+                <Minimize className="h-4 w-4" />
+              ) : (
+                <Maximize className="h-4 w-4" />
+              )}
             </button>
 
-            {/* Mobile backdrop & Popover/Sheet Settings Menu */}
+            {/* Popover/Sheet Settings Menu (inside stageRef so it stays above video in fullscreen) */}
             {menuOpen && (
               <>
                 <div
                   className="fixed inset-0 z-40 bg-black/50 sm:hidden"
                   onClick={() => setMenuOpen(false)}
                 />
-                <div className="fixed inset-x-3 bottom-16 z-50 max-h-[65vh] overflow-y-auto rounded-xl border border-white/15 bg-[#151921]/95 p-2 text-xs text-slate-200 shadow-2xl backdrop-blur-md sm:absolute sm:inset-x-auto sm:bottom-11 sm:right-0 sm:max-h-[75vh] sm:w-72">
-                {menuTab === 'main' && (
-                  <div className="space-y-1">
-                    <button
-                      type="button"
-                      onClick={() => setMenuTab('quality')}
-                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
-                    >
-                      <span>Qualidade</span>
-                      <span className="inline-flex items-center gap-1 font-mono text-slate-400">
-                        {activeQualityLabel}
-                        <ChevronRight className="h-3.5 w-3.5" />
-                      </span>
-                    </button>
+                <div className="absolute bottom-11 right-0 z-50 max-h-[65vh] w-68 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl border border-white/15 bg-[#151921]/95 p-2 text-xs text-slate-200 shadow-2xl backdrop-blur-md sm:w-72">
+                  {menuTab === 'main' && (
+                    <div className="space-y-1">
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('quality')}
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                      >
+                        <span>Qualidade</span>
+                        <span className="inline-flex items-center gap-1 font-mono text-slate-400">
+                          {activeQualityLabel}
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </span>
+                      </button>
 
-                    <button
-                      type="button"
-                      onClick={() => setMenuTab('speed')}
-                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
-                    >
-                      <span>Velocidade</span>
-                      <span className="inline-flex items-center gap-1 font-mono tabular-nums text-slate-400">
-                        {speed === 1 ? 'Normal' : `${speed}×`}
-                        <ChevronRight className="h-3.5 w-3.5" />
-                      </span>
-                    </button>
+                      {playerOptions.length > 0 && onSelectServer && (
+                        <button
+                          type="button"
+                          onClick={() => setMenuTab('servers')}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        >
+                          <span className="inline-flex items-center gap-2">
+                            <Server className="h-3.5 w-3.5 text-slate-400" />
+                            <span>Servidor</span>
+                          </span>
+                          <span className="inline-flex max-w-[120px] items-center gap-1 truncate text-slate-400">
+                            <span className="truncate">{activeServerLabel}</span>
+                            <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+                          </span>
+                        </button>
+                      )}
 
-                    <button
-                      type="button"
-                      onClick={() => setMenuTab('subs')}
-                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
-                    >
-                      <span>Legendas</span>
-                      <span className="inline-flex max-w-[130px] items-center gap-1 truncate text-slate-400">
-                        <span className="truncate">{activeSubLabel}</span>
-                        <ChevronRight className="h-3.5 w-3.5 shrink-0" />
-                      </span>
-                    </button>
+                      {!useNativeVlc && (
+                        <button
+                          type="button"
+                          onClick={() => setMenuTab('speed')}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        >
+                          <span>Velocidade</span>
+                          <span className="inline-flex items-center gap-1 font-mono tabular-nums text-slate-400">
+                            {speed === 1 ? 'Normal' : `${speed}×`}
+                            <ChevronRight className="h-3.5 w-3.5" />
+                          </span>
+                        </button>
+                      )}
 
-                    <div className="my-1 border-t border-white/10" />
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('subs')}
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                      >
+                        <span>Legendas</span>
+                        <span className="inline-flex max-w-[130px] items-center gap-1 truncate text-slate-400">
+                          <span className="truncate">{activeSubLabel}</span>
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+                        </span>
+                      </button>
 
-                    <button
-                      type="button"
-                      onClick={() => setLoop((v) => !v)}
-                      className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
-                    >
-                      <span className="inline-flex items-center gap-2">
-                        <Repeat className="h-3.5 w-3.5 text-slate-400" />
-                        Repetir vídeo
-                      </span>
-                      <span className={loop ? 'font-semibold text-[#f97316]' : 'text-slate-500'}>
-                        {loop ? 'Ligado' : 'Desligado'}
-                      </span>
-                    </button>
+                      <div className="my-1 border-t border-white/10" />
 
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        captureFramePng();
-                      }}
-                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
-                    >
-                      <Camera className="h-3.5 w-3.5 text-slate-400" />
-                      <span>Salvar quadro (PNG)</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setMenuOpen(false);
-                        handleDownloadVideo();
-                      }}
-                      className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
-                    >
-                      <Download className="h-3.5 w-3.5 text-slate-400" />
-                      <span>
-                        {activeStream?.format === 'hls'
-                          ? 'Copiar URL do stream (.m3u8)'
-                          : 'Baixar vídeo (MP4)'}
-                      </span>
-                    </button>
-                  </div>
-                )}
-
-                {menuTab === 'quality' && (
-                  <div className="space-y-1">
-                    <button
-                      type="button"
-                      onClick={() => setMenuTab('main')}
-                      className="mb-1 flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                      <span>Qualidade</span>
-                    </button>
-
-                    {hlsLevels.length > 0 ? (
-                      <>
+                      {useNativeVlc && nativeResumeMs > 3000 && (
                         <button
                           type="button"
                           onClick={() => {
-                            if (hlsRef.current) hlsRef.current.currentLevel = -1;
-                            setActiveHlsLevel(-1);
                             setMenuOpen(false);
+                            void launchNativeVlc(0);
                           }}
-                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
                         >
-                          <span>Automático</span>
-                          {activeHlsLevel === -1 && <Check className="h-3.5 w-3.5 text-[#f97316]" />}
+                          <RotateCcw className="h-3.5 w-3.5 text-slate-400" />
+                          <span>Reiniciar do início</span>
                         </button>
-                        {hlsLevels.map((lvl) => (
+                      )}
+
+                      {!useNativeVlc && (
+                        <>
                           <button
-                            key={lvl.index}
+                            type="button"
+                            onClick={() => setLoop((v) => !v)}
+                            className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                          >
+                            <span className="inline-flex items-center gap-2">
+                              <Repeat className="h-3.5 w-3.5 text-slate-400" />
+                              Repetir vídeo
+                            </span>
+                            <span className={loop ? 'font-semibold text-[#f97316]' : 'text-slate-500'}>
+                              {loop ? 'Ligado' : 'Desligado'}
+                            </span>
+                          </button>
+
+                          <button
                             type="button"
                             onClick={() => {
-                              if (hlsRef.current) hlsRef.current.currentLevel = lvl.index;
-                              setActiveHlsLevel(lvl.index);
+                              setMenuOpen(false);
+                              captureFramePng();
+                            }}
+                            className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                          >
+                            <Camera className="h-3.5 w-3.5 text-slate-400" />
+                            <span>Salvar quadro (PNG)</span>
+                          </button>
+                        </>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMenuOpen(false);
+                          void handleDownloadVideo();
+                        }}
+                        className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                      >
+                        <Download className="h-3.5 w-3.5 text-slate-400" />
+                        <span>
+                          {activeStream?.format === 'hls'
+                            ? 'Copiar URL do stream (.m3u8)'
+                            : 'Baixar vídeo (MP4)'}
+                        </span>
+                      </button>
+                    </div>
+                  )}
+
+                  {menuTab === 'quality' && (
+                    <div className="space-y-1">
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('main')}
+                        className="mb-1 flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        <span>Qualidade</span>
+                      </button>
+
+                      {hlsLevels.length > 0 && !useNativeVlc ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (hlsRef.current) hlsRef.current.currentLevel = -1;
+                              setActiveHlsLevel(-1);
                               setMenuOpen(false);
                             }}
                             className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
                           >
-                            <span className="font-mono">{lvl.label}</span>
-                            {activeHlsLevel === lvl.index && (
+                            <span>Automático</span>
+                            {activeHlsLevel === -1 && (
                               <Check className="h-3.5 w-3.5 text-[#f97316]" />
                             )}
                           </button>
-                        ))}
-                      </>
-                    ) : (
-                      sortedStreams.map((stream, idx) => (
+                          {hlsLevels.map((lvl) => (
+                            <button
+                              key={lvl.index}
+                              type="button"
+                              onClick={() => {
+                                if (hlsRef.current) hlsRef.current.currentLevel = lvl.index;
+                                setActiveHlsLevel(lvl.index);
+                                setMenuOpen(false);
+                              }}
+                              className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                            >
+                              <span className="font-mono">{lvl.label}</span>
+                              {activeHlsLevel === lvl.index && (
+                                <Check className="h-3.5 w-3.5 text-[#f97316]" />
+                              )}
+                            </button>
+                          ))}
+                        </>
+                      ) : (
+                        sortedStreams.map((stream, idx) => (
+                          <button
+                            key={stream.url}
+                            type="button"
+                            onClick={() => {
+                              setSelectedStreamIdx(idx);
+                              setMenuOpen(false);
+                            }}
+                            className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                          >
+                            <span className="font-mono">{stream.label}</span>
+                            {selectedStreamIdx === idx && (
+                              <Check className="h-3.5 w-3.5 text-[#f97316]" />
+                            )}
+                          </button>
+                        ))
+                      )}
+                    </div>
+                  )}
+
+                  {menuTab === 'servers' && (
+                    <div className="space-y-1">
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('main')}
+                        className="mb-1 flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        <span>Servidores</span>
+                      </button>
+                      {playerOptions.map((opt) => (
                         <button
-                          key={stream.url}
+                          key={opt.nume}
                           type="button"
                           onClick={() => {
-                            setSelectedStreamIdx(idx);
+                            autoStartNextRef.current = true;
+                            onSelectServer?.(opt.nume);
                             setMenuOpen(false);
                           }}
                           className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
                         >
-                          <span className="font-mono">{stream.label}</span>
-                          {selectedStreamIdx === idx && (
-                            <Check className="h-3.5 w-3.5 text-[#f97316]" />
-                          )}
-                        </button>
-                      ))
-                    )}
-                  </div>
-                )}
-
-                {menuTab === 'speed' && (
-                  <div className="space-y-1">
-                    <button
-                      type="button"
-                      onClick={() => setMenuTab('main')}
-                      className="mb-1 flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                      <span>Velocidade</span>
-                    </button>
-                    <div className="grid grid-cols-3 gap-1 p-1">
-                      {SPEED_OPTIONS.map((sp) => (
-                        <button
-                          key={sp}
-                          type="button"
-                          onClick={() => {
-                            setSpeed(sp);
-                            setMenuOpen(false);
-                          }}
-                          className={`rounded-md py-1.5 font-mono tabular-nums transition-colors ${
-                            speed === sp
-                              ? 'bg-[#f97316] font-semibold text-[#0d0f12]'
-                              : 'bg-white/5 text-slate-300 hover:bg-white/15'
-                          }`}
-                        >
-                          {sp === 1 ? '1×' : `${sp}×`}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {menuTab === 'subs' && (
-                  <div className="space-y-2">
-                    <button
-                      type="button"
-                      onClick={() => setMenuTab('main')}
-                      className="flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
-                    >
-                      <ChevronLeft className="h-4 w-4" />
-                      <span>Legendas (ASS / SRT / VTT)</span>
-                    </button>
-
-                    <div className="max-h-32 space-y-1 overflow-y-auto">
-                      <button
-                        type="button"
-                        onClick={() => setActiveSubId('off')}
-                        className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left hover:bg-white/10"
-                      >
-                        <span>Desativadas</span>
-                        {activeSubId === 'off' && <Check className="h-3.5 w-3.5 text-[#f97316]" />}
-                      </button>
-                      {subEntries.map((sub) => (
-                        <button
-                          key={sub.id}
-                          type="button"
-                          onClick={() => setActiveSubId(sub.id)}
-                          className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left hover:bg-white/10"
-                        >
-                          <span className="truncate">{sub.label}</span>
-                          {activeSubId === sub.id && (
+                          <span className="truncate">{opt.label}</span>
+                          {selectedServerNume === opt.nume && (
                             <Check className="h-3.5 w-3.5 shrink-0 text-[#f97316]" />
                           )}
                         </button>
                       ))}
                     </div>
+                  )}
 
-                    <button
-                      type="button"
-                      onClick={() => fileInputRef.current?.click()}
-                      className="flex w-full items-center justify-center gap-2 rounded-lg border border-white/15 bg-[#0d0f12] px-3 py-2 font-medium text-white hover:border-[#f97316]"
-                    >
-                      <Upload className="h-3.5 w-3.5 text-[#f97316]" />
-                      <span>Carregar legenda local</span>
-                    </button>
-
-                    <div className="space-y-2 border-t border-white/10 pt-2">
-                      <div className="flex items-center justify-between px-1">
-                        <span className="text-slate-400">Atraso</span>
-                        <div className="flex items-center gap-1.5">
+                  {menuTab === 'speed' && (
+                    <div className="space-y-1">
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('main')}
+                        className="mb-1 flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        <span>Velocidade</span>
+                      </button>
+                      <div className="grid grid-cols-3 gap-1 p-1">
+                        {SPEED_OPTIONS.map((sp) => (
                           <button
+                            key={sp}
                             type="button"
-                            onClick={() => setCapDelay((d) => Number((d - 0.1).toFixed(1)))}
-                            className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
+                            onClick={() => {
+                              setSpeed(sp);
+                              setMenuOpen(false);
+                            }}
+                            className={`rounded-md py-1.5 font-mono tabular-nums transition-colors ${
+                              speed === sp
+                                ? 'bg-[#f97316] font-semibold text-[#0d0f12]'
+                                : 'bg-white/5 text-slate-300 hover:bg-white/15'
+                            }`}
                           >
-                            −0.1s
+                            {sp === 1 ? '1×' : `${sp}×`}
                           </button>
-                          <span className="min-w-[44px] text-center font-mono tabular-nums text-white">
-                            {capDelay >= 0 ? `+${capDelay.toFixed(1)}s` : `${capDelay.toFixed(1)}s`}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => setCapDelay((d) => Number((d + 0.1).toFixed(1)))}
-                            className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
-                          >
-                            +0.1s
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between px-1">
-                        <span className="text-slate-400">Tamanho</span>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setCapScale((s) => Math.max(0.5, Number((s - 0.1).toFixed(2))))
-                            }
-                            className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
-                          >
-                            −
-                          </button>
-                          <span className="min-w-[44px] text-center font-mono tabular-nums text-white">
-                            {Math.round(capScale * 100)}%
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setCapScale((s) => Math.min(2, Number((s + 0.1).toFixed(2))))
-                            }
-                            className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
-                          >
-                            +
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center justify-between px-1">
-                        <span className="text-slate-400">Cor (SRT/VTT)</span>
-                        <div className="flex items-center gap-1.5">
-                          {COLOR_PRESETS.map((hex) => (
-                            <button
-                              key={hex}
-                              type="button"
-                              aria-label={`Cor ${hex}`}
-                              onClick={() => setCapColor(hex)}
-                              className={`h-4 w-4 rounded-full border ${
-                                capColor.toLowerCase() === hex
-                                  ? 'scale-110 border-white'
-                                  : 'border-white/25'
-                              }`}
-                              style={{ backgroundColor: hex }}
-                            />
-                          ))}
-                          <input
-                            type="color"
-                            aria-label="Cor personalizada da legenda"
-                            value={capColor}
-                            onChange={(e) => setCapColor(e.target.value)}
-                            className="h-5 w-6 cursor-pointer rounded border border-white/20 bg-transparent p-0"
-                          />
-                        </div>
+                        ))}
                       </div>
                     </div>
-                  </div>
-                )}
+                  )}
+
+                  {menuTab === 'subs' && (
+                    <div className="space-y-2">
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('main')}
+                        className="flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        <span>Legendas (ASS / SRT / VTT)</span>
+                      </button>
+
+                      <div className="max-h-32 space-y-1 overflow-y-auto">
+                        <button
+                          type="button"
+                          onClick={() => setActiveSubId('off')}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left hover:bg-white/10"
+                        >
+                          <span>Desativadas</span>
+                          {activeSubId === 'off' && (
+                            <Check className="h-3.5 w-3.5 text-[#f97316]" />
+                          )}
+                        </button>
+                        {subEntries.map((sub) => (
+                          <button
+                            key={sub.id}
+                            type="button"
+                            onClick={() => setActiveSubId(sub.id)}
+                            className="flex w-full items-center justify-between rounded-lg px-3 py-1.5 text-left hover:bg-white/10"
+                          >
+                            <span className="truncate">{sub.label}</span>
+                            {activeSubId === sub.id && (
+                              <Check className="h-3.5 w-3.5 shrink-0 text-[#f97316]" />
+                            )}
+                          </button>
+                        ))}
+                      </div>
+
+                      {!useNativeVlc && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => fileInputRef.current?.click()}
+                            className="flex w-full items-center justify-center gap-2 rounded-lg border border-white/15 bg-[#0d0f12] px-3 py-2 font-medium text-white hover:border-[#f97316]"
+                          >
+                            <Upload className="h-3.5 w-3.5 text-[#f97316]" />
+                            <span>Carregar legenda local</span>
+                          </button>
+
+                          <div className="space-y-2 border-t border-white/10 pt-2">
+                            <div className="flex items-center justify-between px-1">
+                              <span className="text-slate-400">Atraso</span>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => setCapDelay((d) => Number((d - 0.1).toFixed(1)))}
+                                  className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
+                                >
+                                  −0.1s
+                                </button>
+                                <span className="min-w-[44px] text-center font-mono tabular-nums text-white">
+                                  {capDelay >= 0
+                                    ? `+${capDelay.toFixed(1)}s`
+                                    : `${capDelay.toFixed(1)}s`}
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => setCapDelay((d) => Number((d + 0.1).toFixed(1)))}
+                                  className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
+                                >
+                                  +0.1s
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center justify-between px-1">
+                              <span className="text-slate-400">Tamanho</span>
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setCapScale((s) => Math.max(0.5, Number((s - 0.1).toFixed(2))))
+                                  }
+                                  className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
+                                >
+                                  −
+                                </button>
+                                <span className="min-w-[44px] text-center font-mono tabular-nums text-white">
+                                  {Math.round(capScale * 100)}%
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setCapScale((s) => Math.min(2, Number((s + 0.1).toFixed(2))))
+                                  }
+                                  className="rounded bg-white/10 px-2 py-0.5 font-mono text-white hover:bg-white/20"
+                                >
+                                  +
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="flex items-center justify-between px-1">
+                              <span className="text-slate-400">Cor (SRT/VTT)</span>
+                              <div className="flex items-center gap-1.5">
+                                {COLOR_PRESETS.map((hex) => (
+                                  <button
+                                    key={hex}
+                                    type="button"
+                                    aria-label={`Cor ${hex}`}
+                                    onClick={() => setCapColor(hex)}
+                                    className={`h-4 w-4 rounded-full border ${
+                                      capColor.toLowerCase() === hex
+                                        ? 'scale-110 border-white'
+                                        : 'border-white/25'
+                                    }`}
+                                    style={{ backgroundColor: hex }}
+                                  />
+                                ))}
+                                <input
+                                  type="color"
+                                  aria-label="Cor personalizada da legenda"
+                                  value={capColor}
+                                  onChange={(e) => setCapColor(e.target.value)}
+                                  className="h-5 w-6 cursor-pointer rounded border border-white/20 bg-transparent p-0"
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               </>
             )}
           </div>
         </div>
       </div>
+
+      {/* In-Player Fullscreen Episode Selector Drawer (stays inside stageRef so fullscreen never exits) */}
+      {episodesOpen && (
+        <div
+          className="absolute inset-0 z-40 flex justify-end bg-black/60 backdrop-blur-[2px]"
+          onClick={() => setEpisodesOpen(false)}
+        >
+          <aside
+            role="dialog"
+            aria-label="Selecionar episódio"
+            onClick={(e) => e.stopPropagation()}
+            className="flex h-full w-80 max-w-[88%] flex-col border-l border-white/12 bg-[#151921]/95 text-slate-200 shadow-2xl backdrop-blur-md"
+          >
+            <div className="flex items-center justify-between gap-2 border-b border-white/10 px-4 py-3">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-white">Episódios</h3>
+                {seriesTitle && (
+                  <p className="truncate text-[11px] text-slate-400">{seriesTitle}</p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={() => setEpisodesOpen(false)}
+                aria-label="Fechar lista de episódios"
+                className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-white/10 hover:text-white"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="flex-1 space-y-1 overflow-y-auto p-2">
+              {seriesEpisodes.length === 0 ? (
+                <div className="px-3 py-8 text-center text-xs text-slate-400">
+                  Lista de episódios indisponível para este título.
+                </div>
+              ) : (
+                seriesEpisodes.map((ep) => {
+                  const isCurrent = isSameEpisodeUrl(ep.url, episodeUrl);
+                  const isWatched = watchedUrls?.has(ep.url) ?? false;
+                  return (
+                    <button
+                      key={ep.url}
+                      ref={isCurrent ? activeEpItemRef : undefined}
+                      type="button"
+                      onClick={() => triggerSelectEpisode(ep.url)}
+                      className={`flex w-full items-center justify-between gap-2.5 rounded-lg border px-3 py-2.5 text-left transition-colors ${
+                        isCurrent
+                          ? 'border-[#f97316] bg-[#f97316]/15 text-white'
+                          : 'border-transparent bg-white/5 text-slate-200 hover:border-white/15 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`font-mono text-[11px] font-semibold tabular-nums ${
+                              isCurrent ? 'text-[#fb923c]' : 'text-slate-400'
+                            }`}
+                          >
+                            {ep.numberLabel || 'EP'}
+                          </span>
+                          {isCurrent && (
+                            <span className="rounded bg-[#f97316]/25 px-1.5 py-0.5 text-[10px] font-semibold text-[#fb923c]">
+                              Assistindo
+                            </span>
+                          )}
+                          {!isCurrent && isWatched && (
+                            <span className="text-[10px] font-medium text-emerald-400">
+                              Visto
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 truncate text-xs font-medium">{ep.title}</div>
+                      </div>
+                      <Play
+                        className={`h-3.5 w-3.5 shrink-0 ${
+                          isCurrent ? 'fill-[#f97316] text-[#f97316]' : 'text-slate-400'
+                        }`}
+                      />
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </aside>
+        </div>
+      )}
     </div>
   );
 }
