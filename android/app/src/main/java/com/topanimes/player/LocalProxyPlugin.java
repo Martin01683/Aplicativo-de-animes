@@ -13,6 +13,8 @@ import android.os.Build;
 import android.provider.Settings;
 import android.util.Log;
 
+import androidx.core.app.PendingIntentCompat;
+
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
@@ -386,16 +388,16 @@ public class LocalProxyPlugin extends Plugin {
                 stagingApk.delete();
 
                 Intent callbackIntent = new Intent(ctx, ApkInstallReceiver.class);
-                int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    piFlags |= PendingIntent.FLAG_MUTABLE;
-                }
-                PendingIntent pendingIntent = PendingIntent.getBroadcast(
+                PendingIntent pendingIntent = PendingIntentCompat.getBroadcast(
                     ctx,
                     sessionId,
                     callbackIntent,
-                    piFlags
+                    PendingIntent.FLAG_UPDATE_CURRENT,
+                    true
                 );
+                if (pendingIntent == null) {
+                    throw new IOException("Não foi possível criar PendingIntent de instalação.");
+                }
                 session.commit(pendingIntent.getIntentSender());
                 session.close();
                 session = null;
@@ -447,9 +449,7 @@ public class LocalProxyPlugin extends Plugin {
         PackageManager pm = ctx.getPackageManager();
         String expectedPkg = ctx.getPackageName();
 
-        int archiveFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-            ? PackageManager.GET_SIGNING_CERTIFICATES
-            : getLegacySignaturesFlag();
+        int archiveFlags = getSigningFlags();
         PackageInfo archiveInfo = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(), archiveFlags);
         if (archiveInfo == null || !expectedPkg.equals(archiveInfo.packageName)) {
             throw new IOException("Pacote inválido ou incompatível com " + expectedPkg + ".");
@@ -470,8 +470,11 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    @SuppressWarnings("deprecation")
-    private static int getLegacySignaturesFlag() {
+    @SuppressWarnings({"deprecation", "PackageManagerGetSignatures"})
+    private static int getSigningFlags() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            return PackageManager.GET_SIGNING_CERTIFICATES;
+        }
         return PackageManager.GET_SIGNATURES;
     }
 

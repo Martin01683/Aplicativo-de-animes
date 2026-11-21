@@ -23,10 +23,10 @@ public class ApkInstallReceiver extends BroadcastReceiver {
         if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
             Intent confirmIntent;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                confirmIntent = intent.getParcelableExtra(PackageInstaller.EXTRA_INTENT, Intent.class);
+                confirmIntent = intent.getParcelableExtra(Intent.EXTRA_INTENT, Intent.class);
             } else {
                 @SuppressWarnings("deprecation")
-                Intent legacyIntent = intent.getParcelableExtra(PackageInstaller.EXTRA_INTENT);
+                Intent legacyIntent = intent.getParcelableExtra(Intent.EXTRA_INTENT);
                 confirmIntent = legacyIntent;
             }
 

@@ -515,6 +515,23 @@ export function CatalogView({
           </section>
 
           <section>
+            <div className="mb-4 flex items-center gap-2 border-b border-white/10 pb-3">
+              <Heart className="h-4 w-4 text-rose-400" />
+              <h2 className="text-xl font-bold text-white">Meus Favoritos</h2>
+            </div>
+
+            {favorites.length === 0 ? (
+              <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
+                Você ainda não favoritou nenhum anime ou filme. Use o botão de coração nos cards ou o botão Favoritar na página do anime.
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                {favorites.map((fav) => renderCard(fav, 'portrait'))}
+              </div>
+            )}
+          </section>
+
+          <section>
             <div className="mb-4 flex items-center justify-between border-b border-white/10 pb-3">
               <div className="flex items-center gap-2">
                 <Clock className="h-4 w-4 text-[#f97316]" />
@@ -560,23 +577,6 @@ export function CatalogView({
                     'landscape'
                   )
                 )}
-              </div>
-            )}
-          </section>
-
-          <section>
-            <div className="mb-4 flex items-center gap-2 border-b border-white/10 pb-3">
-              <Heart className="h-4 w-4 text-rose-400" />
-              <h2 className="text-xl font-bold text-white">Meus Favoritos</h2>
-            </div>
-
-            {favorites.length === 0 ? (
-              <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
-                Você ainda não favoritou nenhum anime ou filme. Use o botão de coração nos cards ou o botão Favoritar na página do anime.
-              </div>
-            ) : (
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                {favorites.map((fav) => renderCard(fav, 'portrait'))}
               </div>
             )}
           </section>
