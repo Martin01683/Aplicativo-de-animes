@@ -1,4 +1,13 @@
 import {
+  canonicalEpisodeProgressKey,
+  computeProgressSnapshot,
+  getResumePositionSec,
+  sanitizeEpisodeProgressMap,
+  upsertEpisodeProgressMap,
+  type EpisodePlaybackProgress,
+  type EpisodeProgressMap,
+} from './playbackProgress';
+import {
   DEFAULT_APP_SETTINGS,
   DEFAULT_APP_SETTINGS_META,
   sanitizeAppSettings,
@@ -14,6 +23,7 @@ import type {
 
 const FAVORITES_KEY = 'topvlc:favorites:v1';
 const HISTORY_KEY = 'topvlc:history:v1';
+const PROGRESS_KEY = 'topvlc:progress:v1';
 const ALERTS_KEY = 'topvlc:alerts:v1';
 const BASELINES_KEY = 'topvlc:fav_baselines:v1';
 const SETTINGS_KEY = 'topvlc:settings:v1';
@@ -51,8 +61,27 @@ export function loadHistory(): WatchHistoryEntry[] {
 }
 
 export function pushHistoryEntry(entry: WatchHistoryEntry): WatchHistoryEntry[] {
-  const existing = loadHistory().filter((item) => item.url !== entry.url);
-  const next = [entry, ...existing].slice(0, 30);
+  const entryKey = canonicalEpisodeProgressKey(entry.url);
+  const previousAll = loadHistory();
+  const prevMatch = previousAll.find(
+    (item) => canonicalEpisodeProgressKey(item.url) === entryKey
+  );
+  const progressMap = loadEpisodeProgressMap();
+  const savedProgress = entryKey ? progressMap[entryKey] : undefined;
+
+  const mergedEntry: WatchHistoryEntry = {
+    ...entry,
+    positionSec:
+      entry.positionSec ?? savedProgress?.positionSec ?? prevMatch?.positionSec,
+    durationSec:
+      entry.durationSec ?? savedProgress?.durationSec ?? prevMatch?.durationSec,
+    completed: entry.completed ?? savedProgress?.completed ?? prevMatch?.completed,
+  };
+
+  const existing = previousAll.filter(
+    (item) => canonicalEpisodeProgressKey(item.url) !== entryKey && item.url !== entry.url
+  );
+  const next = [mergedEntry, ...existing].slice(0, 30);
   try {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
   } catch {
@@ -64,6 +93,96 @@ export function pushHistoryEntry(entry: WatchHistoryEntry): WatchHistoryEntry[] 
 export function clearHistory(): void {
   try {
     localStorage.removeItem(HISTORY_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function loadEpisodeProgressMap(): EpisodeProgressMap {
+  try {
+    const raw = localStorage.getItem(PROGRESS_KEY);
+    if (!raw) return {};
+    return sanitizeEpisodeProgressMap(JSON.parse(raw));
+  } catch {
+    return {};
+  }
+}
+
+export function saveEpisodeProgressMap(map: EpisodeProgressMap): void {
+  try {
+    localStorage.setItem(PROGRESS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore storage quota errors
+  }
+}
+
+export function getEpisodeProgress(url: string): EpisodePlaybackProgress | null {
+  const key = canonicalEpisodeProgressKey(url);
+  if (!key) return null;
+  const map = loadEpisodeProgressMap();
+  return map[key] || null;
+}
+
+export function getEpisodeResumeSeconds(url: string): number {
+  return getResumePositionSec(getEpisodeProgress(url));
+}
+
+export function saveEpisodeProgress(params: {
+  url: string;
+  positionSec: number;
+  durationSec: number;
+  ended?: boolean;
+  forceReset?: boolean;
+}): { map: EpisodeProgressMap; history: WatchHistoryEntry[] | null } {
+  const snapshot = computeProgressSnapshot(params);
+  const currentMap = loadEpisodeProgressMap();
+  if (!snapshot) {
+    return { map: currentMap, history: null };
+  }
+
+  const nextMap = upsertEpisodeProgressMap(currentMap, snapshot);
+  saveEpisodeProgressMap(nextMap);
+
+  const key = canonicalEpisodeProgressKey(params.url);
+  const currentHistory = loadHistory();
+  let updatedHistory: WatchHistoryEntry[] | null = null;
+  if (
+    key &&
+    currentHistory.some((item) => canonicalEpisodeProgressKey(item.url) === key)
+  ) {
+    updatedHistory = currentHistory.map((item) =>
+      canonicalEpisodeProgressKey(item.url) === key
+        ? {
+            ...item,
+            positionSec: snapshot.positionSec,
+            durationSec: snapshot.durationSec,
+            completed: snapshot.completed,
+          }
+        : item
+    );
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
+    } catch {
+      // ignore
+    }
+  }
+
+  return { map: nextMap, history: updatedHistory };
+}
+
+export function clearEpisodeProgress(url: string): EpisodeProgressMap {
+  const key = canonicalEpisodeProgressKey(url);
+  const currentMap = loadEpisodeProgressMap();
+  if (!key || !currentMap[key]) return currentMap;
+  const next = { ...currentMap };
+  delete next[key];
+  saveEpisodeProgressMap(next);
+  return next;
+}
+
+export function clearAllEpisodeProgress(): void {
+  try {
+    localStorage.removeItem(PROGRESS_KEY);
   } catch {
     // ignore
   }
@@ -176,5 +295,3 @@ export function saveAcknowledgedReleaseKey(key: string | null): void {
     // ignore
   }
 }
-
-

@@ -21,6 +21,7 @@ test('sanitizeAppSettings falls back cleanly on invalid or partial input', () =>
       skipIntroSeconds: 42,
       notifyNewEpisodes: false,
       autoDownloadAppUpdates: true,
+      videoScale: 'invalid-scale',
     }),
     {
       ...DEFAULT_APP_SETTINGS,
@@ -42,6 +43,7 @@ test('sanitizeAppSettings preserves valid user values', () => {
     defaultAudioFilter: 'DUB',
     skipIntroSeconds: 90,
     autoPlayNextEpisode: true,
+    videoScale: 'fill',
   });
 
   assert.equal(result.episodeCheckIntervalMinutes, 15);
@@ -53,6 +55,7 @@ test('sanitizeAppSettings preserves valid user values', () => {
   assert.equal(result.defaultAudioFilter, 'DUB');
   assert.equal(result.skipIntroSeconds, 90);
   assert.equal(result.autoPlayNextEpisode, true);
+  assert.equal(result.videoScale, 'fill');
 });
 
 test('getEpisodeCheckIntervalMs returns null for manual mode and ms otherwise', () => {

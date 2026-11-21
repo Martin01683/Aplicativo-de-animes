@@ -1,4 +1,9 @@
 import type { NavSection } from '../components/Header';
+import {
+  DEFAULT_VIDEO_SCALE,
+  sanitizeVideoScaleMode,
+  type VideoScaleMode,
+} from './playbackProgress';
 
 export type EpisodeCheckIntervalMinutes = 0 | 1 | 5 | 15 | 30 | 60;
 export type AppUpdateIntervalHours = 0 | 6 | 24 | 168;
@@ -16,6 +21,7 @@ export interface AppSettings {
   defaultAudioFilter: DefaultAudioFilter;
   skipIntroSeconds: SkipIntroSeconds;
   autoPlayNextEpisode: boolean;
+  videoScale: VideoScaleMode;
 }
 
 export interface AppSettingsMeta {
@@ -34,6 +40,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   defaultAudioFilter: 'ALL',
   skipIntroSeconds: 85,
   autoPlayNextEpisode: false,
+  videoScale: DEFAULT_VIDEO_SCALE,
 };
 
 export const DEFAULT_APP_SETTINGS_META: AppSettingsMeta = {
@@ -128,6 +135,7 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
       typeof input.autoPlayNextEpisode === 'boolean'
         ? input.autoPlayNextEpisode
         : DEFAULT_APP_SETTINGS.autoPlayNextEpisode,
+    videoScale: sanitizeVideoScaleMode(input.videoScale),
   };
 }
 

@@ -3,6 +3,7 @@ package com.topanimes.player;
 import android.app.Activity;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
@@ -93,6 +94,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
         "16:9",
         "Original"
     };
+    private static final String[] SCALE_IDS = new String[] {
+        "best-fit",
+        "fit-screen",
+        "fill",
+        "16:9",
+        "original"
+    };
+
+    private static final String PREFS_NAME = "topanimes_player_prefs";
+    private static final String PREF_VIDEO_SCALE_IDX = "video_scale_idx";
+    private static final String PREF_EPISODE_PROGRESS_JSON = "episode_progress_json";
+    private static final long MIN_RESUME_MS = 2000L;
 
     public static final String EXTRA_TITLE = "title";
     public static final String EXTRA_EPISODE_URL = "episodeUrl";
@@ -107,7 +120,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     public static final String EXTRA_REFERER = "referer";
     public static final String EXTRA_PREFER_DIRECT = "preferDirect";
     public static final String EXTRA_START_POSITION_MS = "startPositionMs";
+    public static final String EXTRA_FORCE_START_POSITION = "forceStartPosition";
     public static final String EXTRA_STREAM_INDEX = "streamIndex";
+    public static final String EXTRA_VIDEO_SCALE = "videoScale";
     public static final String EXTRA_HAS_PREV = "hasPrev";
     public static final String EXTRA_HAS_NEXT = "hasNext";
     public static final String EXTRA_PREV_URL = "prevUrl";
@@ -121,6 +136,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     public static final String RESULT_POSITION_MS = "positionMs";
     public static final String RESULT_DURATION_MS = "durationMs";
     public static final String RESULT_STREAM_INDEX = "streamIndex";
+    public static final String RESULT_VIDEO_SCALE = "videoScale";
     public static final String RESULT_VISITED_EPISODES_JSON = "visitedEpisodesJson";
 
     private static class StreamItem {
@@ -201,7 +217,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private final Set<String> watchedUrls = new HashSet<>();
     private final Set<String> failedServerNumes = new HashSet<>();
     private final Map<String, TopAnimesEpisodeResolver.ResolvedEmbedData> embedProbeCache = new HashMap<>();
-    private final Map<String, String> visitedEpisodes = new LinkedHashMap<>();
+    private static class VisitedEpisodeState {
+        String title;
+        long positionMs;
+        long durationMs;
+        boolean completed;
+
+        VisitedEpisodeState(String title) {
+            this.title = title;
+        }
+    }
+
+    private final Map<String, VisitedEpisodeState> visitedEpisodes = new LinkedHashMap<>();
     private final List<File> cachedSubFiles = new ArrayList<>();
 
     private String episodeTitle = "Episódio";
@@ -221,6 +248,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private long pendingSeekMs = 0L;
     private long lastKnownPositionMs = 0L;
     private long lastKnownDurationMs = 0L;
+    private long lastProgressSavedWallMs = 0L;
     private int skipIntroSeconds = 85;
     private boolean autoPlayNextEpisode = false;
 
@@ -412,7 +440,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         btnSkipIntro.setText("+" + skipIntroSeconds + "s");
 
         if (!episodeUrl.isEmpty()) {
-            visitedEpisodes.put(normalizeUrlKey(episodeUrl), episodeTitle);
+            recordVisitedEpisode(episodeUrl, episodeTitle, 0L, 0L, false);
             watchedUrls.add(normalizeUrlKey(episodeUrl));
         }
 
@@ -428,9 +456,33 @@ public class VlcPlayerActivity extends AppCompatActivity {
             proxyBaseUrl = LocalProxyPlugin.sharedProxyBaseUrl;
         }
 
+        SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        if (prefs.contains(PREF_VIDEO_SCALE_IDX)) {
+            int savedScale = prefs.getInt(PREF_VIDEO_SCALE_IDX, 0);
+            currentScaleIdx = (savedScale >= 0 && savedScale < SCALE_OPTIONS.length) ? savedScale : 0;
+        } else {
+            String extraScale = safeStr(intent.getStringExtra(EXTRA_VIDEO_SCALE));
+            if (!extraScale.isEmpty()) {
+                currentScaleIdx = scaleIdToIndex(extraScale);
+                prefs.edit().putInt(PREF_VIDEO_SCALE_IDX, currentScaleIdx).apply();
+            }
+        }
+
         preferDirect = intent.getBooleanExtra(EXTRA_PREFER_DIRECT, false);
         useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
-        pendingSeekMs = Math.max(0L, intent.getLongExtra(EXTRA_START_POSITION_MS, 0L));
+
+        boolean forceStart = intent.getBooleanExtra(EXTRA_FORCE_START_POSITION, false);
+        long reqStartMs = Math.max(0L, intent.getLongExtra(EXTRA_START_POSITION_MS, 0L));
+        if (forceStart && reqStartMs == 0L && !episodeUrl.isEmpty()) {
+            saveEpisodeProgressPref(episodeUrl, episodeTitle, 0L, 0L, false, true);
+            pendingSeekMs = 0L;
+        } else if (reqStartMs >= MIN_RESUME_MS) {
+            pendingSeekMs = reqStartMs;
+        } else if (!forceStart && !episodeUrl.isEmpty()) {
+            pendingSeekMs = getSavedResumePositionMs(episodeUrl);
+        } else {
+            pendingSeekMs = 0L;
+        }
         lastKnownPositionMs = pendingSeekMs;
 
         parseStreamsJson(intent.getStringExtra(EXTRA_STREAMS_JSON));
@@ -672,11 +724,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         errorOverlay.setVisibility(View.GONE);
                         updatePlayPauseIcons(true);
                         updateEpisodeNavButtons();
-                        if (pendingSeekMs > 0L && mediaPlayer != null && mediaPlayer.isSeekable()) {
-                            long target = pendingSeekMs;
-                            pendingSeekMs = 0L;
-                            mediaPlayer.setTime(target);
-                        }
+                        applyPendingSeekIfReady();
                         if (mediaPlayer != null) {
                             mediaPlayer.setRate(holdSpeedActive ? 2.0f : currentSpeed);
                             mediaPlayer.setVolume(muted ? 0 : 100);
@@ -694,6 +742,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         uiHandler.removeCallbacks(loadWatchdogRunnable);
                         updatePlayPauseIcons(false);
                         setControlsVisible(true);
+                        saveCurrentEpisodeProgress(false);
                     });
                     break;
                 case MediaPlayer.Event.LengthChanged:
@@ -704,6 +753,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             lastKnownDurationMs = len;
                             seekBar.setMax((int) Math.min(Integer.MAX_VALUE, len));
                             timeDurationView.setText(formatMs(len));
+                            applyPendingSeekIfReady();
                         });
                     }
                     break;
@@ -711,6 +761,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     long timeMs = event.getTimeChanged();
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        if (pendingSeekMs > 0L) {
+                            applyPendingSeekIfReady();
+                            if (pendingSeekMs > 0L && timeMs < Math.max(0L, pendingSeekMs - 3000L)) {
+                                return;
+                            }
+                        }
                         lastKnownPositionMs = timeMs;
                         if (timeMs > 500L) {
                             hasPlaybackStartedForStream = true;
@@ -726,6 +782,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             seekBar.setMax((int) Math.min(Integer.MAX_VALUE, totalLen));
                             timeDurationView.setText(formatMs(totalLen));
                         }
+                        long nowWall = System.currentTimeMillis();
+                        if (nowWall - lastProgressSavedWallMs >= 5000L) {
+                            saveCurrentEpisodeProgress(false);
+                        }
                     });
                     break;
                 case MediaPlayer.Event.EndReached:
@@ -740,6 +800,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             handlePlaybackError();
                             return;
                         }
+                        saveCurrentEpisodeProgress(true);
                         if (autoPlayNextEpisode && !nextUrl.isEmpty() && !isSameEpisodeUrl(episodeUrl, nextUrl)) {
                             Toast.makeText(VlcPlayerActivity.this, "Carregando próximo episódio...", Toast.LENGTH_SHORT).show();
                             loadEpisodeInFullscreen(nextUrl);
@@ -1611,6 +1672,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
         String normalizedTarget = TopAnimesEpisodeResolver.normalizeTopAnimesUrl(rawTargetUrl);
         if (normalizedTarget.isEmpty()) return;
 
+        // Flush progress of the outgoing episode before resetting state
+        saveCurrentEpisodeProgress(false);
+
         final int gen = episodeLoadGen.incrementAndGet();
         activePlaybackSessionGen = -1L;
         endReachedHandledSessionGen = -1L;
@@ -1623,12 +1687,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
         hasPlaybackStartedForStream = false;
         loadingEpisode = true;
         playbackFailed = false;
-        pendingSeekMs = 0L;
-        lastKnownPositionMs = 0L;
+        pendingSeekMs = getSavedResumePositionMs(normalizedTarget);
+        lastKnownPositionMs = pendingSeekMs;
         lastKnownDurationMs = 0L;
         seekBar.setProgress(0);
         seekBar.setMax(100);
-        timeCurrentView.setText("0:00");
+        timeCurrentView.setText(formatMs(pendingSeekMs));
         timeDurationView.setText("0:00");
 
         closeSettingsMenu();
@@ -1690,6 +1754,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     preferDirect = resolved.preferDirect;
                     useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
 
+                    long savedForResolved = getSavedResumePositionMs(episodeUrl);
+                    if (savedForResolved > 0L) {
+                        pendingSeekMs = savedForResolved;
+                        lastKnownPositionMs = savedForResolved;
+                    }
+
                     prevUrl = resolved.prevUrl;
                     nextUrl = resolved.nextUrl;
                     syncPrevNextFromSeries();
@@ -1708,7 +1778,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         subtitles.add(new SubtitleItem(sub.label, sub.url, sub.isDefault));
                     }
 
-                    visitedEpisodes.put(normalizeUrlKey(episodeUrl), episodeTitle);
+                    recordVisitedEpisode(episodeUrl, episodeTitle, pendingSeekMs, 0L, false);
                     watchedUrls.add(normalizeUrlKey(episodeUrl));
 
                     updateHeaderTitles();
@@ -1873,6 +1943,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 boolean active = idx == currentScaleIdx;
                 addSettingsRow(SCALE_LABELS[i], active ? "✓" : "", active, v -> {
                     currentScaleIdx = idx;
+                    saveVideoScalePreference(this, scaleIndexToId(idx));
                     if (mediaPlayer != null) {
                         mediaPlayer.setVideoScale(SCALE_OPTIONS[currentScaleIdx]);
                     }
@@ -2091,19 +2162,26 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void finishWithAction(String action) {
+        saveCurrentEpisodeProgress(false);
+
         Intent result = new Intent();
         result.putExtra(RESULT_ACTION, action);
         result.putExtra(RESULT_EPISODE_URL, episodeUrl);
         result.putExtra(RESULT_POSITION_MS, lastKnownPositionMs);
         result.putExtra(RESULT_DURATION_MS, lastKnownDurationMs);
         result.putExtra(RESULT_STREAM_INDEX, currentStreamIdx);
+        result.putExtra(RESULT_VIDEO_SCALE, scaleIndexToId(currentScaleIdx));
 
         JSONArray visitedArr = new JSONArray();
-        for (Map.Entry<String, String> entry : visitedEpisodes.entrySet()) {
+        for (Map.Entry<String, VisitedEpisodeState> entry : visitedEpisodes.entrySet()) {
             try {
+                VisitedEpisodeState st = entry.getValue();
                 JSONObject o = new JSONObject();
                 o.put("url", entry.getKey());
-                o.put("title", entry.getValue());
+                o.put("title", st.title);
+                o.put("positionMs", st.positionMs);
+                o.put("durationMs", st.durationMs);
+                o.put("completed", st.completed);
                 visitedArr.put(o);
             } catch (Exception ignored) {
             }
@@ -2118,6 +2196,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     protected void onPause() {
         super.onPause();
         uiHandler.removeCallbacks(loadWatchdogRunnable);
+        saveCurrentEpisodeProgress(false);
         if (mediaPlayer != null && mediaPlayer.isPlaying()) {
             mediaPlayer.pause();
         }
@@ -2159,6 +2238,177 @@ public class VlcPlayerActivity extends AppCompatActivity {
         super.onDestroy();
     }
 
+    private void applyPendingSeekIfReady() {
+        if (pendingSeekMs <= 0L || mediaPlayer == null || !mediaPlayer.isSeekable()) return;
+        long target = pendingSeekMs;
+        long total = Math.max(lastKnownDurationMs, mediaPlayer.getLength());
+        if (total > 2000L && target > total - 1500L) {
+            target = Math.max(0L, total - 1500L);
+        }
+        pendingSeekMs = 0L;
+        lastKnownPositionMs = target;
+        mediaPlayer.setTime(target);
+        if (!userScrubbing) {
+            seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
+            timeCurrentView.setText(formatMs(target));
+        }
+    }
+
+    private void recordVisitedEpisode(
+        String url,
+        String title,
+        long posMs,
+        long durMs,
+        boolean completed
+    ) {
+        String key = normalizeUrlKey(url);
+        if (key.isEmpty()) return;
+        VisitedEpisodeState state = visitedEpisodes.get(key);
+        if (state == null) {
+            state = new VisitedEpisodeState(title != null && !title.isEmpty() ? title : "Episódio");
+            visitedEpisodes.put(key, state);
+        } else if (title != null && !title.isEmpty()) {
+            state.title = title;
+        }
+        state.positionMs = posMs;
+        if (durMs > 0L) state.durationMs = durMs;
+        state.completed = completed;
+    }
+
+    private void saveCurrentEpisodeProgress(boolean ended) {
+        if (episodeUrl == null || episodeUrl.isEmpty()) return;
+        if (!ended && !hasPlaybackStartedForStream && lastKnownPositionMs < MIN_RESUME_MS) {
+            return;
+        }
+        long posMs = Math.max(0L, lastKnownPositionMs);
+        long durMs = Math.max(0L, lastKnownDurationMs);
+        saveEpisodeProgressPref(episodeUrl, episodeTitle, posMs, durMs, ended, false);
+        lastProgressSavedWallMs = System.currentTimeMillis();
+    }
+
+    private void saveEpisodeProgressPref(
+        String url,
+        String title,
+        long posMs,
+        long durMs,
+        boolean ended,
+        boolean forceReset
+    ) {
+        String canonicalKey = canonicalProgressKey(url);
+        if (canonicalKey.isEmpty()) return;
+
+        boolean completed = !forceReset && isEpisodeCompletedMs(posMs, durMs, ended);
+        long storedPosMs = (forceReset || completed) ? 0L : Math.max(0L, posMs);
+
+        if (!forceReset && !completed && storedPosMs < MIN_RESUME_MS) {
+            return;
+        }
+
+        recordVisitedEpisode(url, title, storedPosMs, durMs, completed);
+
+        try {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String raw = prefs.getString(PREF_EPISODE_PROGRESS_JSON, "{}");
+            JSONObject root = raw != null && !raw.isEmpty() ? new JSONObject(raw) : new JSONObject();
+
+            JSONObject entry = new JSONObject();
+            entry.put("url", normalizeUrlKey(url));
+            entry.put("positionMs", storedPosMs);
+            entry.put("durationMs", Math.max(0L, durMs));
+            entry.put("completed", completed);
+            entry.put("updatedAt", System.currentTimeMillis());
+            root.put(canonicalKey, entry);
+
+            if (root.length() > 200) {
+                pruneProgressEntries(root, 200);
+            }
+            prefs.edit().putString(PREF_EPISODE_PROGRESS_JSON, root.toString()).apply();
+        } catch (Exception e) {
+            Log.w(TAG, "Failed saving episode progress", e);
+        }
+    }
+
+    private long getSavedResumePositionMs(String url) {
+        String canonicalKey = canonicalProgressKey(url);
+        if (canonicalKey.isEmpty()) return 0L;
+        try {
+            SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String raw = prefs.getString(PREF_EPISODE_PROGRESS_JSON, "");
+            if (raw == null || raw.isEmpty()) return 0L;
+            JSONObject root = new JSONObject(raw);
+            JSONObject entry = root.optJSONObject(canonicalKey);
+            if (entry == null) return 0L;
+            boolean completed = entry.optBoolean("completed", false);
+            if (completed) return 0L;
+            long posMs = entry.optLong("positionMs", 0L);
+            long durMs = entry.optLong("durationMs", 0L);
+            if (posMs < MIN_RESUME_MS) return 0L;
+            if (durMs > 0L && isEpisodeCompletedMs(posMs, durMs, false)) return 0L;
+            return posMs;
+        } catch (Exception e) {
+            return 0L;
+        }
+    }
+
+    private static void pruneProgressEntries(JSONObject root, int maxEntries) {
+        try {
+            List<String> keys = new ArrayList<>();
+            java.util.Iterator<String> it = root.keys();
+            while (it.hasNext()) {
+                keys.add(it.next());
+            }
+            keys.sort((a, b) -> {
+                long ta = root.optJSONObject(a) != null ? root.optJSONObject(a).optLong("updatedAt", 0L) : 0L;
+                long tb = root.optJSONObject(b) != null ? root.optJSONObject(b).optLong("updatedAt", 0L) : 0L;
+                return Long.compare(tb, ta);
+            });
+            for (int i = maxEntries; i < keys.size(); i++) {
+                root.remove(keys.get(i));
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static boolean isEpisodeCompletedMs(long posMs, long durMs, boolean ended) {
+        if (ended) return true;
+        if (posMs <= 0L || durMs <= 0L) return false;
+        long remainingMs = Math.max(0L, durMs - posMs);
+        double ratio = (double) posMs / (double) durMs;
+        if (durMs >= 120_000L) {
+            return remainingMs <= 15_000L || ratio >= 0.97;
+        }
+        if (durMs >= 30_000L) {
+            return remainingMs <= 5_000L || ratio >= 0.96;
+        }
+        return remainingMs <= 2_000L || ratio >= 0.95;
+    }
+
+    public static int scaleIdToIndex(String id) {
+        if (id != null) {
+            String clean = id.trim().toLowerCase(Locale.ROOT);
+            for (int i = 0; i < SCALE_IDS.length; i++) {
+                if (SCALE_IDS[i].equals(clean)) return i;
+            }
+        }
+        return 0;
+    }
+
+    public static String scaleIndexToId(int idx) {
+        if (idx >= 0 && idx < SCALE_IDS.length) {
+            return SCALE_IDS[idx];
+        }
+        return SCALE_IDS[0];
+    }
+
+    public static void saveVideoScalePreference(Context ctx, String scaleId) {
+        if (ctx == null) return;
+        int idx = scaleIdToIndex(scaleId);
+        ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putInt(PREF_VIDEO_SCALE_IDX, idx)
+            .apply();
+    }
+
     private int dp(int value) {
         return Math.round(TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
@@ -2177,17 +2427,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
         return safeStr(raw);
     }
 
+    private static String canonicalProgressKey(String raw) {
+        String n = normalizeUrlKey(raw);
+        if (n.isEmpty()) return "";
+        return n
+            .replaceFirst("(?i)^https?://(?:www\\.)?", "")
+            .replaceAll("/+$", "")
+            .toLowerCase(Locale.ROOT);
+    }
+
     private static boolean isSameEpisodeUrl(String a, String b) {
         if (a == null || b == null || a.trim().isEmpty() || b.trim().isEmpty()) return false;
-        String na = normalizeUrlKey(a)
-            .replaceFirst("(?i)^https?://(?:www\\.)?", "")
-            .replaceAll("/+$", "")
-            .toLowerCase(Locale.ROOT);
-        String nb = normalizeUrlKey(b)
-            .replaceFirst("(?i)^https?://(?:www\\.)?", "")
-            .replaceAll("/+$", "")
-            .toLowerCase(Locale.ROOT);
-        return na.equals(nb);
+        return canonicalProgressKey(a).equals(canonicalProgressKey(b));
     }
 
     private static String formatMs(long ms) {

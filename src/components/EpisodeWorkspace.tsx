@@ -15,6 +15,7 @@ import {
   resolveSeriesPrevNext,
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
+import type { VideoScaleMode } from '../lib/playbackProgress';
 import { pickBestFailoverServer } from '../lib/serverFailover';
 import type {
   AnimeDetails,
@@ -38,9 +39,12 @@ interface EpisodeWorkspaceProps {
   onBack: () => void;
   onNavigateUrl: (url: string, kind: 'episode' | 'anime' | 'movie') => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
+  onPlaybackProgress?: () => void;
   onToast: (message: string) => void;
   skipIntroSeconds?: number;
   autoPlayNextEpisode?: boolean;
+  videoScale?: VideoScaleMode;
+  onChangeVideoScale?: (scale: VideoScaleMode) => void;
 }
 
 interface ScopedResolvedEmbed {
@@ -69,9 +73,12 @@ export function EpisodeWorkspace({
   onBack,
   onNavigateUrl,
   onNativeSessionSync,
+  onPlaybackProgress,
   onToast,
   skipIntroSeconds = 85,
   autoPlayNextEpisode = false,
+  videoScale,
+  onChangeVideoScale,
 }: EpisodeWorkspaceProps) {
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
   const playableOptions = useMemo(
@@ -445,6 +452,7 @@ export function EpisodeWorkspace({
               }
               skipIntroSeconds={skipIntroSeconds}
               autoPlayNextEpisode={autoPlayNextEpisode}
+              videoScale={videoScale}
               onPrevEpisode={() =>
                 effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')
               }
@@ -460,6 +468,8 @@ export function EpisodeWorkspace({
                 const match = playableOptions.find((o) => o.nume === nume);
                 if (match) handleManualServerSelect(match);
               }}
+              onChangeVideoScale={onChangeVideoScale}
+              onPlaybackProgress={onPlaybackProgress}
               onServerPlaybackFailed={handleServerPlaybackFailed}
               onRetryEpisodePlayback={handleRetryAllServers}
               onNativeSessionSync={onNativeSessionSync}

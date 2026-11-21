@@ -1,5 +1,11 @@
 import { ArrowLeft, Heart, Play, Star } from 'lucide-react';
 import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
+import {
+  canonicalEpisodeProgressKey,
+  formatPlaybackTimestamp,
+  getResumePositionSec,
+  type EpisodeProgressMap,
+} from '../lib/playbackProgress';
 import type { AnimeDetails, CatalogMediaItem, FavoriteLatestInfo } from '../lib/types';
 import { MediaPoster } from './MediaPoster';
 
@@ -7,6 +13,7 @@ interface AnimeDetailViewProps {
   anime: AnimeDetails;
   isFavorite: boolean;
   watchedUrls: Set<string>;
+  progressMap?: EpisodeProgressMap;
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
   onOpenEpisode: (episodeUrl: string) => void;
   onBack: () => void;
@@ -16,6 +23,7 @@ export function AnimeDetailView({
   anime,
   isFavorite,
   watchedUrls,
+  progressMap,
   onToggleFavorite,
   onOpenEpisode,
   onBack,
@@ -174,7 +182,10 @@ export function AnimeDetailView({
         ) : (
           <div className="divide-y divide-white/8 overflow-hidden rounded-xl border border-white/10 bg-[#151921]">
             {anime.episodes.map((ep) => {
-              const watched = watchedUrls.has(ep.url);
+              const epKey = canonicalEpisodeProgressKey(ep.url);
+              const epProgress = epKey ? progressMap?.[epKey] : undefined;
+              const resumeSec = getResumePositionSec(epProgress);
+              const watched = watchedUrls.has(ep.url) || Boolean(epProgress?.completed);
               return (
                 <button
                   key={ep.url}
@@ -199,14 +210,18 @@ export function AnimeDetailView({
                   </div>
 
                   <div className="flex shrink-0 items-center gap-3">
-                    {watched && (
+                    {resumeSec >= 2 ? (
+                      <span className="text-xs font-medium tabular-nums text-[#fb923c]">
+                        Parou em {formatPlaybackTimestamp(resumeSec)}
+                      </span>
+                    ) : watched ? (
                       <span className="text-xs font-medium text-emerald-400">
                         Visto
                       </span>
-                    )}
+                    ) : null}
                     <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-300 group-hover:text-white">
                       <Play className="h-3.5 w-3.5 text-[#f97316]" />
-                      Abrir
+                      {resumeSec >= 2 ? 'Retomar' : 'Abrir'}
                     </span>
                   </div>
                 </button>

@@ -16,6 +16,7 @@ import {
   Film,
 } from 'lucide-react';
 import { isItemFavorited } from '../lib/favoriteAlerts';
+import { formatPlaybackTimestamp, isEpisodeCompleted } from '../lib/playbackProgress';
 import type {
   AudioType,
   CatalogArchiveCategory,
@@ -176,8 +177,13 @@ export function CatalogView({
     });
   };
 
-  const renderCard = (item: CatalogMediaItem, aspect: 'portrait' | 'landscape') => {
+  const renderCard = (
+    item: CatalogMediaItem,
+    aspect: 'portrait' | 'landscape',
+    progressMeta?: { label?: string; pct?: number }
+  ) => {
     const metaParts: string[] = [];
+    if (progressMeta?.label) metaParts.push(progressMeta.label);
     if (item.episodeLabel) metaParts.push(item.episodeLabel);
     if (item.audioType === 'DUB') metaParts.push('Dublado');
     else if (item.audioType === 'LEG') metaParts.push('Legendado');
@@ -198,12 +204,22 @@ export function CatalogView({
           onClick={() => onOpenItem(item.url, item.kind)}
           className="flex flex-1 flex-col text-left"
         >
-          <MediaPoster
-            src={item.poster}
-            alt={item.title}
-            aspect={aspect}
-            className="w-full border-b border-white/8"
-          />
+          <div className="relative w-full border-b border-white/8">
+            <MediaPoster
+              src={item.poster}
+              alt={item.title}
+              aspect={aspect}
+              className="w-full"
+            />
+            {typeof progressMeta?.pct === 'number' && progressMeta.pct > 0 && (
+              <div className="absolute inset-x-0 bottom-0 h-1 bg-black/60">
+                <div
+                  className="h-full bg-[#f97316]"
+                  style={{ width: `${Math.min(100, Math.max(4, progressMeta.pct))}%` }}
+                />
+              </div>
+            )}
+          </div>
           <div className="flex flex-1 flex-col justify-between p-3.5">
             <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-white group-hover:text-[#f97316]">
               {item.title}
@@ -564,8 +580,21 @@ export function CatalogView({
               </div>
             ) : (
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                {history.map((entry) =>
-                  renderCard(
+                {history.map((entry) => {
+                  const pos = entry.positionSec ?? 0;
+                  const dur = entry.durationSec ?? 0;
+                  const completed =
+                    Boolean(entry.completed) ||
+                    (dur > 0 && isEpisodeCompleted(pos, dur, false));
+                  const hasIncompleteResume = !completed && pos >= 2;
+                  const progressLabel = completed
+                    ? 'Assistido'
+                    : hasIncompleteResume
+                      ? `Continuar em ${formatPlaybackTimestamp(pos)}`
+                      : undefined;
+                  const progressPct =
+                    hasIncompleteResume && dur > 0 ? Math.min(99, (pos / dur) * 100) : undefined;
+                  return renderCard(
                     {
                       id: entry.url,
                       title: entry.title,
@@ -574,9 +603,10 @@ export function CatalogView({
                       poster: entry.poster,
                       audioType: null,
                     },
-                    'landscape'
-                  )
-                )}
+                    'landscape',
+                    { label: progressLabel, pct: progressPct }
+                  );
+                })}
               </div>
             )}
           </section>

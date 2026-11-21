@@ -39,7 +39,9 @@ public class NativeVlcPlayerPlugin extends Plugin {
         String referer = call.getString("referer", "https://topanimes.net/");
         boolean preferDirect = Boolean.TRUE.equals(call.getBoolean("preferDirect", false));
         long startPositionMs = call.getLong("startPositionMs", 0L);
+        boolean forceStartPosition = Boolean.TRUE.equals(call.getBoolean("forceStartPosition", false));
         int streamIndex = call.getInt("streamIndex", 0);
+        String videoScale = call.getString("videoScale", "");
         boolean hasPrev = Boolean.TRUE.equals(call.getBoolean("hasPrev", false));
         boolean hasNext = Boolean.TRUE.equals(call.getBoolean("hasNext", false));
         String prevUrl = call.getString("prevUrl", "");
@@ -74,7 +76,9 @@ public class NativeVlcPlayerPlugin extends Plugin {
         intent.putExtra(VlcPlayerActivity.EXTRA_REFERER, referer);
         intent.putExtra(VlcPlayerActivity.EXTRA_PREFER_DIRECT, preferDirect);
         intent.putExtra(VlcPlayerActivity.EXTRA_START_POSITION_MS, startPositionMs);
+        intent.putExtra(VlcPlayerActivity.EXTRA_FORCE_START_POSITION, forceStartPosition);
         intent.putExtra(VlcPlayerActivity.EXTRA_STREAM_INDEX, streamIndex);
+        intent.putExtra(VlcPlayerActivity.EXTRA_VIDEO_SCALE, videoScale);
         intent.putExtra(VlcPlayerActivity.EXTRA_HAS_PREV, hasPrev);
         intent.putExtra(VlcPlayerActivity.EXTRA_HAS_NEXT, hasNext);
         intent.putExtra(VlcPlayerActivity.EXTRA_PREV_URL, prevUrl);
@@ -84,6 +88,13 @@ public class NativeVlcPlayerPlugin extends Plugin {
         intent.putExtra(VlcPlayerActivity.EXTRA_PROXY_BASE_URL, proxyBaseUrl);
 
         startActivityForResult(call, intent, "onPlayerResult");
+    }
+
+    @PluginMethod
+    public void setVideoScale(PluginCall call) {
+        String videoScale = call.getString("videoScale", "best-fit");
+        VlcPlayerActivity.saveVideoScalePreference(getContext(), videoScale);
+        call.resolve();
     }
 
     @ActivityCallback
@@ -98,6 +109,10 @@ public class NativeVlcPlayerPlugin extends Plugin {
             ret.put("positionMs", data.getLongExtra(VlcPlayerActivity.RESULT_POSITION_MS, 0L));
             ret.put("durationMs", data.getLongExtra(VlcPlayerActivity.RESULT_DURATION_MS, 0L));
             ret.put("streamIndex", data.getIntExtra(VlcPlayerActivity.RESULT_STREAM_INDEX, 0));
+            String videoScale = data.getStringExtra(VlcPlayerActivity.RESULT_VIDEO_SCALE);
+            if (videoScale != null && !videoScale.isEmpty()) {
+                ret.put("videoScale", videoScale);
+            }
 
             String visitedRaw = data.getStringExtra(VlcPlayerActivity.RESULT_VISITED_EPISODES_JSON);
             if (visitedRaw != null && !visitedRaw.isEmpty()) {

@@ -172,6 +172,9 @@ export interface WatchHistoryEntry {
   kind: MediaKind;
   watchedAt: string;
   preferredServer?: string;
+  positionSec?: number;
+  durationSec?: number;
+  completed?: boolean;
 }
 
 export interface FavoriteAlertEntry {

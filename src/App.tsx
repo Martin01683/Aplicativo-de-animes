@@ -31,7 +31,11 @@ import {
   normalizeTopAnimesUrl,
   toSeriesFavoriteItem,
 } from './lib/favoriteAlerts';
-import { isSameEpisodeUrl } from './lib/nativeVlcPlayer';
+import { isSameEpisodeUrl, setNativeVlcVideoScale } from './lib/nativeVlcPlayer';
+import {
+  sanitizeVideoScaleMode,
+  type EpisodeProgressMap,
+} from './lib/playbackProgress';
 import {
   pushRouteFrame,
   resolveBackNavigationStep,
@@ -45,11 +49,13 @@ import {
   type AppSettingsMeta,
 } from './lib/settings';
 import {
+  clearAllEpisodeProgress,
   clearFavoriteAlerts,
   clearHistory,
   loadAcknowledgedReleaseKey,
   loadAppSettings,
   loadAppSettingsMeta,
+  loadEpisodeProgressMap,
   loadFavoriteAlerts,
   loadFavoriteBaselines,
   loadFavorites,
@@ -58,6 +64,7 @@ import {
   saveAcknowledgedReleaseKey,
   saveAppSettings,
   saveAppSettingsMeta,
+  saveEpisodeProgress,
   saveFavoriteAlerts,
   saveFavoriteBaselines,
   saveFavorites,
@@ -198,6 +205,9 @@ export default function App() {
       : 'unsupported'
   );
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
+  const [progressMap, setProgressMap] = useState<EpisodeProgressMap>(() =>
+    loadEpisodeProgressMap()
+  );
   const [toast, setToast] = useState<string>('');
 
   const [buildInfo, setBuildInfo] = useState<AppBuildInfo>(() => getAppBuildInfo());
@@ -247,7 +257,15 @@ export default function App() {
     }, 3500);
   }, []);
 
+  const refreshProgressState = useCallback(() => {
+    setProgressMap(loadEpisodeProgressMap());
+    setHistory(loadHistory());
+  }, []);
+
   const updateSettings = useCallback((patch: Partial<AppSettings>) => {
+    if (patch.videoScale) {
+      void setNativeVlcVideoScale(sanitizeVideoScaleMode(patch.videoScale));
+    }
     setSettings((prev) => {
       const next = { ...prev, ...patch };
       saveAppSettings(next);
@@ -259,6 +277,7 @@ export default function App() {
     const defaults = { ...DEFAULT_APP_SETTINGS };
     setSettings(defaults);
     saveAppSettings(defaults);
+    void setNativeVlcVideoScale(defaults.videoScale);
     showToast('Configurações restauradas para o padrão.');
   }, [showToast]);
 
@@ -1324,7 +1343,9 @@ export default function App() {
             onRequestPushNotifications={() => void handleRequestPushNotifications()}
             onClearHistory={() => {
               clearHistory();
+              clearAllEpisodeProgress();
               setHistory([]);
+              setProgressMap({});
               showToast('Histórico limpo.');
             }}
             onSelectSection={handleSelectSection}
@@ -1357,6 +1378,7 @@ export default function App() {
                 anime={animeDetails}
                 isFavorite={isItemFavorited(animeDetails.url, favorites)}
                 watchedUrls={watchedUrls}
+                progressMap={progressMap}
                 onToggleFavorite={toggleFavorite}
                 onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
                 onBack={() => navigateBackStep()}
@@ -1405,6 +1427,9 @@ export default function App() {
                 onBack={() => navigateBackStep()}
                 onNavigateUrl={openMediaUrl}
                 onNativeSessionSync={(result) => {
+                  if (result.videoScale) {
+                    updateSettings({ videoScale: sanitizeVideoScaleMode(result.videoScale) });
+                  }
                   if (Array.isArray(result.visitedEpisodes) && result.visitedEpisodes.length > 0) {
                     let nextHist = history;
                     for (const visited of result.visitedEpisodes) {
@@ -1418,9 +1443,29 @@ export default function App() {
                         kind: episodeDetails.isMovie ? 'movie' : 'episode',
                         watchedAt: new Date().toISOString(),
                       });
+                      if (
+                        typeof visited.positionMs === 'number' ||
+                        typeof visited.completed === 'boolean'
+                      ) {
+                        saveEpisodeProgress({
+                          url: visited.url,
+                          positionSec: (visited.positionMs || 0) / 1000,
+                          durationSec: (visited.durationMs || 0) / 1000,
+                          ended: Boolean(visited.completed),
+                        });
+                      }
                     }
                     setHistory(nextHist);
                   }
+                  const activeResUrl = result.episodeUrl || episodeDetails.url;
+                  if (activeResUrl && typeof result.positionMs === 'number') {
+                    saveEpisodeProgress({
+                      url: activeResUrl,
+                      positionSec: result.positionMs / 1000,
+                      durationSec: (result.durationMs || 0) / 1000,
+                    });
+                  }
+                  refreshProgressState();
                   if (
                     result.episodeUrl &&
                     !isSameEpisodeUrl(result.episodeUrl, episodeDetails.url)
@@ -1432,9 +1477,12 @@ export default function App() {
                     void openMediaUrl(episodeDetails.nextUrl, 'episode');
                   }
                 }}
+                onPlaybackProgress={refreshProgressState}
                 onToast={showToast}
                 skipIntroSeconds={85}
                 autoPlayNextEpisode={settings.autoPlayNextEpisode}
+                videoScale={settings.videoScale}
+                onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
               />
             ) : null}
           </>
@@ -1477,7 +1525,9 @@ export default function App() {
         alertsCount={alerts.length}
         onClearHistory={() => {
           clearHistory();
+          clearAllEpisodeProgress();
           setHistory([]);
+          setProgressMap({});
           showToast('Histórico limpo.');
         }}
         onClearAlerts={() => {

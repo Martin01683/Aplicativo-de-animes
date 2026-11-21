@@ -1,3 +1,4 @@
+import type { VideoScaleMode } from './playbackProgress';
 import {
   collectActiveSubtitleEvents,
   parseAssEventRuns,
@@ -16,6 +17,7 @@ export interface SubtitleRenderOptions {
   delay: number;
   scale: number;
   colorRgb: [number, number, number];
+  videoScale?: VideoScaleMode;
 }
 
 const rgba = (rgb: [number, number, number], alpha: number) =>
@@ -25,10 +27,38 @@ export function computeContainedVideoRect(
   stageW: number,
   stageH: number,
   videoW: number,
-  videoH: number
+  videoH: number,
+  videoScale: VideoScaleMode = 'best-fit'
 ): VideoViewportRect {
   if (!videoW || !videoH || !stageW || !stageH) {
     return { x: 0, y: 0, w: stageW, h: stageH };
+  }
+  if (videoScale === 'fill') {
+    return { x: 0, y: 0, w: stageW, h: stageH };
+  }
+  if (videoScale === '16:9') {
+    const targetAspect = 16 / 9;
+    const stageAspect = stageW / stageH;
+    if (stageAspect > targetAspect) {
+      const h = stageH;
+      const w = h * targetAspect;
+      return { x: (stageW - w) / 2, y: 0, w, h };
+    }
+    const w = stageW;
+    const h = w / targetAspect;
+    return { x: 0, y: (stageH - h) / 2, w, h };
+  }
+  if (videoScale === 'fit-screen') {
+    const stageAspect = stageW / stageH;
+    const videoAspect = videoW / videoH;
+    if (stageAspect > videoAspect) {
+      const w = stageW;
+      const h = w / videoAspect;
+      return { x: 0, y: (stageH - h) / 2, w, h };
+    }
+    const h = stageH;
+    const w = h * videoAspect;
+    return { x: (stageW - w) / 2, y: 0, w, h };
   }
   const stageAspect = stageW / stageH;
   const videoAspect = videoW / videoH;
@@ -210,7 +240,13 @@ export class SubtitleCanvasRenderer {
     const active = collectActiveSubtitleEvents(script, t);
     if (!active.length) return;
 
-    const vr = computeContainedVideoRect(stageW, stageH, videoW, videoH);
+    const vr = computeContainedVideoRect(
+      stageW,
+      stageH,
+      videoW,
+      videoH,
+      options.videoScale || 'best-fit'
+    );
     const rx = vr.w / script.resX;
     const ry = vr.h / script.resY;
     const scale = options.scale;

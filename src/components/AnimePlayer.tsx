@@ -52,8 +52,21 @@ import {
   isDesktopShortcutsEnabled,
   isSameEpisodeUrl,
   playWithNativeVlc,
+  setNativeVlcVideoScale,
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
+import {
+  DEFAULT_VIDEO_SCALE,
+  getVideoScaleLabel,
+  sanitizeVideoScaleMode,
+  VIDEO_SCALE_OPTIONS,
+  type VideoScaleMode,
+} from '../lib/playbackProgress';
+import {
+  getEpisodeProgress,
+  getEpisodeResumeSeconds,
+  saveEpisodeProgress,
+} from '../lib/storage';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
 import { shouldAutoAdvanceEpisode } from '../lib/serverFailover';
 import { MediaPoster } from './MediaPoster';
@@ -80,12 +93,15 @@ interface AnimePlayerProps {
   errorMessage?: string;
   skipIntroSeconds?: number;
   autoPlayNextEpisode?: boolean;
+  videoScale?: VideoScaleMode;
   hasUntriedFallbackServers?: boolean;
   resumeAfterFailover?: { timeSec: number; autoStart: boolean; key: number } | null;
   onPrevEpisode?: () => void;
   onNextEpisode?: () => void;
   onSelectEpisode?: (episodeUrl: string) => void;
   onSelectServer?: (nume: string) => void;
+  onChangeVideoScale?: (scale: VideoScaleMode) => void;
+  onPlaybackProgress?: () => void;
   onServerPlaybackFailed?: (failedNume: string, resumeTimeSec: number) => void;
   onRetryEpisodePlayback?: () => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
@@ -97,6 +113,7 @@ interface PersistedPlayerPrefs {
   muted: boolean;
   capScale: number;
   capColor: string;
+  videoScale: VideoScaleMode;
 }
 
 interface HlsQualityLevel {
@@ -113,7 +130,7 @@ interface LoadedSubtitleEntry {
   isLocal?: boolean;
 }
 
-type SettingsTab = 'main' | 'quality' | 'speed' | 'subs' | 'servers';
+type SettingsTab = 'main' | 'quality' | 'speed' | 'subs' | 'servers' | 'scale';
 
 const PREFS_KEY = 'topanimes:player:v1';
 const SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
@@ -123,7 +140,15 @@ const FRAME_STEP = 1 / 23.976;
 function loadPrefs(): PersistedPlayerPrefs {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
-    if (!raw) return { volume: 1, muted: false, capScale: 1, capColor: '#ffff00' };
+    if (!raw) {
+      return {
+        volume: 1,
+        muted: false,
+        capScale: 1,
+        capColor: '#ffff00',
+        videoScale: DEFAULT_VIDEO_SCALE,
+      };
+    }
     const parsed = JSON.parse(raw) as Partial<PersistedPlayerPrefs>;
     return {
       volume: typeof parsed.volume === 'number' ? Math.max(0, Math.min(1, parsed.volume)) : 1,
@@ -134,9 +159,16 @@ function loadPrefs(): PersistedPlayerPrefs {
         typeof parsed.capColor === 'string' && hexToRgb(parsed.capColor)
           ? parsed.capColor
           : '#ffff00',
+      videoScale: sanitizeVideoScaleMode(parsed.videoScale),
     };
   } catch {
-    return { volume: 1, muted: false, capScale: 1, capColor: '#ffff00' };
+    return {
+      volume: 1,
+      muted: false,
+      capScale: 1,
+      capColor: '#ffff00',
+      videoScale: DEFAULT_VIDEO_SCALE,
+    };
   }
 }
 
@@ -180,12 +212,15 @@ export function AnimePlayer({
   errorMessage: externalErrorMessage = '',
   skipIntroSeconds = 85,
   autoPlayNextEpisode = false,
+  videoScale,
   hasUntriedFallbackServers = false,
   resumeAfterFailover = null,
   onPrevEpisode,
   onNextEpisode,
   onSelectEpisode,
   onSelectServer,
+  onChangeVideoScale,
+  onPlaybackProgress,
   onServerPlaybackFailed,
   onRetryEpisodePlayback,
   onNativeSessionSync,
@@ -241,6 +276,22 @@ export function AnimePlayer({
   const serverRetryCountRef = useRef(0);
   const pendingSeekSecRef = useRef(0);
   const loadWatchdogTimerRef = useRef<number | null>(null);
+  const latestPlaybackRef = useRef<{
+    url: string;
+    currentTime: number;
+    duration: number;
+    hasStarted: boolean;
+  }>({
+    url: episodeUrl || '',
+    currentTime: 0,
+    duration: 0,
+    hasStarted: false,
+  });
+  const lastSavedProgressWallRef = useRef(0);
+  const prevEpisodeUrlRef = useRef<string | undefined>(episodeUrl);
+  const onPlaybackProgressRef = useRef(onPlaybackProgress);
+  onPlaybackProgressRef.current = onPlaybackProgress;
+
   const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
     time: 0,
     side: 'center',
@@ -273,6 +324,17 @@ export function AnimePlayer({
   const [menuTab, setMenuTab] = useState<SettingsTab>('main');
   const [episodesOpen, setEpisodesOpen] = useState(false);
 
+  // Video scale state (synced with prop and localStorage)
+  const [localVideoScale, setLocalVideoScale] = useState<VideoScaleMode>(() =>
+    sanitizeVideoScaleMode(videoScale ?? initialPrefs.videoScale)
+  );
+  useEffect(() => {
+    if (videoScale) {
+      setLocalVideoScale(sanitizeVideoScaleMode(videoScale));
+    }
+  }, [videoScale]);
+  const effectiveVideoScale = sanitizeVideoScaleMode(videoScale ?? localVideoScale);
+
   // Subtitles state
   const [subEntries, setSubEntries] = useState<LoadedSubtitleEntry[]>([]);
   const [activeSubId, setActiveSubId] = useState<string>('off');
@@ -284,16 +346,110 @@ export function AnimePlayer({
 
   // Persist user prefs
   useEffect(() => {
-    savePrefs({ volume, muted, capScale, capColor });
-  }, [volume, muted, capScale, capColor]);
+    savePrefs({ volume, muted, capScale, capColor, videoScale: effectiveVideoScale });
+  }, [volume, muted, capScale, capColor, effectiveVideoScale]);
 
-  // Reset per-episode guards when switching episodes
+  const persistEpisodeProgressNow = useCallback(
+    (opts?: {
+      url?: string;
+      positionSec?: number;
+      durationSec?: number;
+      ended?: boolean;
+      forceReset?: boolean;
+    }) => {
+      const targetUrl = opts?.url ?? latestPlaybackRef.current.url;
+      if (!targetUrl) return;
+      const positionSec = opts?.positionSec ?? latestPlaybackRef.current.currentTime;
+      const durationSec = opts?.durationSec ?? latestPlaybackRef.current.duration;
+      if (
+        !opts?.forceReset &&
+        !opts?.ended &&
+        !latestPlaybackRef.current.hasStarted &&
+        positionSec < 2
+      ) {
+        return;
+      }
+      if (!opts?.forceReset && !opts?.ended && pendingSeekSecRef.current > 1 && positionSec < 2) {
+        return;
+      }
+      const res = saveEpisodeProgress({
+        url: targetUrl,
+        positionSec,
+        durationSec,
+        ended: opts?.ended,
+        forceReset: opts?.forceReset,
+      });
+      lastSavedProgressWallRef.current = Date.now();
+      if (res.history || opts?.ended || opts?.forceReset || positionSec >= 2) {
+        onPlaybackProgressRef.current?.();
+      }
+    },
+    []
+  );
+
+  // Flush progress on page hide / unmount
   useEffect(() => {
+    const flush = () => {
+      const v = videoRef.current;
+      if (v && !useNativeVlc) {
+        const dur =
+          Number.isFinite(v.duration) && v.duration > 0
+            ? v.duration
+            : latestPlaybackRef.current.duration;
+        if (Number.isFinite(v.currentTime) && v.currentTime > 0) {
+          latestPlaybackRef.current.currentTime = v.currentTime;
+        }
+        if (dur > 0) {
+          latestPlaybackRef.current.duration = dur;
+        }
+      }
+      persistEpisodeProgressNow();
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flush();
+    };
+    window.addEventListener('pagehide', flush);
+    window.addEventListener('beforeunload', flush);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      window.removeEventListener('beforeunload', flush);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      flush();
+    };
+  }, [persistEpisodeProgressNow, useNativeVlc]);
+
+  // Reset per-episode guards and load saved resume point when switching episodes
+  useEffect(() => {
+    const prevUrl = prevEpisodeUrlRef.current;
+    if (prevUrl && !isSameEpisodeUrl(prevUrl, episodeUrl)) {
+      persistEpisodeProgressNow({ url: prevUrl });
+    }
+    prevEpisodeUrlRef.current = episodeUrl;
+
     autoNextTriggeredForUrlRef.current = null;
     serverRetryCountRef.current = 0;
     hasPlaybackStartedRef.current = false;
-    pendingSeekSecRef.current = 0;
-  }, [episodeUrl]);
+
+    const savedEntry = episodeUrl ? getEpisodeProgress(episodeUrl) : null;
+    const savedResumeSec = episodeUrl ? getEpisodeResumeSeconds(episodeUrl) : 0;
+
+    pendingSeekSecRef.current = savedResumeSec > 1 ? savedResumeSec : 0;
+    setNativeResumeMs(savedResumeSec > 1 ? Math.round(savedResumeSec * 1000) : 0);
+    setNativeDurationMs(
+      savedEntry?.durationSec && savedEntry.durationSec > 0
+        ? Math.round(savedEntry.durationSec * 1000)
+        : 0
+    );
+    latestPlaybackRef.current = {
+      url: episodeUrl || '',
+      currentTime: savedResumeSec > 1 ? savedResumeSec : 0,
+      duration: savedEntry?.durationSec || 0,
+      hasStarted: false,
+    };
+    setCurrentTime(savedResumeSec > 1 ? savedResumeSec : 0);
+    setDuration(savedEntry?.durationSec || 0);
+  }, [episodeUrl, persistEpisodeProgressNow]);
 
   // Reset per-server retry counter on server switch
   useEffect(() => {
@@ -304,15 +460,14 @@ export function AnimePlayer({
   useEffect(() => {
     if (!resumeAfterFailover) return;
     autoStartNextRef.current = resumeAfterFailover.autoStart;
-    pendingSeekSecRef.current =
-      resumeAfterFailover.timeSec > 1 ? resumeAfterFailover.timeSec : 0;
+    if (resumeAfterFailover.timeSec > 1) {
+      pendingSeekSecRef.current = resumeAfterFailover.timeSec;
+    }
   }, [resumeAfterFailover]);
 
-  // Reset stream index and native resume timestamp when stream list changes
+  // Reset stream index when stream list changes (keep saved resume position!)
   useEffect(() => {
     setSelectedStreamIdx(0);
-    setNativeResumeMs(0);
-    setNativeDurationMs(0);
   }, [streams, episodeUrl]);
 
   // Reset playback mode whenever stream or preferDirect changes
@@ -328,8 +483,7 @@ export function AnimePlayer({
     setErrorMsg('');
     setPlaying(false);
     setWaiting(false);
-    setCurrentTime(0);
-    setDuration(0);
+    setCurrentTime(pendingSeekSecRef.current > 1 ? pendingSeekSecRef.current : 0);
     setBufferedEnd(0);
     if (videoRef.current) {
       videoRef.current.playbackRate = 1;
@@ -656,6 +810,7 @@ export function AnimePlayer({
           delay: capDelay,
           scale: capScale,
           colorRgb: rgb,
+          videoScale: effectiveVideoScale,
         }
       );
     };
@@ -698,7 +853,15 @@ export function AnimePlayer({
       video.removeEventListener('timeupdate', drawOnce);
       video.removeEventListener('loadedmetadata', drawOnce);
     };
-  }, [activeSubScript, activeSubId, capDelay, capScale, capColor, useNativeVlc]);
+  }, [
+    activeSubScript,
+    activeSubId,
+    capDelay,
+    capScale,
+    capColor,
+    effectiveVideoScale,
+    useNativeVlc,
+  ]);
 
   // Track fullscreen changes + try orientation unlock
   useEffect(() => {
@@ -727,10 +890,50 @@ export function AnimePlayer({
     }
   }, [episodesOpen, menuOpen]);
 
+  const selectVideoScale = useCallback(
+    (nextScale: VideoScaleMode) => {
+      const sanitized = sanitizeVideoScaleMode(nextScale);
+      setLocalVideoScale(sanitized);
+      savePrefs({ volume, muted, capScale, capColor, videoScale: sanitized });
+      onChangeVideoScale?.(sanitized);
+      void setNativeVlcVideoScale(sanitized);
+      setMenuOpen(false);
+      onToast(`Escala de tela: ${getVideoScaleLabel(sanitized)}`);
+    },
+    [capColor, capScale, muted, onChangeVideoScale, onToast, volume]
+  );
+
+  const applyPendingSeek = useCallback((v: HTMLVideoElement) => {
+    if (pendingSeekSecRef.current <= 1) return;
+    if (!Number.isFinite(v.duration) || v.duration <= 0) return;
+    const cap = v.duration > 2 ? Math.max(0, v.duration - 1.5) : v.duration;
+    const target = Math.min(pendingSeekSecRef.current, cap);
+    pendingSeekSecRef.current = 0;
+    try {
+      v.currentTime = target;
+      setCurrentTime(target);
+      latestPlaybackRef.current.currentTime = target;
+      latestPlaybackRef.current.duration = v.duration;
+      latestPlaybackRef.current.hasStarted = true;
+    } catch {
+      pendingSeekSecRef.current = target;
+    }
+  }, []);
+
   const launchNativeVlc = useCallback(
     async (startMs?: number) => {
       if (!sortedStreams.length || nativeLaunching) return;
       setNativeLaunching(true);
+      const explicitStart = typeof startMs === 'number';
+      const targetStartMs = explicitStart ? startMs : nativeResumeMs;
+      if (explicitStart && startMs === 0 && episodeUrl) {
+        persistEpisodeProgressNow({
+          url: episodeUrl,
+          positionSec: 0,
+          durationSec: nativeDurationMs / 1000,
+          forceReset: true,
+        });
+      }
       try {
         const res = await playWithNativeVlc({
           title,
@@ -745,8 +948,10 @@ export function AnimePlayer({
           selectedServerNume,
           referer: referer || 'https://topanimes.net/',
           preferDirect,
-          startPositionMs: typeof startMs === 'number' ? startMs : nativeResumeMs,
+          startPositionMs: targetStartMs,
+          forceStartPosition: explicitStart,
           streamIndex: selectedStreamIdx,
+          videoScale: effectiveVideoScale,
           hasPrev,
           hasNext,
           prevUrl,
@@ -758,15 +963,26 @@ export function AnimePlayer({
         if (typeof res?.streamIndex === 'number' && sortedStreams[res.streamIndex]) {
           setSelectedStreamIdx(res.streamIndex);
         }
+        if (res?.videoScale) {
+          const syncedScale = sanitizeVideoScaleMode(res.videoScale);
+          setLocalVideoScale(syncedScale);
+          onChangeVideoScale?.(syncedScale);
+        }
         if (typeof res?.durationMs === 'number' && res.durationMs > 0) {
           setNativeDurationMs(res.durationMs);
         }
-        if (typeof res?.positionMs === 'number' && res.positionMs > 0) {
-          const nearEnd =
-            typeof res.durationMs === 'number' &&
-            res.durationMs > 0 &&
-            res.positionMs >= res.durationMs - 4000;
-          setNativeResumeMs(nearEnd ? 0 : res.positionMs);
+        const activeResultUrl = res?.episodeUrl || episodeUrl;
+        if (activeResultUrl && typeof res?.positionMs === 'number') {
+          persistEpisodeProgressNow({
+            url: activeResultUrl,
+            positionSec: res.positionMs / 1000,
+            durationSec: (res.durationMs || 0) / 1000,
+          });
+          if (isSameEpisodeUrl(activeResultUrl, episodeUrl)) {
+            setNativeResumeMs(
+              Math.round(getEpisodeResumeSeconds(activeResultUrl) * 1000)
+            );
+          }
         }
 
         if (onNativeSessionSync && res) {
@@ -784,16 +1000,20 @@ export function AnimePlayer({
     },
     [
       autoPlayNextEpisode,
+      effectiveVideoScale,
       episodeUrl,
       hasNext,
       hasPrev,
+      nativeDurationMs,
       nativeLaunching,
       nativeResumeMs,
       nextUrl,
+      onChangeVideoScale,
       onNativeSessionSync,
       onNextEpisode,
       onPrevEpisode,
       onToast,
+      persistEpisodeProgressNow,
       playerOptions,
       preferDirect,
       prevUrl,
@@ -842,13 +1062,37 @@ export function AnimePlayer({
           ? video.duration
           : Number.MAX_SAFE_INTEGER;
       const next = Math.max(0, Math.min(cap, video.currentTime + deltaSeconds));
+      pendingSeekSecRef.current = 0;
       video.currentTime = next;
       setCurrentTime(next);
+      const dur = Number.isFinite(video.duration) ? video.duration : duration;
+      latestPlaybackRef.current.currentTime = next;
+      latestPlaybackRef.current.duration = dur;
+      if (next >= 2) {
+        hasPlaybackStartedRef.current = true;
+        latestPlaybackRef.current.hasStarted = true;
+      }
+      if (episodeUrl) {
+        persistEpisodeProgressNow({
+          url: episodeUrl,
+          positionSec: next,
+          durationSec: dur,
+          forceReset: next < 2 && hasPlaybackStartedRef.current,
+        });
+      }
       const text = label || `${deltaSeconds > 0 ? '+' : ''}${Math.round(deltaSeconds)}s`;
       setSeekBadge({ label: text, key: Date.now() });
       showControlsTemporarily();
     },
-    [launchNativeVlc, nativeResumeMs, showControlsTemporarily, useNativeVlc]
+    [
+      duration,
+      episodeUrl,
+      launchNativeVlc,
+      nativeResumeMs,
+      persistEpisodeProgressNow,
+      showControlsTemporarily,
+      useNativeVlc,
+    ]
   );
 
   const toggleMute = useCallback(() => {
@@ -1290,13 +1534,24 @@ export function AnimePlayer({
 
       {/* HTML5 Video (Web player; Android uses native LibVLC fullscreen engine with identical HUD) */}
       {!useNativeVlc && (
-        <>
+        <div className="relative flex h-full w-full items-center justify-center overflow-hidden">
           <video
             ref={videoRef}
             playsInline
             preload="metadata"
             crossOrigin={useCorsAttr ? 'anonymous' : undefined}
-            className="h-full w-full object-contain"
+            data-video-scale={effectiveVideoScale}
+            className={
+              effectiveVideoScale === 'fit-screen'
+                ? 'h-full w-full object-cover'
+                : effectiveVideoScale === 'fill'
+                  ? 'h-full w-full object-fill'
+                  : effectiveVideoScale === '16:9'
+                    ? 'aspect-video max-h-full max-w-full w-full object-fill'
+                    : effectiveVideoScale === 'original'
+                      ? 'h-full w-full object-none'
+                      : 'h-full w-full object-contain'
+            }
             onPlay={() => {
               setPlaying(true);
               if (!hasPlaybackStartedRef.current) {
@@ -1308,11 +1563,41 @@ export function AnimePlayer({
               clearLoadWatchdog();
               setPlaying(false);
               setControlsVisible(true);
+              const v = videoRef.current;
+              if (v && episodeUrl) {
+                const dur = Number.isFinite(v.duration) ? v.duration : duration;
+                latestPlaybackRef.current.currentTime = v.currentTime;
+                latestPlaybackRef.current.duration = dur;
+                persistEpisodeProgressNow({
+                  url: episodeUrl,
+                  positionSec: v.currentTime,
+                  durationSec: dur,
+                });
+              }
             }}
             onEnded={() => {
               clearLoadWatchdog();
               setPlaying(false);
               setControlsVisible(true);
+              const v = videoRef.current;
+              const reachedGenuineEnd =
+                hasPlaybackStartedRef.current ||
+                (Boolean(v) &&
+                  Number.isFinite(v!.duration) &&
+                  v!.duration > 10 &&
+                  v!.currentTime >= v!.duration - 2);
+              if (episodeUrl && reachedGenuineEnd) {
+                const dur =
+                  v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : duration;
+                latestPlaybackRef.current.currentTime = dur;
+                latestPlaybackRef.current.duration = dur;
+                persistEpisodeProgressNow({
+                  url: episodeUrl,
+                  positionSec: dur,
+                  durationSec: dur,
+                  ended: true,
+                });
+              }
               if (
                 hasNext &&
                 onNextEpisode &&
@@ -1342,6 +1627,7 @@ export function AnimePlayer({
             onPlaying={() => {
               clearLoadWatchdog();
               hasPlaybackStartedRef.current = true;
+              latestPlaybackRef.current.hasStarted = true;
               setWaiting(false);
               setHasVideoFrame(true);
               setErrorMsg('');
@@ -1349,30 +1635,69 @@ export function AnimePlayer({
             onLoadedMetadata={() => {
               const v = videoRef.current;
               if (!v) return;
-              if (pendingSeekSecRef.current > 1) {
-                const cap =
-                  Number.isFinite(v.duration) && v.duration > 2
-                    ? Math.max(0, v.duration - 1.5)
-                    : pendingSeekSecRef.current;
-                v.currentTime = Math.min(pendingSeekSecRef.current, cap);
-                pendingSeekSecRef.current = 0;
+              if (Number.isFinite(v.duration) && v.duration > 0) {
+                setDuration(v.duration);
+                latestPlaybackRef.current.duration = v.duration;
               }
+              applyPendingSeek(v);
+            }}
+            onCanPlay={() => {
+              const v = videoRef.current;
+              if (v) applyPendingSeek(v);
             }}
             onLoadedData={() => setHasVideoFrame(true)}
+            onSeeked={() => {
+              const v = videoRef.current;
+              if (!v || !episodeUrl) return;
+              const dur = Number.isFinite(v.duration) ? v.duration : duration;
+              latestPlaybackRef.current.currentTime = v.currentTime;
+              latestPlaybackRef.current.duration = dur;
+              if (v.currentTime >= 2) {
+                hasPlaybackStartedRef.current = true;
+                latestPlaybackRef.current.hasStarted = true;
+              }
+              persistEpisodeProgressNow({
+                url: episodeUrl,
+                positionSec: v.currentTime,
+                durationSec: dur,
+                forceReset: v.currentTime < 2 && hasPlaybackStartedRef.current,
+              });
+            }}
             onTimeUpdate={() => {
               const v = videoRef.current;
               if (!v) return;
+              if (pendingSeekSecRef.current > 1) {
+                applyPendingSeek(v);
+                if (pendingSeekSecRef.current > 1) return;
+              }
               if (v.currentTime > 0.25) {
                 hasPlaybackStartedRef.current = true;
+                latestPlaybackRef.current.hasStarted = true;
               }
               setCurrentTime(v.currentTime);
+              const dur = Number.isFinite(v.duration) ? v.duration : duration;
+              latestPlaybackRef.current.url = episodeUrl || '';
+              latestPlaybackRef.current.currentTime = v.currentTime;
+              if (dur > 0) latestPlaybackRef.current.duration = dur;
+
               if (v.buffered.length > 0) {
                 setBufferedEnd(v.buffered.end(v.buffered.length - 1));
               }
+
+              if (episodeUrl && Date.now() - lastSavedProgressWallRef.current >= 3000) {
+                persistEpisodeProgressNow({
+                  url: episodeUrl,
+                  positionSec: v.currentTime,
+                  durationSec: dur,
+                });
+              }
             }}
             onDurationChange={() => {
-              if (videoRef.current && Number.isFinite(videoRef.current.duration)) {
-                setDuration(videoRef.current.duration);
+              const v = videoRef.current;
+              if (v && Number.isFinite(v.duration) && v.duration > 0) {
+                setDuration(v.duration);
+                latestPlaybackRef.current.duration = v.duration;
+                applyPendingSeek(v);
               }
             }}
             onError={() => {
@@ -1387,7 +1712,7 @@ export function AnimePlayer({
             ref={canvasRef}
             className="pointer-events-none absolute inset-0 z-10 h-full w-full"
           />
-        </>
+        </div>
       )}
 
       {/* Interactive Gesture Surface (Tap, Double-Tap Seek, Hold 2x) */}
@@ -1554,8 +1879,25 @@ export function AnimePlayer({
                 void launchNativeVlc(target * 1000);
                 return;
               }
-              if (videoRef.current) videoRef.current.currentTime = target;
+              pendingSeekSecRef.current = 0;
+              const v = videoRef.current;
+              if (v) v.currentTime = target;
               setCurrentTime(target);
+              const dur = v && Number.isFinite(v.duration) ? v.duration : duration;
+              latestPlaybackRef.current.currentTime = target;
+              latestPlaybackRef.current.duration = dur;
+              if (target >= 2) {
+                hasPlaybackStartedRef.current = true;
+                latestPlaybackRef.current.hasStarted = true;
+              }
+              if (episodeUrl) {
+                persistEpisodeProgressNow({
+                  url: episodeUrl,
+                  positionSec: target,
+                  durationSec: dur,
+                  forceReset: target < 2 && hasPlaybackStartedRef.current,
+                });
+              }
             }}
             className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
           />
@@ -1825,6 +2167,18 @@ export function AnimePlayer({
                         </span>
                       </button>
 
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('scale')}
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                      >
+                        <span>Escala de Tela</span>
+                        <span className="inline-flex max-w-[140px] items-center gap-1 truncate text-slate-400">
+                          <span className="truncate">{getVideoScaleLabel(effectiveVideoScale)}</span>
+                          <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+                        </span>
+                      </button>
+
                       <div className="my-1 border-t border-white/10" />
 
                       {useNativeVlc && nativeResumeMs > 3000 && (
@@ -1833,6 +2187,31 @@ export function AnimePlayer({
                           onClick={() => {
                             setMenuOpen(false);
                             void launchNativeVlc(0);
+                          }}
+                          className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5 text-slate-400" />
+                          <span>Reiniciar do início</span>
+                        </button>
+                      )}
+
+                      {!useNativeVlc && currentTime > 3 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setMenuOpen(false);
+                            if (videoRef.current) {
+                              videoRef.current.currentTime = 0;
+                            }
+                            setCurrentTime(0);
+                            latestPlaybackRef.current.currentTime = 0;
+                            persistEpisodeProgressNow({
+                              url: episodeUrl,
+                              positionSec: 0,
+                              durationSec: duration,
+                              forceReset: true,
+                            });
+                            onToast('Reprodução reiniciada do início.');
                           }}
                           className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left hover:bg-white/10"
                         >
@@ -1940,6 +2319,11 @@ export function AnimePlayer({
                             key={stream.url}
                             type="button"
                             onClick={() => {
+                              const pos = videoRef.current?.currentTime || 0;
+                              if (pos > 1) {
+                                pendingSeekSecRef.current = pos;
+                                autoStartNextRef.current = Boolean(videoRef.current && !videoRef.current.paused);
+                              }
                               setSelectedStreamIdx(idx);
                               setMenuOpen(false);
                             }}
@@ -1970,6 +2354,10 @@ export function AnimePlayer({
                           key={opt.nume}
                           type="button"
                           onClick={() => {
+                            const pos = videoRef.current?.currentTime || 0;
+                            if (pos > 1) {
+                              pendingSeekSecRef.current = pos;
+                            }
                             autoStartNextRef.current = true;
                             onSelectServer?.(opt.nume);
                             setMenuOpen(false);
@@ -1978,6 +2366,32 @@ export function AnimePlayer({
                         >
                           <span className="truncate">{opt.label}</span>
                           {selectedServerNume === opt.nume && (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-[#f97316]" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {menuTab === 'scale' && (
+                    <div className="space-y-1">
+                      <button
+                        type="button"
+                        onClick={() => setMenuTab('main')}
+                        className="mb-1 flex w-full items-center gap-1.5 border-b border-white/10 px-2 pb-2 font-semibold text-white"
+                      >
+                        <ChevronLeft className="h-4 w-4" />
+                        <span>Escala de Tela</span>
+                      </button>
+                      {VIDEO_SCALE_OPTIONS.map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => selectVideoScale(opt.id)}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        >
+                          <span>{opt.label}</span>
+                          {effectiveVideoScale === opt.id && (
                             <Check className="h-3.5 w-3.5 shrink-0 text-[#f97316]" />
                           )}
                         </button>

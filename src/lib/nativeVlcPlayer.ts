@@ -1,5 +1,6 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import { normalizeTopAnimesUrl } from './favoriteAlerts';
+import type { VideoScaleMode } from './playbackProgress';
 import type { AnimeEpisodeLink, PlayerOption, StreamQuality, SubtitleTrack } from './types';
 
 export interface NativeVlcPlayOptions {
@@ -16,7 +17,9 @@ export interface NativeVlcPlayOptions {
   referer: string;
   preferDirect?: boolean;
   startPositionMs?: number;
+  forceStartPosition?: boolean;
   streamIndex?: number;
+  videoScale?: VideoScaleMode;
   hasPrev?: boolean;
   hasNext?: boolean;
   prevUrl?: string;
@@ -28,6 +31,9 @@ export interface NativeVlcPlayOptions {
 export interface NativeVlcVisitedEpisode {
   url: string;
   title: string;
+  positionMs?: number;
+  durationMs?: number;
+  completed?: boolean;
 }
 
 export interface NativeVlcPlayResult {
@@ -36,11 +42,13 @@ export interface NativeVlcPlayResult {
   positionMs: number;
   durationMs: number;
   streamIndex: number;
+  videoScale?: VideoScaleMode;
   visitedEpisodes?: NativeVlcVisitedEpisode[];
 }
 
 export interface NativeVlcPlayerPlugin {
   play(options: NativeVlcPlayOptions): Promise<NativeVlcPlayResult>;
+  setVideoScale(options: { videoScale: VideoScaleMode }): Promise<void>;
 }
 
 const NativeVlcPlayer = registerPlugin<NativeVlcPlayerPlugin>('NativeVlcPlayer');
@@ -128,6 +136,15 @@ export async function playWithNativeVlc(
   options: NativeVlcPlayOptions
 ): Promise<NativeVlcPlayResult> {
   return NativeVlcPlayer.play(options);
+}
+
+export async function setNativeVlcVideoScale(videoScale: VideoScaleMode): Promise<void> {
+  if (!isAndroidNativeVlcSupported()) return;
+  try {
+    await NativeVlcPlayer.setVideoScale({ videoScale });
+  } catch {
+    // ignore if native plugin method is unavailable
+  }
 }
 
 export type PlayerGestureSide = 'left' | 'center' | 'right';

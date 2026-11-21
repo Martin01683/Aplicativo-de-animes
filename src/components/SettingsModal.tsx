@@ -20,6 +20,10 @@ import {
   type AppUpdateCheckResult,
 } from '../lib/appUpdater';
 import {
+  VIDEO_SCALE_OPTIONS,
+  type VideoScaleMode,
+} from '../lib/playbackProgress';
+import {
   APP_UPDATE_INTERVAL_OPTIONS,
   EPISODE_CHECK_INTERVAL_OPTIONS,
   formatRelativeTimestamp,
@@ -640,6 +644,31 @@ export function SettingsModal({
                     </button>
                   ))}
                 </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
+                <label htmlFor="video-scale-select" className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-slate-200">
+                    Escala de tela padrão
+                  </span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Define o modo de ajuste do vídeo ao iniciar a reprodução.
+                  </span>
+                </label>
+                <select
+                  id="video-scale-select"
+                  value={settings.videoScale}
+                  onChange={(e) =>
+                    onUpdateSettings({ videoScale: e.target.value as VideoScaleMode })
+                  }
+                  className="min-h-[40px] rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
+                >
+                  {VIDEO_SCALE_OPTIONS.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
               </div>
 
               <div className="flex items-center justify-between gap-4 px-4 py-3.5">
