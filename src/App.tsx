@@ -246,6 +246,7 @@ export default function App() {
   const settingsRef = useRef(settings);
   const settingsMetaRef = useRef(settingsMeta);
   const buildInfoRef = useRef(buildInfo);
+  const appUpdateResultRef = useRef(appUpdateResult);
   const acknowledgedReleaseKeyRef = useRef(acknowledgedReleaseKey);
   const routeRef = useRef(route);
   const routeStackRef = useRef(routeStack);
@@ -255,7 +256,10 @@ export default function App() {
   const navRequestGenRef = useRef(0);
   const handlingPopstateRef = useRef(false);
   const initialCheckDoneRef = useRef(false);
+  const startupAppUpdateCheckedRef = useRef(false);
+  const checkingAppUpdateRef = useRef(false);
   const autoDownloadTriggeredForRef = useRef<string | null>(null);
+  const updateToastNotifiedForRef = useRef<string | null>(null);
 
   favoritesRef.current = favorites;
   baselinesRef.current = baselines;
@@ -264,6 +268,7 @@ export default function App() {
   settingsRef.current = settings;
   settingsMetaRef.current = settingsMeta;
   buildInfoRef.current = buildInfo;
+  appUpdateResultRef.current = appUpdateResult;
   acknowledgedReleaseKeyRef.current = acknowledgedReleaseKey;
   routeRef.current = route;
   routeStackRef.current = routeStack;
@@ -452,7 +457,7 @@ export default function App() {
 
   const handleDownloadAppUpdate = useCallback(
     async (explicitRelease?: RemoteAppRelease | null) => {
-      const targetRelease = explicitRelease || appUpdateResult?.latestRelease;
+      const targetRelease = explicitRelease || appUpdateResultRef.current?.latestRelease;
       const asset = targetRelease?.apkAsset;
       if (!asset?.downloadUrl) {
         showToast('Nenhum arquivo de atualização encontrado nesta release.');
@@ -517,11 +522,13 @@ export default function App() {
         }
       }
     },
-    [appUpdateResult, markReleaseAcknowledged, showToast]
+    [markReleaseAcknowledged, showToast]
   );
 
   const checkForAppUpdates = useCallback(
     async (options: { manual?: boolean; triggerAutoDownload?: boolean } = {}) => {
+      if (checkingAppUpdateRef.current) return;
+      checkingAppUpdateRef.current = true;
       setCheckingAppUpdate(true);
       setAppUpdateError('');
       try {
@@ -562,7 +569,8 @@ export default function App() {
             void handleDownloadAppUpdate(evaluated.latestRelease);
           } else if (options.manual) {
             showToast(`Nova atualização encontrada: ${evaluated.latestRelease.releaseName}`);
-          } else {
+          } else if (updateToastNotifiedForRef.current !== key) {
+            updateToastNotifiedForRef.current = key;
             showToast('Nova versão do TopAnimes disponível nas Configurações.');
           }
         } else if (options.manual) {
@@ -576,6 +584,7 @@ export default function App() {
           showToast(msg);
         }
       } finally {
+        checkingAppUpdateRef.current = false;
         setCheckingAppUpdate(false);
       }
     },
@@ -652,7 +661,7 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [checkFavoriteUpdates, settings.episodeCheckIntervalMinutes]);
 
-  // Load native Android version info and run scheduled GitHub update check
+  // Load native Android version info and run one-shot startup GitHub update check
   useEffect(() => {
     let cancelled = false;
 
@@ -668,8 +677,10 @@ export default function App() {
         }
       }
 
+      if (cancelled || startupAppUpdateCheckedRef.current) return;
+      startupAppUpdateCheckedRef.current = true;
+
       if (
-        !cancelled &&
         shouldRunScheduledAppUpdateCheck(
           settingsRef.current,
           settingsMetaRef.current.lastAppUpdateCheckAt,

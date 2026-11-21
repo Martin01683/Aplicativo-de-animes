@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   APP_UPDATE_INTERVAL_OPTIONS,
   DEFAULT_APP_SETTINGS,
@@ -8,6 +11,9 @@ import {
   sanitizeAppSettings,
   shouldRunScheduledAppUpdateCheck,
 } from './settings';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = resolve(__dirname, '../..');
 
 test('sanitizeAppSettings falls back cleanly on invalid or partial input', () => {
   assert.equal(DEFAULT_APP_SETTINGS.episodeCheckIntervalMinutes, 15);
@@ -141,4 +147,13 @@ test('formatRelativeTimestamp formats recent and null timestamps cleanly', () =>
   assert.equal(formatRelativeTimestamp('2026-11-21T11:59:40.000Z', now), 'Agora mesmo');
   assert.equal(formatRelativeTimestamp('2026-11-21T11:45:00.000Z', now), 'Há 15 min');
   assert.equal(formatRelativeTimestamp('2026-11-21T09:00:00.000Z', now), 'Há 3 h');
+});
+
+test('App.tsx runs startup app update check at most once without callback dependency loops', () => {
+  const appTsx = readFileSync(resolve(ROOT, 'src/App.tsx'), 'utf-8');
+  assert.match(appTsx, /appUpdateResultRef\.current\?\.latestRelease/);
+  assert.doesNotMatch(appTsx, /\[appUpdateResult,\s*markReleaseAcknowledged,\s*showToast\]/);
+  assert.match(appTsx, /if\s*\(cancelled\s*\|\|\s*startupAppUpdateCheckedRef\.current\)\s*return;/);
+  assert.match(appTsx, /if\s*\(checkingAppUpdateRef\.current\)\s*return;/);
+  assert.match(appTsx, /updateToastNotifiedForRef\.current\s*!==\s*key/);
 });
