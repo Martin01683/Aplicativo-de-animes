@@ -77,6 +77,7 @@ import {
 } from './lib/storage';
 import type {
   AnimeDetails,
+  CalendarDaySection,
   CatalogArchiveCategory,
   CatalogFilters,
   CatalogMediaItem,
@@ -84,6 +85,7 @@ import type {
   FavoriteAlertEntry,
   FavoriteBaselineMap,
   FavoriteLatestInfo,
+  GlossaryResponse,
   HomeCatalog,
   MediaKind,
   PaginatedCatalogResponse,
@@ -91,6 +93,7 @@ import type {
   SearchResultItem,
   SliderMovieItem,
   WatchHistoryEntry,
+  WeeklyCalendarResponse,
 } from './lib/types';
 
 type ActiveRoute = AppRouteFrame;
@@ -182,9 +185,15 @@ export default function App() {
   });
   const [selectedGenre, setSelectedGenre] = useState('');
   const [selectedYear, setSelectedYear] = useState('');
+  const [selectedGlossary, setSelectedGlossary] = useState('');
   const [filteredCatalog, setFilteredCatalog] = useState<ArchiveCategoryBucket>({
     ...EMPTY_BUCKET,
   });
+
+  const [weeklyCalendarDays, setWeeklyCalendarDays] = useState<CalendarDaySection[]>([]);
+  const [selectedCalendarDay, setSelectedCalendarDay] = useState('hoje');
+  const [loadingWeeklyCalendar, setLoadingWeeklyCalendar] = useState(false);
+  const [weeklyCalendarInitialized, setWeeklyCalendarInitialized] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResultItem[] | null>(null);
@@ -862,17 +871,78 @@ export default function App() {
     [showToast]
   );
 
+  const fetchWeeklyCalendar = useCallback(async () => {
+    setLoadingWeeklyCalendar(true);
+    try {
+      const res = await apiFetch('/api/calendar');
+      const data = (await res.json()) as WeeklyCalendarResponse & { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Erro ao carregar calendário semanal.');
+      if (Array.isArray(data.days) && data.days.length > 0) {
+        setWeeklyCalendarDays(data.days);
+        setSelectedCalendarDay((current) =>
+          data.days.some((d) => d.id === current) ? current : data.days[0].id
+        );
+      }
+    } catch {
+      // Fallback remains home.calendar ("Hoje") rendered by CatalogView
+    } finally {
+      setLoadingWeeklyCalendar(false);
+      setWeeklyCalendarInitialized(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeSection === 'calendar' && !weeklyCalendarInitialized && !loadingWeeklyCalendar) {
+      void fetchWeeklyCalendar();
+    }
+  }, [activeSection, fetchWeeklyCalendar, loadingWeeklyCalendar, weeklyCalendarInitialized]);
+
+  const fetchGlossaryCatalog = useCallback(
+    async (term: string, category: CatalogArchiveCategory) => {
+      setFilteredCatalog((prev) => ({ ...prev, loading: true }));
+      try {
+        const type =
+          category === 'movies' ? 'movies' : category === 'animes' ? 'tvshows' : 'all';
+        const res = await apiFetch(
+          `/api/glossary?term=${encodeURIComponent(term)}&type=${encodeURIComponent(type)}`
+        );
+        const data = (await res.json()) as GlossaryResponse & { error?: string };
+        if (!res.ok) throw new Error(data.error || 'Erro ao consultar índice alfabético');
+        setFilteredCatalog({
+          items: Array.isArray(data.items) ? data.items : [],
+          currentPage: 1,
+          totalPages: 1,
+          loading: false,
+          initialized: true,
+        });
+      } catch (err) {
+        setFilteredCatalog((prev) => ({ ...prev, loading: false, initialized: true }));
+        showToast(err instanceof Error ? err.message : 'Falha ao consultar índice alfabético.');
+      }
+    },
+    [showToast]
+  );
+
   useEffect(() => {
     if (
       activeSection === 'catalog' &&
       !selectedGenre &&
       !selectedYear &&
+      !selectedGlossary &&
       !archiveState[archiveCategory].initialized &&
       !archiveState[archiveCategory].loading
     ) {
       fetchArchivePage(archiveCategory, 1, false);
     }
-  }, [activeSection, archiveCategory, archiveState, fetchArchivePage, selectedGenre, selectedYear]);
+  }, [
+    activeSection,
+    archiveCategory,
+    archiveState,
+    fetchArchivePage,
+    selectedGenre,
+    selectedGlossary,
+    selectedYear,
+  ]);
 
   const handleLoadMoreReleases = useCallback(async () => {
     if (loadingMoreReleases || releasesPage >= releasesTotalPages) return;
@@ -895,6 +965,7 @@ export default function App() {
   const handleSelectArchiveCategory = useCallback((category: CatalogArchiveCategory) => {
     setSelectedGenre('');
     setSelectedYear('');
+    setSelectedGlossary('');
     setFilteredCatalog({ ...EMPTY_BUCKET });
     setArchiveCategory(category);
   }, []);
@@ -902,6 +973,7 @@ export default function App() {
   const handleSelectGenre = useCallback(
     (genreSlug: string) => {
       setSelectedYear('');
+      setSelectedGlossary('');
       setSelectedGenre(genreSlug);
       if (!genreSlug) {
         setFilteredCatalog({ ...EMPTY_BUCKET });
@@ -915,6 +987,7 @@ export default function App() {
   const handleSelectYear = useCallback(
     (yearSlug: string) => {
       setSelectedGenre('');
+      setSelectedGlossary('');
       setSelectedYear(yearSlug);
       if (!yearSlug) {
         setFilteredCatalog({ ...EMPTY_BUCKET });
@@ -925,9 +998,24 @@ export default function App() {
     [fetchFilteredCatalog]
   );
 
+  const handleSelectGlossary = useCallback(
+    (term: string) => {
+      setSelectedGenre('');
+      setSelectedYear('');
+      setSelectedGlossary(term);
+      if (!term) {
+        setFilteredCatalog({ ...EMPTY_BUCKET });
+        return;
+      }
+      void fetchGlossaryCatalog(term, archiveCategory);
+    },
+    [archiveCategory, fetchGlossaryCatalog]
+  );
+
   const handleClearCatalogFilters = useCallback(() => {
     setSelectedGenre('');
     setSelectedYear('');
+    setSelectedGlossary('');
     setFilteredCatalog({ ...EMPTY_BUCKET });
   }, []);
 
@@ -1322,7 +1410,7 @@ export default function App() {
       settingsOpen,
       routeStack: routeStackRef.current,
       hasSearchResults: searchResults !== null,
-      hasCatalogFilters: Boolean(selectedGenre || selectedYear),
+      hasCatalogFilters: Boolean(selectedGenre || selectedYear || selectedGlossary),
       activeSection,
       defaultSection: settings.defaultSection,
     });
@@ -1364,6 +1452,7 @@ export default function App() {
     loadAnimeDetailsForRoute,
     searchResults,
     selectedGenre,
+    selectedGlossary,
     selectedYear,
     settings.defaultSection,
     settingsOpen,
@@ -1462,7 +1551,11 @@ export default function App() {
             catalogFilters={catalogFilters}
             selectedGenre={selectedGenre}
             selectedYear={selectedYear}
+            selectedGlossary={selectedGlossary}
             filteredCatalog={filteredCatalog}
+            weeklyCalendarDays={weeklyCalendarDays}
+            selectedCalendarDay={selectedCalendarDay}
+            loadingWeeklyCalendar={loadingWeeklyCalendar}
             favorites={favorites}
             history={history}
             alerts={alerts}
@@ -1483,8 +1576,10 @@ export default function App() {
             onLoadMoreArchiveCategory={handleLoadMoreArchiveCategory}
             onSelectGenre={handleSelectGenre}
             onSelectYear={handleSelectYear}
+            onSelectGlossary={handleSelectGlossary}
             onClearCatalogFilters={handleClearCatalogFilters}
             onLoadMoreFiltered={handleLoadMoreFiltered}
+            onSelectCalendarDay={setSelectedCalendarDay}
             onOpenItem={openMediaUrl}
             onToggleFavorite={toggleFavorite}
             onCheckFavoriteUpdates={() => void checkFavoriteUpdates({ manual: true })}
@@ -1538,6 +1633,7 @@ export default function App() {
                   })
                 }
                 onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
+                onOpenAnime={(animeUrl) => void openMediaUrl(animeUrl, 'anime')}
                 onBack={() => navigateBackStep()}
               />
             ) : null}

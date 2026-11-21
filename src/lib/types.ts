@@ -23,6 +23,27 @@ export interface CatalogMediaItem {
   rating?: string;
   year?: string;
   isHiatus?: boolean;
+  statusBadge?: string;
+}
+
+export interface CalendarDaySection {
+  id: string;
+  label: string;
+  isToday: boolean;
+  items: CatalogMediaItem[];
+}
+
+export interface WeeklyCalendarResponse {
+  days: CalendarDaySection[];
+  sourceMode: 'live' | 'snapshot';
+  fetchedAt: string;
+}
+
+export interface GlossaryResponse {
+  term: string;
+  type: string;
+  items: CatalogMediaItem[];
+  sourceMode: 'live' | 'fallback';
 }
 
 export interface CatalogFilterOption {
@@ -71,8 +92,15 @@ export interface SearchResultItem {
   kind: MediaKind;
   poster: string;
   year?: string;
+  rating?: string;
   excerpt?: string;
   audioType: AudioType;
+}
+
+export interface SearchSuggestResponse {
+  query: string;
+  results: SearchResultItem[];
+  sourceMode: 'live' | 'fallback';
 }
 
 export interface PaginatedSearchResponse {
@@ -96,12 +124,23 @@ export interface AnimeEpisodeLink {
 
 export interface AnimeDetails {
   title: string;
+  alternativeTitle?: string;
+  originalTitle?: string;
   url: string;
   poster: string;
   backdrop: string;
   synopsis: string;
   year?: string;
   rating?: string;
+  tmdbRating?: string;
+  tmdbVotes?: string;
+  firstAirDate?: string;
+  lastAirDate?: string;
+  seasonsCount?: string;
+  episodesTotalCount?: string;
+  averageDuration?: string;
+  myAnimeListUrl?: string;
+  allSeasonsUrl?: string;
   genres: string[];
   audioType: AudioType;
   episodes: AnimeEpisodeLink[];

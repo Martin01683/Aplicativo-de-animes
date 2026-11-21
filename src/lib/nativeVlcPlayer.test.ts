@@ -183,4 +183,36 @@ describe('VlcPlayerActivity - Android focus & LibVLC surface lifecycle', () => {
   });
 });
 
+describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () => {
+  const resolverJavaPath = resolve(
+    ROOT,
+    'android/app/src/main/java/com/topanimes/player/TopAnimesEpisodeResolver.java'
+  );
+  const proxyJavaPath = resolve(
+    ROOT,
+    'android/app/src/main/java/com/topanimes/player/LocalProxyPlugin.java'
+  );
+  const resolverJava = readFileSync(resolverJavaPath, 'utf8');
+  const proxyJava = readFileSync(proxyJavaPath, 'utf8');
+
+  it('parses JW Player sources & tracks in TopAnimesEpisodeResolver so KojimaCDN 1080p short-circuits', () => {
+    assert.match(resolverJava, /Pattern\.compile\("sources\\\\s\*:\\\\s\*\(\\\\\[[\s\S]*?parseLooseJsArray/);
+    assert.match(resolverJava, /Pattern\.compile\("tracks\\\\s\*:\\\\s\*\(\\\\\[[\s\S]*?parseLooseJsArray/);
+    assert.match(resolverJava, /private static JSONArray parseLooseJsArray\(String raw\)/);
+  });
+
+  it('hydrates missing player iframes via doo_player_ajax / wp-json and filters new ad domains', () => {
+    assert.match(resolverJava, /hydrateMissingDooPlayerSources\(html,\s*episodeUrl,\s*sourceMap\)/);
+    assert.match(resolverJava, /action=doo_player_ajax&post=/);
+    assert.match(resolverJava, /private static String postFormText\(/);
+    assert.match(resolverJava, /metilinksemvoce\|viewanalitycs\|agl004\|videoad\|autotop\|canalfutebol/);
+  });
+
+  it('supports HTTP POST in LocalProxyPlugin.fetchPage for native DooPlay AJAX requests', () => {
+    assert.match(proxyJava, /String rawMethod = call\.getString\("method",\s*"GET"\)/);
+    assert.match(proxyJava, /String requestBody = call\.getString\("body",\s*null\)/);
+    assert.match(proxyJava, /conn\.setDoOutput\(true\)/);
+  });
+});
+
 

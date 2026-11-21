@@ -3,6 +3,7 @@ import type {
   AnimeDetails,
   AnimeEpisodeLink,
   AudioType,
+  CalendarDaySection,
   CatalogFilterOption,
   CatalogFilters,
   CatalogMediaItem,
@@ -15,6 +16,7 @@ import type {
   StreamFormat,
   StreamQuality,
   SubtitleTrack,
+  WeeklyCalendarResponse,
 } from './types.ts';
 import { isSafeExternalHttpUrl, normalizeTopAnimesUrl, unwrapAvisoUrl } from './urlSafety.ts';
 
@@ -50,7 +52,8 @@ const ITAG_HEIGHT: Record<number, number> = {
   78: 480,
 };
 
-const AD_HOST_RE = /(?:^|[/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker)(?:[/._?-]|$)/i;
+const AD_HOST_RE =
+  /(?:^|[/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker|metilinksemvoce|viewanalitycs|agl004|videoad|autotop|canalfutebol)(?:[/._?-]|$)/i;
 
 function cleanText(val: string | undefined): string {
   return String(val || '').replace(/\s+/g, ' ').trim();
@@ -159,7 +162,10 @@ export function parseHomeHtml(
 
     const badgeText = cleanText(root.find('.buttonextra').text());
     const audioType = inferAudioType(badgeText || title);
-    const isHiatus = /HIATO/i.test(cleanText(root.find('.adiado_text').text()));
+    const adiadoText = cleanText(root.find('.adiado_text').text());
+    const isAdiado = /\bADIADO\b/i.test(adiadoText);
+    const isHiatus = /\bHIATO\b/i.test(adiadoText) || isAdiado;
+    const statusBadge = isAdiado ? 'Adiado' : isHiatus ? 'Hiato' : undefined;
     const poster = upgradeImageUrl(root.find('.poster img').attr('src') || root.find('.poster img').attr('data-src'));
     const year = cleanText(root.find('.data span').first().text());
 
@@ -172,6 +178,7 @@ export function parseHomeHtml(
       audioType,
       year: year || undefined,
       isHiatus,
+      statusBadge,
     });
   });
 
@@ -232,6 +239,109 @@ export function parseHomeHtml(
     releases,
     animes,
     movies,
+    sourceMode,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function normalizeCalendarDayMeta(rawTitle: string, index: number): {
+  id: string;
+  label: string;
+  isToday: boolean;
+} {
+  const cleaned = cleanText(rawTitle);
+  const folded = cleaned
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+  if (folded.includes('hoje')) return { id: 'hoje', label: 'Hoje', isToday: true };
+  if (folded.includes('domingo')) return { id: 'domingo', label: 'Domingo', isToday: false };
+  if (folded.includes('segunda')) return { id: 'segunda', label: 'Segunda', isToday: false };
+  if (folded.includes('terca')) return { id: 'terca', label: 'Terça', isToday: false };
+  if (folded.includes('quarta')) return { id: 'quarta', label: 'Quarta', isToday: false };
+  if (folded.includes('quinta')) return { id: 'quinta', label: 'Quinta', isToday: false };
+  if (folded.includes('sexta')) return { id: 'sexta', label: 'Sexta', isToday: false };
+  if (folded.includes('sabado')) return { id: 'sabado', label: 'Sábado', isToday: false };
+  const slug = folded.replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || `dia-${index}`;
+  return { id: slug, label: cleaned || `Dia ${index + 1}`, isToday: false };
+}
+
+export function parseCalendarPageHtml(
+  html: string,
+  sourceMode: 'live' | 'snapshot' = 'live'
+): WeeklyCalendarResponse {
+  const $ = cheerio.load(html);
+  const days: CalendarDaySection[] = [];
+  const seenDayIds = new Set<string>();
+
+  const container = $('#archive-content').first().length
+    ? $('#archive-content').first()
+    : $('.module .content').first();
+
+  const headers = container.children('header');
+  headers.each((sectionIdx, headerEl) => {
+    const rawHeading = cleanText($(headerEl).find('h2, h1').first().text());
+    if (!rawHeading) return;
+    const grid = $(headerEl).nextAll('.items').first();
+    if (!grid.length) return;
+
+    const meta = normalizeCalendarDayMeta(rawHeading, sectionIdx);
+    if (seenDayIds.has(meta.id)) return;
+    seenDayIds.add(meta.id);
+
+    const items: CatalogMediaItem[] = [];
+    const seenUrls = new Set<string>();
+    grid.find('article.item').each((idx, el) => {
+      const root = $(el);
+      const link = root.find('.data h3 a').attr('href') || root.find('.poster a').attr('href');
+      const url = normalizeTopAnimesUrl(link || '');
+      const title =
+        cleanText(root.find('.data h3 a').text()) || cleanText(root.find('.poster img').attr('alt'));
+      if (!url || !title || seenUrls.has(url)) return;
+      seenUrls.add(url);
+
+      const badgeText = cleanText(root.find('.buttonextra').text());
+      const audioType = inferAudioType(badgeText || title);
+      const adiadoText = cleanText(root.find('.adiado_text').text());
+      const isAdiado = /\bADIADO\b/i.test(adiadoText);
+      const isHiatus = /\bHIATO\b/i.test(adiadoText) || isAdiado;
+      const statusBadge = isAdiado ? 'Adiado' : isHiatus ? 'Hiato' : undefined;
+      const poster = upgradeImageUrl(
+        root.find('.poster img').attr('src') || root.find('.poster img').attr('data-src')
+      );
+      const year = cleanText(root.find('.data span').first().text());
+      const rawRating = cleanText(root.find('.rating').first().text());
+      const numericRating = Number.parseFloat(rawRating);
+      const rating =
+        Number.isFinite(numericRating) && numericRating > 0
+          ? Number(numericRating.toFixed(1)).toString()
+          : undefined;
+
+      items.push({
+        id: makeSlugId(url, `wcal-${meta.id}-${idx}`),
+        title,
+        url,
+        kind: inferMediaKindFromUrl(url),
+        poster,
+        audioType,
+        rating,
+        year: year || undefined,
+        isHiatus,
+        statusBadge,
+      });
+    });
+
+    days.push({
+      id: meta.id,
+      label: meta.label,
+      isToday: meta.isToday,
+      items,
+    });
+  });
+
+  return {
+    days,
     sourceMode,
     fetchedAt: new Date().toISOString(),
   };
@@ -456,7 +566,15 @@ export function parseSearchHtml(html: string): SearchResultItem[] {
 }
 
 export function parseWpSearchJson(
-  payload: Record<string, { title?: string; url?: string; img?: string; extra?: { date?: string } }>
+  payload: Record<
+    string,
+    {
+      title?: string;
+      url?: string;
+      img?: string;
+      extra?: { date?: string | boolean; imdb?: string | number | boolean };
+    }
+  >
 ): SearchResultItem[] {
   if (!payload || typeof payload !== 'object' || 'error' in payload) return [];
   const results: SearchResultItem[] = [];
@@ -465,17 +583,201 @@ export function parseWpSearchJson(
     const url = normalizeTopAnimesUrl(item.url || '');
     const title = cleanText(item.title);
     if (!url || !title) continue;
+    const rawDate = typeof item.extra?.date === 'string' ? cleanText(item.extra.date) : '';
+    const rawImdb =
+      typeof item.extra?.imdb === 'string' || typeof item.extra?.imdb === 'number'
+        ? cleanText(String(item.extra.imdb))
+        : '';
+    const parsedImdb = Number.parseFloat(rawImdb);
+    const rating =
+      Number.isFinite(parsedImdb) && parsedImdb > 0
+        ? Number(parsedImdb.toFixed(1)).toString()
+        : undefined;
     results.push({
       id: makeSlugId(url, `wp-${key}`),
       title,
       url,
       kind: inferMediaKindFromUrl(url),
       poster: upgradeImageUrl(item.img),
-      year: cleanText(item.extra?.date) || undefined,
+      year: rawDate || undefined,
+      rating,
       audioType: inferAudioType(title),
     });
   }
   return results;
+}
+
+export function parseWpGlossaryJson(
+  payload: Record<
+    string,
+    {
+      title?: string;
+      url?: string;
+      img?: string;
+      year?: string | number | boolean;
+      imdb?: string | number | boolean;
+    }
+  >
+): CatalogMediaItem[] {
+  if (!payload || typeof payload !== 'object' || 'error' in payload) return [];
+  const items: CatalogMediaItem[] = [];
+  const seen = new Set<string>();
+  for (const [key, item] of Object.entries(payload)) {
+    if (!item || typeof item !== 'object') continue;
+    const url = normalizeTopAnimesUrl(item.url || '');
+    const title = cleanText(item.title);
+    if (!url || !title || seen.has(url)) continue;
+    seen.add(url);
+
+    const rawYear =
+      typeof item.year === 'string' || typeof item.year === 'number'
+        ? cleanText(String(item.year))
+        : '';
+    const rawImdb =
+      typeof item.imdb === 'string' || typeof item.imdb === 'number'
+        ? cleanText(String(item.imdb))
+        : '';
+    const parsedImdb = Number.parseFloat(rawImdb);
+    const rating =
+      Number.isFinite(parsedImdb) && parsedImdb > 0
+        ? Number(parsedImdb.toFixed(1)).toString()
+        : undefined;
+
+    items.push({
+      id: makeSlugId(url, `gl-${key}`),
+      title,
+      url,
+      kind: inferMediaKindFromUrl(url),
+      poster: upgradeImageUrl(item.img),
+      audioType: inferAudioType(title),
+      rating,
+      year: rawYear || undefined,
+    });
+  }
+  return items;
+}
+
+export function extractDooPlayNonce(html: string): string | null {
+  if (!html) return null;
+  const dtGonzaMatch = html.match(/var\s+dtGonza\s*=\s*(\{[\s\S]*?\});/);
+  if (dtGonzaMatch?.[1]) {
+    const nonceMatch = dtGonzaMatch[1].match(/["']nonce["']\s*:\s*["']([a-zA-Z0-9_-]{4,64})["']/);
+    if (nonceMatch?.[1]) return nonceMatch[1];
+  }
+  const fallbackMatch = html.match(/["']glossary["']\s*:[\s\S]{0,200}?["']nonce["']\s*:\s*["']([a-zA-Z0-9_-]{4,64})["']/);
+  return fallbackMatch?.[1] || null;
+}
+
+export interface DooPlayAjaxConfig {
+  ajaxUrl: string;
+  playerApi: string;
+  playMethod: 'admin_ajax' | 'wp_json';
+}
+
+export function extractDooPlayAjaxConfig(html: string): DooPlayAjaxConfig {
+  const defaults: DooPlayAjaxConfig = {
+    ajaxUrl: 'https://topanimes.net/wp-admin/admin-ajax.php',
+    playerApi: 'https://topanimes.net/wp-json/dooplayer/v2/',
+    playMethod: 'admin_ajax',
+  };
+  if (!html) return defaults;
+
+  const dtAjaxMatch = html.match(/var\s+dtAjax\s*=\s*(\{[\s\S]*?\});/);
+  if (!dtAjaxMatch?.[1]) return defaults;
+
+  const rawBlock = dtAjaxMatch[1];
+  const urlMatch = rawBlock.match(/["']url["']\s*:\s*["']([^"']+)["']/);
+  const apiMatch = rawBlock.match(/["']player_api["']\s*:\s*["']([^"']+)["']/);
+  const methodMatch = rawBlock.match(/["']play_method["']\s*:\s*["']([^"']+)["']/);
+
+  const normalizedAjaxUrl = urlMatch?.[1]
+    ? normalizeTopAnimesUrl(urlMatch[1].replace(/\\\//g, '/')) || defaults.ajaxUrl
+    : defaults.ajaxUrl;
+  const normalizedApi = apiMatch?.[1]
+    ? normalizeTopAnimesUrl(apiMatch[1].replace(/\\\//g, '/')) || defaults.playerApi
+    : defaults.playerApi;
+
+  return {
+    ajaxUrl: normalizedAjaxUrl,
+    playerApi: normalizedApi.endsWith('/') ? normalizedApi : `${normalizedApi}/`,
+    playMethod: methodMatch?.[1] === 'wp_json' ? 'wp_json' : 'admin_ajax',
+  };
+}
+
+export interface MissingDooPlayerOption {
+  post: string;
+  nume: string;
+  type: string;
+  label: string;
+}
+
+export function extractMissingDooPlayerOptions(html: string): MissingDooPlayerOption[] {
+  const $ = cheerio.load(html);
+  const resolvedNumes = new Set<string>();
+
+  $('[id^="source-player-"]').each((_, el) => {
+    const id = $(el).attr('id') || '';
+    const nume = id.replace(/^source-player-/, '');
+    if (!nume || nume === 'trailer') return;
+    const iframe = $(el).find('iframe').first();
+    const rawSrc = iframe.attr('src') || iframe.attr('data-src') || '';
+    if (unwrapAvisoUrl(rawSrc)) {
+      resolvedNumes.add(nume);
+    }
+  });
+
+  const missing: MissingDooPlayerOption[] = [];
+  $('#playeroptionsul li.dooplay_player_option').each((_, el) => {
+    const li = $(el);
+    const nume = cleanText(li.attr('data-nume'));
+    const post = cleanText(li.attr('data-post'));
+    const type = cleanText(li.attr('data-type')) || 'tv';
+    if (!nume || !post || nume === 'trailer' || resolvedNumes.has(nume)) return;
+    const label = cleanText(li.find('.title').text()) || `Servidor ${nume}`;
+    if (classifyProviderKind(label, '') === 'abyss') return;
+    missing.push({ post, nume, type, label });
+  });
+
+  return missing;
+}
+
+export function parseDooPlayerAjaxResponse(body: string, baseUrl = 'https://topanimes.net/'): string {
+  const trimmed = String(body || '').trim();
+  if (!trimmed) return '';
+
+  let rawTarget: string;
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as { embed_url?: unknown; url?: unknown };
+      const val =
+        typeof parsed.embed_url === 'string'
+          ? parsed.embed_url
+          : typeof parsed.url === 'string'
+            ? parsed.url
+            : '';
+      rawTarget = val.trim();
+    } catch {
+      return '';
+    }
+  } else {
+    rawTarget = trimmed;
+  }
+
+  if (!rawTarget) return '';
+
+  if (/<iframe\b/i.test(rawTarget)) {
+    const iframeMatch = rawTarget.match(/<iframe[^>]+(?:src|data-src)=["']([^"']+)["']/i);
+    rawTarget = iframeMatch?.[1]?.trim() || '';
+  }
+  if (!rawTarget) return '';
+
+  let resolved = rawTarget;
+  try {
+    resolved = new URL(rawTarget, baseUrl).href;
+  } catch {
+    // keep rawTarget
+  }
+  return unwrapAvisoUrl(resolved);
 }
 
 export function parseSeasonNumberFromLabel(label: string): number | null {
@@ -494,6 +796,27 @@ export function parseSeasonNumberFromLabel(label: string): number | null {
   return null;
 }
 
+function extractYearFromDateText(text: string): string | undefined {
+  const clean = cleanText(text);
+  if (!clean) return undefined;
+  const fullYear = clean.match(/\b((?:19|20)\d{2})\b/);
+  if (fullYear?.[1]) return fullYear[1];
+  const shortDate = clean.match(/^\d{1,2}\/\d{1,2}\/(\d{2})$/);
+  if (shortDate?.[1]) {
+    const yy = Number.parseInt(shortDate[1], 10);
+    return String(yy >= 50 ? 1900 + yy : 2000 + yy);
+  }
+  return undefined;
+}
+
+function looksLikePureYearOrDate(text: string): boolean {
+  const clean = cleanText(text);
+  if (!clean) return false;
+  return /^(?:(?:19|20)\d{2}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|(?:jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez|feb|apr|may|aug|sep|oct|dec)[a-z.]*\s+\d{1,2},?\s+(?:19|20)\d{2})$/i.test(
+    clean
+  );
+}
+
 export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails {
   const $ = cheerio.load(html);
   const canonicalUrl = normalizeTopAnimesUrl(pageUrl) || pageUrl;
@@ -501,11 +824,108 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
   const rawTitle = cleanText($('.sheader .data h1').first().text()) || cleanText($('h1').first().text());
   const title = rawTitle.replace(/\s*-\s*TopAnimes\.net\s*$/i, '').trim() || 'Anime';
 
-  const poster = upgradeImageUrl($('.sheader .poster img').attr('src') || $('.poster img').first().attr('src'));
+  const poster = upgradeImageUrl(
+    $('.sheader .poster img').attr('src') ||
+      $('.sheader .poster img').attr('data-src') ||
+      $('.poster img').first().attr('src')
+  );
   const backdrop = upgradeImageUrl($('meta[property="og:image"]').attr('content')) || poster;
-  const synopsis = cleanText($('#info .wp-content p, .wp-content p').first().text());
-  const year = cleanText($('.sheader .extra .date').first().text());
-  const rating = cleanText($('.dt_rating_vgs').first().text());
+
+  const synopsisParagraphs: string[] = [];
+  $('#info .wp-content p, .sbox .wp-content p, .wp-content p').each((_, el) => {
+    const p = cleanText($(el).text());
+    if (p && !synopsisParagraphs.includes(p)) synopsisParagraphs.push(p);
+  });
+  const synopsis = synopsisParagraphs.join('\n\n');
+
+  const rawHeaderDate = cleanText($('.sheader .extra .date').first().text());
+  let year: string | undefined;
+  let alternativeTitle: string | undefined;
+  if (rawHeaderDate) {
+    if (looksLikePureYearOrDate(rawHeaderDate)) {
+      year = extractYearFromDateText(rawHeaderDate) || rawHeaderDate;
+    } else if (rawHeaderDate.toLowerCase() !== title.toLowerCase()) {
+      alternativeTitle = rawHeaderDate;
+    }
+  }
+
+  let originalTitle: string | undefined;
+  let tmdbRating: string | undefined;
+  let tmdbVotes: string | undefined;
+  let firstAirDate: string | undefined;
+  let lastAirDate: string | undefined;
+  let seasonsCount: string | undefined;
+  let episodesTotalCount: string | undefined;
+  let averageDuration: string | undefined;
+  let myAnimeListUrl: string | undefined;
+
+  $('#info .custom_fields, .custom_fields').each((_, el) => {
+    const field = $(el);
+    const rawLabel = cleanText(field.find('.variante').first().text());
+    const foldedLabel = rawLabel
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    const valorEl = field.find('.valor, .valor2').first();
+    const valueText = cleanText(valorEl.text());
+
+    if (!foldedLabel) return;
+
+    if (foldedLabel.includes('titulo original') && valueText) {
+      originalTitle = originalTitle || valueText;
+    } else if (foldedLabel.includes('tmdb') || foldedLabel.includes('imdb')) {
+      const strongScore = cleanText(valorEl.find('strong').first().text());
+      const scoreMatch = (strongScore || valueText).match(/(\d+(?:[.,]\d+)?)/);
+      if (scoreMatch?.[1]) {
+        const normalizedScore = scoreMatch[1].replace(',', '.');
+        if (Number.parseFloat(normalizedScore) > 0) {
+          tmdbRating = tmdbRating || normalizedScore;
+        }
+      }
+      const votesMatch = valueText.match(/(\d[\d.,]*\s*votos?)/i);
+      if (votesMatch?.[1]) {
+        tmdbVotes = tmdbVotes || cleanText(votesMatch[1]);
+      }
+    } else if (foldedLabel.includes('estreia') && valueText) {
+      firstAirDate = firstAirDate || valueText;
+    } else if (foldedLabel.includes('ultimo episodio') && valueText) {
+      lastAirDate = lastAirDate || valueText;
+    } else if (foldedLabel === 'temporadas' && valueText) {
+      seasonsCount = seasonsCount || valueText;
+    } else if (foldedLabel === 'episodios' && valueText) {
+      episodesTotalCount = episodesTotalCount || valueText;
+    } else if (foldedLabel.includes('duracao') && valueText) {
+      averageDuration = averageDuration || valueText;
+    } else if (foldedLabel.includes('links')) {
+      valorEl.find('a[href]').each((__, aEl) => {
+        const href = cleanText($(aEl).attr('href'));
+        if (
+          !myAnimeListUrl &&
+          href &&
+          isSafeExternalHttpUrl(href) &&
+          /(?:^|\.)myanimelist\.net$/i.test(new URL(href).hostname)
+        ) {
+          myAnimeListUrl = href;
+        }
+      });
+    }
+  });
+
+  if (!year && firstAirDate) {
+    year = extractYearFromDateText(firstAirDate);
+  }
+
+  const rawAllSeasons = cleanText($('seasons[data]').first().attr('data'));
+  const allSeasonsUrl = rawAllSeasons ? normalizeTopAnimesUrl(rawAllSeasons) || undefined : undefined;
+
+  const rawRating =
+    cleanText($('.dt_rating_vgs').first().text()) ||
+    cleanText($('.sheader .rating-value').first().text()) ||
+    tmdbRating ||
+    '';
+  const numericRating = Number.parseFloat(rawRating);
+  const rating =
+    Number.isFinite(numericRating) && numericRating > 0 ? rawRating : undefined;
 
   const genres: string[] = [];
   $('.sgeneros a').each((_, el) => {
@@ -514,7 +934,8 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
   });
 
   const episodes: AnimeEpisodeLink[] = [];
-  const seasonContainers = $('#seasons .se-c');
+  const seenEpisodeUrls = new Set<string>();
+  const seasonContainers = $('#seasons .se-c, #seasons .se-cu');
 
   const pushEpisodeLi = (
     li: ReturnType<typeof $>,
@@ -522,13 +943,14 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
     containerSeasonTitle: string
   ) => {
     const href = normalizeTopAnimesUrl(li.find('.episodiotitle a').attr('href') || '');
-    if (!href) return;
+    if (!href || seenEpisodeUrls.has(href)) return;
+    seenEpisodeUrls.add(href);
     const epTitle = cleanText(li.find('.episodiotitle a').text()) || 'Episódio';
     const numberLabel = cleanText(li.find('.numerando').text());
     const epNumText = cleanText(li.find('.epnumber').text());
     const parsedNum = Number.parseInt(epNumText, 10);
     const date = cleanText(li.find('.episodiotitle .date').text());
-    const thumb = upgradeImageUrl(li.find('.imagen img').attr('src'));
+    const thumb = upgradeImageUrl(li.find('.imagen img').attr('src') || li.find('.imagen img').attr('data-src'));
 
     const parsedSeasonFromLabel = parseSeasonNumberFromLabel(numberLabel);
     const seasonNumber = parsedSeasonFromLabel ?? containerSeasonNum ?? 1;
@@ -568,12 +990,23 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
 
   return {
     title,
+    alternativeTitle,
+    originalTitle,
     url: canonicalUrl,
     poster,
     backdrop,
     synopsis,
-    year: year || undefined,
-    rating: rating || undefined,
+    year,
+    rating,
+    tmdbRating,
+    tmdbVotes,
+    firstAirDate,
+    lastAirDate,
+    seasonsCount,
+    episodesTotalCount,
+    averageDuration,
+    myAnimeListUrl,
+    allSeasonsUrl,
     genres,
     audioType: inferAudioType(title),
     episodes,

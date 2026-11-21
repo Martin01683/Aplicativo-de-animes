@@ -3,14 +3,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import {
+  extractDooPlayAjaxConfig,
+  extractDooPlayNonce,
+  extractMissingDooPlayerOptions,
   extractStreamsFromEmbed,
   parseAnimePageHtml,
+  parseCalendarPageHtml,
   parseCatalogArchiveHtml,
+  parseDooPlayerAjaxResponse,
   parseEpisodePageHtml,
   parseEpisodesArchiveHtml,
   parseHomeHtml,
   parseSearchHtml,
   parseSearchPageHtml,
+  parseWpGlossaryJson,
   parseWpSearchJson,
 } from './topanimesParser.ts';
 import { isSafeExternalHttpUrl, isTopAnimesUrl, unwrapAvisoUrl } from './urlSafety.ts';
@@ -265,5 +271,180 @@ describe('topanimesParser', () => {
     assert.equal(parsed.items[0].quality, 'FHD');
     assert.equal(parsed.currentPage, 1);
     assert.equal(parsed.totalPages, 7);
+  });
+
+  it('recognizes ADIADO alongside HIATO in homepage calendar items', () => {
+    const html = `
+      <div id="dt-seasons">
+        <article class="item">
+          <div class="poster">
+            <img src="https://image.tmdb.org/t/p/w185/op.jpg" alt="One Piece" />
+            <div class="adiado_layer"><span class="adiado_text">ADIADO</span></div>
+          </div>
+          <div class="data"><h3><a href="https://topanimes.net/animes/one-piece/">One Piece</a></h3><span>1999</span></div>
+        </article>
+        <article class="item">
+          <div class="poster">
+            <img src="https://image.tmdb.org/t/p/w185/h.jpg" alt="Hiato Anime" />
+            <div class="adiado_layer"><span class="adiado_text">HIATO</span></div>
+          </div>
+          <div class="data"><h3><a href="https://topanimes.net/animes/hiato-anime/">Hiato Anime</a></h3><span>2026</span></div>
+        </article>
+      </div>`;
+    const home = parseHomeHtml(html, 'live');
+    assert.equal(home.calendar.length, 2);
+    assert.equal(home.calendar[0].isHiatus, true);
+    assert.equal(home.calendar[0].statusBadge, 'Adiado');
+    assert.equal(home.calendar[1].isHiatus, true);
+    assert.equal(home.calendar[1].statusBadge, 'Hiato');
+  });
+
+  it('separates alternativeTitle from year, extracts #info custom_fields/MAL, and parses .se-cu seasons', () => {
+    const html = `
+      <div class="sheader">
+        <div class="poster"><img src="https://image.tmdb.org/t/p/w500/p.jpg" /></div>
+        <div class="data">
+          <h1>Kusuriya no Hitorigoto 3</h1>
+          <div class="extra"><span class="date" itemprop="dateCreated">The Apothecary Diaries Season 3</span></div>
+        </div>
+      </div>
+      <span class="dt_rating_vgs">8.7</span>
+      <div id="info">
+        <div class="wp-content"><p>Terceira temporada.</p></div>
+        <div class="custom_fields"><b class="variante">Título original</b><span class="valor">薬屋のひとりごと</span></div>
+        <div class="custom_fields"><b class="variante">Classificação TMDb</b><span class="valor"><b id="repimdb"><strong>8.6</strong> 644 votos</b></span></div>
+        <div class="custom_fields"><b class="variante">Data de estreia</b><span class="valor">22/10/23</span></div>
+        <div class="custom_fields"><b class="variante">Data do último episódio</b><span class="valor">04/07/25</span></div>
+        <div class="custom_fields"><b class="variante">Temporadas</b><span class="valor">1</span></div>
+        <div class="custom_fields"><b class="variante">Episódios</b><span class="valor">60</span></div>
+        <div class="custom_fields"><b class="variante">Duração média</b><span class="valor">23 minutos</span></div>
+        <div class="custom_fields"><b class="variante">Links</b><span class="valor2"><a href="https://myanimelist.net/anime/61987">MAL</a></span></div>
+      </div>
+      <seasons data="https://topanimes.net/animes/kusuriya-no-hitorigoto/"></seasons>
+      <div id="seasons">
+        <div class="se-c"><div class="se-a"><ul class="episodios">
+          <li><div class="numerando">3 - 1</div><div class="epnumber">1</div><div class="episodiotitle"><a href="https://topanimes.net/episodio/kusuriya-3-ep-1/">Episódio 1</a></div></li>
+        </ul></div></div>
+        <div class="se-cu"><div class="se-a"><ul class="episodios">
+          <li><div class="numerando">3 - 2</div><div class="epnumber">2</div><div class="episodiotitle"><a href="https://topanimes.net/episodio/kusuriya-3-ep-2/">Episódio 2</a></div></li>
+        </ul></div></div>
+      </div>`;
+
+    const anime = parseAnimePageHtml(html, 'https://topanimes.net/animes/kusuriya-no-hitorigoto-3/');
+    assert.equal(anime.alternativeTitle, 'The Apothecary Diaries Season 3');
+    assert.equal(anime.originalTitle, '薬屋のひとりごと');
+    assert.equal(anime.year, '2023');
+    assert.equal(anime.rating, '8.7');
+    assert.equal(anime.tmdbRating, '8.6');
+    assert.equal(anime.tmdbVotes, '644 votos');
+    assert.equal(anime.firstAirDate, '22/10/23');
+    assert.equal(anime.lastAirDate, '04/07/25');
+    assert.equal(anime.seasonsCount, '1');
+    assert.equal(anime.episodesTotalCount, '60');
+    assert.equal(anime.averageDuration, '23 minutos');
+    assert.equal(anime.myAnimeListUrl, 'https://myanimelist.net/anime/61987');
+    assert.equal(anime.allSeasonsUrl, 'https://topanimes.net/animes/kusuriya-no-hitorigoto/');
+    assert.equal(anime.episodes.length, 2);
+    assert.equal(anime.episodes[1].episodeNumber, 2);
+  });
+
+  it('parses /calendario/ weekly sections with normalized labels and ratings', () => {
+    const calHtml = `
+      <div id="archive-content" class="animation-2 items">
+        <header><h2>Calendário de Hoje</h2></header>
+        <div class="items featured">
+          <article class="item tvshows">
+            <div class="poster"><img src="https://image.tmdb.org/t/p/w185/a.jpg" alt="Dreamland" /><div class="rating">0</div></div>
+            <div class="data"><h3><a href="https://topanimes.net/animes/dreamland/">Dreamland</a></h3><span>2026</span></div>
+          </article>
+        </div>
+        <header><h2>Sabado</h2></header>
+        <div class="items featured">
+          <article class="item tvshows">
+            <div class="poster"><img src="https://image.tmdb.org/t/p/w185/b.jpg" alt="Frieren Dublado" /><div class="rating">8.718</div></div>
+            <div class="data"><h3><a href="https://topanimes.net/animes/frieren-dublado/">Frieren Dublado</a></h3><span>2026</span></div>
+          </article>
+        </div>
+      </div>`;
+    const cal = parseCalendarPageHtml(calHtml, 'live');
+    assert.equal(cal.days.length, 2);
+    assert.equal(cal.days[0].id, 'hoje');
+    assert.equal(cal.days[0].isToday, true);
+    assert.equal(cal.days[0].items[0].rating, undefined);
+    assert.equal(cal.days[1].id, 'sabado');
+    assert.equal(cal.days[1].label, 'Sábado');
+    assert.equal(cal.days[1].items[0].rating, '8.7');
+    assert.equal(cal.days[1].items[0].audioType, 'DUB');
+  });
+
+  it('extracts DooPlay nonce, AJAX player fallback options, search/glossary JSON, and filters new ad domains', () => {
+    const html = `
+      <script>
+        var dtGonza = {"api":"https://topanimes.net/wp-json/dooplay/search/","glossary":"https://topanimes.net/wp-json/dooplay/glossary/","nonce":"84ea18fe09"};
+        var dtAjax = {"url":"/wp-admin/admin-ajax.php","player_api":"https://topanimes.net/wp-json/dooplayer/v2/","play_method":"admin_ajax"};
+      </script>
+      <ul id="playeroptionsul">
+        <li class="dooplay_player_option" data-post="666510" data-type="tv" data-nume="1"><span class="title">KojimaCDN</span></li>
+        <li class="dooplay_player_option" data-post="666510" data-type="tv" data-nume="2"><span class="title">Zuplay</span></li>
+        <li class="dooplay_player_option" data-post="666510" data-type="tv" data-nume="5"><span class="title">aniplay</span></li>
+      </ul>
+      <div id="source-player-1"><iframe src="https://topanimes.net/antivirus2/yes/?id=ok"></iframe></div>
+      <div id="source-player-2"></div>`;
+
+    assert.equal(extractDooPlayNonce(html), '84ea18fe09');
+    const ajaxCfg = extractDooPlayAjaxConfig(html);
+    assert.equal(ajaxCfg.ajaxUrl, 'https://topanimes.net/wp-admin/admin-ajax.php');
+    assert.equal(ajaxCfg.playMethod, 'admin_ajax');
+
+    const missing = extractMissingDooPlayerOptions(html);
+    assert.equal(missing.length, 1);
+    assert.deepEqual(missing[0], { post: '666510', nume: '2', type: 'tv', label: 'Zuplay' });
+
+    assert.equal(
+      parseDooPlayerAjaxResponse(
+        JSON.stringify({
+          embed_url: '<iframe src="https://topanimes.net/aviso/?url=https%3A%2F%2Fcsst.online%2Fembed%2F123"></iframe>',
+          type: 'dtshcode',
+        })
+      ),
+      'https://csst.online/embed/123'
+    );
+
+    const wpSearch = parseWpSearchJson({
+      '10': {
+        title: 'Kusuriya no Hitorigoto 3',
+        url: 'https://topanimes.net/animes/kusuriya-no-hitorigoto-3/',
+        img: 'https://image.tmdb.org/t/p/w92/k.jpg',
+        extra: { date: false, imdb: '8.7' },
+      },
+    });
+    assert.equal(wpSearch.length, 1);
+    assert.equal(wpSearch[0].year, undefined);
+    assert.equal(wpSearch[0].rating, '8.7');
+
+    const glossary = parseWpGlossaryJson({
+      '1': {
+        title: 'Ao no Hako Dublado',
+        url: 'https://topanimes.net/animes/ao-no-hako-dublado/',
+        img: 'https://image.tmdb.org/t/p/w185/ao.jpg',
+        year: '2025',
+        imdb: '8.4',
+      },
+    });
+    assert.equal(glossary.length, 1);
+    assert.equal(glossary[0].audioType, 'DUB');
+    assert.equal(glossary[0].rating, '8.4');
+
+    const filteredEmbed = extractStreamsFromEmbed(
+      'https://topanimes.net/antivirus2/yes/?id=test',
+      `
+        const ad1 = "https://cvt-s2.agl004.fun/promo.mp4";
+        const ad2 = "https://viewanalitycs.org/v.m3u8";
+        const ad3 = "https://www.metilinksemvoce.site/video.mp4";
+        const real = "https://doce-de-leite-vegano.b-cdn.net/real/cdn_stream.m3u8?token=ok&expires=1795286692";
+      `
+    );
+    assert.equal(filteredEmbed.streams.length, 1);
+    assert.ok(filteredEmbed.streams[0].url.includes('doce-de-leite-vegano.b-cdn.net'));
   });
 });

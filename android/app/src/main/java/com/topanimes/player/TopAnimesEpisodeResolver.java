@@ -10,6 +10,7 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
@@ -35,7 +36,7 @@ public final class TopAnimesEpisodeResolver {
 
     private static final Pattern TAG_STRIP_PATTERN = Pattern.compile("<[^>]+>");
     private static final Pattern AD_HOST_PATTERN = Pattern.compile(
-        "(?:^|[/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker)(?:[/._?-]|$)",
+        "(?:^|[/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker|metilinksemvoce|viewanalitycs|agl004|videoad|autotop|canalfutebol)(?:[/._?-]|$)",
         Pattern.CASE_INSENSITIVE
     );
 
@@ -176,6 +177,7 @@ public final class TopAnimesEpisodeResolver {
         String html = fetchText(episodeUrl, TOPANIMES_ORIGIN + "/", 11000);
         String title = extractEpisodeTitle(html);
         Map<String, String> sourceMap = extractSourcePlayerMap(html, episodeUrl);
+        hydrateMissingDooPlayerSources(html, episodeUrl, sourceMap);
         List<ServerOption> options = extractServerOptions(html, sourceMap, episodeUrl);
 
         String seriesUrl = "";
@@ -587,6 +589,147 @@ public final class TopAnimesEpisodeResolver {
         return map;
     }
 
+    private static void hydrateMissingDooPlayerSources(
+        String html,
+        String episodeUrl,
+        Map<String, String> sourceMap
+    ) {
+        if (html == null || html.isEmpty()) return;
+
+        String ajaxUrl = TOPANIMES_ORIGIN + "/wp-admin/admin-ajax.php";
+        String playerApi = TOPANIMES_ORIGIN + "/wp-json/dooplayer/v2/";
+        String playMethod = "admin_ajax";
+
+        Matcher cfgM = Pattern.compile("var\\s+dtAjax\\s*=\\s*(\\{[\\s\\S]*?\\});").matcher(html);
+        if (cfgM.find()) {
+            String cfgBlock = cfgM.group(1);
+            Matcher uM = Pattern.compile("[\"']url[\"']\\s*:\\s*[\"']([^\"']+)[\"']").matcher(cfgBlock);
+            if (uM.find()) {
+                String norm = normalizeTopAnimesUrl(uM.group(1).replace("\\/", "/"));
+                if (!norm.isEmpty()) ajaxUrl = norm;
+            }
+            Matcher aM = Pattern.compile("[\"']player_api[\"']\\s*:\\s*[\"']([^\"']+)[\"']").matcher(cfgBlock);
+            if (aM.find()) {
+                String norm = normalizeTopAnimesUrl(aM.group(1).replace("\\/", "/"));
+                if (!norm.isEmpty()) playerApi = norm.endsWith("/") ? norm : (norm + "/");
+            }
+            Matcher mM = Pattern.compile("[\"']play_method[\"']\\s*:\\s*[\"']([^\"']+)[\"']").matcher(cfgBlock);
+            if (mM.find() && "wp_json".equalsIgnoreCase(mM.group(1).trim())) {
+                playMethod = "wp_json";
+            }
+        }
+
+        Matcher li = Pattern.compile(
+            "<li[^>]*class=[\"'][^\"']*dooplay_player_option[^\"']*[\"'][^>]*>([\\s\\S]*?)</li>",
+            Pattern.CASE_INSENSITIVE
+        ).matcher(html);
+
+        while (li.find()) {
+            String fullTag = li.group(0);
+            String inner = li.group(1);
+
+            Matcher numeM = Pattern.compile("data-nume=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(fullTag);
+            Matcher postM = Pattern.compile("data-post=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(fullTag);
+            if (!numeM.find() || !postM.find()) continue;
+
+            String nume = numeM.group(1).trim();
+            String post = postM.group(1).trim();
+            if (nume.isEmpty() || post.isEmpty() || "trailer".equalsIgnoreCase(nume) || sourceMap.containsKey(nume)) {
+                continue;
+            }
+
+            String type = "tv";
+            Matcher typeM = Pattern.compile("data-type=[\"']([^\"']+)[\"']", Pattern.CASE_INSENSITIVE).matcher(fullTag);
+            if (typeM.find() && !typeM.group(1).trim().isEmpty()) {
+                type = typeM.group(1).trim();
+            }
+
+            String label = "Servidor " + nume;
+            Matcher titleM = Pattern.compile("class=[\"'][^\"']*title[^\"']*[\"'][^>]*>([\\s\\S]*?)<", Pattern.CASE_INSENSITIVE).matcher(inner);
+            if (titleM.find()) {
+                String parsedLabel = cleanHtmlText(titleM.group(1));
+                if (!parsedLabel.isEmpty()) label = parsedLabel;
+            }
+            if ("abyss".equals(classifyProviderKind(label, ""))) continue;
+
+            String resolvedUrl = resolveDooPlayerAjaxOption(ajaxUrl, playerApi, playMethod, episodeUrl, post, nume, type);
+            if (!resolvedUrl.isEmpty()) {
+                sourceMap.put(nume, resolvedUrl);
+            }
+        }
+    }
+
+    private static String resolveDooPlayerAjaxOption(
+        String ajaxUrl,
+        String playerApi,
+        String playMethod,
+        String episodeUrl,
+        String post,
+        String nume,
+        String type
+    ) {
+        boolean preferWpJson = "wp_json".equalsIgnoreCase(playMethod);
+        for (int attempt = 0; attempt < 2; attempt++) {
+            boolean useWpJson = (attempt == 0) == preferWpJson;
+            try {
+                String body;
+                if (useWpJson) {
+                    String target = playerApi
+                        + URLEncoder.encode(post, "UTF-8") + "/"
+                        + URLEncoder.encode(type, "UTF-8") + "/"
+                        + URLEncoder.encode(nume, "UTF-8");
+                    body = fetchText(target, episodeUrl, 8000);
+                } else {
+                    String form = "action=doo_player_ajax&post=" + URLEncoder.encode(post, "UTF-8")
+                        + "&nume=" + URLEncoder.encode(nume, "UTF-8")
+                        + "&type=" + URLEncoder.encode(type, "UTF-8");
+                    body = postFormText(ajaxUrl, episodeUrl, form, 8000);
+                }
+                String extracted = parseDooPlayerAjaxResponse(body, episodeUrl);
+                if (!extracted.isEmpty()) {
+                    return extracted;
+                }
+            } catch (Exception ignored) {
+                // Fall back to alternate DooPlay player method
+            }
+        }
+        return "";
+    }
+
+    private static String parseDooPlayerAjaxResponse(String body, String baseUrl) {
+        if (body == null) return "";
+        String trimmed = body.trim();
+        if (trimmed.isEmpty()) return "";
+
+        String rawTarget = "";
+        if (trimmed.startsWith("{")) {
+            try {
+                JSONObject json = new JSONObject(trimmed);
+                rawTarget = json.optString("embed_url", "");
+                if (rawTarget.isEmpty()) {
+                    rawTarget = json.optString("url", "");
+                }
+            } catch (Exception e) {
+                return "";
+            }
+        } else {
+            rawTarget = trimmed;
+        }
+        rawTarget = rawTarget.trim();
+        if (rawTarget.isEmpty()) return "";
+
+        if (rawTarget.toLowerCase(Locale.ROOT).contains("<iframe")) {
+            Matcher iframeM = Pattern.compile(
+                "<iframe[^>]+(?:src|data-src)=[\"']([^\"']+)[\"']",
+                Pattern.CASE_INSENSITIVE
+            ).matcher(rawTarget);
+            rawTarget = iframeM.find() ? iframeM.group(1).trim() : "";
+        }
+        if (rawTarget.isEmpty()) return "";
+
+        return unwrapAvisoUrl(resolveRelativeUrl(baseUrl, rawTarget));
+    }
+
     private static List<ServerOption> extractServerOptions(String html, Map<String, String> sourceMap, String baseUrl) {
         List<ServerOption> options = new ArrayList<>();
         Matcher li = Pattern.compile(
@@ -753,14 +896,63 @@ public final class TopAnimesEpisodeResolver {
             }
         }
 
-        // 4. Fallback direct .m3u8 / .mp4 scan
-        Matcher urlM = Pattern.compile("https?://[^\"'\\\\\\s<>]+?(?:\\.m3u8|\\.mp4)(?:\\?[^\"'\\\\\\s<>]*)?", Pattern.CASE_INSENSITIVE).matcher(trimmed);
-        while (urlM.find()) {
-            String found = urlM.group(0);
-            if (AD_HOST_PATTERN.matcher(found).find()) continue;
-            String fmt = guessStreamFormat(found, "");
-            int h = labelToHeight("", found);
-            streams.add(new StreamCandidate(formatQualityLabel("", h, fmt), h, found, fmt));
+        // 4. JW Player (`jwplayer(...).setup({ sources: [...], tracks: [...] })`)
+        Matcher jwSourcesM = Pattern.compile("sources\\s*:\\s*(\\[[\\s\\S]*?\\])", Pattern.CASE_INSENSITIVE).matcher(trimmed);
+        if (jwSourcesM.find()) {
+            JSONArray parsedSources = parseLooseJsArray(jwSourcesM.group(1));
+            if (parsedSources != null) {
+                for (int i = 0; i < parsedSources.length(); i++) {
+                    JSONObject s = parsedSources.optJSONObject(i);
+                    if (s == null) continue;
+                    String rawUrl = s.optString("file", "");
+                    if (rawUrl.isEmpty()) rawUrl = s.optString("src", "");
+                    if (rawUrl.isEmpty()) rawUrl = s.optString("url", "");
+                    if (rawUrl.isEmpty()) continue;
+                    String abs = resolveRelativeUrl(embedUrl, rawUrl);
+                    if (!isSafeHttpUrl(abs)) continue;
+                    String rawLabel = s.optString("label", "");
+                    String rawType = s.optString("type", "");
+                    String fmt = guessStreamFormat(abs, rawType);
+                    int h = labelToHeight(rawLabel, abs);
+                    streams.add(new StreamCandidate(formatQualityLabel(rawLabel, h, fmt), h, abs, fmt));
+                }
+            }
+        }
+
+        Matcher jwTracksM = Pattern.compile("tracks\\s*:\\s*(\\[[\\s\\S]*?\\])", Pattern.CASE_INSENSITIVE).matcher(trimmed);
+        if (jwTracksM.find()) {
+            JSONArray parsedTracks = parseLooseJsArray(jwTracksM.group(1));
+            if (parsedTracks != null) {
+                for (int i = 0; i < parsedTracks.length(); i++) {
+                    JSONObject t = parsedTracks.optJSONObject(i);
+                    if (t == null) continue;
+                    String kind = t.optString("kind", "");
+                    if (!kind.isEmpty() && !kind.toLowerCase(Locale.ROOT).matches(".*(captions|subtitles).*")) {
+                        continue;
+                    }
+                    String rawFile = t.optString("file", "");
+                    if (rawFile.isEmpty()) continue;
+                    String abs = resolveRelativeUrl(embedUrl, rawFile);
+                    if (!isSafeHttpUrl(abs)) continue;
+                    String lbl = t.optString("label", "Legenda");
+                    if (lbl.isEmpty()) lbl = "Legenda";
+                    boolean def = t.optBoolean("default", false)
+                        || lbl.toLowerCase(Locale.ROOT).matches(".*(portugu[eê]s|pt[-_]?br).*");
+                    subtitles.add(new SubtitleCandidate(lbl, abs, def));
+                }
+            }
+        }
+
+        // 5. Fallback direct .m3u8 / .mp4 scan
+        if (streams.isEmpty()) {
+            Matcher urlM = Pattern.compile("https?://[^\"'\\\\\\s<>]+?(?:\\.m3u8|\\.mp4)(?:\\?[^\"'\\\\\\s<>]*)?", Pattern.CASE_INSENSITIVE).matcher(trimmed);
+            while (urlM.find()) {
+                String found = urlM.group(0);
+                if (AD_HOST_PATTERN.matcher(found).find()) continue;
+                String fmt = guessStreamFormat(found, "");
+                int h = labelToHeight("", found);
+                streams.add(new StreamCandidate(formatQualityLabel("", h, fmt), h, found, fmt));
+            }
         }
 
         String provider = embedUrl.contains("booonceivu.shop")
@@ -770,6 +962,29 @@ public final class TopAnimesEpisodeResolver {
                 : "Direto";
 
         return new ExtractedResult(dedupeAndSortStreams(streams), dedupeSubtitles(subtitles), provider);
+    }
+
+    private static JSONArray parseLooseJsArray(String raw) {
+        if (raw == null || raw.trim().isEmpty()) return null;
+        try {
+            return new JSONArray(raw);
+        } catch (Exception ignored) {
+            // Normalize loose JS object syntax (unquoted keys, single quotes, trailing commas)
+        }
+        try {
+            String normalized = raw.replaceAll("([{,]\\s*)([a-zA-Z0-9_]+)\\s*:", "$1\"$2\":");
+            Matcher singleQuoted = Pattern.compile("'([^'\\\\]*(?:\\\\.[^'\\\\]*)*)'").matcher(normalized);
+            StringBuffer sb = new StringBuffer();
+            while (singleQuoted.find()) {
+                String inner = singleQuoted.group(1).replace("\\'", "'").replace("\"", "\\\"");
+                singleQuoted.appendReplacement(sb, Matcher.quoteReplacement("\"" + inner + "\""));
+            }
+            singleQuoted.appendTail(sb);
+            normalized = sb.toString().replaceAll(",\\s*([}\\]])", "$1");
+            return new JSONArray(normalized);
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static List<StreamCandidate> dedupeAndSortStreams(List<StreamCandidate> list) {
@@ -914,6 +1129,52 @@ public final class TopAnimesEpisodeResolver {
                 return out.toString(StandardCharsets.UTF_8.name());
             }
             throw new IOException("Excesso de redirecionamentos.");
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static String postFormText(String rawUrl, String referer, String formBody, int timeoutMs) throws IOException {
+        if (!isSafeHttpUrl(rawUrl)) {
+            throw new IOException("URL bloqueada.");
+        }
+        HttpURLConnection conn = null;
+        try {
+            URL parsed = new URL(rawUrl);
+            conn = (HttpURLConnection) parsed.openConnection();
+            conn.setInstanceFollowRedirects(false);
+            conn.setConnectTimeout(timeoutMs);
+            conn.setReadTimeout(timeoutMs);
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("User-Agent", DEFAULT_UA);
+            conn.setRequestProperty("Accept", "application/json,text/html,*/*;q=0.9");
+            conn.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8");
+            conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+            conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+            if (referer != null && isSafeHttpUrl(referer)) {
+                conn.setRequestProperty("Referer", referer);
+            }
+            byte[] payload = (formBody != null ? formBody : "").getBytes(StandardCharsets.UTF_8);
+            conn.setDoOutput(true);
+            conn.setFixedLengthStreamingMode(payload.length);
+            try (OutputStream out = conn.getOutputStream()) {
+                out.write(payload);
+            }
+
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                throw new IOException("Servidor retornou HTTP " + code);
+            }
+
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            try (InputStream in = conn.getInputStream()) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                }
+            }
+            return out.toString(StandardCharsets.UTF_8.name());
         } finally {
             if (conn != null) conn.disconnect();
         }

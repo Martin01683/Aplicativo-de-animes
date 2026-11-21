@@ -9,6 +9,11 @@ import {
   Server,
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
+import {
+  createEmbedCacheEntry,
+  isEmbedCacheEntryValid,
+  type CachedEmbedEntry,
+} from '../lib/embedCache';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
 import {
   isDesktopShortcutsEnabled,
@@ -110,7 +115,7 @@ export function EpisodeWorkspace({
     key: number;
   } | null>(null);
 
-  const embedCacheRef = useRef<Map<string, ResolvedEmbed>>(new Map());
+  const embedCacheRef = useRef<Map<string, CachedEmbedEntry>>(new Map());
   const failedServersByEpisodeRef = useRef<Map<string, Set<string>>>(new Map());
   const activeEpisodeUrlRef = useRef(episode.url);
   activeEpisodeUrlRef.current = episode.url;
@@ -184,12 +189,22 @@ export function EpisodeWorkspace({
   const resolveEmbedCached = useCallback(async (opt: PlayerOption): Promise<ResolvedEmbed> => {
     const cacheKey = opt.embedUrl;
     const cached = embedCacheRef.current.get(cacheKey);
-    if (cached) return cached;
+    if (isEmbedCacheEntryValid(cached)) {
+      return cached.data;
+    }
+    if (cached) {
+      embedCacheRef.current.delete(cacheKey);
+    }
 
     try {
       const res = await apiFetch(`/api/resolve-embed?url=${encodeURIComponent(opt.embedUrl)}`);
       const data = (await res.json()) as ResolvedEmbed;
-      embedCacheRef.current.set(cacheKey, data);
+      const entry = createEmbedCacheEntry(data);
+      if (entry) {
+        embedCacheRef.current.set(cacheKey, entry);
+      } else {
+        embedCacheRef.current.delete(cacheKey);
+      }
       return data;
     } catch {
       return {
@@ -294,6 +309,12 @@ export function EpisodeWorkspace({
       failedSet.add(failedNume);
       failedServersByEpisodeRef.current.set(epKey, failedSet);
 
+      // Invalidate any cached signed stream URL (e.g. expired BunnyCDN token) for the failed server
+      const failedOpt = playableOptions.find((o) => o.nume === failedNume);
+      if (failedOpt) {
+        embedCacheRef.current.delete(failedOpt.embedUrl);
+      }
+
       setLoadingEmbed(true);
       try {
         const winner = await findBestAvailableServer(epKey, failedSet);
@@ -326,18 +347,19 @@ export function EpisodeWorkspace({
         setLoadingEmbed(false);
       }
     },
-    [episode.url, findBestAvailableServer, onToast]
+    [episode.url, findBestAvailableServer, onToast, playableOptions]
   );
 
   const handleManualServerSelect = useCallback(
     (opt: PlayerOption) => {
       const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
       const failedSet = failedServersByEpisodeRef.current.get(epKey);
-      if (failedSet) {
+      if (failedSet?.has(opt.nume)) {
         failedSet.delete(opt.nume);
+        embedCacheRef.current.delete(opt.embedUrl);
       }
       setFailoverExhaustedMsg('');
-      setSelectedOption(opt);
+      setSelectedOption({ ...opt });
     },
     [episode.url]
   );

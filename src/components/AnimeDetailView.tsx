@@ -1,4 +1,22 @@
-import { ArrowLeft, Check, CheckCheck, Heart, Play, Star } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  ArrowDownNarrowWide,
+  ArrowLeft,
+  ArrowUpWideNarrow,
+  Calendar,
+  Check,
+  CheckCheck,
+  Clock,
+  ExternalLink,
+  Heart,
+  Layers,
+  Play,
+  Search,
+  SkipForward,
+  Star,
+  X,
+} from 'lucide-react';
+import { isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
 import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
@@ -28,6 +46,7 @@ interface AnimeDetailViewProps {
     label?: string
   ) => void;
   onOpenEpisode: (episodeUrl: string) => void;
+  onOpenAnime?: (animeUrl: string) => void;
   onBack: () => void;
 }
 
@@ -39,11 +58,74 @@ export function AnimeDetailView({
   onToggleFavorite,
   onToggleEpisodesWatched,
   onOpenEpisode,
+  onOpenAnime,
   onBack,
 }: AnimeDetailViewProps) {
+  const [episodeFilter, setEpisodeFilter] = useState('');
+  const [sortDesc, setSortDesc] = useState(false);
+
+  useEffect(() => {
+    setEpisodeFilter('');
+    setSortDesc(false);
+  }, [anime.url]);
+
   const latestEpisode = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster);
   const firstEpisode = anime.episodes[0];
-  const seasonGroups = groupEpisodesBySeason(anime.episodes);
+  const lastEpisodeItem =
+    anime.episodes.length > 1 ? anime.episodes[anime.episodes.length - 1] : null;
+  const quickLastEpisode =
+    latestEpisode && firstEpisode && latestEpisode.episodeUrl !== firstEpisode.url
+      ? {
+          url: latestEpisode.episodeUrl,
+          label: latestEpisode.episodeLabel || latestEpisode.episodeTitle,
+        }
+      : lastEpisodeItem && firstEpisode && lastEpisodeItem.url !== firstEpisode.url
+        ? {
+            url: lastEpisodeItem.url,
+            label: lastEpisodeItem.title,
+          }
+        : null;
+
+  const baseSeasonGroups = useMemo(() => groupEpisodesBySeason(anime.episodes), [anime.episodes]);
+
+  const visibleSeasonGroups = useMemo(() => {
+    const query = episodeFilter.trim().toLowerCase();
+    const isPureDigits = /^\d+$/.test(query);
+    const numericTarget = isPureDigits ? Number.parseInt(query, 10) : null;
+
+    const groups = baseSeasonGroups
+      .map((group) => {
+        const filtered = !query
+          ? group.episodes
+          : group.episodes.filter((ep) => {
+              if (numericTarget !== null) {
+                if (ep.episodeNumber === numericTarget) return true;
+                const labelMatch = ep.numberLabel.match(/(\d+)\s*$/);
+                if (labelMatch && Number.parseInt(labelMatch[1], 10) === numericTarget) {
+                  return true;
+                }
+                const titleNum = ep.title.match(/\b(\d+)\b/);
+                if (titleNum && Number.parseInt(titleNum[1], 10) === numericTarget) {
+                  return true;
+                }
+                return (
+                  ep.numberLabel.toLowerCase().includes(query) ||
+                  ep.title.toLowerCase().includes(query)
+                );
+              }
+              return (
+                ep.title.toLowerCase().includes(query) ||
+                ep.numberLabel.toLowerCase().includes(query) ||
+                (ep.date && ep.date.toLowerCase().includes(query))
+              );
+            });
+        const ordered = sortDesc ? [...filtered].reverse() : filtered;
+        return { ...group, episodes: ordered };
+      })
+      .filter((g) => g.episodes.length > 0);
+
+    return sortDesc ? [...groups].reverse() : groups;
+  }, [baseSeasonGroups, episodeFilter, sortDesc]);
 
   const isWatchedEpisode = (ep: AnimeEpisodeLink) =>
     isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls);
@@ -51,6 +133,49 @@ export function AnimeDetailView({
   const totalWatchedCount = anime.episodes.filter(isWatchedEpisode).length;
   const allEpisodesWatched =
     anime.episodes.length > 0 && totalWatchedCount === anime.episodes.length;
+
+  const subtitleParts: string[] = [];
+  if (anime.alternativeTitle) subtitleParts.push(anime.alternativeTitle);
+  if (
+    anime.originalTitle &&
+    anime.originalTitle.toLowerCase() !== anime.title.toLowerCase() &&
+    anime.originalTitle.toLowerCase() !== (anime.alternativeTitle || '').toLowerCase()
+  ) {
+    subtitleParts.push(anime.originalTitle);
+  }
+
+  const extraMetaItems: Array<{ label: string; value: string; kind?: 'date' | 'clock' | 'star' | 'layers' }> = [];
+  if (anime.firstAirDate) {
+    extraMetaItems.push({ label: 'Estreia', value: anime.firstAirDate, kind: 'date' });
+  }
+  if (anime.lastAirDate) {
+    extraMetaItems.push({ label: 'Último ep.', value: anime.lastAirDate, kind: 'date' });
+  }
+  if (anime.averageDuration) {
+    extraMetaItems.push({ label: 'Duração', value: anime.averageDuration, kind: 'clock' });
+  }
+  if (anime.tmdbRating) {
+    extraMetaItems.push({
+      label: 'TMDb',
+      value: anime.tmdbVotes ? `${anime.tmdbRating} (${anime.tmdbVotes})` : anime.tmdbRating,
+      kind: 'star',
+    });
+  }
+  if (anime.seasonsCount) {
+    extraMetaItems.push({ label: 'Temporadas', value: anime.seasonsCount, kind: 'layers' });
+  }
+  if (anime.episodesTotalCount && anime.episodesTotalCount !== String(anime.episodes.length)) {
+    extraMetaItems.push({ label: 'Total catálogo', value: `${anime.episodesTotalCount} eps` });
+  }
+
+  const handleOpenMyAnimeList = () => {
+    if (!anime.myAnimeListUrl) return;
+    if (isNativeAndroidApp()) {
+      void openExternalOrVlcUrl(anime.myAnimeListUrl);
+      return;
+    }
+    window.open(anime.myAnimeListUrl, '_blank', 'noopener,noreferrer');
+  };
 
   const handleToggleFav = () => {
     onToggleFavorite(
@@ -146,13 +271,19 @@ export function AnimeDetailView({
               {anime.title}
             </h1>
 
+            {subtitleParts.length > 0 && (
+              <p className="mt-1 text-xs font-medium text-slate-400 sm:text-sm">
+                {subtitleParts.join(' · ')}
+              </p>
+            )}
+
             {anime.genres.length > 0 && (
               <p className="mt-2 text-sm text-slate-400">
                 {anime.genres.join(' · ')}
               </p>
             )}
 
-            <div className="mt-4 flex flex-wrap items-center gap-3">
+            <div className="mt-4 flex flex-wrap items-center gap-2.5">
               {firstEpisode && (
                 <button
                   type="button"
@@ -161,6 +292,17 @@ export function AnimeDetailView({
                 >
                   <Play className="h-4 w-4 fill-current" />
                   <span>Assistir {firstEpisode.title}</span>
+                </button>
+              )}
+
+              {quickLastEpisode && (
+                <button
+                  type="button"
+                  onClick={() => onOpenEpisode(quickLastEpisode.url)}
+                  className="inline-flex items-center gap-2 rounded-lg border border-[#f97316]/45 bg-[#f97316]/12 px-4 py-2.5 text-sm font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/20"
+                >
+                  <SkipForward className="h-4 w-4" />
+                  <span>Último ({quickLastEpisode.label})</span>
                 </button>
               )}
 
@@ -179,9 +321,49 @@ export function AnimeDetailView({
                 />
                 <span>{isFavorite ? 'Nos Favoritos' : 'Adicionar aos Favoritos'}</span>
               </button>
+
+              {anime.myAnimeListUrl && (
+                <button
+                  type="button"
+                  onClick={handleOpenMyAnimeList}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/35 bg-sky-500/10 px-3.5 py-2.5 text-xs font-semibold text-sky-300 transition-colors hover:bg-sky-500/20"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  <span>MyAnimeList</span>
+                </button>
+              )}
+
+              {anime.allSeasonsUrl && onOpenAnime && (
+                <button
+                  type="button"
+                  onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#0d0f12] px-3.5 py-2.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white"
+                >
+                  <Layers className="h-3.5 w-3.5 text-[#f97316]" />
+                  <span>Ver todas as temporadas</span>
+                </button>
+              )}
             </div>
 
-            <p className="mt-4 max-w-3xl border-t border-white/10 pt-4 text-sm leading-relaxed text-slate-300">
+            {extraMetaItems.length > 0 && (
+              <dl className="mt-4 flex flex-wrap gap-2 border-t border-white/10 pt-4">
+                {extraMetaItems.map((meta) => (
+                  <div
+                    key={meta.label}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-white/8 bg-[#0d0f12]/70 px-2.5 py-1.5 text-xs"
+                  >
+                    {meta.kind === 'date' && <Calendar className="h-3 w-3 text-slate-400" />}
+                    {meta.kind === 'clock' && <Clock className="h-3 w-3 text-slate-400" />}
+                    {meta.kind === 'star' && <Star className="h-3 w-3 fill-amber-400 text-amber-400" />}
+                    {meta.kind === 'layers' && <Layers className="h-3 w-3 text-slate-400" />}
+                    <dt className="text-slate-400">{meta.label}:</dt>
+                    <dd className="font-medium tabular-nums text-slate-200">{meta.value}</dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+
+            <p className="mt-4 max-w-3xl whitespace-pre-line border-t border-white/10 pt-4 text-sm leading-relaxed text-slate-300">
               {anime.synopsis || 'Sinopse não disponível para este título.'}
             </p>
           </div>
@@ -199,45 +381,103 @@ export function AnimeDetailView({
             )}
           </div>
 
-          {anime.episodes.length > 0 && seasonGroups.length > 1 && (
-            <button
-              type="button"
-              onClick={() =>
-                onToggleEpisodesWatched(
-                  anime.episodes,
-                  !allEpisodesWatched,
+          <div className="flex flex-wrap items-center gap-2">
+            {anime.episodes.length > 1 && (
+              <>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
+                  <input
+                    type="text"
+                    value={episodeFilter}
+                    onChange={(e) => setEpisodeFilter(e.target.value)}
+                    placeholder="Buscar episódio..."
+                    aria-label="Buscar episódio por número ou título"
+                    className="w-40 rounded-lg border border-white/12 bg-[#151921] py-1.5 pl-8 pr-7 text-xs text-white placeholder:text-slate-500 focus:border-[#f97316] focus:outline-none sm:w-48"
+                  />
+                  {episodeFilter && (
+                    <button
+                      type="button"
+                      onClick={() => setEpisodeFilter('')}
+                      aria-label="Limpar busca de episódio"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-slate-400 hover:text-white"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setSortDesc((prev) => !prev)}
+                  aria-pressed={sortDesc}
+                  title="Alternar ordem dos episódios"
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+                >
+                  {sortDesc ? (
+                    <ArrowUpWideNarrow className="h-3.5 w-3.5 text-[#f97316]" />
+                  ) : (
+                    <ArrowDownNarrowWide className="h-3.5 w-3.5 text-[#f97316]" />
+                  )}
+                  <span>{sortDesc ? 'Mais recentes' : 'Crescente'}</span>
+                </button>
+              </>
+            )}
+
+            {anime.episodes.length > 0 && baseSeasonGroups.length > 1 && (
+              <button
+                type="button"
+                onClick={() =>
+                  onToggleEpisodesWatched(
+                    anime.episodes,
+                    !allEpisodesWatched,
+                    allEpisodesWatched
+                      ? 'Todas as temporadas desmarcadas'
+                      : 'Todas as temporadas marcadas como vistas'
+                  )
+                }
+                aria-pressed={allEpisodesWatched}
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                   allEpisodesWatched
-                    ? 'Todas as temporadas desmarcadas'
-                    : 'Todas as temporadas marcadas como vistas'
-                )
-              }
-              aria-pressed={allEpisodesWatched}
-              className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                allEpisodesWatched
-                  ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                  : 'border-white/12 bg-[#151921] text-slate-200 hover:border-[#f97316]/60 hover:text-white'
-              }`}
-            >
-              <CheckCheck className="h-3.5 w-3.5" />
-              <span>
-                {allEpisodesWatched
-                  ? 'Desmarcar todas as temporadas'
-                  : 'Marcar tudo como visto'}
-              </span>
-            </button>
-          )}
+                    ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                    : 'border-white/12 bg-[#151921] text-slate-200 hover:border-[#f97316]/60 hover:text-white'
+                }`}
+              >
+                <CheckCheck className="h-3.5 w-3.5" />
+                <span>
+                  {allEpisodesWatched
+                    ? 'Desmarcar todas as temporadas'
+                    : 'Marcar tudo como visto'}
+                </span>
+              </button>
+            )}
+          </div>
         </div>
 
         {anime.episodes.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
             Nenhum episódio listado nesta página.
           </div>
+        ) : visibleSeasonGroups.length === 0 ? (
+          <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center">
+            <p className="text-sm text-slate-400">
+              Nenhum episódio encontrado para &ldquo;{episodeFilter}&rdquo;.
+            </p>
+            <button
+              type="button"
+              onClick={() => setEpisodeFilter('')}
+              className="mt-3 rounded-lg bg-[#f97316] px-3.5 py-1.5 text-xs font-semibold text-[#0d0f12]"
+            >
+              Limpar filtro
+            </button>
+          </div>
         ) : (
           <div className="space-y-5">
-            {seasonGroups.map((group) => {
-              const seasonWatchedCount = group.episodes.filter(isWatchedEpisode).length;
+            {visibleSeasonGroups.map((group) => {
+              const fullGroup =
+                baseSeasonGroups.find((g) => g.seasonNumber === group.seasonNumber) || group;
+              const seasonWatchedCount = fullGroup.episodes.filter(isWatchedEpisode).length;
               const seasonAllWatched =
-                group.episodes.length > 0 && seasonWatchedCount === group.episodes.length;
+                fullGroup.episodes.length > 0 && seasonWatchedCount === fullGroup.episodes.length;
 
               return (
                 <div
@@ -250,7 +490,7 @@ export function AnimeDetailView({
                         {group.label}
                       </span>
                       <span className="font-mono text-[11px] tabular-nums text-slate-400">
-                        {seasonWatchedCount}/{group.episodes.length} vistos
+                        {seasonWatchedCount}/{fullGroup.episodes.length} vistos
                       </span>
                     </div>
 
@@ -258,7 +498,7 @@ export function AnimeDetailView({
                       type="button"
                       onClick={() =>
                         onToggleEpisodesWatched(
-                          group.episodes,
+                          fullGroup.episodes,
                           !seasonAllWatched,
                           seasonAllWatched
                             ? `${group.label} desmarcada`

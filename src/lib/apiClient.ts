@@ -12,22 +12,34 @@ import {
   pickLatestAnimeEpisode,
 } from './favoriteAlerts';
 import {
+  classifyProviderKind,
+  extractDooPlayAjaxConfig,
+  extractDooPlayNonce,
+  extractMissingDooPlayerOptions,
   extractStreamsFromEmbed,
   inferMediaKindFromUrl,
   parseAnimePageHtml,
+  parseCalendarPageHtml,
   parseCatalogArchiveHtml,
+  parseDooPlayerAjaxResponse,
   parseEpisodePageHtml,
   parseEpisodesArchiveHtml,
   parseHomeHtml,
   parseSearchPageHtml,
+  parseWpGlossaryJson,
+  parseWpSearchJson,
 } from './topanimesParser';
 import type {
   CatalogArchiveCategory,
   CatalogFilters,
+  CatalogMediaItem,
+  EpisodeDetails,
   FavoriteLatestInfo,
   HomeCatalog,
+  PlayerOption,
   ResolvedEmbed,
   SearchResultItem,
+  WeeklyCalendarResponse,
 } from './types';
 import { isSafeExternalHttpUrl, isTopAnimesUrl, unwrapAvisoUrl } from './urlSafety';
 
@@ -36,6 +48,9 @@ export interface NativeFetchPageOptions {
   referer?: string;
   accept?: string;
   timeoutMs?: number;
+  method?: 'GET' | 'POST';
+  body?: string;
+  contentType?: string;
 }
 
 export interface NativeFetchPageResult {
@@ -80,6 +95,8 @@ const MOVIES_ARCHIVE_SNAPSHOT_URL = '/assets/aistudio/captura-topanimes.net-2026
 
 let cachedProxyBaseUrl = '';
 let cachedHome: { value: HomeCatalog; expiresAt: number } | null = null;
+let cachedCalendar: { value: WeeklyCalendarResponse; expiresAt: number } | null = null;
+let cachedDooPlayNonce: { value: string; expiresAt: number } | null = null;
 let cachedFallbackFilters: CatalogFilters | null = null;
 
 export function isNativeAndroidApp(): boolean {
@@ -234,7 +251,14 @@ export interface ApiJsonResponse {
 
 export type PageFetcher = (
   url: string,
-  options?: { referer?: string; accept?: string; timeoutMs?: number }
+  options?: {
+    referer?: string;
+    accept?: string;
+    timeoutMs?: number;
+    method?: 'GET' | 'POST';
+    body?: string;
+    contentType?: string;
+  }
 ) => Promise<NativeFetchPageResult>;
 
 export type SnapshotFetcher = (assetPath: string) => Promise<string | null>;
@@ -258,7 +282,14 @@ async function defaultSnapshotFetcher(assetPath: string): Promise<string | null>
 
 async function nativePageFetcher(
   url: string,
-  options: { referer?: string; accept?: string; timeoutMs?: number } = {}
+  options: {
+    referer?: string;
+    accept?: string;
+    timeoutMs?: number;
+    method?: 'GET' | 'POST';
+    body?: string;
+    contentType?: string;
+  } = {}
 ): Promise<NativeFetchPageResult> {
   if (!isSafeExternalHttpUrl(url)) {
     throw new Error('URL externa inválida ou bloqueada por segurança.');
@@ -268,7 +299,177 @@ async function nativePageFetcher(
     referer: options.referer,
     accept: options.accept,
     timeoutMs: options.timeoutMs,
+    method: options.method,
+    body: options.body,
+    contentType: options.contentType,
   });
+}
+
+function rememberNativeDooPlayNonce(html: string, useCache: boolean): string | null {
+  const found = extractDooPlayNonce(html);
+  if (found && useCache) {
+    cachedDooPlayNonce = { value: found, expiresAt: Date.now() + 25 * 60 * 1000 };
+  }
+  return found;
+}
+
+async function getNativeDooPlayNonce(
+  fetchPage: PageFetcher,
+  forceRefresh: boolean,
+  useCache: boolean
+): Promise<string | null> {
+  if (useCache && !forceRefresh && cachedDooPlayNonce && cachedDooPlayNonce.expiresAt > Date.now()) {
+    return cachedDooPlayNonce.value;
+  }
+  try {
+    const res = await fetchPage(`${TOPANIMES_ORIGIN}/`, {
+      referer: `${TOPANIMES_ORIGIN}/`,
+      timeoutMs: 8000,
+    });
+    if (res.ok) {
+      return rememberNativeDooPlayNonce(res.body, useCache);
+    }
+  } catch {
+    // Ignore nonce fetch errors
+  }
+  return null;
+}
+
+async function getNativeWeeklyCalendar(
+  fetchPage: PageFetcher,
+  readSnapshot: SnapshotFetcher,
+  useCache: boolean
+): Promise<WeeklyCalendarResponse> {
+  if (useCache && cachedCalendar && cachedCalendar.expiresAt > Date.now()) {
+    return cachedCalendar.value;
+  }
+
+  try {
+    const res = await fetchPage(`${TOPANIMES_ORIGIN}/calendario/`, {
+      referer: `${TOPANIMES_ORIGIN}/`,
+      timeoutMs: 10000,
+    });
+    if (res.ok) {
+      rememberNativeDooPlayNonce(res.body, useCache);
+      const parsed = parseCalendarPageHtml(res.body, 'live');
+      if (parsed.days.length > 0) {
+        if (useCache) {
+          cachedCalendar = { value: parsed, expiresAt: Date.now() + 5 * 60 * 1000 };
+        }
+        return parsed;
+      }
+    }
+  } catch {
+    // Fall back to home calendar
+  }
+
+  const home = await getNativeHomeCatalog(fetchPage, readSnapshot);
+  const fallback: WeeklyCalendarResponse = {
+    days: [
+      {
+        id: 'hoje',
+        label: 'Hoje',
+        isToday: true,
+        items: home.calendar,
+      },
+    ],
+    sourceMode: 'snapshot',
+    fetchedAt: new Date().toISOString(),
+  };
+  if (useCache) {
+    cachedCalendar = { value: fallback, expiresAt: Date.now() + 60 * 1000 };
+  }
+  return fallback;
+}
+
+async function hydrateNativeEpisodeOptions(
+  html: string,
+  pageUrl: string,
+  parsed: EpisodeDetails,
+  fetchPage: PageFetcher
+): Promise<EpisodeDetails> {
+  const missing = extractMissingDooPlayerOptions(html);
+  if (missing.length === 0) return parsed;
+
+  const cfg = extractDooPlayAjaxConfig(html);
+  const existingByNume = new Map<string, PlayerOption>();
+  for (const opt of parsed.options) {
+    existingByNume.set(opt.nume, opt);
+  }
+
+  const hydratedList = await Promise.all(
+    missing.map(async (item): Promise<PlayerOption | null> => {
+      const preferWpJson = cfg.playMethod === 'wp_json';
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const useWpJson = (attempt === 0) === preferWpJson;
+        try {
+          let body = '';
+          if (useWpJson) {
+            const target = `${cfg.playerApi}${encodeURIComponent(item.post)}/${encodeURIComponent(
+              item.type
+            )}/${encodeURIComponent(item.nume)}`;
+            const res = await fetchPage(target, {
+              referer: pageUrl,
+              accept: 'application/json,text/html,*/*;q=0.9',
+              timeoutMs: 8000,
+            });
+            if (res.ok) body = res.body;
+          } else {
+            const formBody = new URLSearchParams({
+              action: 'doo_player_ajax',
+              post: item.post,
+              nume: item.nume,
+              type: item.type,
+            }).toString();
+            const res = await fetchPage(cfg.ajaxUrl, {
+              method: 'POST',
+              body: formBody,
+              referer: pageUrl,
+              accept: 'application/json,text/html,*/*;q=0.9',
+              timeoutMs: 8000,
+            });
+            if (res.ok) body = res.body;
+          }
+
+          const embedUrl = parseDooPlayerAjaxResponse(body, pageUrl);
+          if (embedUrl) {
+            const providerKind = classifyProviderKind(item.label, embedUrl);
+            if (providerKind === 'abyss') return null;
+            return {
+              nume: item.nume,
+              label: item.label,
+              embedUrl,
+              providerKind,
+            };
+          }
+        } catch {
+          // Try alternate DooPlay method
+        }
+      }
+      return null;
+    })
+  );
+
+  let changed = false;
+  for (const opt of hydratedList) {
+    if (!opt || existingByNume.has(opt.nume)) continue;
+    existingByNume.set(opt.nume, opt);
+    changed = true;
+  }
+
+  if (!changed) return parsed;
+
+  const merged = Array.from(existingByNume.values()).sort((a, b) => {
+    const na = Number.parseInt(a.nume, 10);
+    const nb = Number.parseInt(b.nume, 10);
+    if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+    return a.nume.localeCompare(b.nume);
+  });
+
+  return {
+    ...parsed,
+    options: merged,
+  };
 }
 
 async function getFallbackCatalogFilters(
@@ -295,6 +496,7 @@ async function getNativeHomeCatalog(
       timeoutMs: 9000,
     });
     if (res.ok) {
+      rememberNativeDooPlayNonce(res.body, true);
       const parsed = parseHomeHtml(res.body, 'live');
       if (parsed.releases.length > 0 || parsed.animes.length > 0) {
         cachedHome = { value: parsed, expiresAt: Date.now() + 3 * 60 * 1000 };
@@ -445,6 +647,7 @@ export async function routeNativeApiRequest(
 ): Promise<ApiJsonResponse> {
   const fetchPage = deps.fetchPage || nativePageFetcher;
   const readSnapshot = deps.readSnapshot || defaultSnapshotFetcher;
+  const useCache = !deps.fetchPage;
   const url = new URL(pathWithQuery, 'http://localhost');
   const pathname = url.pathname;
 
@@ -513,6 +716,152 @@ export async function routeNativeApiRequest(
         status: 502,
         body: { error: err instanceof Error ? err.message : 'Erro ao carregar catálogo.' },
       };
+    }
+  }
+
+  if (pathname === '/api/calendar') {
+    try {
+      const calendar = await getNativeWeeklyCalendar(fetchPage, readSnapshot, useCache);
+      return { status: 200, body: calendar };
+    } catch (err) {
+      return {
+        status: 502,
+        body: {
+          error: err instanceof Error ? err.message : 'Erro ao carregar calendário semanal.',
+        },
+      };
+    }
+  }
+
+  if (pathname === '/api/search-suggest') {
+    const query = (url.searchParams.get('q') || '').trim();
+    if (query.length < 2) {
+      return { status: 200, body: { query, results: [], sourceMode: 'live' } };
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const nonce = await getNativeDooPlayNonce(fetchPage, attempt > 0, useCache);
+        if (!nonce) break;
+        const apiUrl = `${TOPANIMES_ORIGIN}/wp-json/dooplay/search/?keyword=${encodeURIComponent(
+          query
+        )}&nonce=${encodeURIComponent(nonce)}`;
+        const response = await fetchPage(apiUrl, {
+          referer: `${TOPANIMES_ORIGIN}/`,
+          accept: 'application/json,*/*;q=0.9',
+          timeoutMs: 7000,
+        });
+        if (!response.ok) {
+          if (attempt === 0) continue;
+          break;
+        }
+        const rawJson = JSON.parse(response.body) as Record<string, unknown>;
+        if (rawJson && typeof rawJson === 'object' && 'error' in rawJson) {
+          if (attempt === 0 && /nonce|invalid|security/i.test(String(rawJson.error || ''))) {
+            continue;
+          }
+          return { status: 200, body: { query, results: [], sourceMode: 'live' } };
+        }
+        const results = parseWpSearchJson(
+          rawJson as Parameters<typeof parseWpSearchJson>[0]
+        ).slice(0, 10);
+        return { status: 200, body: { query, results, sourceMode: 'live' } };
+      } catch {
+        if (attempt === 0) continue;
+      }
+    }
+
+    try {
+      const catalog = await getNativeHomeCatalog(fetchPage, readSnapshot);
+      const needle = query.toLowerCase();
+      const pool = [...catalog.animes, ...catalog.calendar, ...catalog.movies, ...catalog.releases];
+      const seen = new Set<string>();
+      const results: SearchResultItem[] = [];
+      for (const item of pool) {
+        if (seen.has(item.url)) continue;
+        if (item.title.toLowerCase().includes(needle)) {
+          seen.add(item.url);
+          results.push({
+            id: item.id,
+            title: item.title,
+            url: item.url,
+            kind: item.kind,
+            poster: item.poster,
+            year: item.year,
+            rating: item.rating,
+            audioType: item.audioType,
+          });
+          if (results.length >= 8) break;
+        }
+      }
+      return { status: 200, body: { query, results, sourceMode: 'fallback' } };
+    } catch {
+      return { status: 200, body: { query, results: [], sourceMode: 'fallback' } };
+    }
+  }
+
+  if (pathname === '/api/glossary') {
+    const rawTerm = (url.searchParams.get('term') || '').trim().toLowerCase();
+    const isNumericBucket = rawTerm === '#' || rawTerm === '09' || rawTerm === '0-9';
+    const apiTerm = isNumericBucket ? '09' : /^[a-z]$/.test(rawTerm) ? rawTerm : '';
+    const displayTerm = isNumericBucket ? '#' : apiTerm.toUpperCase();
+    const rawType = (url.searchParams.get('type') || 'all').trim().toLowerCase();
+    const type = ['all', 'tvshows', 'movies'].includes(rawType) ? rawType : 'all';
+
+    if (!apiTerm) {
+      return { status: 400, body: { error: 'Informe uma letra válida (A-Z ou #).' } };
+    }
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const nonce = await getNativeDooPlayNonce(fetchPage, attempt > 0, useCache);
+        if (!nonce) break;
+        const apiUrl = `${TOPANIMES_ORIGIN}/wp-json/dooplay/glossary/?term=${encodeURIComponent(
+          apiTerm
+        )}&nonce=${encodeURIComponent(nonce)}&type=${encodeURIComponent(type)}`;
+        const response = await fetchPage(apiUrl, {
+          referer: `${TOPANIMES_ORIGIN}/animes/`,
+          accept: 'application/json,*/*;q=0.9',
+          timeoutMs: 8000,
+        });
+        if (!response.ok) {
+          if (attempt === 0) continue;
+          break;
+        }
+        const rawJson = JSON.parse(response.body) as Record<string, unknown>;
+        if (rawJson && typeof rawJson === 'object' && 'error' in rawJson) {
+          if (attempt === 0 && /nonce|invalid|security/i.test(String(rawJson.error || ''))) {
+            continue;
+          }
+          return { status: 200, body: { term: displayTerm, type, items: [], sourceMode: 'live' } };
+        }
+        const items = parseWpGlossaryJson(rawJson as Parameters<typeof parseWpGlossaryJson>[0]);
+        return { status: 200, body: { term: displayTerm, type, items, sourceMode: 'live' } };
+      } catch {
+        if (attempt === 0) continue;
+      }
+    }
+
+    try {
+      const catalog = await getNativeHomeCatalog(fetchPage, readSnapshot);
+      const pool: CatalogMediaItem[] =
+        type === 'movies'
+          ? catalog.movies
+          : type === 'tvshows'
+            ? [...catalog.animes, ...catalog.calendar]
+            : [...catalog.animes, ...catalog.calendar, ...catalog.movies];
+      const seen = new Set<string>();
+      const items = pool.filter((item) => {
+        if (seen.has(item.url)) return false;
+        const firstChar = item.title.trim().charAt(0).toLowerCase();
+        const matches = isNumericBucket ? /^[^a-z]$/.test(firstChar) : firstChar === apiTerm;
+        if (!matches) return false;
+        seen.add(item.url);
+        return true;
+      });
+      return { status: 200, body: { term: displayTerm, type, items, sourceMode: 'fallback' } };
+    } catch {
+      return { status: 200, body: { term: displayTerm, type, items: [], sourceMode: 'fallback' } };
     }
   }
 
@@ -881,7 +1230,13 @@ export async function routeNativeApiRequest(
         timeoutMs: 10000,
       });
       if (response.ok) {
-        const parsed = parseEpisodePageHtml(response.body, target);
+        rememberNativeDooPlayNonce(response.body, useCache);
+        const parsed = await hydrateNativeEpisodeOptions(
+          response.body,
+          target,
+          parseEpisodePageHtml(response.body, target),
+          fetchPage
+        );
         return { status: 200, body: { ...parsed, sourceMode: 'live' } };
       }
     } catch {

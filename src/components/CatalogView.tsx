@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import {
   Search,
   X,
@@ -14,7 +14,10 @@ import {
   Shuffle,
   Sparkles,
   Film,
+  Calendar,
+  Star,
 } from 'lucide-react';
+import { apiFetch } from '../lib/apiClient';
 import { isItemFavorited } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
@@ -23,6 +26,7 @@ import {
 } from '../lib/playbackProgress';
 import type {
   AudioType,
+  CalendarDaySection,
   CatalogArchiveCategory,
   CatalogFilters,
   CatalogMediaItem,
@@ -30,11 +34,42 @@ import type {
   HomeCatalog,
   MediaKind,
   SearchResultItem,
+  SearchSuggestResponse,
   SliderMovieItem,
   WatchHistoryEntry,
 } from '../lib/types';
 import type { NavSection } from './Header';
 import { MediaPoster } from './MediaPoster';
+
+const GLOSSARY_TERMS = [
+  '#',
+  'A',
+  'B',
+  'C',
+  'D',
+  'E',
+  'F',
+  'G',
+  'H',
+  'I',
+  'J',
+  'K',
+  'L',
+  'M',
+  'N',
+  'O',
+  'P',
+  'Q',
+  'R',
+  'S',
+  'T',
+  'U',
+  'V',
+  'W',
+  'X',
+  'Y',
+  'Z',
+] as const;
 
 export interface ArchiveCategoryState {
   items: CatalogMediaItem[];
@@ -67,7 +102,11 @@ interface CatalogViewProps {
   catalogFilters: CatalogFilters;
   selectedGenre: string;
   selectedYear: string;
+  selectedGlossary: string;
   filteredCatalog: ArchiveCategoryState;
+  weeklyCalendarDays: CalendarDaySection[];
+  selectedCalendarDay: string;
+  loadingWeeklyCalendar: boolean;
   favorites: CatalogMediaItem[];
   history: WatchHistoryEntry[];
   alerts: FavoriteAlertEntry[];
@@ -83,8 +122,10 @@ interface CatalogViewProps {
   onLoadMoreArchiveCategory: (category: CatalogArchiveCategory) => void;
   onSelectGenre: (genreSlug: string) => void;
   onSelectYear: (yearSlug: string) => void;
+  onSelectGlossary: (term: string) => void;
   onClearCatalogFilters: () => void;
   onLoadMoreFiltered: () => void;
+  onSelectCalendarDay: (dayId: string) => void;
   onOpenItem: (url: string, kind: MediaKind) => void;
   onToggleFavorite: (item: CatalogMediaItem) => void;
   onCheckFavoriteUpdates: () => void;
@@ -130,7 +171,11 @@ export function CatalogView({
   catalogFilters,
   selectedGenre,
   selectedYear,
+  selectedGlossary,
   filteredCatalog,
+  weeklyCalendarDays,
+  selectedCalendarDay,
+  loadingWeeklyCalendar,
   favorites,
   history,
   alerts,
@@ -146,8 +191,10 @@ export function CatalogView({
   onLoadMoreArchiveCategory,
   onSelectGenre,
   onSelectYear,
+  onSelectGlossary,
   onClearCatalogFilters,
   onLoadMoreFiltered,
+  onSelectCalendarDay,
   onOpenItem,
   onToggleFavorite,
   onCheckFavoriteUpdates,
@@ -161,6 +208,11 @@ export function CatalogView({
 }: CatalogViewProps) {
   const [searchInput, setSearchInput] = useState(searchQuery);
   const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>(defaultAudioFilter);
+  const [suggestions, setSuggestions] = useState<SearchResultItem[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [suggestOpen, setSuggestOpen] = useState(false);
+  const searchBoxRef = useRef<HTMLDivElement>(null);
+  const suggestReqGenRef = useRef(0);
 
   useEffect(() => {
     setAudioFilter(defaultAudioFilter);
@@ -170,8 +222,50 @@ export function CatalogView({
     setSearchInput(searchQuery);
   }, [searchQuery]);
 
+  useEffect(() => {
+    const handleOutside = (e: MouseEvent) => {
+      if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
+        setSuggestOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
+
+  useEffect(() => {
+    const trimmed = searchInput.trim();
+    if (!suggestOpen || trimmed.length < 2) {
+      setSuggestions([]);
+      setLoadingSuggestions(false);
+      return;
+    }
+
+    const reqId = ++suggestReqGenRef.current;
+    const timer = window.setTimeout(() => {
+      setLoadingSuggestions(true);
+      apiFetch(`/api/search-suggest?q=${encodeURIComponent(trimmed)}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data: SearchSuggestResponse | null) => {
+          if (suggestReqGenRef.current !== reqId) return;
+          setSuggestions(Array.isArray(data?.results) ? data.results.slice(0, 8) : []);
+        })
+        .catch(() => {
+          if (suggestReqGenRef.current !== reqId) return;
+          setSuggestions([]);
+        })
+        .finally(() => {
+          if (suggestReqGenRef.current === reqId) {
+            setLoadingSuggestions(false);
+          }
+        });
+    }, 300);
+
+    return () => window.clearTimeout(timer);
+  }, [searchInput, suggestOpen]);
+
   const handleSearchSubmit = (e: FormEvent) => {
     e.preventDefault();
+    setSuggestOpen(false);
     onSearch(searchInput.trim());
   };
 
@@ -203,7 +297,8 @@ export function CatalogView({
     if (item.quality) metaParts.push(item.quality);
     if (item.year) metaParts.push(item.year);
     if (item.rating && Number.parseFloat(item.rating) > 0) metaParts.push(`★ ${item.rating}`);
-    if (item.isHiatus) metaParts.push('Hiato');
+    if (item.statusBadge) metaParts.push(item.statusBadge);
+    else if (item.isHiatus) metaParts.push('Hiato');
 
     const favActive = isItemFavorited(item.url, favorites);
 
@@ -269,11 +364,25 @@ export function CatalogView({
     );
   };
 
-  const hasActiveFilter = Boolean(selectedGenre || selectedYear);
+  const hasActiveFilter = Boolean(selectedGenre || selectedYear || selectedGlossary);
   const displayedArchive = hasActiveFilter
     ? filteredCatalog
     : archiveState[archiveCategory];
   const activeGenreLabel = catalogFilters.genres.find((g) => g.slug === selectedGenre)?.label;
+
+  const effectiveCalendarDays: CalendarDaySection[] =
+    weeklyCalendarDays.length > 0
+      ? weeklyCalendarDays
+      : catalog
+        ? [{ id: 'hoje', label: 'Hoje', isToday: true, items: catalog.calendar }]
+        : [];
+  const activeCalendarDay =
+    effectiveCalendarDays.find((d) => d.id === selectedCalendarDay) ||
+    effectiveCalendarDays[0] ||
+    null;
+
+  const showSuggestDropdown =
+    suggestOpen && searchInput.trim().length >= 2 && (loadingSuggestions || suggestions.length > 0);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
@@ -287,13 +396,25 @@ export function CatalogView({
             Buscar anime, episódio ou filme
           </label>
           <div className="flex flex-wrap gap-2 sm:flex-nowrap">
-            <div className="relative min-w-0 flex-1">
+            <div ref={searchBoxRef} className="relative min-w-0 flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
               <input
                 id="catalog-search-input"
                 type="text"
+                autoComplete="off"
                 value={searchInput}
-                onChange={(e) => setSearchInput(e.target.value)}
+                onFocus={() => {
+                  if (searchInput.trim().length >= 2) setSuggestOpen(true);
+                }}
+                onChange={(e) => {
+                  setSearchInput(e.target.value);
+                  setSuggestOpen(e.target.value.trim().length >= 2);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    setSuggestOpen(false);
+                  }
+                }}
                 placeholder="Ex: Kusuriya, Frieren, Naruto, Dublado..."
                 className="w-full rounded-lg border border-white/12 bg-[#0d0f12] py-2.5 pl-9 pr-9 text-sm text-white placeholder:text-slate-500 focus:border-[#f97316] focus:outline-none"
               />
@@ -302,6 +423,8 @@ export function CatalogView({
                   type="button"
                   onClick={() => {
                     setSearchInput('');
+                    setSuggestions([]);
+                    setSuggestOpen(false);
                     onClearSearch();
                   }}
                   aria-label="Limpar busca"
@@ -309,6 +432,80 @@ export function CatalogView({
                 >
                   <X className="h-4 w-4" />
                 </button>
+              )}
+
+              {showSuggestDropdown && (
+                <div
+                  role="listbox"
+                  aria-label="Sugestões de busca"
+                  className="absolute left-0 right-0 top-full z-30 mt-1.5 overflow-hidden rounded-xl border border-white/15 bg-[#151921] shadow-2xl"
+                >
+                  {loadingSuggestions && suggestions.length === 0 ? (
+                    <div className="flex items-center gap-2 px-3.5 py-3 text-xs text-slate-400">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                      <span>Buscando sugestões...</span>
+                    </div>
+                  ) : (
+                    <div className="max-h-80 divide-y divide-white/8 overflow-y-auto">
+                      {suggestions.map((item) => (
+                        <button
+                          key={item.url}
+                          type="button"
+                          role="option"
+                          onClick={() => {
+                            setSuggestOpen(false);
+                            onOpenItem(item.url, item.kind);
+                          }}
+                          className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-white/5"
+                        >
+                          <MediaPoster
+                            src={item.poster}
+                            alt={item.title}
+                            aspect="portrait"
+                            className="h-12 w-9 shrink-0 rounded border border-white/10"
+                          />
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-medium text-white">
+                              {item.title}
+                            </p>
+                            <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                              <span>{item.kind === 'movie' ? 'Filme' : 'Anime'}</span>
+                              {item.audioType && (
+                                <span
+                                  className={
+                                    item.audioType === 'DUB'
+                                      ? 'text-emerald-400'
+                                      : 'text-rose-400'
+                                  }
+                                >
+                                  {item.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
+                                </span>
+                              )}
+                              {item.year && <span className="tabular-nums">{item.year}</span>}
+                              {item.rating && (
+                                <span className="inline-flex items-center gap-0.5 tabular-nums text-amber-400">
+                                  <Star className="h-3 w-3 fill-amber-400" />
+                                  {item.rating}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSuggestOpen(false);
+                          onSearch(searchInput.trim());
+                        }}
+                        className="flex w-full items-center justify-center gap-1.5 bg-[#0d0f12]/70 px-3.5 py-2.5 text-xs font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/15"
+                      >
+                        <Search className="h-3.5 w-3.5" />
+                        <span>Ver todos os resultados para &ldquo;{searchInput.trim()}&rdquo;</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
             <div className="flex w-full gap-2 sm:w-auto">
@@ -713,17 +910,78 @@ export function CatalogView({
 
           {activeSection === 'calendar' && (
             <section>
-              <div className="mb-5 border-b border-white/10 pb-3">
-                <h1 className="text-xl font-bold text-white">
-                  Calendário da Temporada
-                </h1>
-                <p className="mt-0.5 text-xs text-slate-400">
-                  Séries em exibição semanal — abra uma série para escolher o episódio e assistir
-                </p>
+              <div className="mb-5 space-y-4 border-b border-white/10 pb-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Calendar className="h-4 w-4 text-[#f97316]" />
+                      <h1 className="text-xl font-bold text-white">
+                        Calendário Semanal
+                      </h1>
+                    </div>
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      Séries em exibição semanal — filtre por dia da semana e abra para escolher o episódio
+                    </p>
+                  </div>
+
+                  {loadingWeeklyCalendar && (
+                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                      <span>Atualizando semana...</span>
+                    </span>
+                  )}
+                </div>
+
+                {effectiveCalendarDays.length > 1 && (
+                  <div
+                    role="tablist"
+                    aria-label="Dias da semana"
+                    className="flex flex-wrap items-center gap-1.5"
+                  >
+                    {effectiveCalendarDays.map((day) => {
+                      const active = activeCalendarDay?.id === day.id;
+                      return (
+                        <button
+                          key={day.id}
+                          type="button"
+                          role="tab"
+                          aria-selected={active}
+                          onClick={() => onSelectCalendarDay(day.id)}
+                          className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                            active
+                              ? 'border-[#f97316] bg-[#f97316]/15 text-white'
+                              : 'border-white/10 bg-[#151921] text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {day.label}
+                          <span className="ml-1.5 tabular-nums opacity-75">
+                            ({day.items.length})
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                {catalog.calendar.map((item) => renderCard(item, 'portrait'))}
-              </div>
+
+              {loadingWeeklyCalendar && !activeCalendarDay ? (
+                <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                  {Array.from({ length: 10 }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="aspect-[2/3] animate-pulse rounded-xl border border-white/8 bg-[#151921]"
+                    />
+                  ))}
+                </div>
+              ) : !activeCalendarDay || activeCalendarDay.items.length === 0 ? (
+                <div className="rounded-xl border border-white/10 bg-[#151921] p-10 text-center text-sm text-slate-400">
+                  Nenhum anime listado para este dia no momento.
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                  {activeCalendarDay.items.map((item) => renderCard(item, 'portrait'))}
+                </div>
+              )}
             </section>
           )}
 
@@ -735,14 +993,20 @@ export function CatalogView({
                     <h1 className="text-xl font-bold text-white">Animes &amp; Filmes</h1>
                     <p className="mt-0.5 text-xs tabular-nums text-slate-400">
                       {hasActiveFilter
-                        ? `${selectedGenre ? `Gênero: ${activeGenreLabel || selectedGenre}` : `Ano: ${selectedYear}`} · ${displayedArchive.items.length} título(s)${
+                        ? `${
+                            selectedGlossary
+                              ? `Índice A–Z: ${selectedGlossary}`
+                              : selectedGenre
+                                ? `Gênero: ${activeGenreLabel || selectedGenre}`
+                                : `Ano: ${selectedYear}`
+                          } · ${displayedArchive.items.length} título(s)${
                             displayedArchive.totalPages > 1
                               ? ` · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
                               : ''
                           }`
                         : displayedArchive.totalPages > 1
                           ? `Exibindo ${displayedArchive.items.length} título(s) · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
-                          : 'Navegue por categoria, gênero ou ano de lançamento'}
+                          : 'Navegue por categoria, gênero, ano ou índice alfabético A–Z'}
                     </p>
                   </div>
 
@@ -770,7 +1034,7 @@ export function CatalogView({
                 </div>
 
                 {/* Genre & Year Filter Bar */}
-                {(catalogFilters.genres.length > 0 || catalogFilters.years.length > 0) && (
+                {(catalogFilters.genres.length > 0 || catalogFilters.years.length > 0 || hasActiveFilter) && (
                   <div className="flex flex-wrap items-center gap-2.5">
                     {catalogFilters.genres.length > 0 && (
                       <select
@@ -816,6 +1080,29 @@ export function CatalogView({
                     )}
                   </div>
                 )}
+
+                {/* Alphabetical A-Z Glossary Strip */}
+                <div className="flex flex-wrap items-center gap-1" aria-label="Navegação alfabética A-Z">
+                  <span className="mr-1 text-[11px] font-medium text-slate-400">A–Z:</span>
+                  {GLOSSARY_TERMS.map((letter) => {
+                    const active = selectedGlossary === letter;
+                    return (
+                      <button
+                        key={letter}
+                        type="button"
+                        onClick={() => onSelectGlossary(active ? '' : letter)}
+                        aria-pressed={active}
+                        className={`flex h-7 min-w-[28px] items-center justify-center rounded-md border px-1.5 text-xs font-semibold transition-colors ${
+                          active
+                            ? 'border-[#f97316] bg-[#f97316] text-[#0d0f12]'
+                            : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                        }`}
+                      >
+                        {letter}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
               {/* Em Destaque Strip on Animes Tab */}
@@ -925,9 +1212,11 @@ export function CatalogView({
                 <div>
                   <h2 className="mb-3 text-base font-semibold text-white">
                     {hasActiveFilter
-                      ? selectedGenre
-                        ? `Animes de ${activeGenreLabel || selectedGenre}`
-                        : `Lançamentos de ${selectedYear}`
+                      ? selectedGlossary
+                        ? `Títulos com "${selectedGlossary}"`
+                        : selectedGenre
+                          ? `Animes de ${activeGenreLabel || selectedGenre}`
+                          : `Lançamentos de ${selectedYear}`
                       : archiveCategory === 'movies'
                         ? 'Catálogo de Filmes'
                         : 'Adicionado recentemente'}

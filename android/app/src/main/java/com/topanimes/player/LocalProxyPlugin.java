@@ -207,6 +207,10 @@ public class LocalProxyPlugin extends Plugin {
         }
         String referer = call.getString("referer", "https://topanimes.net/");
         String accept = call.getString("accept", "text/html,application/xhtml+xml,application/json,*/*;q=0.9");
+        String rawMethod = call.getString("method", "GET");
+        String method = "POST".equalsIgnoreCase(rawMethod) ? "POST" : "GET";
+        String requestBody = call.getString("body", null);
+        String contentType = call.getString("contentType", null);
         int timeoutMs = call.getInt("timeoutMs", 12000);
 
         if (executor == null || executor.isShutdown()) {
@@ -216,7 +220,16 @@ public class LocalProxyPlugin extends Plugin {
         executor.execute(() -> {
             HttpURLConnection conn = null;
             try {
-                RedirectResult res = openWithRedirects(rawUrl, referer, accept, null, timeoutMs);
+                RedirectResult res = openWithRedirects(
+                    rawUrl,
+                    referer,
+                    accept,
+                    null,
+                    timeoutMs,
+                    method,
+                    requestBody,
+                    contentType
+                );
                 conn = res.connection;
                 int status = conn.getResponseCode();
                 InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
@@ -954,7 +967,22 @@ public class LocalProxyPlugin extends Plugin {
         String rangeHeader,
         int timeoutMs
     ) throws IOException {
+        return openWithRedirects(rawUrl, referer, accept, rangeHeader, timeoutMs, "GET", null, null);
+    }
+
+    private static RedirectResult openWithRedirects(
+        String rawUrl,
+        String referer,
+        String accept,
+        String rangeHeader,
+        int timeoutMs,
+        String initialMethod,
+        String requestBody,
+        String contentType
+    ) throws IOException {
         String currentUrl = rawUrl;
+        String currentMethod = "POST".equalsIgnoreCase(initialMethod) ? "POST" : "GET";
+        String currentBody = "POST".equals(currentMethod) ? requestBody : null;
         for (int hop = 0; hop <= 4; hop++) {
             if (!isSafeHttpUrl(currentUrl)) {
                 throw new IOException("URL bloqueada por segurança.");
@@ -964,7 +992,7 @@ public class LocalProxyPlugin extends Plugin {
             conn.setInstanceFollowRedirects(false);
             conn.setConnectTimeout(timeoutMs);
             conn.setReadTimeout(timeoutMs);
-            conn.setRequestMethod("GET");
+            conn.setRequestMethod(currentMethod);
             conn.setRequestProperty("User-Agent", DEFAULT_UA);
             conn.setRequestProperty("Accept", accept != null ? accept : "*/*");
             conn.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8");
@@ -978,8 +1006,24 @@ public class LocalProxyPlugin extends Plugin {
                 && !isTikTokCdn) {
                 conn.setRequestProperty("Referer", referer);
             }
-            if (rangeHeader != null && !rangeHeader.isEmpty()) {
+            if (rangeHeader != null && !rangeHeader.isEmpty() && "GET".equals(currentMethod)) {
                 conn.setRequestProperty("Range", rangeHeader);
+            }
+
+            if ("POST".equals(currentMethod) && currentBody != null) {
+                byte[] payload = currentBody.getBytes(StandardCharsets.UTF_8);
+                conn.setDoOutput(true);
+                conn.setRequestProperty(
+                    "Content-Type",
+                    contentType != null && !contentType.isEmpty()
+                        ? contentType
+                        : "application/x-www-form-urlencoded; charset=UTF-8"
+                );
+                conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+                conn.setFixedLengthStreamingMode(payload.length);
+                try (OutputStream out = conn.getOutputStream()) {
+                    out.write(payload);
+                }
             }
 
             int code = conn.getResponseCode();
@@ -988,6 +1032,10 @@ public class LocalProxyPlugin extends Plugin {
                 conn.disconnect();
                 if (loc == null || loc.isEmpty()) {
                     throw new IOException("Redirecionamento sem destino.");
+                }
+                if (code != 307 && code != 308) {
+                    currentMethod = "GET";
+                    currentBody = null;
                 }
                 currentUrl = new URL(parsed, loc).toString();
                 continue;
