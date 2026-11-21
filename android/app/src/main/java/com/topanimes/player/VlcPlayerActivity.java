@@ -267,6 +267,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private long sessionCounter = 0L;
     private long endReachedHandledSessionGen = -1L;
     private boolean hasPlaybackStartedForStream = false;
+    private int playbackTimeAdvanceCount = 0;
+    private long firstTimeChangedMs = -1L;
+    private boolean userInitiatedPause = false;
+    private boolean triedAlternateTransport = false;
     private int currentServerRetryCount = 0;
 
     private float currentSpeed = 1.0f;
@@ -524,8 +528,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
         String proxy = safeStr(intent.getStringExtra(EXTRA_PROXY_BASE_URL));
         if (!proxy.isEmpty()) {
             proxyBaseUrl = proxy;
-        } else if (LocalProxyPlugin.sharedProxyBaseUrl != null) {
-            proxyBaseUrl = LocalProxyPlugin.sharedProxyBaseUrl;
+        } else {
+            String ensured = LocalProxyPlugin.ensureSharedProxyBaseUrl();
+            if (ensured != null && !ensured.isEmpty()) {
+                proxyBaseUrl = ensured;
+            }
         }
 
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
@@ -541,6 +548,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
 
         preferDirect = intent.getBooleanExtra(EXTRA_PREFER_DIRECT, false);
+        triedAlternateTransport = false;
         useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
 
         boolean forceStart = intent.getBooleanExtra(EXTRA_FORCE_START_POSITION, false);
@@ -777,9 +785,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     float pct = event.getBuffering();
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
-                        if (pct >= 100f && !loadingEpisode) {
+                        if (pct >= 100f && !loadingEpisode && (hasActiveVout || hasPlaybackStartedForStream)) {
                             hideLoading();
-                        } else if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
+                        } else if (mediaPlayer != null && (!mediaPlayer.isPlaying() || !hasPlaybackStartedForStream)) {
                             showLoading(loadingEpisode ? "Carregando episódio..." : null);
                         }
                     });
@@ -791,6 +799,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         hasActiveVout = voutCount > 0;
                         if (hasActiveVout && mediaPlayer != null) {
                             mediaPlayer.setVideoScale(SCALE_OPTIONS[currentScaleIdx]);
+                            if (!loadingEpisode) {
+                                hideLoading();
+                                if (!pauseAfterRestoreFrame && mediaPlayer.isPlaying()) {
+                                    updatePlayPauseIcons(true);
+                                    scheduleControlsAutoHide();
+                                }
+                            }
+                            if (firstTimeChangedMs >= 0L && !hasPlaybackStartedForStream) {
+                                markPlaybackStartedForStream();
+                            }
                             maybeSchedulePauseAfterRestoreFrame();
                         }
                     });
@@ -798,14 +816,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 case MediaPlayer.Event.Playing:
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
-                        uiHandler.removeCallbacks(loadWatchdogRunnable);
-                        hasPlaybackStartedForStream = true;
                         playbackFailed = false;
                         playbackEnded = false;
                         loadingEpisode = false;
-                        hideLoading();
+                        userInitiatedPause = false;
                         errorOverlay.setVisibility(View.GONE);
                         updateEpisodeNavButtons();
+                        if (hasActiveVout || hasPlaybackStartedForStream) {
+                            hideLoading();
+                        }
                         applyPendingSeekIfReady();
                         if (mediaPlayer != null) {
                             mediaPlayer.setRate(holdSpeedActive ? 2.0f : currentSpeed);
@@ -834,7 +853,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             setControlsVisible(true);
                             uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
                             uiHandler.postDelayed(pauseAfterRestoreFallbackRunnable, 4000L);
-                        } else {
+                        } else if (hasActiveVout || hasPlaybackStartedForStream) {
                             updatePlayPauseIcons(true);
                             scheduleControlsAutoHide();
                         }
@@ -843,7 +862,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 case MediaPlayer.Event.Paused:
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
-                        uiHandler.removeCallbacks(loadWatchdogRunnable);
+                        if (hasPlaybackStartedForStream || userInitiatedPause || pauseAfterRestoreFrame) {
+                            uiHandler.removeCallbacks(loadWatchdogRunnable);
+                        }
                         updatePlayPauseIcons(false);
                         setControlsVisible(true);
                         saveCurrentEpisodeProgress(false);
@@ -877,9 +898,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             return;
                         }
                         lastKnownPositionMs = timeMs;
-                        if (timeMs > 500L) {
-                            hasPlaybackStartedForStream = true;
-                            uiHandler.removeCallbacks(loadWatchdogRunnable);
+                        if (firstTimeChangedMs < 0L) {
+                            firstTimeChangedMs = timeMs;
+                        }
+                        playbackTimeAdvanceCount++;
+                        if (!hasPlaybackStartedForStream) {
+                            boolean confirmedWithVideo = hasActiveVout
+                                && (timeMs > 0L || playbackTimeAdvanceCount >= 2);
+                            boolean confirmedTimeProgress = timeMs >= 1000L
+                                && Math.abs(timeMs - firstTimeChangedMs) >= 400L;
+                            if (confirmedWithVideo || confirmedTimeProgress) {
+                                markPlaybackStartedForStream();
+                            }
                         }
                         if (!userScrubbing) {
                             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, timeMs));
@@ -973,6 +1003,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private void finishPauseAfterRestoreFrame() {
         pauseAfterRestoreScheduled = false;
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
         if (!pauseAfterRestoreFrame || isFinishing() || isDestroyed()) return;
@@ -1098,6 +1129,30 @@ public class VlcPlayerActivity extends AppCompatActivity {
         btnPlayBottom.setImageResource(res);
     }
 
+    private void markPlaybackStartedForStream() {
+        if (hasPlaybackStartedForStream) return;
+        hasPlaybackStartedForStream = true;
+        playbackFailed = false;
+        loadingEpisode = false;
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
+        hideLoading();
+        errorOverlay.setVisibility(View.GONE);
+        updateEpisodeNavButtons();
+        if (!pauseAfterRestoreFrame) {
+            updatePlayPauseIcons(true);
+            scheduleControlsAutoHide();
+        }
+    }
+
+    private static boolean shouldSkipDirectFallbackForUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.isEmpty()) return false;
+        String lower = rawUrl.toLowerCase(Locale.ROOT);
+        if (lower.contains(".m3u8")) {
+            return lower.contains("b-cdn.net") || lower.contains("tiktokcdn.com");
+        }
+        return false;
+    }
+
     private void prepareAndPlayCurrentStream() {
         prepareAndPlayCurrentStream(false);
     }
@@ -1134,6 +1189,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return;
         }
 
+        String ensuredProxy = LocalProxyPlugin.ensureSharedProxyBaseUrl();
+        if (ensuredProxy != null && !ensuredProxy.isEmpty()) {
+            proxyBaseUrl = ensuredProxy;
+            if (!preferDirect && !triedAlternateTransport) {
+                useProxyForAttempt = true;
+            }
+        }
+
         attachVideoViewsIfNeeded();
         if (!pauseAfterFirstFrame) {
             requestAudioFocus();
@@ -1151,10 +1214,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
 
         hasPlaybackStartedForStream = false;
+        playbackTimeAdvanceCount = 0;
+        firstTimeChangedMs = -1L;
+        userInitiatedPause = false;
         playbackFailed = false;
+        loadingEpisode = false;
         subtitlesAttached = false;
+        updateEpisodeNavButtons();
         errorOverlay.setVisibility(View.GONE);
-        showLoading(loadingEpisode ? "Carregando episódio..." : null);
+        showLoading(null);
 
         activePlaybackSessionGen = ++sessionCounter;
 
@@ -1176,22 +1244,38 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private void handlePlaybackError() {
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         boolean keepPaused = pauseAfterRestoreFrame;
-        if (!useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
-            useProxyForAttempt = true;
-            pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
-            prepareAndPlayCurrentStream(keepPaused);
-            return;
+
+        if (proxyBaseUrl.isEmpty()) {
+            String ensured = LocalProxyPlugin.ensureSharedProxyBaseUrl();
+            if (ensured != null && !ensured.isEmpty()) {
+                proxyBaseUrl = ensured;
+            }
         }
-        if (useProxyForAttempt && !preferDirect) {
-            preferDirect = true;
-            useProxyForAttempt = false;
-            pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
-            prepareAndPlayCurrentStream(keepPaused);
-            return;
+
+        String currentUrl = (!streams.isEmpty() && currentStreamIdx >= 0 && currentStreamIdx < streams.size())
+            ? streams.get(currentStreamIdx).url
+            : "";
+
+        if (!triedAlternateTransport) {
+            if (!useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
+                triedAlternateTransport = true;
+                useProxyForAttempt = true;
+                pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
+                prepareAndPlayCurrentStream(keepPaused);
+                return;
+            }
+            if (useProxyForAttempt && !shouldSkipDirectFallbackForUrl(currentUrl)) {
+                triedAlternateTransport = true;
+                useProxyForAttempt = false;
+                pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
+                prepareAndPlayCurrentStream(keepPaused);
+                return;
+            }
         }
 
         if (currentServerRetryCount < MAX_RETRIES_PER_SERVER) {
             currentServerRetryCount++;
+            triedAlternateTransport = false;
             useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
             pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
             prepareAndPlayCurrentStream(keepPaused);
@@ -1345,6 +1429,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
                 loadingEpisode = false;
                 currentServerRetryCount = 0;
+                triedAlternateTransport = false;
                 selectedServerNume = winner.option.nume;
                 referer = winner.resolved.referer;
                 preferDirect = winner.resolved.preferDirect;
@@ -1515,6 +1600,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         findViewById(R.id.vlc_btn_retry).setOnClickListener(v -> {
             failedServerNumes.clear();
             currentServerRetryCount = 0;
+            triedAlternateTransport = false;
             synchronized (embedProbeCache) {
                 embedProbeCache.clear();
             }
@@ -1788,11 +1874,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return;
         }
         if (mediaPlayer.isPlaying()) {
+            userInitiatedPause = true;
             mediaPlayer.pause();
         } else if (playbackEnded
             || !mediaPlayer.getVLCVout().areViewsAttached()
             || !mediaPlayer.hasMedia()
             || activePlaybackSessionGen <= 0L) {
+            userInitiatedPause = false;
             if (playbackEnded) {
                 playbackEnded = false;
                 pendingSeekMs = 0L;
@@ -1802,6 +1890,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             }
             prepareAndPlayCurrentStream(false);
         } else {
+            userInitiatedPause = false;
             requestAudioFocus();
             mediaPlayer.play();
             scheduleControlsAutoHide();
@@ -2130,6 +2219,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     if (!resolved.selectedServerNume.isEmpty()) selectedServerNume = resolved.selectedServerNume;
                     referer = resolved.referer;
                     preferDirect = resolved.preferDirect;
+                    triedAlternateTransport = false;
                     useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
 
                     long savedForResolved = getSavedResumePositionMs(episodeUrl);
@@ -2274,6 +2364,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         if (idx != currentStreamIdx) {
                             currentStreamIdx = idx;
                             pendingSeekMs = Math.max(0L, lastKnownPositionMs);
+                            triedAlternateTransport = false;
                             useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
                             prepareAndPlayCurrentStream();
                         }
@@ -2417,6 +2508,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 selectedServerNume = opt.nume;
                 referer = resolved.referer;
                 preferDirect = resolved.preferDirect;
+                triedAlternateTransport = false;
                 useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
                 pendingSeekMs = resumePos;
                 streams.clear();
@@ -2542,6 +2634,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
                 uiHandler.post(() -> {
                     if (!pauseAfterRestoreFrame && mediaPlayer != null && mediaPlayer.isPlaying()) {
+                        userInitiatedPause = true;
                         mediaPlayer.pause();
                     }
                 });

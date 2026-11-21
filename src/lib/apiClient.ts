@@ -408,7 +408,7 @@ async function resolveNativeEmbedUrl(
 
     const firstUrl = extracted.streams[0]?.url || '';
     const preferDirect =
-      /(?:^|\.)(?:booonceivu\.shop|123flmsfree\.com|321moviesfree\.com|tiktokcdn\.com)$/i.test(
+      /(?:^|\.)(?:booonceivu\.shop|123flmsfree\.com|321moviesfree\.com)$/i.test(
         new URL(firstUrl).hostname
       );
 

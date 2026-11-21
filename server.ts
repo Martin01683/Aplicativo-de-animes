@@ -41,6 +41,14 @@ import {
   parseGitHubReleasePayload,
 } from './src/lib/appUpdater.ts';
 import { buildM3uPlaylist, DEFAULT_BROWSER_UA, sanitizeFilename } from './src/lib/vlc.ts';
+import {
+  adjustContentRangeForStrip,
+  findMpegTsSyncOffset,
+  isDisguisedContentType,
+  isStartAtZeroRange,
+  looksLikeM3u8Manifest,
+  TS_PROBE_BUFFER_SIZE,
+} from './src/lib/mpegTsUnmask.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -131,9 +139,16 @@ async function safeFetch(
       Accept: options.accept || 'text/html,application/xhtml+xml,application/json,*/*;q=0.9',
       'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
     };
-    // filevideo1.com blocks requests carrying csst.online as Referer (403)
+    // filevideo1.com blocks requests carrying csst.online as Referer (403);
+    // tiktokcdn.com does not need Referer and works cleanly without leaking topanimes.net
     const isFileVideo = /filevideo1\.com/i.test(validated.hostname);
-    if (options.referer && isSafeExternalHttpUrl(options.referer) && !(isFileVideo && /csst\.online/i.test(options.referer))) {
+    const isTikTokCdn = /(?:^|\.)tiktokcdn\.com$/i.test(validated.hostname);
+    if (
+      options.referer &&
+      isSafeExternalHttpUrl(options.referer) &&
+      !(isFileVideo && /csst\.online/i.test(options.referer)) &&
+      !isTikTokCdn
+    ) {
       headers.Referer = options.referer;
     }
     if (options.range) {
@@ -362,7 +377,8 @@ function rewriteM3u8Playlist(manifest: string, baseManifestUrl: string, referer:
         const abs = new URL(trimmed, baseManifestUrl).href;
         if (!isSafeExternalHttpUrl(abs)) return line;
         if (DIRECT_SEGMENT_HOSTS_RE.test(new URL(abs).hostname)) return abs;
-        return `/api/stream-proxy?url=${encodeURIComponent(abs)}&referer=${encodeURIComponent(referer)}`;
+        const isNestedPlaylist = /\.m3u8(?:$|\?)/i.test(abs);
+        return `/api/stream-proxy?url=${encodeURIComponent(abs)}&referer=${encodeURIComponent(referer)}${isNestedPlaylist ? '' : '&hls_seg=1'}`;
       } catch {
         return line;
       }
@@ -953,6 +969,7 @@ async function createAppServer(): Promise<void> {
     const refererParam = String(req.query.referer || `${TOPANIMES_ORIGIN}/`).trim();
     const referer = isSafeExternalHttpUrl(refererParam) ? refererParam : `${TOPANIMES_ORIGIN}/`;
     const isDownload = String(req.query.download || '') === '1';
+    const isHlsSegment = String(req.query.hls_seg || '') === '1';
 
     if (!isSafeExternalHttpUrl(targetUrl)) {
       res.status(400).send('URL inválida');
@@ -997,6 +1014,122 @@ async function createAppServer(): Promise<void> {
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.send(rewritten);
         return;
+      }
+
+      const shouldProbeTs =
+        upstream.ok &&
+        !isDownload &&
+        Boolean(upstream.body) &&
+        isStartAtZeroRange(rangeHeader) &&
+        (isHlsSegment || isDisguisedContentType(contentType));
+
+      if (shouldProbeTs && upstream.body) {
+        const reader = upstream.body.getReader();
+        const onAbort = () => {
+          reader.cancel().catch(() => {});
+        };
+        streamAbort.signal.addEventListener('abort', onAbort, { once: true });
+
+        try {
+          const probeChunks: Buffer[] = [];
+          let bufferedLen = 0;
+          let reachedEof = false;
+
+          while (bufferedLen < TS_PROBE_BUFFER_SIZE) {
+            const { done, value } = await reader.read();
+            if (done) {
+              reachedEof = true;
+              break;
+            }
+            if (value && value.byteLength > 0) {
+              const chunkBuf = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+              probeChunks.push(chunkBuf);
+              bufferedLen += chunkBuf.length;
+            }
+          }
+
+          const initialBuf = Buffer.concat(probeChunks, bufferedLen);
+
+          if (looksLikeM3u8Manifest(initialBuf, Math.min(initialBuf.length, TS_PROBE_BUFFER_SIZE))) {
+            const restChunks: Buffer[] = [initialBuf];
+            if (!reachedEof) {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value && value.byteLength > 0) {
+                  restChunks.push(Buffer.from(value.buffer, value.byteOffset, value.byteLength));
+                }
+              }
+            }
+            const rawManifest = Buffer.concat(restChunks).toString('utf8');
+            const rewritten = rewriteM3u8Playlist(rawManifest, upstream.url || targetUrl, referer);
+            res.status(200);
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.send(rewritten);
+            return;
+          }
+
+          const tsOffset = findMpegTsSyncOffset(initialBuf, initialBuf.length, reachedEof);
+          let outStatus = upstream.status;
+          let outContentType = contentType || 'application/octet-stream';
+          const rawLength = upstream.headers.get('content-length');
+          let outContentLength = rawLength ? Number.parseInt(rawLength, 10) : -1;
+          if (!Number.isFinite(outContentLength)) outContentLength = -1;
+          let outContentRange = upstream.headers.get('content-range');
+          let outAcceptRanges = upstream.headers.get('accept-ranges');
+
+          if (tsOffset >= 0) {
+            outContentType = 'video/mp2t';
+            if (tsOffset > 0) {
+              if (outContentLength >= tsOffset) {
+                outContentLength -= tsOffset;
+              } else if (outContentLength >= 0) {
+                outContentLength = -1;
+              }
+              if (outStatus === 206) {
+                const adjusted = adjustContentRangeForStrip(outContentRange, tsOffset);
+                if (adjusted) {
+                  outContentRange = adjusted;
+                } else {
+                  outStatus = 200;
+                  outContentRange = null;
+                }
+              }
+              outAcceptRanges = null;
+            }
+          }
+
+          res.status(outStatus);
+          res.setHeader('Content-Type', outContentType);
+          if (outContentLength >= 0) res.setHeader('Content-Length', String(outContentLength));
+          if (outContentRange) res.setHeader('Content-Range', outContentRange);
+          if (outAcceptRanges) res.setHeader('Accept-Ranges', outAcceptRanges);
+          res.setHeader('Access-Control-Allow-Origin', '*');
+
+          const firstSlice = tsOffset > 0 ? initialBuf.subarray(tsOffset) : initialBuf;
+          if (firstSlice.length > 0 && !res.write(firstSlice)) {
+            await new Promise<void>((resolve) => res.once('drain', resolve));
+          }
+
+          if (!reachedEof) {
+            while (!streamAbort.signal.aborted && !res.writableEnded) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              if (value && value.byteLength > 0) {
+                const buf = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+                if (!res.write(buf)) {
+                  await new Promise<void>((resolve) => res.once('drain', resolve));
+                }
+              }
+            }
+          }
+          if (!res.writableEnded) res.end();
+          return;
+        } finally {
+          streamAbort.signal.removeEventListener('abort', onAbort);
+          reader.releaseLock();
+        }
       }
 
       res.status(upstream.status);

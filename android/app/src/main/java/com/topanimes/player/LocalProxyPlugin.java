@@ -59,14 +59,37 @@ public class LocalProxyPlugin extends Plugin {
     private static final String DEFAULT_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     private static final Pattern DIRECT_HOSTS_PATTERN = Pattern.compile(
-        "(?:^|\\.)(?:tiktokcdn\\.com|booonceivu\\.shop|123flmsfree\\.com|321moviesfree\\.com)$",
+        "(?:^|\\.)(?:booonceivu\\.shop|123flmsfree\\.com|321moviesfree\\.com)$",
+        Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern DISGUISED_SEGMENT_PATH_PATTERN = Pattern.compile(
+        "\\.(?:image|png|jpe?g|gif|webp|bmp|ico|svg|js|css|html?|txt)$",
+        Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern DISGUISED_CONTENT_TYPE_PATTERN = Pattern.compile(
+        "^(?:image/|text/(?:plain|html|css|javascript)|application/(?:javascript|x-javascript|octet-stream)|binary/octet-stream)",
+        Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern ZERO_RANGE_PATTERN = Pattern.compile(
+        "^bytes=0-\\d*$",
+        Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern CONTENT_RANGE_PATTERN = Pattern.compile(
+        "^bytes\\s+(\\d+)-(\\d+)/(\\d+|\\*)$",
         Pattern.CASE_INSENSITIVE
     );
     private static final Pattern URI_ATTR_PATTERN = Pattern.compile("URI=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
     private static final Pattern M3U8_EXT_PATTERN = Pattern.compile("\\.m3u8(?:$|\\?)", Pattern.CASE_INSENSITIVE);
+    private static final int MPEG_TS_PACKET_SIZE = 188;
+    private static final int MPEG_TS_SYNC_BYTE = 0x47;
+    private static final int TS_PROBE_BUFFER_SIZE = 32768;
 
     public static volatile String sharedProxyBaseUrl = "";
     private static volatile WeakReference<LocalProxyPlugin> activeInstanceRef = new WeakReference<>(null);
+    private static ServerSocket sharedServerSocket;
+    private static volatile int sharedProxyPort = -1;
+    private static volatile boolean sharedProxyRunning = false;
+    private static ExecutorService sharedProxyExecutor;
 
     public static void notifyInstallStage(String stage, int percent, String message) {
         LocalProxyPlugin instance = activeInstanceRef.get();
@@ -78,14 +101,55 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
+    public static synchronized String ensureSharedProxyBaseUrl() {
+        if (sharedProxyRunning && sharedProxyPort > 0 && sharedServerSocket != null && !sharedServerSocket.isClosed()) {
+            sharedProxyBaseUrl = "http://127.0.0.1:" + sharedProxyPort;
+            return sharedProxyBaseUrl;
+        }
+        try {
+            if (sharedProxyExecutor == null || sharedProxyExecutor.isShutdown()) {
+                sharedProxyExecutor = Executors.newCachedThreadPool();
+            }
+            sharedServerSocket = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
+            sharedProxyPort = sharedServerSocket.getLocalPort();
+            sharedProxyBaseUrl = "http://127.0.0.1:" + sharedProxyPort;
+            sharedProxyRunning = true;
+
+            final ServerSocket boundSocket = sharedServerSocket;
+            final ExecutorService pool = sharedProxyExecutor;
+            Thread acceptThread = new Thread(() -> {
+                while (sharedProxyRunning && !boundSocket.isClosed()) {
+                    try {
+                        Socket client = boundSocket.accept();
+                        pool.execute(() -> handleSocketStatic(client));
+                    } catch (IOException e) {
+                        if (sharedProxyRunning) {
+                            Log.w(TAG, "Accept error: " + e.getMessage());
+                        }
+                    }
+                }
+            }, "TopAnimesProxyAccept");
+            acceptThread.setDaemon(true);
+            acceptThread.start();
+            Log.i(TAG, "Local proxy started on 127.0.0.1:" + sharedProxyPort);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to start local proxy", e);
+        }
+        return sharedProxyBaseUrl;
+    }
+
     public static String buildSharedProxyUrl(String targetUrl, String referer) {
         String base = sharedProxyBaseUrl;
+        if (base == null || base.isEmpty() || !sharedProxyRunning) {
+            base = ensureSharedProxyBaseUrl();
+        }
         if (base == null || base.isEmpty() || targetUrl == null || targetUrl.isEmpty()) {
             return targetUrl;
         }
         try {
             String safeReferer = (referer != null && isSafeHttpUrl(referer)) ? referer : "https://topanimes.net/";
-            return base + "/stream-proxy?url="
+            String pathSuffix = M3U8_EXT_PATTERN.matcher(targetUrl).find() ? "/stream-proxy/playlist.m3u8" : "/stream-proxy";
+            return base + pathSuffix + "?url="
                 + URLEncoder.encode(targetUrl, "UTF-8")
                 + "&referer=" + URLEncoder.encode(safeReferer, "UTF-8");
         } catch (Exception e) {
@@ -93,9 +157,6 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private ServerSocket serverSocket;
-    private volatile int proxyPort = -1;
-    private volatile boolean running = false;
     private ExecutorService executor;
     private final AtomicLong activeApkDownloadId = new AtomicLong(0L);
     private volatile HttpURLConnection activeApkConnection = null;
@@ -115,55 +176,25 @@ public class LocalProxyPlugin extends Plugin {
             activeInstanceRef.clear();
         }
         cancelActiveApkDownloadInternal();
-        running = false;
-        if (serverSocket != null) {
-            try {
-                serverSocket.close();
-            } catch (IOException ignored) {
-            }
-        }
         if (executor != null) {
             executor.shutdownNow();
+            executor = null;
         }
         super.handleOnDestroy();
     }
 
     private synchronized void startProxyServer() {
-        if (running && proxyPort > 0) return;
-        try {
+        if (executor == null || executor.isShutdown()) {
             executor = Executors.newCachedThreadPool();
-            serverSocket = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
-            proxyPort = serverSocket.getLocalPort();
-            sharedProxyBaseUrl = "http://127.0.0.1:" + proxyPort;
-            running = true;
-
-            Thread acceptThread = new Thread(() -> {
-                while (running && !serverSocket.isClosed()) {
-                    try {
-                        Socket client = serverSocket.accept();
-                        executor.execute(() -> handleSocket(client));
-                    } catch (IOException e) {
-                        if (running) {
-                            Log.w(TAG, "Accept error: " + e.getMessage());
-                        }
-                    }
-                }
-            }, "TopAnimesProxyAccept");
-            acceptThread.setDaemon(true);
-            acceptThread.start();
-            Log.i(TAG, "Local proxy started on 127.0.0.1:" + proxyPort);
-        } catch (IOException e) {
-            Log.e(TAG, "Failed to start local proxy", e);
         }
+        ensureSharedProxyBaseUrl();
     }
 
     @PluginMethod
     public void getProxyBaseUrl(PluginCall call) {
-        if (!running || proxyPort <= 0) {
-            startProxyServer();
-        }
+        String base = ensureSharedProxyBaseUrl();
         JSObject ret = new JSObject();
-        ret.put("baseUrl", proxyPort > 0 ? ("http://127.0.0.1:" + proxyPort) : "");
+        ret.put("baseUrl", base != null ? base : "");
         call.resolve(ret);
     }
 
@@ -683,7 +714,7 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private void handleSocket(Socket client) {
+    private static void handleSocketStatic(Socket client) {
         try (Socket sock = client) {
             sock.setSoTimeout(30000);
             InputStream in = new BufferedInputStream(sock.getInputStream());
@@ -725,6 +756,7 @@ public class LocalProxyPlugin extends Plugin {
             String refererParam = query.getOrDefault("referer", "https://topanimes.net/");
             String referer = isSafeHttpUrl(refererParam) ? refererParam : "https://topanimes.net/";
             boolean isDownload = "1".equals(query.get("download"));
+            boolean isHlsSegment = "1".equals(query.get("hls_seg"));
 
             if (!isSafeHttpUrl(targetUrl)) {
                 writeSimpleResponse(out, 400, "Bad Request", "URL inválida");
@@ -756,7 +788,9 @@ public class LocalProxyPlugin extends Plugin {
                         null,
                         false
                     );
-                    out.write(payload);
+                    if (!"HEAD".equals(method)) {
+                        out.write(payload);
+                    }
                     out.flush();
                     return;
                 }
@@ -771,6 +805,111 @@ public class LocalProxyPlugin extends Plugin {
                 String contentRange = conn.getHeaderField("Content-Range");
                 String acceptRanges = conn.getHeaderField("Accept-Ranges");
 
+                InputStream bodyStream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
+
+                // KojimaCDN and similar HLS hosts disguise MPEG-TS segments with a prepended fake
+                // PNG/image header and image/* Content-Type (which breaks LibVLC's adaptive demuxer).
+                // Probe the initial bytes and strip any leading wrapper before 0x47 TS sync packets.
+                boolean shouldProbeTs = status >= 200
+                    && status < 300
+                    && !isDownload
+                    && bodyStream != null
+                    && isStartAtZeroRange(rangeHeader)
+                    && (isHlsSegment || isDisguisedContentType(contentType));
+
+                if (shouldProbeTs) {
+                    byte[] probeBuf = new byte[TS_PROBE_BUFFER_SIZE];
+                    int probeLen = readUpTo(bodyStream, probeBuf);
+                    boolean reachedEof = probeLen < probeBuf.length;
+
+                    if (looksLikeM3u8Manifest(probeBuf, probeLen)) {
+                        ByteArrayOutputStream manifestOut = new ByteArrayOutputStream(probeLen + 8192);
+                        manifestOut.write(probeBuf, 0, probeLen);
+                        if (!reachedEof) {
+                            byte[] restBuf = new byte[8192];
+                            int rn;
+                            while ((rn = bodyStream.read(restBuf)) != -1) {
+                                manifestOut.write(restBuf, 0, rn);
+                            }
+                        }
+                        String rawManifest = manifestOut.toString(StandardCharsets.UTF_8.name());
+                        String rewritten = rewriteM3u8Playlist(rawManifest, upstream.finalUrl, referer);
+                        byte[] payload = rewritten.getBytes(StandardCharsets.UTF_8);
+                        writeCorsHeaders(
+                            out,
+                            200,
+                            "OK",
+                            "application/vnd.apple.mpegurl; charset=utf-8",
+                            payload.length,
+                            null,
+                            null,
+                            false
+                        );
+                        if (!"HEAD".equals(method)) {
+                            out.write(payload);
+                        }
+                        out.flush();
+                        return;
+                    }
+
+                    int tsOffset = findMpegTsSyncOffset(probeBuf, probeLen, reachedEof);
+                    int outStatus = status;
+                    String outStatusText = statusText;
+                    String outContentType = contentType != null ? contentType : "application/octet-stream";
+                    long outContentLength = contentLength;
+                    String outContentRange = contentRange;
+                    String outAcceptRanges = acceptRanges;
+
+                    if (tsOffset >= 0) {
+                        outContentType = "video/mp2t";
+                        if (tsOffset > 0) {
+                            if (outContentLength >= tsOffset) {
+                                outContentLength -= tsOffset;
+                            } else if (outContentLength >= 0) {
+                                outContentLength = -1;
+                            }
+                            if (outStatus == 206) {
+                                String adjustedRange = adjustContentRangeForStrip(outContentRange, tsOffset);
+                                if (adjustedRange != null) {
+                                    outContentRange = adjustedRange;
+                                } else {
+                                    outStatus = 200;
+                                    outStatusText = "OK";
+                                    outContentRange = null;
+                                }
+                            }
+                            outAcceptRanges = null;
+                        }
+                    }
+
+                    writeCorsHeaders(
+                        out,
+                        outStatus,
+                        outStatusText,
+                        outContentType,
+                        outContentLength,
+                        outContentRange,
+                        outAcceptRanges,
+                        false
+                    );
+
+                    if (!"HEAD".equals(method)) {
+                        int startOff = tsOffset > 0 ? tsOffset : 0;
+                        if (probeLen > startOff) {
+                            out.write(probeBuf, startOff, probeLen - startOff);
+                        }
+                        if (!reachedEof) {
+                            byte[] buf = new byte[65536];
+                            int read;
+                            while ((read = bodyStream.read(buf)) != -1) {
+                                out.write(buf, 0, read);
+                            }
+                        }
+                    }
+                    out.flush();
+                    return;
+                }
+
                 writeCorsHeaders(
                     out,
                     status,
@@ -782,7 +921,6 @@ public class LocalProxyPlugin extends Plugin {
                     isDownload
                 );
 
-                InputStream bodyStream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
                 if (bodyStream != null && !"HEAD".equals(method)) {
                     byte[] buf = new byte[65536];
                     int read;
@@ -809,7 +947,7 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private RedirectResult openWithRedirects(
+    private static RedirectResult openWithRedirects(
         String rawUrl,
         String referer,
         String accept,
@@ -833,7 +971,11 @@ public class LocalProxyPlugin extends Plugin {
 
             String host = parsed.getHost() != null ? parsed.getHost().toLowerCase(Locale.ROOT) : "";
             boolean isFileVideo = host.contains("filevideo1.com");
-            if (referer != null && isSafeHttpUrl(referer) && !(isFileVideo && referer.toLowerCase(Locale.ROOT).contains("csst.online"))) {
+            boolean isTikTokCdn = host.equals("tiktokcdn.com") || host.endsWith(".tiktokcdn.com");
+            if (referer != null
+                && isSafeHttpUrl(referer)
+                && !(isFileVideo && referer.toLowerCase(Locale.ROOT).contains("csst.online"))
+                && !isTikTokCdn) {
                 conn.setRequestProperty("Referer", referer);
             }
             if (rangeHeader != null && !rangeHeader.isEmpty()) {
@@ -855,7 +997,7 @@ public class LocalProxyPlugin extends Plugin {
         throw new IOException("Excesso de redirecionamentos.");
     }
 
-    private String rewriteM3u8Playlist(String manifest, String baseManifestUrl, String referer) {
+    private static String rewriteM3u8Playlist(String manifest, String baseManifestUrl, String referer) {
         String[] lines = manifest.split("\\r?\\n");
         StringBuilder sb = new StringBuilder();
         for (int i = 0; i < lines.length; i++) {
@@ -872,11 +1014,16 @@ public class LocalProxyPlugin extends Plugin {
                     try {
                         String abs = new URL(new URL(baseManifestUrl), rawUri).toString();
                         if (isSafeHttpUrl(abs)) {
-                            String host = new URL(abs).getHost();
-                            if (host != null && DIRECT_HOSTS_PATTERN.matcher(host).find()) {
+                            URL absUrl = new URL(abs);
+                            String host = absUrl.getHost();
+                            boolean isNestedPlaylist = M3U8_EXT_PATTERN.matcher(abs).find();
+                            if (!isNestedPlaylist
+                                && host != null
+                                && DIRECT_HOSTS_PATTERN.matcher(host).find()
+                                && !isDisguisedSegmentUrl(absUrl)) {
                                 replacement = "URI=\"" + abs + "\"";
                             } else {
-                                replacement = "URI=\"" + buildProxyUrl(abs, referer) + "\"";
+                                replacement = "URI=\"" + buildProxyUrl(abs, referer, false, isNestedPlaylist) + "\"";
                             }
                         }
                     } catch (Exception ignored) {
@@ -889,11 +1036,16 @@ public class LocalProxyPlugin extends Plugin {
                 try {
                     String abs = new URL(new URL(baseManifestUrl), trimmed).toString();
                     if (isSafeHttpUrl(abs)) {
-                        String host = new URL(abs).getHost();
-                        if (host != null && DIRECT_HOSTS_PATTERN.matcher(host).find()) {
+                        URL absUrl = new URL(abs);
+                        String host = absUrl.getHost();
+                        boolean isNestedPlaylist = M3U8_EXT_PATTERN.matcher(abs).find();
+                        if (!isNestedPlaylist
+                            && host != null
+                            && DIRECT_HOSTS_PATTERN.matcher(host).find()
+                            && !isDisguisedSegmentUrl(absUrl)) {
                             sb.append(abs);
                         } else {
-                            sb.append(buildProxyUrl(abs, referer));
+                            sb.append(buildProxyUrl(abs, referer, !isNestedPlaylist, isNestedPlaylist));
                         }
                     } else {
                         sb.append(line);
@@ -907,13 +1059,180 @@ public class LocalProxyPlugin extends Plugin {
         return sb.toString();
     }
 
-    private String buildProxyUrl(String absUrl, String referer) {
+    private static String buildProxyUrl(
+        String absUrl,
+        String referer,
+        boolean isHlsSegment,
+        boolean isPlaylistUrl
+    ) {
         try {
-            return "http://127.0.0.1:" + proxyPort + "/stream-proxy?url="
+            String pathSuffix = isPlaylistUrl
+                ? "/stream-proxy/playlist.m3u8"
+                : (isHlsSegment ? "/stream-proxy/segment.ts" : "/stream-proxy");
+            return "http://127.0.0.1:" + sharedProxyPort + pathSuffix + "?url="
                 + URLEncoder.encode(absUrl, "UTF-8")
-                + "&referer=" + URLEncoder.encode(referer, "UTF-8");
+                + "&referer=" + URLEncoder.encode(referer, "UTF-8")
+                + (isHlsSegment ? "&hls_seg=1" : "");
         } catch (Exception e) {
             return absUrl;
+        }
+    }
+
+    private static boolean isDisguisedSegmentUrl(URL url) {
+        if (url == null) return false;
+        String path = url.getPath();
+        return path != null && DISGUISED_SEGMENT_PATH_PATTERN.matcher(path).find();
+    }
+
+    private static boolean isDisguisedContentType(String contentType) {
+        return contentType != null && DISGUISED_CONTENT_TYPE_PATTERN.matcher(contentType.trim()).find();
+    }
+
+    private static boolean isStartAtZeroRange(String rangeHeader) {
+        if (rangeHeader == null || rangeHeader.trim().isEmpty()) return true;
+        return ZERO_RANGE_PATTERN.matcher(rangeHeader.trim()).matches();
+    }
+
+    private static int readUpTo(InputStream in, byte[] buf) throws IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int n = in.read(buf, total, buf.length - total);
+            if (n == -1) break;
+            total += n;
+        }
+        return total;
+    }
+
+    private static boolean looksLikeM3u8Manifest(byte[] buf, int len) {
+        int i = 0;
+        if (len >= 3
+            && (buf[0] & 0xFF) == 0xEF
+            && (buf[1] & 0xFF) == 0xBB
+            && (buf[2] & 0xFF) == 0xBF) {
+            i = 3;
+        }
+        while (i < len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' || buf[i] == '\n')) {
+            i++;
+        }
+        if (len - i < 7) return false;
+        return buf[i] == '#'
+            && buf[i + 1] == 'E'
+            && buf[i + 2] == 'X'
+            && buf[i + 3] == 'T'
+            && buf[i + 4] == 'M'
+            && buf[i + 5] == '3'
+            && buf[i + 6] == 'U';
+    }
+
+    private static boolean isValidTsPacketHeader(byte[] buf, int pos) {
+        if ((buf[pos] & 0xFF) != MPEG_TS_SYNC_BYTE) return false;
+        // transport_error_indicator must be 0
+        if ((buf[pos + 1] & 0x80) != 0) return false;
+        // adaptation_field_control must be non-zero (01, 10, or 11)
+        return (buf[pos + 3] & 0x30) != 0;
+    }
+
+    private static boolean isValidMpegTsStart(
+        byte[] buf,
+        int len,
+        int offset,
+        boolean reachedEof,
+        boolean relaxedMinPackets
+    ) {
+        if (offset < 0 || offset >= len) return false;
+        int remaining = len - offset;
+        if (remaining >= MPEG_TS_PACKET_SIZE * 5) {
+            for (int k = 0; k < 5; k++) {
+                if (!isValidTsPacketHeader(buf, offset + k * MPEG_TS_PACKET_SIZE)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (reachedEof) {
+            if (remaining < MPEG_TS_PACKET_SIZE * 2 || (remaining % MPEG_TS_PACKET_SIZE) != 0) {
+                return false;
+            }
+            int packetCount = remaining / MPEG_TS_PACKET_SIZE;
+            for (int k = 0; k < packetCount; k++) {
+                if (!isValidTsPacketHeader(buf, offset + k * MPEG_TS_PACKET_SIZE)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        int requiredPackets = relaxedMinPackets ? 3 : 4;
+        if (remaining >= MPEG_TS_PACKET_SIZE * requiredPackets) {
+            for (int k = 0; k < requiredPackets; k++) {
+                if (!isValidTsPacketHeader(buf, offset + k * MPEG_TS_PACKET_SIZE)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+
+    private static int findPngEndOffset(byte[] buf, int len) {
+        if (len < 16) return -1;
+        if ((buf[0] & 0xFF) != 0x89
+            || buf[1] != 'P'
+            || buf[2] != 'N'
+            || buf[3] != 'G'
+            || buf[4] != 0x0D
+            || buf[5] != 0x0A
+            || buf[6] != 0x1A
+            || buf[7] != 0x0A) {
+            return -1;
+        }
+        for (int i = 8; i + 8 <= len; i++) {
+            if (buf[i] == 'I'
+                && buf[i + 1] == 'E'
+                && buf[i + 2] == 'N'
+                && buf[i + 3] == 'D') {
+                return i + 8;
+            }
+        }
+        return -1;
+    }
+
+    private static int findMpegTsSyncOffset(byte[] buf, int len, boolean reachedEof) {
+        if (len < MPEG_TS_PACKET_SIZE * 2) return -1;
+        if (isValidMpegTsStart(buf, len, 0, reachedEof, true)) {
+            return 0;
+        }
+        int pngEnd = findPngEndOffset(buf, len);
+        if (pngEnd > 0 && isValidMpegTsStart(buf, len, pngEnd, reachedEof, true)) {
+            return pngEnd;
+        }
+        int maxOffset = len - MPEG_TS_PACKET_SIZE * 2;
+        for (int i = 1; i <= maxOffset; i++) {
+            if ((buf[i] & 0xFF) != MPEG_TS_SYNC_BYTE) continue;
+            if (isValidMpegTsStart(buf, len, i, reachedEof, false)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String adjustContentRangeForStrip(String contentRange, int stripBytes) {
+        if (contentRange == null || stripBytes <= 0) return null;
+        Matcher m = CONTENT_RANGE_PATTERN.matcher(contentRange.trim());
+        if (!m.matches()) return null;
+        try {
+            long start = Long.parseLong(m.group(1));
+            long end = Long.parseLong(m.group(2));
+            if (start != 0L || end < stripBytes) return null;
+            long newEnd = end - stripBytes;
+            String totalStr = m.group(3);
+            if ("*".equals(totalStr)) {
+                return "bytes 0-" + newEnd + "/*";
+            }
+            long total = Long.parseLong(totalStr);
+            if (total <= stripBytes) return null;
+            return "bytes 0-" + newEnd + "/" + (total - stripBytes);
+        } catch (NumberFormatException ignored) {
+            return null;
         }
     }
 

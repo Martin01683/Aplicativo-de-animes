@@ -357,8 +357,7 @@ public final class TopAnimesEpisodeResolver {
                     String lh = host.toLowerCase(Locale.ROOT);
                     preferDirect = lh.endsWith("booonceivu.shop")
                         || lh.endsWith("123flmsfree.com")
-                        || lh.endsWith("321moviesfree.com")
-                        || lh.endsWith("tiktokcdn.com");
+                        || lh.endsWith("321moviesfree.com");
                 }
             } catch (Exception ignored) {
             }
