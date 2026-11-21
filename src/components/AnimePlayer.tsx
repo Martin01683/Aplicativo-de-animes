@@ -69,7 +69,7 @@ import {
   saveEpisodeProgress,
 } from '../lib/storage';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
-import { shouldAutoAdvanceEpisode } from '../lib/serverFailover';
+import { isGenuineEpisodeEnd, shouldAutoAdvanceEpisode } from '../lib/serverFailover';
 import { MediaPoster } from './MediaPoster';
 
 interface AnimePlayerProps {
@@ -273,6 +273,11 @@ export function AnimePlayer({
   const preHoldSpeedRef = useRef(1);
   const autoStartNextRef = useRef(false);
   const hasPlaybackStartedRef = useRef(false);
+  const loadedMediaEpisodeUrlRef = useRef<string | null>(null);
+  const firstTimeUpdateSecRef = useRef<number | null>(null);
+  const userSeekedInStreamRef = useRef(false);
+  const applyingPendingSeekRef = useRef(false);
+  const streamPreparedWallRef = useRef(0);
   const autoNextTriggeredForUrlRef = useRef<string | null>(null);
   const serverRetryCountRef = useRef(0);
   const pendingSeekSecRef = useRef(0);
@@ -431,6 +436,11 @@ export function AnimePlayer({
     autoNextTriggeredForUrlRef.current = null;
     serverRetryCountRef.current = 0;
     hasPlaybackStartedRef.current = false;
+    loadedMediaEpisodeUrlRef.current = null;
+    firstTimeUpdateSecRef.current = null;
+    userSeekedInStreamRef.current = false;
+    applyingPendingSeekRef.current = false;
+    streamPreparedWallRef.current = 0;
 
     const savedEntry = episodeUrl ? getEpisodeProgress(episodeUrl) : null;
     const savedResumeSec = episodeUrl ? getEpisodeResumeSeconds(episodeUrl) : 0;
@@ -479,6 +489,9 @@ export function AnimePlayer({
   // Reset speed per video
   useEffect(() => {
     hasPlaybackStartedRef.current = false;
+    firstTimeUpdateSecRef.current = null;
+    userSeekedInStreamRef.current = false;
+    applyingPendingSeekRef.current = false;
     setSpeed(1);
     setHasVideoFrame(false);
     setErrorMsg('');
@@ -656,6 +669,12 @@ export function AnimePlayer({
     if (!activeMediaUrl || !activeStream || loadingEpisode) {
       clearLoadWatchdog();
       disposedEffectRef.current = true;
+      loadedMediaEpisodeUrlRef.current = null;
+      hasPlaybackStartedRef.current = false;
+      firstTimeUpdateSecRef.current = null;
+      userSeekedInStreamRef.current = false;
+      applyingPendingSeekRef.current = false;
+      streamPreparedWallRef.current = 0;
       video.removeAttribute('src');
       video.load();
       return;
@@ -663,6 +682,12 @@ export function AnimePlayer({
 
     let disposed = false;
     disposedEffectRef.current = false;
+    loadedMediaEpisodeUrlRef.current = episodeUrl || null;
+    hasPlaybackStartedRef.current = false;
+    firstTimeUpdateSecRef.current = null;
+    userSeekedInStreamRef.current = false;
+    applyingPendingSeekRef.current = false;
+    streamPreparedWallRef.current = Date.now();
     setErrorMsg('');
     setHlsLevels([]);
     setActiveHlsLevel(-1);
@@ -740,6 +765,7 @@ export function AnimePlayer({
       return () => {
         disposed = true;
         disposedEffectRef.current = true;
+        loadedMediaEpisodeUrlRef.current = null;
         clearLoadWatchdog();
         hls.destroy();
         if (hlsRef.current === hls) hlsRef.current = null;
@@ -754,6 +780,7 @@ export function AnimePlayer({
     return () => {
       disposed = true;
       disposedEffectRef.current = true;
+      loadedMediaEpisodeUrlRef.current = null;
       clearLoadWatchdog();
       video.removeAttribute('src');
       video.load();
@@ -764,6 +791,7 @@ export function AnimePlayer({
     advanceFallbackOrFail,
     armLoadWatchdog,
     clearLoadWatchdog,
+    episodeUrl,
     loadingEpisode,
     useCorsAttr,
     retryToken,
@@ -917,12 +945,14 @@ export function AnimePlayer({
     const target = Math.min(pendingSeekSecRef.current, cap);
     pendingSeekSecRef.current = 0;
     try {
+      applyingPendingSeekRef.current = true;
       v.currentTime = target;
       setCurrentTime(target);
+      firstTimeUpdateSecRef.current = target;
       latestPlaybackRef.current.currentTime = target;
       latestPlaybackRef.current.duration = v.duration;
-      latestPlaybackRef.current.hasStarted = true;
     } catch {
+      applyingPendingSeekRef.current = false;
       pendingSeekSecRef.current = target;
     }
   }, []);
@@ -1070,6 +1100,9 @@ export function AnimePlayer({
           : Number.MAX_SAFE_INTEGER;
       const next = Math.max(0, Math.min(cap, video.currentTime + deltaSeconds));
       pendingSeekSecRef.current = 0;
+      applyingPendingSeekRef.current = false;
+      userSeekedInStreamRef.current = true;
+      firstTimeUpdateSecRef.current = next;
       video.currentTime = next;
       setCurrentTime(next);
       const dur = Number.isFinite(video.duration) ? video.duration : duration;
@@ -1589,33 +1622,54 @@ export function AnimePlayer({
               setPlaying(false);
               setControlsVisible(true);
               const v = videoRef.current;
+              if (
+                disposedEffectRef.current ||
+                loadingEpisode ||
+                !loadedMediaEpisodeUrlRef.current ||
+                !episodeUrl ||
+                !isSameEpisodeUrl(loadedMediaEpisodeUrlRef.current, episodeUrl)
+              ) {
+                return;
+              }
+              const effectiveDuration =
+                v && Number.isFinite(v.duration) && v.duration > 0
+                  ? v.duration
+                  : latestPlaybackRef.current.duration || duration;
+              const effectiveCurrentTime =
+                v && Number.isFinite(v.currentTime) && v.currentTime > 0
+                  ? v.currentTime
+                  : latestPlaybackRef.current.currentTime;
+              const wallElapsedMs =
+                streamPreparedWallRef.current > 0
+                  ? Date.now() - streamPreparedWallRef.current
+                  : 0;
               const reachedGenuineEnd =
-                hasPlaybackStartedRef.current ||
-                (Boolean(v) &&
-                  Number.isFinite(v!.duration) &&
-                  v!.duration > 10 &&
-                  v!.currentTime >= v!.duration - 2);
-              if (episodeUrl && reachedGenuineEnd) {
-                const dur =
-                  v && Number.isFinite(v.duration) && v.duration > 0 ? v.duration : duration;
-                latestPlaybackRef.current.currentTime = dur;
-                latestPlaybackRef.current.duration = dur;
+                hasPlaybackStartedRef.current &&
+                (userSeekedInStreamRef.current || wallElapsedMs >= 2500) &&
+                isGenuineEpisodeEnd(effectiveCurrentTime, effectiveDuration);
+              if (reachedGenuineEnd) {
+                latestPlaybackRef.current.currentTime = effectiveDuration;
+                latestPlaybackRef.current.duration = effectiveDuration;
                 persistEpisodeProgressNow({
                   url: episodeUrl,
-                  positionSec: dur,
-                  durationSec: dur,
+                  positionSec: effectiveDuration,
+                  durationSec: effectiveDuration,
                   ended: true,
                 });
               }
               if (
                 hasNext &&
                 onNextEpisode &&
+                reachedGenuineEnd &&
                 shouldAutoAdvanceEpisode({
                   autoPlayNextEpisode,
                   loadingEpisode,
                   playbackFailed: Boolean(effectiveErrorMsg),
                   hasPlaybackStarted: hasPlaybackStartedRef.current,
+                  currentTimeSec: effectiveCurrentTime,
+                  durationSec: effectiveDuration,
                   currentEpisodeUrl: episodeUrl,
+                  loadedMediaEpisodeUrl: loadedMediaEpisodeUrlRef.current,
                   nextEpisodeUrl: nextUrl,
                   alreadyTriggeredForUrl: autoNextTriggeredForUrlRef.current,
                 })
@@ -1623,7 +1677,7 @@ export function AnimePlayer({
                 autoNextTriggeredForUrlRef.current = episodeUrl || null;
                 onToast('Carregando próximo episódio...');
                 triggerNextEpisode();
-              } else if (!hasPlaybackStartedRef.current && !loadingEpisode && !effectiveErrorMsg) {
+              } else if (!reachedGenuineEnd && !loadingEpisode && !effectiveErrorMsg) {
                 advanceFallbackOrFail();
               }
             }}
@@ -1634,9 +1688,6 @@ export function AnimePlayer({
               }
             }}
             onPlaying={() => {
-              clearLoadWatchdog();
-              hasPlaybackStartedRef.current = true;
-              latestPlaybackRef.current.hasStarted = true;
               setWaiting(false);
               setHasVideoFrame(true);
               setErrorMsg('');
@@ -1658,9 +1709,23 @@ export function AnimePlayer({
             onSeeked={() => {
               const v = videoRef.current;
               if (!v || !episodeUrl) return;
+              if (
+                loadedMediaEpisodeUrlRef.current &&
+                !isSameEpisodeUrl(loadedMediaEpisodeUrlRef.current, episodeUrl)
+              ) {
+                return;
+              }
+              const wasAutoResumeSeek = applyingPendingSeekRef.current;
+              applyingPendingSeekRef.current = false;
               const dur = Number.isFinite(v.duration) ? v.duration : duration;
               latestPlaybackRef.current.currentTime = v.currentTime;
               latestPlaybackRef.current.duration = dur;
+              if (wasAutoResumeSeek) {
+                firstTimeUpdateSecRef.current = v.currentTime;
+                return;
+              }
+              userSeekedInStreamRef.current = true;
+              firstTimeUpdateSecRef.current = v.currentTime;
               if (v.currentTime >= 2) {
                 hasPlaybackStartedRef.current = true;
                 latestPlaybackRef.current.hasStarted = true;
@@ -1675,11 +1740,26 @@ export function AnimePlayer({
             onTimeUpdate={() => {
               const v = videoRef.current;
               if (!v) return;
+              if (
+                loadedMediaEpisodeUrlRef.current &&
+                episodeUrl &&
+                !isSameEpisodeUrl(loadedMediaEpisodeUrlRef.current, episodeUrl)
+              ) {
+                return;
+              }
               if (pendingSeekSecRef.current > 1) {
                 applyPendingSeek(v);
                 if (pendingSeekSecRef.current > 1) return;
               }
-              if (v.currentTime > 0.25) {
+              if (
+                firstTimeUpdateSecRef.current === null ||
+                v.currentTime < firstTimeUpdateSecRef.current
+              ) {
+                firstTimeUpdateSecRef.current = v.currentTime;
+              }
+              const forwardDelta = v.currentTime - firstTimeUpdateSecRef.current;
+              if (forwardDelta >= 0.4 || (v.currentTime >= 1 && forwardDelta > 0)) {
+                clearLoadWatchdog();
                 hasPlaybackStartedRef.current = true;
                 latestPlaybackRef.current.hasStarted = true;
               }
@@ -1889,6 +1969,9 @@ export function AnimePlayer({
                 return;
               }
               pendingSeekSecRef.current = 0;
+              applyingPendingSeekRef.current = false;
+              userSeekedInStreamRef.current = true;
+              firstTimeUpdateSecRef.current = target;
               const v = videoRef.current;
               if (v) v.currentTime = target;
               setCurrentTime(target);

@@ -88,22 +88,64 @@ export function pickBestFailoverServer(
 }
 
 /**
+ * Determines whether a media `ended` event happened genuinely near the end of
+ * the episode rather than on a premature EOF, broken/truncated stream, empty
+ * manifest, or uninitialized media element.
+ */
+export function isGenuineEpisodeEnd(
+  currentTimeSec: number | null | undefined,
+  durationSec: number | null | undefined
+): boolean {
+  if (
+    typeof currentTimeSec !== 'number' ||
+    typeof durationSec !== 'number' ||
+    !Number.isFinite(currentTimeSec) ||
+    !Number.isFinite(durationSec)
+  ) {
+    return false;
+  }
+  if (durationSec < 10 || currentTimeSec < 5) {
+    return false;
+  }
+  const remainingSec = Math.max(0, durationSec - currentTimeSec);
+  const ratio = currentTimeSec / durationSec;
+  if (durationSec >= 120) {
+    return remainingSec <= 20 || ratio >= 0.96;
+  }
+  if (durationSec >= 30) {
+    return remainingSec <= 8 || ratio >= 0.94;
+  }
+  return remainingSec <= 3 || ratio >= 0.9;
+}
+
+/**
  * Guards auto-advancing to the next episode so stale events, unstarted/broken
- * episodes, or duplicate end triggers never skip intermediate chapters.
+ * episodes, premature EOFs, or duplicate end triggers never skip intermediate chapters.
  */
 export function shouldAutoAdvanceEpisode(params: {
   autoPlayNextEpisode: boolean;
   loadingEpisode: boolean;
   playbackFailed: boolean;
   hasPlaybackStarted: boolean;
+  currentTimeSec: number;
+  durationSec: number;
   currentEpisodeUrl?: string;
+  loadedMediaEpisodeUrl?: string | null;
   nextEpisodeUrl?: string;
   alreadyTriggeredForUrl?: string | null;
 }): boolean {
   if (!params.autoPlayNextEpisode) return false;
   if (params.loadingEpisode || params.playbackFailed) return false;
   if (!params.hasPlaybackStarted) return false;
+  if (!isGenuineEpisodeEnd(params.currentTimeSec, params.durationSec)) return false;
   if (!params.currentEpisodeUrl || !params.nextEpisodeUrl) return false;
+  if (
+    params.loadedMediaEpisodeUrl !== undefined &&
+    (!params.loadedMediaEpisodeUrl ||
+      !isSameEpisodeUrl(params.loadedMediaEpisodeUrl, params.currentEpisodeUrl))
+  ) {
+    return false;
+  }
   if (isSameEpisodeUrl(params.currentEpisodeUrl, params.nextEpisodeUrl)) return false;
   if (
     params.alreadyTriggeredForUrl &&

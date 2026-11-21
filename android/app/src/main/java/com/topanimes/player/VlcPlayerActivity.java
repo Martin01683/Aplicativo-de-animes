@@ -269,6 +269,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private boolean hasPlaybackStartedForStream = false;
     private int playbackTimeAdvanceCount = 0;
     private long firstTimeChangedMs = -1L;
+    private long streamPreparedWallMs = 0L;
+    private boolean userSeekedInCurrentStream = false;
     private boolean userInitiatedPause = false;
     private boolean triedAlternateTransport = false;
     private int currentServerRetryCount = 0;
@@ -806,7 +808,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                                     scheduleControlsAutoHide();
                                 }
                             }
-                            if (firstTimeChangedMs >= 0L && !hasPlaybackStartedForStream) {
+                            if (firstTimeChangedMs >= 0L
+                                && !hasPlaybackStartedForStream
+                                && (lastKnownPositionMs - firstTimeChangedMs) >= 500L) {
                                 markPlaybackStartedForStream();
                             }
                             maybeSchedulePauseAfterRestoreFrame();
@@ -898,15 +902,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             return;
                         }
                         lastKnownPositionMs = timeMs;
-                        if (firstTimeChangedMs < 0L) {
+                        if (firstTimeChangedMs < 0L || timeMs < firstTimeChangedMs) {
                             firstTimeChangedMs = timeMs;
                         }
                         playbackTimeAdvanceCount++;
+                        long forwardProgressMs = timeMs - firstTimeChangedMs;
                         if (!hasPlaybackStartedForStream) {
                             boolean confirmedWithVideo = hasActiveVout
-                                && (timeMs > 0L || playbackTimeAdvanceCount >= 2);
-                            boolean confirmedTimeProgress = timeMs >= 1000L
-                                && Math.abs(timeMs - firstTimeChangedMs) >= 400L;
+                                && playbackTimeAdvanceCount >= 2
+                                && forwardProgressMs >= 500L;
+                            boolean confirmedTimeProgress = playbackTimeAdvanceCount >= 2
+                                && timeMs >= 1500L
+                                && forwardProgressMs >= 1000L;
                             if (confirmedWithVideo || confirmedTimeProgress) {
                                 markPlaybackStartedForStream();
                             }
@@ -938,18 +945,37 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         if (loadingEpisode || playbackFailed || endReachedHandledSessionGen == eventSession) return;
                         endReachedHandledSessionGen = eventSession;
                         updatePlayPauseIcons(false);
-                        if (!hasPlaybackStartedForStream) {
-                            Log.w(TAG, "EndReached fired before playback started; running server failover");
+                        long reportedPosMs = mediaPlayer != null ? Math.max(0L, mediaPlayer.getTime()) : 0L;
+                        long reportedDurMs = mediaPlayer != null ? Math.max(0L, mediaPlayer.getLength()) : 0L;
+                        long posMs = Math.max(lastKnownPositionMs, reportedPosMs);
+                        long durMs = Math.max(lastKnownDurationMs, reportedDurMs);
+                        long wallElapsedMs = streamPreparedWallMs > 0L
+                            ? (SystemClock.elapsedRealtime() - streamPreparedWallMs)
+                            : 0L;
+                        boolean enoughWatchTime = userSeekedInCurrentStream || wallElapsedMs >= 2500L;
+                        if (!hasPlaybackStartedForStream
+                            || !enoughWatchTime
+                            || !isGenuinePlaybackEndMs(posMs, durMs)) {
+                            Log.w(
+                                TAG,
+                                "Premature EndReached (started=" + hasPlaybackStartedForStream
+                                    + ", posMs=" + posMs
+                                    + ", durMs=" + durMs
+                                    + ", elapsedMs=" + wallElapsedMs
+                                    + "); running server failover instead of auto-advance"
+                            );
                             handlePlaybackError();
                             return;
                         }
+                        lastKnownPositionMs = Math.max(posMs, durMs);
+                        lastKnownDurationMs = durMs;
                         saveCurrentEpisodeProgress(true);
                         if (autoPlayNextEpisode && !nextUrl.isEmpty() && !isSameEpisodeUrl(episodeUrl, nextUrl)) {
                             Toast.makeText(VlcPlayerActivity.this, "Carregando próximo episódio...", Toast.LENGTH_SHORT).show();
-                            loadEpisodeInFullscreen(nextUrl);
+                            loadEpisodeInFullscreen(nextUrl, false);
                         } else if (autoPlayNextEpisode && hasNextFlag && nextUrl.isEmpty()) {
                             Toast.makeText(VlcPlayerActivity.this, "Carregando próximo episódio...", Toast.LENGTH_SHORT).show();
-                            finishWithAction("next");
+                            finishWithAction("next", false);
                         } else {
                             playbackEnded = true;
                             pauseAfterRestoreFrame = false;
@@ -1216,6 +1242,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         hasPlaybackStartedForStream = false;
         playbackTimeAdvanceCount = 0;
         firstTimeChangedMs = -1L;
+        userSeekedInCurrentStream = false;
+        streamPreparedWallMs = SystemClock.elapsedRealtime();
         userInitiatedPause = false;
         playbackFailed = false;
         loadingEpisode = false;
@@ -1224,7 +1252,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         errorOverlay.setVisibility(View.GONE);
         showLoading(null);
 
-        activePlaybackSessionGen = ++sessionCounter;
+        activePlaybackSessionGen = -1L;
 
         Media media = new Media(libVlc, Uri.parse(targetUrl));
         media.setHWDecoderEnabled(true, false);
@@ -1237,6 +1265,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
         mediaPlayer.setMedia(media);
         media.release();
+        activePlaybackSessionGen = ++sessionCounter;
         mediaPlayer.play();
         uiHandler.postDelayed(loadWatchdogRunnable, LOAD_WATCHDOG_TIMEOUT_MS);
     }
@@ -1346,6 +1375,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
         loadingEpisode = true;
         playbackFailed = false;
         hasPlaybackStartedForStream = false;
+        hasActiveVout = false;
+        firstTimeChangedMs = -1L;
+        playbackTimeAdvanceCount = 0;
+        userSeekedInCurrentStream = false;
+        streamPreparedWallMs = 0L;
         errorOverlay.setVisibility(View.GONE);
         showLoading("Buscando servidor com melhor qualidade...");
         updateEpisodeNavButtons();
@@ -1676,6 +1710,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 }
                 if (mediaPlayer != null) {
                     long target = bar.getProgress();
+                    userSeekedInCurrentStream = true;
+                    if (!hasPlaybackStartedForStream) {
+                        firstTimeChangedMs = target;
+                    }
                     mediaPlayer.setTime(target);
                     lastKnownPositionMs = target;
                 }
@@ -1928,6 +1966,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
         long target = current + deltaMs;
         if (target < 0L) target = 0L;
         if (total > 0L && target > total) target = total;
+        userSeekedInCurrentStream = true;
+        if (!hasPlaybackStartedForStream) {
+            firstTimeChangedMs = target;
+        }
         mediaPlayer.setTime(target);
         lastKnownPositionMs = target;
         timeCurrentView.setText(formatMs(target));
@@ -2124,12 +2166,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void loadEpisodeInFullscreen(String rawTargetUrl) {
+        loadEpisodeInFullscreen(rawTargetUrl, true);
+    }
+
+    private void loadEpisodeInFullscreen(String rawTargetUrl, boolean saveOutgoingProgress) {
         String normalizedTarget = TopAnimesEpisodeResolver.normalizeTopAnimesUrl(rawTargetUrl);
         if (normalizedTarget.isEmpty()) return;
 
         // Flush progress of the outgoing episode before resetting state
-        captureCurrentPositionMs();
-        saveCurrentEpisodeProgress(false);
+        if (saveOutgoingProgress) {
+            captureCurrentPositionMs();
+            saveCurrentEpisodeProgress(false);
+        }
 
         final int gen = episodeLoadGen.incrementAndGet();
         activePlaybackSessionGen = -1L;
@@ -2152,6 +2200,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
         currentServerRetryCount = 0;
         hasPlaybackStartedForStream = false;
+        hasActiveVout = false;
+        firstTimeChangedMs = -1L;
+        playbackTimeAdvanceCount = 0;
+        userSeekedInCurrentStream = false;
+        streamPreparedWallMs = 0L;
         loadingEpisode = true;
         playbackFailed = false;
         pendingSeekMs = getSavedResumePositionMs(normalizedTarget);
@@ -2479,6 +2532,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
         failedServerNumes.remove(opt.nume);
         currentServerRetryCount = 0;
         hasPlaybackStartedForStream = false;
+        hasActiveVout = false;
+        firstTimeChangedMs = -1L;
+        playbackTimeAdvanceCount = 0;
+        userSeekedInCurrentStream = false;
+        streamPreparedWallMs = 0L;
         playbackFailed = false;
         loadingEpisode = true;
         errorOverlay.setVisibility(View.GONE);
@@ -2670,8 +2728,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void finishWithAction(String action) {
-        captureCurrentPositionMs();
-        saveCurrentEpisodeProgress(false);
+        finishWithAction(action, true);
+    }
+
+    private void finishWithAction(String action, boolean saveOutgoingProgress) {
+        if (saveOutgoingProgress) {
+            captureCurrentPositionMs();
+            saveCurrentEpisodeProgress(false);
+        }
 
         Intent result = new Intent();
         result.putExtra(RESULT_ACTION, action);
@@ -3042,6 +3106,19 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return remainingMs <= 5_000L || ratio >= 0.96;
         }
         return remainingMs <= 2_000L || ratio >= 0.95;
+    }
+
+    private static boolean isGenuinePlaybackEndMs(long posMs, long durMs) {
+        if (durMs < 10_000L || posMs < 5_000L) return false;
+        long remainingMs = Math.max(0L, durMs - posMs);
+        double ratio = (double) posMs / (double) durMs;
+        if (durMs >= 120_000L) {
+            return remainingMs <= 20_000L || ratio >= 0.96;
+        }
+        if (durMs >= 30_000L) {
+            return remainingMs <= 8_000L || ratio >= 0.94;
+        }
+        return remainingMs <= 3_000L || ratio >= 0.90;
     }
 
     public static int scaleIdToIndex(String id) {

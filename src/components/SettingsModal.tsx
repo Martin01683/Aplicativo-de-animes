@@ -702,7 +702,7 @@ export function SettingsModal({
                     Avançar automaticamente para o próximo episódio
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
-                    Ao terminar o vídeo atual no player web, abre o próximo episódio da série.
+                    Ao terminar o vídeo atual, abre automaticamente o próximo episódio da série.
                   </span>
                 </label>
                 <ToggleSwitch

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   getResolvedBestQuality,
+  isGenuineEpisodeEnd,
   pickBestFailoverServer,
   scoreStreamQuality,
   shouldAutoAdvanceEpisode,
@@ -108,9 +109,27 @@ test('pickBestFailoverServer breaks equal-quality ties by provider reliability',
   });
 });
 
-test('shouldAutoAdvanceEpisode blocks unstarted, loading, failed, and duplicate end triggers', () => {
+test('isGenuineEpisodeEnd rejects premature EOFs, broken short clips, and unknown durations', () => {
+  // Unknown / zero / NaN duration or near-zero position -> never a genuine end
+  assert.equal(isGenuineEpisodeEnd(0, 0), false);
+  assert.equal(isGenuineEpisodeEnd(0, Number.NaN), false);
+  assert.equal(isGenuineEpisodeEnd(1.5, 1440), false);
+  assert.equal(isGenuineEpisodeEnd(6, 6), false); // 6s broken/error stub clip
+  assert.equal(isGenuineEpisodeEnd(15, 1440), false); // dropped right after start
+  assert.equal(isGenuineEpisodeEnd(300, 1440), false); // mid-episode connection drop
+
+  // Genuine endings on standard episodes and shorter clips
+  assert.equal(isGenuineEpisodeEnd(1438, 1440), true);
+  assert.equal(isGenuineEpisodeEnd(1425, 1440), true); // slight container duration drift
+  assert.equal(isGenuineEpisodeEnd(115, 120), true);
+  assert.equal(isGenuineEpisodeEnd(28, 30), true);
+  assert.equal(isGenuineEpisodeEnd(14, 15), true);
+});
+
+test('shouldAutoAdvanceEpisode blocks unstarted, loading, premature EOF, mismatched media, and duplicate triggers', () => {
   const ep1 = 'https://topanimes.net/episodio/anime-episodio-1/';
   const ep2 = 'https://topanimes.net/episodio/anime-episodio-2/';
+  const ep3 = 'https://topanimes.net/episodio/anime-episodio-3/';
 
   assert.equal(
     shouldAutoAdvanceEpisode({
@@ -118,7 +137,10 @@ test('shouldAutoAdvanceEpisode blocks unstarted, loading, failed, and duplicate 
       loadingEpisode: false,
       playbackFailed: false,
       hasPlaybackStarted: true,
+      currentTimeSec: 1435,
+      durationSec: 1440,
       currentEpisodeUrl: ep1,
+      loadedMediaEpisodeUrl: ep1,
       nextEpisodeUrl: ep2,
       alreadyTriggeredForUrl: null,
     }),
@@ -132,8 +154,59 @@ test('shouldAutoAdvanceEpisode blocks unstarted, loading, failed, and duplicate 
       loadingEpisode: false,
       playbackFailed: false,
       hasPlaybackStarted: false,
-      currentEpisodeUrl: ep1,
-      nextEpisodeUrl: ep2,
+      currentTimeSec: 1435,
+      durationSec: 1440,
+      currentEpisodeUrl: ep2,
+      loadedMediaEpisodeUrl: ep2,
+      nextEpisodeUrl: ep3,
+    }),
+    false
+  );
+
+  // Started flag flipped, but stream hit premature EOF at 2s / 24min -> do NOT skip to ep 3!
+  assert.equal(
+    shouldAutoAdvanceEpisode({
+      autoPlayNextEpisode: true,
+      loadingEpisode: false,
+      playbackFailed: false,
+      hasPlaybackStarted: true,
+      currentTimeSec: 2,
+      durationSec: 1440,
+      currentEpisodeUrl: ep2,
+      loadedMediaEpisodeUrl: ep2,
+      nextEpisodeUrl: ep3,
+    }),
+    false
+  );
+
+  // Premature EOF with unknown duration (0s) -> do NOT skip!
+  assert.equal(
+    shouldAutoAdvanceEpisode({
+      autoPlayNextEpisode: true,
+      loadingEpisode: false,
+      playbackFailed: false,
+      hasPlaybackStarted: true,
+      currentTimeSec: 0,
+      durationSec: 0,
+      currentEpisodeUrl: ep2,
+      loadedMediaEpisodeUrl: ep2,
+      nextEpisodeUrl: ep3,
+    }),
+    false
+  );
+
+  // Stale ended event from outgoing Ep 1 arriving after Ep 2 became active -> blocked!
+  assert.equal(
+    shouldAutoAdvanceEpisode({
+      autoPlayNextEpisode: true,
+      loadingEpisode: false,
+      playbackFailed: false,
+      hasPlaybackStarted: true,
+      currentTimeSec: 1440,
+      durationSec: 1440,
+      currentEpisodeUrl: ep2,
+      loadedMediaEpisodeUrl: ep1,
+      nextEpisodeUrl: ep3,
     }),
     false
   );
@@ -145,7 +218,10 @@ test('shouldAutoAdvanceEpisode blocks unstarted, loading, failed, and duplicate 
       loadingEpisode: false,
       playbackFailed: false,
       hasPlaybackStarted: true,
+      currentTimeSec: 1440,
+      durationSec: 1440,
       currentEpisodeUrl: ep1,
+      loadedMediaEpisodeUrl: ep1,
       nextEpisodeUrl: ep2,
       alreadyTriggeredForUrl: ep1,
     }),
@@ -159,7 +235,10 @@ test('shouldAutoAdvanceEpisode blocks unstarted, loading, failed, and duplicate 
       loadingEpisode: true,
       playbackFailed: false,
       hasPlaybackStarted: true,
+      currentTimeSec: 1440,
+      durationSec: 1440,
       currentEpisodeUrl: ep1,
+      loadedMediaEpisodeUrl: ep1,
       nextEpisodeUrl: ep2,
     }),
     false

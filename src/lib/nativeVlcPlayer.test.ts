@@ -181,6 +181,45 @@ describe('VlcPlayerActivity - Android focus & LibVLC surface lifecycle', () => {
     assert.match(prepMatch[0], /if\s*\(!isActivityStarted\)/);
     assert.match(prepMatch[0], /attachVideoViewsIfNeeded\(\)/);
   });
+
+  it('prevents runaway auto-advance on premature LibVLC EndReached events', () => {
+    // 1. Must require real forward playback progress (not Vout + 0ms tick) before confirming playback started
+    assert.match(activityJava, /long forwardProgressMs = timeMs - firstTimeChangedMs;/);
+    assert.match(
+      activityJava,
+      /boolean confirmedWithVideo = hasActiveVout[\s\S]*?playbackTimeAdvanceCount >= 2[\s\S]*?forwardProgressMs >= 500L;/
+    );
+
+    // 2. Must validate genuine playback end (position vs duration + elapsed time) in Event.EndReached
+    assert.match(
+      activityJava,
+      /private static boolean isGenuinePlaybackEndMs\(long posMs, long durMs\)/
+    );
+    assert.match(
+      activityJava,
+      /if\s*\(!hasPlaybackStartedForStream[\s\S]*?\|\|\s*!enoughWatchTime[\s\S]*?\|\|\s*!isGenuinePlaybackEndMs\(posMs, durMs\)\)/
+    );
+    assert.match(
+      activityJava,
+      /Premature EndReached[\s\S]*?handlePlaybackError\(\);[\s\S]*?return;/
+    );
+
+    // 3. Must assign activePlaybackSessionGen AFTER setMedia() and right before play()
+    assert.match(
+      activityJava,
+      /activePlaybackSessionGen = -1L;[\s\S]*?mediaPlayer\.setMedia\(media\);[\s\S]*?activePlaybackSessionGen = \+\+sessionCounter;[\s\S]*?mediaPlayer\.play\(\);/
+    );
+
+    // 4. Must immediately clear Vout / TimeChanged / elapsed markers in loadEpisodeInFullscreen
+    const loadEpMatch = activityJava.match(
+      /private void loadEpisodeInFullscreen\(String rawTargetUrl, boolean saveOutgoingProgress\)[\s\S]*?\r?\n {4}\}/
+    );
+    assert.ok(loadEpMatch, 'missing loadEpisodeInFullscreen(String, boolean)');
+    assert.match(loadEpMatch[0], /hasActiveVout = false;/);
+    assert.match(loadEpMatch[0], /firstTimeChangedMs = -1L;/);
+    assert.match(loadEpMatch[0], /userSeekedInCurrentStream = false;/);
+    assert.match(loadEpMatch[0], /streamPreparedWallMs = 0L;/);
+  });
 });
 
 describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () => {
