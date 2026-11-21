@@ -222,7 +222,7 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
       assert.doesNotMatch(raw, /actions\/download-artifact@v4\b/);
     });
 
-    it('generates an automatic git changelog for every published GitHub Release', () => {
+    it('generates an automatic git changelog for every published GitHub Release and updates CHANGELOG.md', () => {
       const publishSteps = publishJob.steps ?? [];
       const checkoutStep = publishSteps.find((s) => s.uses?.startsWith('actions/checkout'));
       assert.ok(checkoutStep, 'publish-release must checkout git history to generate changelog');
@@ -231,6 +231,7 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
       assert.match(publish.run, /git log --no-merges/);
       assert.match(publish.run, /## Changelog/);
       assert.match(publish.run, /--notes-file "\$NOTES_FILE"/);
+      assert.match(publish.run, />\s*CHANGELOG\.md/);
     });
   });
 });
