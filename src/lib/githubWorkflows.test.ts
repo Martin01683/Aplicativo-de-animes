@@ -171,6 +171,14 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
       assert.match(publish?.run ?? '', /gh release delete-asset .*TopAnimes-debug\.apk/);
     });
 
+    it('creates a new versioned release per build so previous versions stay available', () => {
+      const publish = (publishJob.steps ?? []).find((s) => s.name === 'Publish APK Release');
+      const script = publish?.run ?? '';
+      assert.match(script, /v1\.0\.\$\{\{\s*github\.run_number\s*\}\}/);
+      assert.match(script, /gh release create "\$TAG" TopAnimes\.apk/);
+      assert.doesNotMatch(script, /gh release upload\b[^\n]*--clobber/);
+    });
+
     it('requires all four signing secrets before building', () => {
       const prepare = buildSteps.find((s) => s.name === 'Prepare release signing key');
       assert.ok(prepare, 'missing "Prepare release signing key" step');
