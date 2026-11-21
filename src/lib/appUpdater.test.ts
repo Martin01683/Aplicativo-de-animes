@@ -7,8 +7,10 @@ import {
   extractCommitShaFromNotes,
   formatBytes,
   isAllowedGitHubDownloadUrl,
+  isCancelledApkProgressEvent,
   normalizeSha256Digest,
   parseGitHubReleasePayload,
+  reduceApkDownloadProgress,
 } from './appUpdater';
 
 const SAMPLE_RELEASE_PAYLOAD = {
@@ -155,4 +157,81 @@ test('normalizeSha256Digest parses prefixed and raw 64-hex digests and rejects i
   assert.equal(normalizeSha256Digest('sha256:short'), '');
   assert.equal(normalizeSha256Digest(''), '');
   assert.equal(normalizeSha256Digest(undefined), '');
+});
+
+test('isCancelledApkProgressEvent and reduceApkDownloadProgress clear cancelled notices immediately', () => {
+  assert.equal(
+    isCancelledApkProgressEvent({
+      stage: 'cancelled',
+      message: 'Atualização cancelada.',
+    }),
+    true
+  );
+  assert.equal(
+    isCancelledApkProgressEvent({
+      stage: 'error',
+      message: 'Instalação cancelada pelo usuário.',
+    }),
+    true
+  );
+  assert.equal(
+    isCancelledApkProgressEvent({
+      stage: 'error',
+      message: 'Falha na verificação SHA-256 do APK baixado.',
+    }),
+    false
+  );
+
+  const cancelled = reduceApkDownloadProgress({
+    downloadedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    stage: 'cancelled',
+    message: 'Instalação cancelada pelo usuário.',
+  });
+  assert.equal(cancelled.progress, null);
+  assert.equal(cancelled.downloading, false);
+  assert.equal(cancelled.toastMessage, 'Instalação cancelada pelo usuário.');
+
+  const legacyAborted = reduceApkDownloadProgress({
+    downloadedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    stage: 'error',
+    message: 'Instalação cancelada pelo usuário.',
+  });
+  assert.equal(legacyAborted.progress, null);
+  assert.equal(legacyAborted.downloading, false);
+  assert.equal(legacyAborted.toastMessage, 'Instalação cancelada pelo usuário.');
+
+  const downloading = reduceApkDownloadProgress({
+    downloadedBytes: 12_000_000,
+    totalBytes: 88_000_000,
+    percent: 14,
+    stage: 'downloading',
+  });
+  assert.equal(downloading.downloading, true);
+  assert.equal(downloading.progress?.percent, 14);
+  assert.equal(downloading.toastMessage, undefined);
+
+  const installed = reduceApkDownloadProgress({
+    downloadedBytes: 88_000_000,
+    totalBytes: 88_000_000,
+    percent: 100,
+    stage: 'installed',
+  });
+  assert.equal(installed.downloading, false);
+  assert.equal(installed.acknowledgeRelease, true);
+  assert.equal(installed.toastMessage, 'Atualização instalada com sucesso!');
+
+  const failed = reduceApkDownloadProgress({
+    downloadedBytes: 0,
+    totalBytes: 0,
+    percent: 0,
+    stage: 'error',
+    message: 'Falha ao instalar atualização no sistema.',
+  });
+  assert.equal(failed.downloading, false);
+  assert.equal(failed.progress?.stage, 'error');
+  assert.equal(failed.toastMessage, 'Falha ao instalar atualização no sistema.');
 });

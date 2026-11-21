@@ -59,6 +59,8 @@ interface SettingsModalProps {
   swUpdateAvailable: boolean;
   onCheckAppUpdateNow: () => void;
   onDownloadAppUpdate: () => void;
+  onCancelAppUpdate: () => void;
+  onDismissApkProgress: () => void;
   onApplySwUpdate: () => void;
   // Local data actions
   historyCount: number;
@@ -122,6 +124,8 @@ export function SettingsModal({
   swUpdateAvailable,
   onCheckAppUpdateNow,
   onDownloadAppUpdate,
+  onCancelAppUpdate,
+  onDismissApkProgress,
   onApplySwUpdate,
   historyCount,
   alertsCount,
@@ -462,15 +466,16 @@ export function SettingsModal({
                       </div>
 
                       {latestRelease.notes && (
-                        <p className="line-clamp-3 text-xs leading-relaxed text-slate-400">
+                        <p className="line-clamp-3 break-words text-xs leading-relaxed text-slate-400">
                           {latestRelease.notes}
                         </p>
                       )}
 
-                      {(downloadingAppUpdate || apkDownloadProgress) && (
-                        <div className="space-y-1.5 rounded-lg border border-white/8 bg-[#151921] p-3">
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-medium text-slate-200">
+                      {(downloadingAppUpdate ||
+                        (apkDownloadProgress && apkDownloadProgress.stage !== 'cancelled')) && (
+                        <div className="space-y-2 rounded-lg border border-white/8 bg-[#151921] p-3">
+                          <div className="flex items-center justify-between gap-2.5 text-xs">
+                            <span className="min-w-0 flex-1 font-medium leading-snug text-slate-200">
                               {apkDownloadProgress?.stage === 'verifying'
                                 ? 'Verificando integridade SHA-256 e assinatura...'
                                 : apkDownloadProgress?.stage === 'installing'
@@ -481,13 +486,25 @@ export function SettingsModal({
                                       ? apkDownloadProgress.message || 'Falha ao atualizar APK.'
                                       : `Baixando atualização... ${apkDownloadProgress?.percent ?? 0}%`}
                             </span>
-                            {apkDownloadProgress && apkDownloadProgress.downloadedBytes > 0 && (
-                              <span className="font-mono tabular-nums text-slate-400">
-                                {formatBytes(apkDownloadProgress.downloadedBytes)}
-                                {apkDownloadProgress.totalBytes > 0
-                                  ? ` / ${formatBytes(apkDownloadProgress.totalBytes)}`
-                                  : ''}
-                              </span>
+                            {apkDownloadProgress?.stage === 'error' ||
+                            apkDownloadProgress?.stage === 'installed' ? (
+                              <button
+                                type="button"
+                                onClick={onDismissApkProgress}
+                                aria-label="Fechar aviso de atualização"
+                                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-white/10 bg-[#0d0f12] text-slate-400 transition-colors hover:border-white/25 hover:text-white"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={onCancelAppUpdate}
+                                className="inline-flex min-h-[34px] shrink-0 items-center gap-1 rounded-md border border-white/12 bg-[#0d0f12] px-2.5 py-1 text-xs font-medium text-slate-200 transition-colors hover:border-rose-500/45 hover:text-rose-200"
+                              >
+                                <X className="h-3.5 w-3.5" />
+                                <span>Cancelar</span>
+                              </button>
                             )}
                           </div>
                           <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
@@ -514,6 +531,14 @@ export function SettingsModal({
                               }}
                             />
                           </div>
+                          {apkDownloadProgress && apkDownloadProgress.downloadedBytes > 0 && (
+                            <div className="flex justify-end text-[11px] font-mono tabular-nums text-slate-400">
+                              {formatBytes(apkDownloadProgress.downloadedBytes)}
+                              {apkDownloadProgress.totalBytes > 0
+                                ? ` / ${formatBytes(apkDownloadProgress.totalBytes)}`
+                                : ''}
+                            </div>
+                          )}
                         </div>
                       )}
 

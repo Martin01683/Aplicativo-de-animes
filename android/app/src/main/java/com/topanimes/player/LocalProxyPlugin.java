@@ -46,8 +46,10 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -69,6 +71,9 @@ public class LocalProxyPlugin extends Plugin {
     public static void notifyInstallStage(String stage, int percent, String message) {
         LocalProxyPlugin instance = activeInstanceRef.get();
         if (instance != null) {
+            if ("installed".equals(stage) || "cancelled".equals(stage) || "error".equals(stage)) {
+                instance.activeApkSessionId = -1;
+            }
             instance.emitDownloadProgress(0L, 0L, percent, stage, message);
         }
     }
@@ -92,6 +97,10 @@ public class LocalProxyPlugin extends Plugin {
     private volatile int proxyPort = -1;
     private volatile boolean running = false;
     private ExecutorService executor;
+    private final AtomicLong activeApkDownloadId = new AtomicLong(0L);
+    private volatile HttpURLConnection activeApkConnection = null;
+    private volatile PackageInstaller.Session activeApkSession = null;
+    private volatile int activeApkSessionId = -1;
 
     @Override
     public void load() {
@@ -105,6 +114,7 @@ public class LocalProxyPlugin extends Plugin {
         if (activeInstanceRef.get() == this) {
             activeInstanceRef.clear();
         }
+        cancelActiveApkDownloadInternal();
         running = false;
         if (serverSocket != null) {
             try {
@@ -238,6 +248,69 @@ public class LocalProxyPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void cancelApkDownload(PluginCall call) {
+        boolean cancelled = cancelActiveApkDownloadInternal();
+        emitDownloadProgress(0L, 0L, 0, "cancelled", "Atualização cancelada.");
+        JSObject ret = new JSObject();
+        ret.put("cancelled", cancelled);
+        call.resolve(ret);
+    }
+
+    private synchronized boolean cancelActiveApkDownloadInternal() {
+        boolean hadActive = activeApkConnection != null || activeApkSession != null || activeApkSessionId >= 0;
+        activeApkDownloadId.incrementAndGet();
+
+        final HttpURLConnection conn = activeApkConnection;
+        activeApkConnection = null;
+        if (conn != null) {
+            if (executor != null && !executor.isShutdown()) {
+                executor.execute(() -> {
+                    try {
+                        conn.disconnect();
+                    } catch (Exception ignored) {
+                    }
+                });
+            } else {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+
+        PackageInstaller.Session sess = activeApkSession;
+        activeApkSession = null;
+        if (sess != null) {
+            try {
+                sess.abandon();
+            } catch (Exception ignored) {
+            }
+        }
+
+        int sessId = activeApkSessionId;
+        activeApkSessionId = -1;
+        if (sessId >= 0) {
+            try {
+                getContext().getPackageManager().getPackageInstaller().abandonSession(sessId);
+            } catch (Exception ignored) {
+            }
+        }
+
+        return hadActive;
+    }
+
+    private synchronized long prepareNewApkDownload() {
+        cancelActiveApkDownloadInternal();
+        return activeApkDownloadId.incrementAndGet();
+    }
+
+    private void ensureApkDownloadActive(long downloadId) {
+        if (activeApkDownloadId.get() != downloadId || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("Atualização cancelada.");
+        }
+    }
+
+    @PluginMethod
     public void downloadAndInstallApk(PluginCall call) {
         String rawUrl = call.getString("url", "");
         String expectedSha256 = normalizeSha256Hex(call.getString("expectedSha256", ""));
@@ -272,20 +345,26 @@ public class LocalProxyPlugin extends Plugin {
             startProxyServer();
         }
 
+        final long downloadId = prepareNewApkDownload();
+
         executor.execute(() -> {
             File stagingApk = new File(ctx.getCacheDir(), "topanimes_update_staging.apk");
             HttpURLConnection conn = null;
             PackageInstaller.Session session = null;
             try {
+                ensureApkDownloadActive(downloadId);
                 emitDownloadProgress(0L, 0L, 0, "downloading", null);
 
                 String currentUrl = rawUrl.trim();
                 for (int hop = 0; hop <= 6; hop++) {
+                    ensureApkDownloadActive(downloadId);
                     if (!isAllowedGitHubCdnUrl(currentUrl)) {
                         throw new IOException("Redirecionamento fora dos domínios oficiais do GitHub.");
                     }
                     URL parsed = new URL(currentUrl);
                     conn = (HttpURLConnection) parsed.openConnection();
+                    activeApkConnection = conn;
+                    ensureApkDownloadActive(downloadId);
                     conn.setInstanceFollowRedirects(false);
                     conn.setConnectTimeout(15000);
                     conn.setReadTimeout(30000);
@@ -297,6 +376,9 @@ public class LocalProxyPlugin extends Plugin {
                     if (code >= 300 && code < 400) {
                         String loc = conn.getHeaderField("Location");
                         conn.disconnect();
+                        if (activeApkConnection == conn) {
+                            activeApkConnection = null;
+                        }
                         conn = null;
                         if (loc == null || loc.isEmpty()) {
                             throw new IOException("Redirecionamento vazio ao baixar APK.");
@@ -330,6 +412,7 @@ public class LocalProxyPlugin extends Plugin {
                      FileOutputStream fos = new FileOutputStream(stagingApk)) {
                     int n;
                     while ((n = in.read(buf)) != -1) {
+                        ensureApkDownloadActive(downloadId);
                         fos.write(buf, 0, n);
                         sha256.update(buf, 0, n);
                         downloaded += n;
@@ -345,6 +428,7 @@ public class LocalProxyPlugin extends Plugin {
                     fos.getFD().sync();
                 }
 
+                ensureApkDownloadActive(downloadId);
                 emitDownloadProgress(downloaded, totalBytes, 100, "verifying", null);
 
                 if (!expectedSha256.isEmpty()) {
@@ -356,6 +440,7 @@ public class LocalProxyPlugin extends Plugin {
 
                 verifySelfUpdateArchive(ctx, stagingApk);
 
+                ensureApkDownloadActive(downloadId);
                 emitDownloadProgress(downloaded, totalBytes, 100, "installing", null);
 
                 PackageInstaller installer = ctx.getPackageManager().getPackageInstaller();
@@ -372,16 +457,21 @@ public class LocalProxyPlugin extends Plugin {
                 }
 
                 int sessionId = installer.createSession(params);
+                activeApkSessionId = sessionId;
                 session = installer.openSession(sessionId);
+                activeApkSession = session;
 
                 try (InputStream apkIn = new BufferedInputStream(new FileInputStream(stagingApk));
                      OutputStream sessionOut = session.openWrite("TopAnimes.apk", 0L, stagingApk.length())) {
                     int read;
                     while ((read = apkIn.read(buf)) != -1) {
+                        ensureApkDownloadActive(downloadId);
                         sessionOut.write(buf, 0, read);
                     }
                     session.fsync(sessionOut);
                 }
+
+                ensureApkDownloadActive(downloadId);
 
                 // Remove temporary file right away once copied into PackageManager's session
                 //noinspection ResultOfMethodCallIgnored
@@ -400,25 +490,66 @@ public class LocalProxyPlugin extends Plugin {
                 }
                 session.commit(pendingIntent.getIntentSender());
                 session.close();
+                if (activeApkSession == session) {
+                    activeApkSession = null;
+                }
                 session = null;
 
                 JSObject ret = new JSObject();
                 ret.put("started", true);
                 ret.put("needsPermission", false);
                 call.resolve(ret);
-            } catch (Exception e) {
-                Log.e(TAG, "Self-update failed", e);
+            } catch (CancellationException ce) {
+                Log.i(TAG, "Self-update cancelled by user");
                 if (session != null) {
                     try {
                         session.abandon();
                     } catch (Exception ignored) {
                     }
                 }
-                String msg = e.getMessage() != null ? e.getMessage() : "Falha ao baixar e validar atualização.";
-                emitDownloadProgress(0L, 0L, 0, "error", msg);
-                call.reject(msg);
+                activeApkSession = null;
+                activeApkSessionId = -1;
+                emitDownloadProgress(0L, 0L, 0, "cancelled", "Atualização cancelada.");
+                JSObject ret = new JSObject();
+                ret.put("started", false);
+                ret.put("cancelled", true);
+                ret.put("needsPermission", false);
+                ret.put("message", "Atualização cancelada.");
+                call.resolve(ret);
+            } catch (Exception e) {
+                if (session != null) {
+                    try {
+                        session.abandon();
+                    } catch (Exception ignored) {
+                    }
+                }
+                activeApkSession = null;
+                activeApkSessionId = -1;
+                if (activeApkDownloadId.get() != downloadId || Thread.currentThread().isInterrupted()) {
+                    Log.i(TAG, "Self-update aborted due to cancellation");
+                    emitDownloadProgress(0L, 0L, 0, "cancelled", "Atualização cancelada.");
+                    JSObject ret = new JSObject();
+                    ret.put("started", false);
+                    ret.put("cancelled", true);
+                    ret.put("needsPermission", false);
+                    ret.put("message", "Atualização cancelada.");
+                    call.resolve(ret);
+                } else {
+                    Log.e(TAG, "Self-update failed", e);
+                    String msg = e.getMessage() != null ? e.getMessage() : "Falha ao baixar e validar atualização.";
+                    emitDownloadProgress(0L, 0L, 0, "error", msg);
+                    call.reject(msg);
+                }
             } finally {
-                if (conn != null) conn.disconnect();
+                if (conn != null) {
+                    try {
+                        conn.disconnect();
+                    } catch (Exception ignored) {
+                    }
+                    if (activeApkConnection == conn) {
+                        activeApkConnection = null;
+                    }
+                }
                 if (stagingApk.exists()) {
                     //noinspection ResultOfMethodCallIgnored
                     stagingApk.delete();

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Check,
   ChevronLeft,
   ChevronRight,
   Heart,
@@ -15,7 +16,11 @@ import {
   resolveSeriesPrevNext,
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
-import type { VideoScaleMode } from '../lib/playbackProgress';
+import {
+  isEpisodeMarkedWatched,
+  type EpisodeProgressMap,
+  type VideoScaleMode,
+} from '../lib/playbackProgress';
 import { pickBestFailoverServer } from '../lib/serverFailover';
 import type {
   AnimeDetails,
@@ -33,9 +38,11 @@ interface EpisodeWorkspaceProps {
   episode: EpisodeDetails;
   isFavorite: boolean;
   watchedUrls?: Set<string>;
+  progressMap?: EpisodeProgressMap;
   initialSeriesEpisodes?: AnimeEpisodeLink[];
   loadingEpisode?: boolean;
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
+  onToggleEpisodeWatched?: (episode: EpisodeDetails, watched: boolean) => void;
   onBack: () => void;
   onNavigateUrl: (url: string, kind: 'episode' | 'anime' | 'movie') => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
@@ -67,9 +74,11 @@ export function EpisodeWorkspace({
   episode,
   isFavorite,
   watchedUrls,
+  progressMap,
   initialSeriesEpisodes,
   loadingEpisode = false,
   onToggleFavorite,
+  onToggleEpisodeWatched,
   onBack,
   onNavigateUrl,
   onNativeSessionSync,
@@ -506,47 +515,68 @@ export function EpisodeWorkspace({
                 )}
               </div>
 
-              <button
-                type="button"
-                onClick={() => {
-                  const epNum =
-                    extractEpisodeNumber(episode.episodeLabel || '') ??
-                    extractEpisodeNumber(episode.title) ??
-                    extractEpisodeNumber(episode.url);
-                  onToggleFavorite(
-                    {
-                      id: episode.seriesUrl || episode.url,
-                      title: episode.seriesTitle,
-                      url: episode.seriesUrl || episode.url,
-                      kind: episode.isMovie ? 'movie' : 'anime',
-                      poster: episode.poster || episode.backdrop,
-                      audioType: null,
-                    },
-                    episode.isMovie
-                      ? null
-                      : {
-                          episodeUrl: normalizeTopAnimesUrl(episode.url),
-                          episodeTitle: episode.title,
-                          episodeLabel:
-                            episode.episodeLabel ||
-                            (epNum !== null ? `EP ${epNum}` : 'Episódio atual'),
-                          episodeNumber: epNum,
-                          poster: episode.backdrop || episode.poster,
-                        }
+              <div className="flex flex-wrap items-center gap-2">
+                {onToggleEpisodeWatched && (() => {
+                  const watched = isEpisodeMarkedWatched(episode.url, progressMap, watchedUrls);
+                  return (
+                    <button
+                      type="button"
+                      onClick={() => onToggleEpisodeWatched(episode, !watched)}
+                      aria-pressed={watched}
+                      className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                        watched
+                          ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                          : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
+                      }`}
+                    >
+                      <Check className="h-3.5 w-3.5" />
+                      <span>{watched ? 'Visto' : 'Marcar como visto'}</span>
+                    </button>
                   );
-                }}
-                aria-pressed={isFavorite}
-                className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
-                  isFavorite
-                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                    : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:text-white'
-                }`}
-              >
-                <Heart
-                  className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : ''}`}
-                />
-                <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
-              </button>
+                })()}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    const epNum =
+                      extractEpisodeNumber(episode.episodeLabel || '') ??
+                      extractEpisodeNumber(episode.title) ??
+                      extractEpisodeNumber(episode.url);
+                    onToggleFavorite(
+                      {
+                        id: episode.seriesUrl || episode.url,
+                        title: episode.seriesTitle,
+                        url: episode.seriesUrl || episode.url,
+                        kind: episode.isMovie ? 'movie' : 'anime',
+                        poster: episode.poster || episode.backdrop,
+                        audioType: null,
+                      },
+                      episode.isMovie
+                        ? null
+                        : {
+                            episodeUrl: normalizeTopAnimesUrl(episode.url),
+                            episodeTitle: episode.title,
+                            episodeLabel:
+                              episode.episodeLabel ||
+                              (epNum !== null ? `EP ${epNum}` : 'Episódio atual'),
+                            episodeNumber: epNum,
+                            poster: episode.backdrop || episode.poster,
+                          }
+                    );
+                  }}
+                  aria-pressed={isFavorite}
+                  className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                    isFavorite
+                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                      : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:text-white'
+                  }`}
+                >
+                  <Heart
+                    className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : ''}`}
+                  />
+                  <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
+                </button>
+              </div>
             </div>
 
             <div className="pt-4">

@@ -52,7 +52,7 @@ public class ApkInstallReceiver extends BroadcastReceiver {
         }
 
         if (status == PackageInstaller.STATUS_FAILURE_ABORTED) {
-            LocalProxyPlugin.notifyInstallStage("error", 0, "Instalação cancelada pelo usuário.");
+            LocalProxyPlugin.notifyInstallStage("cancelled", 0, "Instalação cancelada pelo usuário.");
             return;
         }
 

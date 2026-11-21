@@ -18,6 +18,23 @@ export function normalizeTopAnimesUrl(rawUrl: string): string {
   }
 }
 
+export function canonicalEpisodeKey(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+  const normalized = normalizeTopAnimesUrl(trimmed) || trimmed;
+  try {
+    const parsed = new URL(normalized);
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    const pathname = parsed.pathname.replace(/\/+$/, '').toLowerCase();
+    return `${host}${pathname}${parsed.search}`;
+  } catch {
+    return normalized
+      .replace(/^https?:\/\/(?:www\.)?/i, '')
+      .replace(/\/+$/, '')
+      .toLowerCase();
+  }
+}
+
 export function extractMediaSlug(rawUrl: string): string {
   const trimmed = rawUrl.trim();
   if (!trimmed) return '';
@@ -208,12 +225,67 @@ function pickNewerCandidate(
   return a;
 }
 
+export function advanceBaselineWithWatchedEpisodes(params: {
+  animeUrl: string;
+  episodes: Array<{
+    url: string;
+    episodeNumber?: number | null;
+    title?: string;
+    numberLabel?: string;
+  }>;
+  baselines: FavoriteBaselineMap;
+  nowIso?: string;
+}): FavoriteBaselineMap {
+  const { animeUrl, episodes, baselines, nowIso = new Date().toISOString() } = params;
+  if (!animeUrl || episodes.length === 0) return baselines;
+
+  const baselineKey = normalizeTopAnimesUrl(animeUrl) || animeUrl;
+  let bestEp: { url: string; episodeNumber: number | null } | null = null;
+  for (const ep of episodes) {
+    if (!ep.url) continue;
+    const epNum =
+      ep.episodeNumber ??
+      extractEpisodeNumber(ep.url) ??
+      extractEpisodeNumber(ep.title || '') ??
+      extractEpisodeNumber(ep.numberLabel || '');
+    if (!bestEp) {
+      bestEp = { url: normalizeTopAnimesUrl(ep.url), episodeNumber: epNum };
+    } else if (
+      epNum !== null &&
+      (bestEp.episodeNumber === null || epNum >= bestEp.episodeNumber)
+    ) {
+      bestEp = { url: normalizeTopAnimesUrl(ep.url), episodeNumber: epNum };
+    }
+  }
+  if (!bestEp) return baselines;
+
+  const current = baselines[baselineKey] || baselines[animeUrl];
+  if (
+    current &&
+    current.lastEpisodeNumber !== null &&
+    bestEp.episodeNumber !== null &&
+    bestEp.episodeNumber < current.lastEpisodeNumber
+  ) {
+    return baselines;
+  }
+
+  return {
+    ...baselines,
+    [baselineKey]: {
+      lastEpisodeUrl: bestEp.url,
+      lastEpisodeNumber: bestEp.episodeNumber ?? current?.lastEpisodeNumber ?? null,
+      updatedAt: nowIso,
+    },
+  };
+}
+
 export function detectNewFavoriteEpisodes(params: {
   favorites: CatalogMediaItem[];
   releases: CatalogMediaItem[];
   baselines: FavoriteBaselineMap;
   existingAlerts: FavoriteAlertEntry[];
   latestByAnimeUrl?: Record<string, FavoriteLatestInfo>;
+  watchedEpisodeKeys?: Set<string>;
   nowIso?: string;
 }): {
   newAlerts: FavoriteAlertEntry[];
@@ -226,6 +298,7 @@ export function detectNewFavoriteEpisodes(params: {
     baselines,
     existingAlerts,
     latestByAnimeUrl = {},
+    watchedEpisodeKeys,
     nowIso = new Date().toISOString(),
   } = params;
 
@@ -246,6 +319,13 @@ export function detectNewFavoriteEpisodes(params: {
     if (!latest) continue;
 
     const latestEpUrl = normalizeTopAnimesUrl(latest.episodeUrl);
+    const latestCanonicalKey = canonicalEpisodeKey(latest.episodeUrl);
+    const alreadyWatched = Boolean(
+      watchedEpisodeKeys &&
+        (watchedEpisodeKeys.has(latestCanonicalKey) ||
+          watchedEpisodeKeys.has(latestEpUrl) ||
+          watchedEpisodeKeys.has(latest.episodeUrl))
+    );
     const baselineKey = favNormUrl || fav.url;
     const existingBaseline = nextBaselines[baselineKey] || nextBaselines[fav.url];
 
@@ -274,6 +354,10 @@ export function detectNewFavoriteEpisodes(params: {
       lastEpisodeNumber: latest.episodeNumber,
       updatedAt: nowIso,
     };
+
+    if (alreadyWatched) {
+      continue;
+    }
 
     if (!existingEpisodeUrls.has(latestEpUrl)) {
       existingEpisodeUrls.add(latestEpUrl);

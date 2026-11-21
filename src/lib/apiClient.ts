@@ -5,6 +5,7 @@ import {
   isAllowedGitHubDownloadUrl,
   normalizeSha256Digest,
   parseGitHubReleasePayload,
+  type ApkDownloadProgressState,
 } from './appUpdater';
 import {
   normalizeTopAnimesUrl,
@@ -49,13 +50,7 @@ export interface NativeAppBuildInfoResult {
   versionCode: number;
 }
 
-export interface ApkDownloadProgressEvent {
-  downloadedBytes: number;
-  totalBytes: number;
-  percent: number;
-  stage: 'downloading' | 'verifying' | 'installing' | 'installed' | 'error';
-  message?: string;
-}
+export type ApkDownloadProgressEvent = ApkDownloadProgressState;
 
 export interface LocalProxyPlugin {
   getProxyBaseUrl(): Promise<{ baseUrl: string }>;
@@ -66,7 +61,8 @@ export interface LocalProxyPlugin {
     url: string;
     filename?: string;
     expectedSha256?: string;
-  }): Promise<{ started: boolean; needsPermission?: boolean; message?: string }>;
+  }): Promise<{ started: boolean; cancelled?: boolean; needsPermission?: boolean; message?: string }>;
+  cancelApkDownload(): Promise<{ cancelled: boolean }>;
   addListener(
     eventName: 'apkDownloadProgress',
     listenerFunc: (event: ApkDownloadProgressEvent) => void
@@ -175,11 +171,24 @@ export async function addApkDownloadProgressListener(
   }
 }
 
+export async function cancelAppUpdateDownload(): Promise<boolean> {
+  if (!isNativeAndroidApp()) return false;
+  try {
+    const res = await LocalProxy.cancelApkDownload();
+    return Boolean(res?.cancelled);
+  } catch {
+    return false;
+  }
+}
+
 export async function downloadAppUpdateApk(
   downloadUrl: string,
   filename = 'TopAnimes.apk',
   expectedSha256?: string
-): Promise<{ mode: 'native-installer' | 'permission-required' | 'browser-download'; message?: string }> {
+): Promise<{
+  mode: 'native-installer' | 'permission-required' | 'browser-download' | 'cancelled';
+  message?: string;
+}> {
   if (!isAllowedGitHubDownloadUrl(downloadUrl)) {
     throw new Error('URL de download do GitHub inválida ou não permitida.');
   }
@@ -190,6 +199,12 @@ export async function downloadAppUpdateApk(
       filename,
       expectedSha256: cleanSha256 || undefined,
     });
+    if (res?.cancelled) {
+      return {
+        mode: 'cancelled',
+        message: res.message || 'Atualização cancelada.',
+      };
+    }
     if (res?.needsPermission) {
       return {
         mode: 'permission-required',

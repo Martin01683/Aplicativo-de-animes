@@ -1,4 +1,5 @@
 import {
+  buildWatchedProgressMap,
   canonicalEpisodeProgressKey,
   computeProgressSnapshot,
   getResumePositionSec,
@@ -178,6 +179,41 @@ export function clearEpisodeProgress(url: string): EpisodeProgressMap {
   delete next[key];
   saveEpisodeProgressMap(next);
   return next;
+}
+
+export function setEpisodesWatched(
+  urls: string[],
+  watched: boolean
+): { map: EpisodeProgressMap; history: WatchHistoryEntry[] | null } {
+  const currentMap = loadEpisodeProgressMap();
+  const nextMap = buildWatchedProgressMap(currentMap, urls, watched);
+  saveEpisodeProgressMap(nextMap);
+
+  const keySet = new Set(urls.map((u) => canonicalEpisodeProgressKey(u)).filter(Boolean));
+  const currentHistory = loadHistory();
+  let updatedHistory: WatchHistoryEntry[] | null = null;
+
+  if (
+    keySet.size > 0 &&
+    currentHistory.some((item) => keySet.has(canonicalEpisodeProgressKey(item.url)))
+  ) {
+    updatedHistory = currentHistory.map((item) =>
+      keySet.has(canonicalEpisodeProgressKey(item.url))
+        ? {
+            ...item,
+            positionSec: 0,
+            completed: watched,
+          }
+        : item
+    );
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
+    } catch {
+      // ignore
+    }
+  }
+
+  return { map: nextMap, history: updatedHistory };
 }
 
 export function clearAllEpisodeProgress(): void {

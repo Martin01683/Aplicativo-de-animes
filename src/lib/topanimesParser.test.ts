@@ -163,6 +163,8 @@ describe('topanimesParser', () => {
     assert.equal(anime.title, 'Kusuriya no Hitorigoto 3');
     assert.equal(anime.episodes.length, 1);
     assert.equal(anime.episodes[0].episodeNumber, 1);
+    assert.equal(anime.episodes[0].seasonNumber, 3);
+    assert.equal(anime.episodes[0].seasonLabel, 'Temporada 3');
 
     const searchHtml = `<div class="search-page"><div class="result-item"><article>
       <div class="thumbnail"><a href="https://topanimes.net/animes/kusuriya-no-hitorigoto-3-dublado/"><img src="https://image.tmdb.org/t/p/w92/s.jpg"/></a></div>

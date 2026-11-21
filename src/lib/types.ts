@@ -86,6 +86,8 @@ export interface PaginatedSearchResponse {
 export interface AnimeEpisodeLink {
   numberLabel: string;
   episodeNumber: number | null;
+  seasonNumber?: number;
+  seasonLabel?: string;
   title: string;
   url: string;
   date?: string;

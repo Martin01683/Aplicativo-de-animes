@@ -308,3 +308,69 @@ export function formatShortSha(sha: string): string {
   const clean = sha.trim();
   return clean ? clean.slice(0, 7) : 'local';
 }
+
+export type ApkDownloadStage =
+  | 'downloading'
+  | 'verifying'
+  | 'installing'
+  | 'installed'
+  | 'cancelled'
+  | 'error';
+
+export interface ApkDownloadProgressState {
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  stage: ApkDownloadStage;
+  message?: string;
+}
+
+export function isCancelledApkProgressEvent(
+  event: Pick<ApkDownloadProgressState, 'stage' | 'message'> | null | undefined
+): boolean {
+  if (!event) return false;
+  if (event.stage === 'cancelled') return true;
+  if (event.stage === 'error' && event.message) {
+    return /\bcancelad[oa]\b/i.test(event.message);
+  }
+  return false;
+}
+
+export function reduceApkDownloadProgress(
+  event: ApkDownloadProgressState | null
+): {
+  progress: ApkDownloadProgressState | null;
+  downloading: boolean;
+  toastMessage?: string;
+  acknowledgeRelease?: boolean;
+} {
+  if (!event) {
+    return { progress: null, downloading: false };
+  }
+  if (isCancelledApkProgressEvent(event)) {
+    return {
+      progress: null,
+      downloading: false,
+      toastMessage: event.message || 'Atualização cancelada.',
+    };
+  }
+  if (event.stage === 'installed') {
+    return {
+      progress: event,
+      downloading: false,
+      toastMessage: 'Atualização instalada com sucesso!',
+      acknowledgeRelease: true,
+    };
+  }
+  if (event.stage === 'error') {
+    return {
+      progress: event,
+      downloading: false,
+      toastMessage: event.message || 'Falha ao atualizar APK.',
+    };
+  }
+  return {
+    progress: event,
+    downloading: true,
+  };
+}

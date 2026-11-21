@@ -58,6 +58,7 @@ import {
 import {
   DEFAULT_VIDEO_SCALE,
   getVideoScaleLabel,
+  isEpisodeMarkedWatched,
   sanitizeVideoScaleMode,
   VIDEO_SCALE_OPTIONS,
   type VideoScaleMode,
@@ -2607,7 +2608,7 @@ export function AnimePlayer({
               ) : (
                 seriesEpisodes.map((ep) => {
                   const isCurrent = isSameEpisodeUrl(ep.url, episodeUrl);
-                  const isWatched = watchedUrls?.has(ep.url) ?? false;
+                  const isWatched = isEpisodeMarkedWatched(ep.url, undefined, watchedUrls);
                   return (
                     <button
                       key={ep.url}

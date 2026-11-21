@@ -1,4 +1,4 @@
-import { normalizeTopAnimesUrl } from './favoriteAlerts';
+import { canonicalEpisodeKey } from './favoriteAlerts';
 
 export type VideoScaleMode = 'best-fit' | 'fit-screen' | 'fill' | '16:9' | 'original';
 
@@ -55,20 +55,7 @@ export type EpisodeProgressMap = Record<string, EpisodePlaybackProgress>;
 export const MIN_RESUME_SECONDS = 2;
 
 export function canonicalEpisodeProgressKey(rawUrl: string): string {
-  const trimmed = (rawUrl || '').trim();
-  if (!trimmed) return '';
-  const normalized = normalizeTopAnimesUrl(trimmed) || trimmed;
-  try {
-    const parsed = new URL(normalized);
-    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
-    const pathname = parsed.pathname.replace(/\/+$/, '').toLowerCase();
-    return `${host}${pathname}${parsed.search}`;
-  } catch {
-    return normalized
-      .replace(/^https?:\/\/(?:www\.)?/i, '')
-      .replace(/\/+$/, '')
-      .toLowerCase();
-  }
+  return canonicalEpisodeKey(rawUrl);
 }
 
 export function isEpisodeCompleted(
@@ -163,7 +150,7 @@ export function computeProgressSnapshot(params: {
 export function upsertEpisodeProgressMap(
   map: EpisodeProgressMap,
   entry: EpisodePlaybackProgress,
-  maxEntries = 200
+  maxEntries = 1500
 ): EpisodeProgressMap {
   const key = canonicalEpisodeProgressKey(entry.url);
   if (!key) return map;
@@ -232,4 +219,98 @@ export function formatPlaybackTimestamp(sec: number): string {
   const r = s % 60;
   const pad = (n: number) => (n < 10 ? `0${n}` : `${n}`);
   return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+}
+
+export function buildWatchedProgressMap(
+  currentMap: EpisodeProgressMap,
+  urls: string[],
+  watched: boolean,
+  nowIso: string = new Date().toISOString(),
+  maxEntries = 1500
+): EpisodeProgressMap {
+  let next: EpisodeProgressMap = { ...currentMap };
+  for (const rawUrl of urls) {
+    const url = (rawUrl || '').trim();
+    const key = canonicalEpisodeProgressKey(url);
+    if (!key) continue;
+
+    if (watched) {
+      const existing = next[key];
+      next = upsertEpisodeProgressMap(
+        next,
+        {
+          url: existing?.url || url,
+          positionSec: 0,
+          durationSec: existing?.durationSec ?? 0,
+          completed: true,
+          updatedAt: nowIso,
+        },
+        maxEntries
+      );
+    } else {
+      delete next[key];
+    }
+  }
+  return next;
+}
+
+export function isEpisodeMarkedWatched(
+  url: string,
+  progressMap?: EpisodeProgressMap,
+  watchedUrls?: Set<string>
+): boolean {
+  const key = canonicalEpisodeProgressKey(url);
+  if (key && progressMap?.[key]?.completed) return true;
+  if (watchedUrls?.has(url)) return true;
+  if (key && watchedUrls?.has(key)) return true;
+  return false;
+}
+
+export interface SeasonEpisodeGroup<T> {
+  seasonNumber: number;
+  label: string;
+  episodes: T[];
+}
+
+export function groupEpisodesBySeason<
+  T extends { seasonNumber?: number; seasonLabel?: string; numberLabel?: string },
+>(episodes: T[]): Array<SeasonEpisodeGroup<T>> {
+  const groups = new Map<number, SeasonEpisodeGroup<T>>();
+
+  for (const ep of episodes) {
+    let seasonNumber =
+      typeof ep.seasonNumber === 'number' &&
+      Number.isFinite(ep.seasonNumber) &&
+      ep.seasonNumber > 0
+        ? Math.floor(ep.seasonNumber)
+        : 0;
+
+    if (!seasonNumber && ep.numberLabel) {
+      const m = ep.numberLabel.trim().match(/^(\d+)\s*[-–/]\s*\d+/);
+      if (m?.[1]) {
+        const parsed = Number.parseInt(m[1], 10);
+        if (Number.isFinite(parsed) && parsed > 0) {
+          seasonNumber = parsed;
+        }
+      }
+    }
+
+    if (!seasonNumber) {
+      seasonNumber = 1;
+    }
+
+    const label = ep.seasonLabel?.trim() || `Temporada ${seasonNumber}`;
+    const existing = groups.get(seasonNumber);
+    if (existing) {
+      existing.episodes.push(ep);
+    } else {
+      groups.set(seasonNumber, {
+        seasonNumber,
+        label,
+        episodes: [ep],
+      });
+    }
+  }
+
+  return Array.from(groups.values()).sort((a, b) => a.seasonNumber - b.seasonNumber);
 }

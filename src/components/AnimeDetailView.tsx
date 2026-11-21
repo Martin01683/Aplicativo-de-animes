@@ -1,12 +1,19 @@
-import { ArrowLeft, Heart, Play, Star } from 'lucide-react';
+import { ArrowLeft, Check, CheckCheck, Heart, Play, Star } from 'lucide-react';
 import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
   formatPlaybackTimestamp,
   getResumePositionSec,
+  groupEpisodesBySeason,
+  isEpisodeMarkedWatched,
   type EpisodeProgressMap,
 } from '../lib/playbackProgress';
-import type { AnimeDetails, CatalogMediaItem, FavoriteLatestInfo } from '../lib/types';
+import type {
+  AnimeDetails,
+  AnimeEpisodeLink,
+  CatalogMediaItem,
+  FavoriteLatestInfo,
+} from '../lib/types';
 import { MediaPoster } from './MediaPoster';
 
 interface AnimeDetailViewProps {
@@ -15,6 +22,11 @@ interface AnimeDetailViewProps {
   watchedUrls: Set<string>;
   progressMap?: EpisodeProgressMap;
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
+  onToggleEpisodesWatched: (
+    episodes: AnimeEpisodeLink[],
+    watched: boolean,
+    label?: string
+  ) => void;
   onOpenEpisode: (episodeUrl: string) => void;
   onBack: () => void;
 }
@@ -25,11 +37,20 @@ export function AnimeDetailView({
   watchedUrls,
   progressMap,
   onToggleFavorite,
+  onToggleEpisodesWatched,
   onOpenEpisode,
   onBack,
 }: AnimeDetailViewProps) {
   const latestEpisode = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster);
   const firstEpisode = anime.episodes[0];
+  const seasonGroups = groupEpisodesBySeason(anime.episodes);
+
+  const isWatchedEpisode = (ep: AnimeEpisodeLink) =>
+    isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls);
+
+  const totalWatchedCount = anime.episodes.filter(isWatchedEpisode).length;
+  const allEpisodesWatched =
+    anime.episodes.length > 0 && totalWatchedCount === anime.episodes.length;
 
   const handleToggleFav = () => {
     onToggleFavorite(
@@ -168,11 +189,43 @@ export function AnimeDetailView({
       </div>
 
       <section className="mt-8">
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-white">Episódios</h2>
-          <span className="font-mono text-xs tabular-nums text-slate-400">
-            {anime.episodes.length} disponíveis
-          </span>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-semibold text-white">Episódios</h2>
+            {anime.episodes.length > 0 && (
+              <span className="font-mono text-xs tabular-nums text-slate-400">
+                {totalWatchedCount}/{anime.episodes.length} vistos
+              </span>
+            )}
+          </div>
+
+          {anime.episodes.length > 0 && seasonGroups.length > 1 && (
+            <button
+              type="button"
+              onClick={() =>
+                onToggleEpisodesWatched(
+                  anime.episodes,
+                  !allEpisodesWatched,
+                  allEpisodesWatched
+                    ? 'Todas as temporadas desmarcadas'
+                    : 'Todas as temporadas marcadas como vistas'
+                )
+              }
+              aria-pressed={allEpisodesWatched}
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                allEpisodesWatched
+                  ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                  : 'border-white/12 bg-[#151921] text-slate-200 hover:border-[#f97316]/60 hover:text-white'
+              }`}
+            >
+              <CheckCheck className="h-3.5 w-3.5" />
+              <span>
+                {allEpisodesWatched
+                  ? 'Desmarcar todas as temporadas'
+                  : 'Marcar tudo como visto'}
+              </span>
+            </button>
+          )}
         </div>
 
         {anime.episodes.length === 0 ? (
@@ -180,51 +233,124 @@ export function AnimeDetailView({
             Nenhum episódio listado nesta página.
           </div>
         ) : (
-          <div className="divide-y divide-white/8 overflow-hidden rounded-xl border border-white/10 bg-[#151921]">
-            {anime.episodes.map((ep) => {
-              const epKey = canonicalEpisodeProgressKey(ep.url);
-              const epProgress = epKey ? progressMap?.[epKey] : undefined;
-              const resumeSec = getResumePositionSec(epProgress);
-              const watched = watchedUrls.has(ep.url) || Boolean(epProgress?.completed);
+          <div className="space-y-5">
+            {seasonGroups.map((group) => {
+              const seasonWatchedCount = group.episodes.filter(isWatchedEpisode).length;
+              const seasonAllWatched =
+                group.episodes.length > 0 && seasonWatchedCount === group.episodes.length;
+
               return (
-                <button
-                  key={ep.url}
-                  type="button"
-                  onClick={() => onOpenEpisode(ep.url)}
-                  className="group flex w-full items-center justify-between gap-4 px-4 py-3 text-left transition-colors hover:bg-white/5"
+                <div
+                  key={group.seasonNumber}
+                  className="overflow-hidden rounded-xl border border-white/10 bg-[#151921]"
                 >
-                  <div className="flex min-w-0 items-center gap-4">
-                    <span className="w-16 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400">
-                      {ep.numberLabel || 'EP'}
-                    </span>
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium text-white group-hover:text-[#f97316]">
-                        {ep.title}
-                      </div>
-                      {ep.date && (
-                        <div className="mt-0.5 text-xs tabular-nums text-slate-500">
-                          {ep.date}
-                        </div>
-                      )}
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/10 bg-[#0d0f12]/55 px-4 py-2.5">
+                    <div className="flex items-center gap-2.5">
+                      <span className="text-xs font-semibold uppercase tracking-wide text-slate-200">
+                        {group.label}
+                      </span>
+                      <span className="font-mono text-[11px] tabular-nums text-slate-400">
+                        {seasonWatchedCount}/{group.episodes.length} vistos
+                      </span>
                     </div>
+
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onToggleEpisodesWatched(
+                          group.episodes,
+                          !seasonAllWatched,
+                          seasonAllWatched
+                            ? `${group.label} desmarcada`
+                            : `${group.label} marcada como vista`
+                        )
+                      }
+                      aria-pressed={seasonAllWatched}
+                      className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
+                        seasonAllWatched
+                          ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                          : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
+                      }`}
+                    >
+                      <CheckCheck className="h-3.5 w-3.5" />
+                      <span>
+                        {seasonAllWatched
+                          ? 'Temporada vista'
+                          : 'Marcar temporada como vista'}
+                      </span>
+                    </button>
                   </div>
 
-                  <div className="flex shrink-0 items-center gap-3">
-                    {resumeSec >= 2 ? (
-                      <span className="text-xs font-medium tabular-nums text-[#fb923c]">
-                        Parou em {formatPlaybackTimestamp(resumeSec)}
-                      </span>
-                    ) : watched ? (
-                      <span className="text-xs font-medium text-emerald-400">
-                        Visto
-                      </span>
-                    ) : null}
-                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-300 group-hover:text-white">
-                      <Play className="h-3.5 w-3.5 text-[#f97316]" />
-                      {resumeSec >= 2 ? 'Retomar' : 'Abrir'}
-                    </span>
+                  <div className="divide-y divide-white/8">
+                    {group.episodes.map((ep) => {
+                      const epKey = canonicalEpisodeProgressKey(ep.url);
+                      const epProgress = epKey ? progressMap?.[epKey] : undefined;
+                      const resumeSec = getResumePositionSec(epProgress);
+                      const watched = isWatchedEpisode(ep);
+                      return (
+                        <div
+                          key={ep.url}
+                          className="group flex items-center justify-between gap-2 px-4 py-3 transition-colors hover:bg-white/5 sm:gap-4"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => onOpenEpisode(ep.url)}
+                            className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
+                          >
+                            <div className="flex min-w-0 items-center gap-3 sm:gap-4">
+                              <span className="w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400 sm:w-16">
+                                {ep.numberLabel || 'EP'}
+                              </span>
+                              <div className="min-w-0">
+                                <div className="truncate text-sm font-medium text-white group-hover:text-[#f97316]">
+                                  {ep.title}
+                                </div>
+                                {ep.date && (
+                                  <div className="mt-0.5 text-xs tabular-nums text-slate-500">
+                                    {ep.date}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="flex shrink-0 items-center gap-2.5">
+                              {resumeSec >= 2 && (
+                                <span className="text-xs font-medium tabular-nums text-[#fb923c]">
+                                  Parou em {formatPlaybackTimestamp(resumeSec)}
+                                </span>
+                              )}
+                              <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-300 group-hover:text-white">
+                                <Play className="h-3.5 w-3.5 text-[#f97316]" />
+                                <span className="hidden sm:inline">
+                                  {resumeSec >= 2 ? 'Retomar' : 'Abrir'}
+                                </span>
+                              </span>
+                            </div>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => onToggleEpisodesWatched([ep], !watched)}
+                            aria-pressed={watched}
+                            aria-label={
+                              watched
+                                ? `Desmarcar ${ep.title} como visto`
+                                : `Marcar ${ep.title} como visto`
+                            }
+                            className={`inline-flex shrink-0 items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                              watched
+                                ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                                : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
+                            }`}
+                          >
+                            <Check className="h-3.5 w-3.5" />
+                            <span>{watched ? 'Visto' : 'Marcar visto'}</span>
+                          </button>
+                        </div>
+                      );
+                    })}
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>

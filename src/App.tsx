@@ -10,6 +10,7 @@ import { useOnlineStatus } from './hooks/useOnlineStatus';
 import {
   addApkDownloadProgressListener,
   apiFetch,
+  cancelAppUpdateDownload,
   downloadAppUpdateApk,
   getNativeAppBuildInfo,
   isNativeAndroidApp,
@@ -19,12 +20,15 @@ import {
   buildReleaseIdentityKey,
   evaluateUpdateStatus,
   getAppBuildInfo,
+  reduceApkDownloadProgress,
   type AppBuildInfo,
   type AppUpdateCheckResult,
   type RemoteAppRelease,
 } from './lib/appUpdater';
 import {
+  advanceBaselineWithWatchedEpisodes,
   buildFavoriteBaseline,
+  canonicalEpisodeKey,
   detectNewFavoriteEpisodes,
   findMatchingFavorite,
   isItemFavorited,
@@ -33,6 +37,7 @@ import {
 } from './lib/favoriteAlerts';
 import { isSameEpisodeUrl, setNativeVlcVideoScale } from './lib/nativeVlcPlayer';
 import {
+  canonicalEpisodeProgressKey,
   sanitizeVideoScaleMode,
   type EpisodeProgressMap,
 } from './lib/playbackProgress';
@@ -68,6 +73,7 @@ import {
   saveFavoriteAlerts,
   saveFavoriteBaselines,
   saveFavorites,
+  setEpisodesWatched,
 } from './lib/storage';
 import type {
   AnimeDetails,
@@ -221,6 +227,8 @@ export default function App() {
   const [swUpdateAvailable, setSwUpdateAvailable] = useState(false);
   const waitingSwRef = useRef<ServiceWorker | null>(null);
   const pendingUpdateReleaseRef = useRef<RemoteAppRelease | null>(null);
+  const apkUpdateRequestTokenRef = useRef(0);
+  const apkInstalledClearTimerRef = useRef<number | null>(null);
 
   const favoritesRef = useRef(favorites);
   const baselinesRef = useRef(baselines);
@@ -232,6 +240,7 @@ export default function App() {
   const acknowledgedReleaseKeyRef = useRef(acknowledgedReleaseKey);
   const routeRef = useRef(route);
   const routeStackRef = useRef(routeStack);
+  const watchedEpisodeKeysRef = useRef<Set<string>>(new Set());
   const animeDetailsCacheRef = useRef<Map<string, AnimeDetails>>(new Map());
   const episodeDetailsCacheRef = useRef<Map<string, EpisodeDetails>>(new Map());
   const navRequestGenRef = useRef(0);
@@ -362,6 +371,7 @@ export default function App() {
           baselines: baselinesRef.current,
           existingAlerts: alertsRef.current,
           latestByAnimeUrl,
+          watchedEpisodeKeys: watchedEpisodeKeysRef.current,
         });
 
         setBaselines(detection.nextBaselines);
@@ -410,6 +420,27 @@ export default function App() {
     );
   }, []);
 
+  const handleDismissApkProgress = useCallback(() => {
+    if (apkInstalledClearTimerRef.current !== null) {
+      window.clearTimeout(apkInstalledClearTimerRef.current);
+      apkInstalledClearTimerRef.current = null;
+    }
+    setApkDownloadProgress(null);
+  }, []);
+
+  const handleCancelAppUpdate = useCallback(() => {
+    apkUpdateRequestTokenRef.current += 1;
+    pendingUpdateReleaseRef.current = null;
+    if (apkInstalledClearTimerRef.current !== null) {
+      window.clearTimeout(apkInstalledClearTimerRef.current);
+      apkInstalledClearTimerRef.current = null;
+    }
+    setDownloadingAppUpdate(false);
+    setApkDownloadProgress(null);
+    showToast('Atualização cancelada.');
+    void cancelAppUpdateDownload();
+  }, [showToast]);
+
   const handleDownloadAppUpdate = useCallback(
     async (explicitRelease?: RemoteAppRelease | null) => {
       const targetRelease = explicitRelease || appUpdateResult?.latestRelease;
@@ -418,8 +449,16 @@ export default function App() {
         showToast('Nenhum arquivo de atualização encontrado nesta release.');
         return;
       }
+      const token = ++apkUpdateRequestTokenRef.current;
+      if (apkInstalledClearTimerRef.current !== null) {
+        window.clearTimeout(apkInstalledClearTimerRef.current);
+        apkInstalledClearTimerRef.current = null;
+      }
       pendingUpdateReleaseRef.current = targetRelease || null;
       setDownloadingAppUpdate(true);
+      if (isNativeAndroidApp()) {
+        setToast('');
+      }
       setApkDownloadProgress(
         isNativeAndroidApp()
           ? { downloadedBytes: 0, totalBytes: asset.sizeBytes || 0, percent: 0, stage: 'downloading' }
@@ -431,6 +470,12 @@ export default function App() {
           asset.name || 'TopAnimes.apk',
           asset.digest
         );
+        if (apkUpdateRequestTokenRef.current !== token) return;
+        if (result.mode === 'cancelled') {
+          setApkDownloadProgress(null);
+          showToast(result.message || 'Atualização cancelada.');
+          return;
+        }
         if (result.mode === 'permission-required') {
           showToast(
             result.message ||
@@ -446,13 +491,21 @@ export default function App() {
         }
         showToast('Verificação concluída — confirme a instalação no sistema Android.');
       } catch (err) {
+        if (apkUpdateRequestTokenRef.current !== token) return;
         const msg = err instanceof Error ? err.message : 'Falha ao iniciar download da atualização.';
-        setApkDownloadProgress((prev) =>
-          prev ? { ...prev, stage: 'error', message: msg } : null
-        );
-        showToast(msg);
+        const reduced = reduceApkDownloadProgress({
+          downloadedBytes: 0,
+          totalBytes: asset.sizeBytes || 0,
+          percent: 0,
+          stage: 'error',
+          message: msg,
+        });
+        setApkDownloadProgress(reduced.progress);
+        showToast(reduced.toastMessage || msg);
       } finally {
-        setDownloadingAppUpdate(false);
+        if (apkUpdateRequestTokenRef.current === token) {
+          setDownloadingAppUpdate(false);
+        }
       }
     },
     [appUpdateResult, markReleaseAcknowledged, showToast]
@@ -633,21 +686,33 @@ export default function App() {
     let active = true;
     const handlePromise = addApkDownloadProgressListener((event) => {
       if (!active) return;
-      setApkDownloadProgress(event);
-      if (event.stage === 'installed') {
-        setDownloadingAppUpdate(false);
+      if (apkInstalledClearTimerRef.current !== null) {
+        window.clearTimeout(apkInstalledClearTimerRef.current);
+        apkInstalledClearTimerRef.current = null;
+      }
+      const reduced = reduceApkDownloadProgress(event);
+      setApkDownloadProgress(reduced.progress);
+      setDownloadingAppUpdate(reduced.downloading);
+      if (reduced.acknowledgeRelease) {
         markReleaseAcknowledged(pendingUpdateReleaseRef.current);
-        showToast('Atualização instalada com sucesso!');
-      } else if (event.stage === 'error') {
-        setDownloadingAppUpdate(false);
-        if (event.message) {
-          showToast(event.message);
-        }
+        apkInstalledClearTimerRef.current = window.setTimeout(() => {
+          apkInstalledClearTimerRef.current = null;
+          setApkDownloadProgress((current) =>
+            current?.stage === 'installed' ? null : current
+          );
+        }, 4500);
+      }
+      if (reduced.toastMessage) {
+        showToast(reduced.toastMessage);
       }
     });
 
     return () => {
       active = false;
+      if (apkInstalledClearTimerRef.current !== null) {
+        window.clearTimeout(apkInstalledClearTimerRef.current);
+        apkInstalledClearTimerRef.current = null;
+      }
       void handlePromise.then((handle) => handle?.remove());
     };
   }, [markReleaseAcknowledged, showToast]);
@@ -1152,9 +1217,94 @@ export default function App() {
     [alerts]
   );
 
-  const watchedUrls = useMemo(
-    () => new Set(history.map((h) => h.url)),
-    [history]
+  const watchedUrls = useMemo(() => {
+    const urls = new Set<string>();
+    for (const entry of Object.values(progressMap)) {
+      if (!entry?.completed || !entry.url) continue;
+      urls.add(entry.url);
+      const norm = normalizeTopAnimesUrl(entry.url);
+      if (norm) urls.add(norm);
+    }
+    for (const item of history) {
+      if (!item.completed || !item.url) continue;
+      urls.add(item.url);
+      const norm = normalizeTopAnimesUrl(item.url);
+      if (norm) urls.add(norm);
+    }
+    return urls;
+  }, [history, progressMap]);
+
+  const watchedEpisodeKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const url of watchedUrls) {
+      const key = canonicalEpisodeProgressKey(url);
+      if (key) keys.add(key);
+    }
+    return keys;
+  }, [watchedUrls]);
+
+  watchedEpisodeKeysRef.current = watchedEpisodeKeys;
+
+  const handleToggleEpisodesWatched = useCallback(
+    (
+      episodes: Array<{
+        url: string;
+        episodeNumber?: number | null;
+        title?: string;
+        numberLabel?: string;
+      }>,
+      watched: boolean,
+      options?: { animeUrl?: string; toastMessage?: string }
+    ) => {
+      const urls = episodes.map((ep) => ep.url).filter(Boolean);
+      if (urls.length === 0) return;
+
+      const { map: nextMap, history: nextHistory } = setEpisodesWatched(urls, watched);
+      setProgressMap(nextMap);
+      if (nextHistory) {
+        setHistory(nextHistory);
+      }
+
+      if (watched) {
+        const keySet = new Set(urls.map((u) => canonicalEpisodeKey(u)).filter(Boolean));
+        const hasMatchingUnreadAlert = alertsRef.current.some(
+          (a) => !a.read && keySet.has(canonicalEpisodeKey(a.episodeUrl))
+        );
+        if (hasMatchingUnreadAlert) {
+          const nextAlerts = alertsRef.current.map((a) =>
+            keySet.has(canonicalEpisodeKey(a.episodeUrl)) ? { ...a, read: true } : a
+          );
+          setAlerts(nextAlerts);
+          saveFavoriteAlerts(nextAlerts);
+        }
+
+        if (options?.animeUrl) {
+          const favMatch = findMatchingFavorite(options.animeUrl, favoritesRef.current);
+          if (favMatch) {
+            const nextBaselines = advanceBaselineWithWatchedEpisodes({
+              animeUrl: favMatch.url,
+              episodes,
+              baselines: baselinesRef.current,
+            });
+            if (nextBaselines !== baselinesRef.current) {
+              setBaselines(nextBaselines);
+              saveFavoriteBaselines(nextBaselines);
+            }
+          }
+        }
+      }
+
+      const defaultMsg =
+        urls.length === 1
+          ? watched
+            ? 'Episódio marcado como visto.'
+            : 'Episódio desmarcado como visto.'
+          : watched
+            ? `${urls.length} episódios marcados como vistos.`
+            : `${urls.length} episódios desmarcados.`;
+      showToast(options?.toastMessage || defaultMsg);
+    },
+    [showToast]
   );
 
   const handleSelectSection = (section: NavSection) => {
@@ -1350,6 +1500,7 @@ export default function App() {
             }}
             onSelectSection={handleSelectSection}
             defaultAudioFilter={settings.defaultAudioFilter}
+            watchedEpisodeKeys={watchedEpisodeKeys}
           />
         )}
 
@@ -1380,6 +1531,12 @@ export default function App() {
                 watchedUrls={watchedUrls}
                 progressMap={progressMap}
                 onToggleFavorite={toggleFavorite}
+                onToggleEpisodesWatched={(eps, watched, label) =>
+                  handleToggleEpisodesWatched(eps, watched, {
+                    animeUrl: animeDetails.url,
+                    toastMessage: label,
+                  })
+                }
                 onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
                 onBack={() => navigateBackStep()}
               />
@@ -1415,6 +1572,7 @@ export default function App() {
                   favorites
                 )}
                 watchedUrls={watchedUrls}
+                progressMap={progressMap}
                 initialSeriesEpisodes={
                   animeDetails &&
                   episodeDetails.seriesUrl &&
@@ -1424,6 +1582,21 @@ export default function App() {
                 }
                 loadingEpisode={loadingDetail}
                 onToggleFavorite={toggleFavorite}
+                onToggleEpisodeWatched={(ep, watched) =>
+                  handleToggleEpisodesWatched(
+                    [
+                      {
+                        url: ep.url,
+                        title: ep.title,
+                        numberLabel: ep.episodeLabel || '',
+                      },
+                    ],
+                    watched,
+                    {
+                      animeUrl: ep.seriesUrl || ep.url,
+                    }
+                  )
+                }
                 onBack={() => navigateBackStep()}
                 onNavigateUrl={openMediaUrl}
                 onNativeSessionSync={(result) => {
@@ -1497,7 +1670,16 @@ export default function App() {
 
       <SettingsModal
         open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        onClose={() => {
+          setSettingsOpen(false);
+          if (
+            apkDownloadProgress?.stage === 'error' ||
+            apkDownloadProgress?.stage === 'installed' ||
+            apkDownloadProgress?.stage === 'cancelled'
+          ) {
+            handleDismissApkProgress();
+          }
+        }}
         settings={settings}
         settingsMeta={settingsMeta}
         onUpdateSettings={updateSettings}
@@ -1520,6 +1702,8 @@ export default function App() {
         swUpdateAvailable={swUpdateAvailable}
         onCheckAppUpdateNow={() => void checkForAppUpdates({ manual: true })}
         onDownloadAppUpdate={() => void handleDownloadAppUpdate()}
+        onCancelAppUpdate={handleCancelAppUpdate}
+        onDismissApkProgress={handleDismissApkProgress}
         onApplySwUpdate={handleApplySwUpdate}
         historyCount={history.length}
         alertsCount={alerts.length}

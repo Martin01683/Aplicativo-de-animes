@@ -1,14 +1,17 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  buildWatchedProgressMap,
   canonicalEpisodeProgressKey,
   computeProgressSnapshot,
   DEFAULT_VIDEO_SCALE,
   formatPlaybackTimestamp,
   getResumePositionSec,
   getVideoScaleLabel,
+  groupEpisodesBySeason,
   indexToVideoScale,
   isEpisodeCompleted,
+  isEpisodeMarkedWatched,
   sanitizeEpisodeProgressMap,
   sanitizeVideoScaleMode,
   upsertEpisodeProgressMap,
@@ -135,4 +138,53 @@ test('videoScale helpers round-trip modes, indices, and fallback safely', () => 
 test('formatPlaybackTimestamp formats mm:ss and h:mm:ss cleanly', () => {
   assert.equal(formatPlaybackTimestamp(65), '1:05');
   assert.equal(formatPlaybackTimestamp(3661), '1:01:01');
+});
+
+test('buildWatchedProgressMap marks and unmarks single episodes and entire seasons cleanly', () => {
+  const s1Urls = [
+    'https://topanimes.net/episodio/anime-episodio-1/',
+    'https://topanimes.net/episodio/anime-episodio-2/',
+    'https://topanimes.net/episodio/anime-episodio-3/',
+  ];
+  let map = buildWatchedProgressMap({}, s1Urls, true, '2026-11-21T12:00:00Z');
+  for (const u of s1Urls) {
+    assert.equal(isEpisodeMarkedWatched(u, map), true);
+    assert.equal(getResumePositionSec(map[canonicalEpisodeProgressKey(u)]), 0);
+  }
+
+  // Unmark a single episode while keeping the rest watched
+  map = buildWatchedProgressMap(map, [s1Urls[1]], false);
+  assert.equal(isEpisodeMarkedWatched(s1Urls[0], map), true);
+  assert.equal(isEpisodeMarkedWatched(s1Urls[1], map), false);
+  assert.equal(isEpisodeMarkedWatched(s1Urls[2], map), true);
+
+  // Unmark entire season
+  map = buildWatchedProgressMap(map, s1Urls, false);
+  for (const u of s1Urls) {
+    assert.equal(isEpisodeMarkedWatched(u, map), false);
+  }
+});
+
+test('groupEpisodesBySeason groups episodes by explicit seasonNumber or numerando label', () => {
+  const groups = groupEpisodesBySeason([
+    { numberLabel: '1 - 1', title: 'EP 1', url: 'https://topanimes.net/episodio/a-1/' },
+    { numberLabel: '1 - 2', title: 'EP 2', url: 'https://topanimes.net/episodio/a-2/' },
+    { numberLabel: '2 - 1', title: 'EP 1 T2', url: 'https://topanimes.net/episodio/a-3/' },
+    {
+      numberLabel: 'EP 4',
+      seasonNumber: 3,
+      seasonLabel: 'Temporada 3 (Final)',
+      title: 'EP 4',
+      url: 'https://topanimes.net/episodio/a-4/',
+    },
+  ]);
+
+  assert.equal(groups.length, 3);
+  assert.equal(groups[0].seasonNumber, 1);
+  assert.equal(groups[0].label, 'Temporada 1');
+  assert.equal(groups[0].episodes.length, 2);
+  assert.equal(groups[1].seasonNumber, 2);
+  assert.equal(groups[1].episodes.length, 1);
+  assert.equal(groups[2].seasonNumber, 3);
+  assert.equal(groups[2].label, 'Temporada 3 (Final)');
 });

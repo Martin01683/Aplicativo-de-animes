@@ -16,7 +16,11 @@ import {
   Film,
 } from 'lucide-react';
 import { isItemFavorited } from '../lib/favoriteAlerts';
-import { formatPlaybackTimestamp, isEpisodeCompleted } from '../lib/playbackProgress';
+import {
+  canonicalEpisodeProgressKey,
+  formatPlaybackTimestamp,
+  isEpisodeCompleted,
+} from '../lib/playbackProgress';
 import type {
   AudioType,
   CatalogArchiveCategory,
@@ -90,6 +94,7 @@ interface CatalogViewProps {
   onClearHistory: () => void;
   onSelectSection: (section: NavSection) => void;
   defaultAudioFilter: 'ALL' | 'DUB' | 'LEG';
+  watchedEpisodeKeys?: Set<string>;
 }
 
 const ARCHIVE_TABS: Array<{ id: CatalogArchiveCategory; label: string }> = [
@@ -152,6 +157,7 @@ export function CatalogView({
   onClearHistory,
   onSelectSection,
   defaultAudioFilter,
+  watchedEpisodeKeys,
 }: CatalogViewProps) {
   const [searchInput, setSearchInput] = useState(searchQuery);
   const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>(defaultAudioFilter);
@@ -183,7 +189,14 @@ export function CatalogView({
     progressMeta?: { label?: string; pct?: number }
   ) => {
     const metaParts: string[] = [];
-    if (progressMeta?.label) metaParts.push(progressMeta.label);
+    if (progressMeta?.label) {
+      metaParts.push(progressMeta.label);
+    } else if (
+      item.kind === 'episode' &&
+      watchedEpisodeKeys?.has(canonicalEpisodeProgressKey(item.url))
+    ) {
+      metaParts.push('Visto');
+    }
     if (item.episodeLabel) metaParts.push(item.episodeLabel);
     if (item.audioType === 'DUB') metaParts.push('Dublado');
     else if (item.audioType === 'LEG') metaParts.push('Legendado');

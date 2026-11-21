@@ -478,6 +478,22 @@ export function parseWpSearchJson(
   return results;
 }
 
+export function parseSeasonNumberFromLabel(label: string): number | null {
+  const trimmed = cleanText(label);
+  if (!trimmed) return null;
+  const dashMatch = trimmed.match(/^(\d+)\s*[-–/]\s*\d+/);
+  if (dashMatch?.[1]) {
+    const n = Number.parseInt(dashMatch[1], 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  const wordMatch = trimmed.match(/(?:temporada|season|t)\s*0*(\d+)/i);
+  if (wordMatch?.[1]) {
+    const n = Number.parseInt(wordMatch[1], 10);
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+  return null;
+}
+
 export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails {
   const $ = cheerio.load(html);
   const canonicalUrl = normalizeTopAnimesUrl(pageUrl) || pageUrl;
@@ -498,8 +514,13 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
   });
 
   const episodes: AnimeEpisodeLink[] = [];
-  $('#seasons .episodios li').each((_, el) => {
-    const li = $(el);
+  const seasonContainers = $('#seasons .se-c');
+
+  const pushEpisodeLi = (
+    li: ReturnType<typeof $>,
+    containerSeasonNum: number | null,
+    containerSeasonTitle: string
+  ) => {
     const href = normalizeTopAnimesUrl(li.find('.episodiotitle a').attr('href') || '');
     if (!href) return;
     const epTitle = cleanText(li.find('.episodiotitle a').text()) || 'Episódio';
@@ -509,15 +530,41 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
     const date = cleanText(li.find('.episodiotitle .date').text());
     const thumb = upgradeImageUrl(li.find('.imagen img').attr('src'));
 
+    const parsedSeasonFromLabel = parseSeasonNumberFromLabel(numberLabel);
+    const seasonNumber = parsedSeasonFromLabel ?? containerSeasonNum ?? 1;
+    const seasonLabel =
+      containerSeasonTitle && (!parsedSeasonFromLabel || parsedSeasonFromLabel === containerSeasonNum)
+        ? containerSeasonTitle
+        : `Temporada ${seasonNumber}`;
+
     episodes.push({
       numberLabel: numberLabel || (Number.isFinite(parsedNum) ? String(parsedNum) : ''),
       episodeNumber: Number.isFinite(parsedNum) ? parsedNum : null,
+      seasonNumber,
+      seasonLabel,
       title: epTitle,
       url: href,
       date: date || undefined,
       thumb: thumb || undefined,
     });
-  });
+  };
+
+  if (seasonContainers.length > 0) {
+    seasonContainers.each((idx, secEl) => {
+      const sec = $(secEl);
+      const rawSeT = Number.parseInt(cleanText(sec.find('.se-q .se-t').first().text()), 10);
+      const rawSeTitle = cleanText(sec.find('.se-q .title').first().text());
+      const fallbackSeasonNum =
+        Number.isFinite(rawSeT) && rawSeT > 0 ? rawSeT : idx + 1;
+      sec.find('.episodios li').each((_, el) => {
+        pushEpisodeLi($(el), fallbackSeasonNum, rawSeTitle);
+      });
+    });
+  } else {
+    $('#seasons .episodios li').each((_, el) => {
+      pushEpisodeLi($(el), null, '');
+    });
+  }
 
   return {
     title,

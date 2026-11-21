@@ -1,14 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  advanceBaselineWithWatchedEpisodes,
   buildFavoriteBaseline,
+  canonicalEpisodeKey,
   detectNewFavoriteEpisodes,
   extractEpisodeNumber,
   extractMediaSlug,
   isItemFavorited,
   toSeriesFavoriteItem,
 } from './favoriteAlerts';
-import type { CatalogMediaItem } from './types';
+import type { CatalogMediaItem, FavoriteBaselineMap } from './types';
 
 test('extractMediaSlug strips category prefixes and episode suffixes', () => {
   assert.equal(
@@ -162,5 +164,102 @@ test('pickLatestAnimeEpisode picks highest numbered episode regardless of list o
   assert.ok(latest);
   assert.equal(latest.episodeNumber, 4);
   assert.equal(latest.episodeLabel, 'EP 4');
+});
+
+test('detectNewFavoriteEpisodes suppresses notifications for episodes already marked as watched while still alerting on subsequent unwatched episodes', () => {
+  const fav: CatalogMediaItem = {
+    id: 'https://topanimes.net/animes/solo-leveling/',
+    title: 'Solo Leveling',
+    url: 'https://topanimes.net/animes/solo-leveling/',
+    kind: 'anime',
+    poster: 'https://example.com/sl.jpg',
+    audioType: 'LEG',
+  };
+
+  const baselines: FavoriteBaselineMap = {
+    [fav.url]: {
+      lastEpisodeUrl: 'https://topanimes.net/episodio/solo-leveling-episodio-10/',
+      lastEpisodeNumber: 10,
+      updatedAt: '2026-11-20T08:00:00Z',
+    },
+  };
+
+  const ep12Release: CatalogMediaItem = {
+    id: 'ep12',
+    title: 'Solo Leveling',
+    episodeLabel: 'EP 12',
+    url: 'https://topanimes.net/episodio/solo-leveling-episodio-12/',
+    kind: 'episode',
+    poster: 'https://example.com/ep12.jpg',
+    audioType: 'LEG',
+  };
+
+  // User already marked Season 1 (including EP 12) as watched
+  const watchedKeys = new Set([
+    canonicalEpisodeKey('https://topanimes.net/episodio/solo-leveling-episodio-11/'),
+    canonicalEpisodeKey('https://topanimes.net/episodio/solo-leveling-episodio-12/'),
+  ]);
+
+  const checkWatched = detectNewFavoriteEpisodes({
+    favorites: [fav],
+    releases: [ep12Release],
+    baselines,
+    existingAlerts: [],
+    watchedEpisodeKeys: watchedKeys,
+    nowIso: '2026-11-21T10:00:00Z',
+  });
+
+  // No notification should be created for EP 12, and baseline advances silently
+  assert.equal(checkWatched.newAlerts.length, 0);
+  assert.equal(checkWatched.nextAlerts.length, 0);
+  assert.equal(checkWatched.nextBaselines[fav.url].lastEpisodeNumber, 12);
+
+  // When EP 13 comes out later and is NOT marked watched, notification MUST fire
+  const ep13Release: CatalogMediaItem = {
+    id: 'ep13',
+    title: 'Solo Leveling',
+    episodeLabel: 'EP 13',
+    url: 'https://topanimes.net/episodio/solo-leveling-episodio-13/',
+    kind: 'episode',
+    poster: 'https://example.com/ep13.jpg',
+    audioType: 'LEG',
+  };
+
+  const checkUnwatched = detectNewFavoriteEpisodes({
+    favorites: [fav],
+    releases: [ep13Release],
+    baselines: checkWatched.nextBaselines,
+    existingAlerts: checkWatched.nextAlerts,
+    watchedEpisodeKeys: watchedKeys,
+    nowIso: '2026-11-21T12:00:00Z',
+  });
+
+  assert.equal(checkUnwatched.newAlerts.length, 1);
+  assert.equal(checkUnwatched.newAlerts[0].episodeLabel, 'EP 13');
+});
+
+test('advanceBaselineWithWatchedEpisodes updates favorite baseline to highest marked episode', () => {
+  const animeUrl = 'https://topanimes.net/animes/frieren/';
+  const next = advanceBaselineWithWatchedEpisodes({
+    animeUrl,
+    episodes: [
+      { url: 'https://topanimes.net/episodio/frieren-episodio-1/', episodeNumber: 1 },
+      { url: 'https://topanimes.net/episodio/frieren-episodio-28/', episodeNumber: 28 },
+    ],
+    baselines: {
+      [animeUrl]: {
+        lastEpisodeUrl: 'https://topanimes.net/episodio/frieren-episodio-5/',
+        lastEpisodeNumber: 5,
+        updatedAt: '2026-11-20T00:00:00Z',
+      },
+    },
+    nowIso: '2026-11-21T12:00:00Z',
+  });
+
+  assert.equal(next[animeUrl].lastEpisodeNumber, 28);
+  assert.equal(
+    next[animeUrl].lastEpisodeUrl,
+    'https://topanimes.net/episodio/frieren-episodio-28/'
+  );
 });
 
