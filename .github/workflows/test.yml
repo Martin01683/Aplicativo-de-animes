@@ -1,5 +1,23 @@
 name: CI
 
+# ---------------------------------------------------------------------------
+# APK de release assinado
+# ---------------------------------------------------------------------------
+# O APK publicado é o build de RELEASE, assinado sempre com a mesma chave. É isso
+# que permite instalar uma versão nova por cima da anterior: o Android recusa a
+# atualização ("pacote já existe") quando a assinatura muda entre as versões — e o
+# keystore de debug muda a cada execução do GitHub Actions.
+#
+# Secrets necessários (Settings > Secrets and variables > Actions):
+#   ANDROID_KEYSTORE_BASE64    arquivo do keystore codificado em base64 (uma linha)
+#   ANDROID_KEYSTORE_PASSWORD  senha do keystore
+#   ANDROID_KEY_ALIAS          alias da chave
+#   ANDROID_KEY_PASSWORD       senha da chave
+#
+# NUNCA troque nem perca essa chave: com outra chave o app precisa ser desinstalado
+# antes de instalar a nova versão. Guarde uma cópia do keystore e das senhas.
+# ---------------------------------------------------------------------------
+
 on:
   push:
     branches: ['main', 'dev']
@@ -12,7 +30,7 @@ on:
   workflow_call:
     inputs:
       publish:
-        description: 'Publishes TopAnimes-debug.apk to a GitHub Release after CI and Android build succeed'
+        description: 'Publishes the signed release TopAnimes.apk to a GitHub Release after CI and Android build succeed'
         required: false
         type: boolean
         default: false
@@ -58,7 +76,7 @@ jobs:
         run: npm run build
 
   build-apk:
-    name: Build TopAnimes APK
+    name: Build TopAnimes APK (release)
     needs: validate-and-test
     runs-on: ubuntu-latest
 
@@ -80,26 +98,80 @@ jobs:
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # Nenhum secret é exposto nos passos de npm: os scripts de instalação das
+      # dependências rodam sem acesso à chave de assinatura.
       - name: Install npm dependencies
         run: npm install
 
       - name: Build web bundle and sync Capacitor Android
         run: npm run apk:sync
 
-      - name: Build Debug APK
+      - name: Prepare release signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          missing=0
+          for name in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error title=Secret ausente::O secret $name não está configurado. Veja o cabeçalho de .github/workflows/test.yml."
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Sem a chave de assinatura não dá para gerar o APK de release instalável. Configure os secrets e rode de novo."
+            exit 1
+          fi
+
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE"
+
+          # Falha cedo e com mensagem clara se o alias/senha não baterem com o keystore.
+          keytool -list -keystore "$KEYSTORE" -storepass:env ANDROID_KEYSTORE_PASSWORD \
+            -alias "$ANDROID_KEY_ALIAS" > /dev/null
+
+          {
+            echo "ANDROID_KEYSTORE_PATH=$KEYSTORE"
+            # versionCode precisa sempre crescer para o Android aceitar como atualização.
+            # Minutos desde 1970: crescente em qualquer workflow e nunca reinicia.
+            echo "APP_VERSION_CODE=$(( $(date +%s) / 60 ))"
+            echo "APP_VERSION_NAME=1.0.${{ github.run_number }}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build Release APK
         working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Verify release APK (signed, not debuggable)
+        run: |
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs "$APK"
+
+          BADGING="$("$BUILD_TOOLS/aapt2" dump badging "$APK")"
+          echo "$BADGING" | grep -E "^package:"
+          if echo "$BADGING" | grep -q "application-debuggable"; then
+            echo "::error::O APK gerado é debuggable. O release deve ser o build normal (release), não o debug."
+            exit 1
+          fi
 
       - name: Rename APK output
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk TopAnimes-debug.apk
+        run: cp android/app/build/outputs/apk/release/app-release.apk TopAnimes.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: TopAnimes-debug-apk
-          path: TopAnimes-debug.apk
+          name: TopAnimes-apk
+          path: TopAnimes.apk
           retention-days: 30
 
   publish-release:
@@ -119,7 +191,7 @@ jobs:
       - name: Download APK artifact
         uses: actions/download-artifact@v4
         with:
-          name: TopAnimes-debug-apk
+          name: TopAnimes-apk
 
       - name: Publish APK Release
         env:
@@ -127,11 +199,17 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           TAG="latest-apk"
+          NOTES="Build automático (release assinado) gerado após validação de segurança, lint, testes unitários e compilação Android (${{ github.sha }})."
+          NOTES="$NOTES"$'\n\n'"Instalação: baixe TopAnimes.apk e instale por cima da versão anterior. Se aparecer \"pacote já existe\" / \"conflita com um pacote existente\", desinstale o app UMA vez (a versão antiga foi assinada com outra chave) e instale de novo; as próximas atualizações instalam por cima normalmente."
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" TopAnimes-debug.apk --clobber
+            # Versões antigas deste workflow publicavam o APK de debug: remove para
+            # que o release tenha apenas o APK normal (release).
+            gh release delete-asset "$TAG" TopAnimes-debug.apk --yes 2>/dev/null || true
+            gh release upload "$TAG" TopAnimes.apk --clobber
+            gh release edit "$TAG" --notes "$NOTES"
           else
-            gh release create "$TAG" TopAnimes-debug.apk \
+            gh release create "$TAG" TopAnimes.apk \
               --target "${{ github.sha }}" \
               --title "TopAnimes Android APK" \
-              --notes "Build automático gerado após validação de segurança, lint, testes unitários e compilação Android (${{ github.sha }})."
+              --notes "$NOTES"
           fi

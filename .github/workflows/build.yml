@@ -12,5 +12,8 @@ jobs:
     uses: ./.github/workflows/test.yml
     with:
       publish: true
+    # Reusable workflows do not receive the caller's secrets automatically.
+    # The release signing key (ANDROID_KEYSTORE_*) must reach test.yml.
+    secrets: inherit
     permissions:
       contents: write

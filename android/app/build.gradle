@@ -1,5 +1,35 @@
 apply plugin: 'com.android.application'
 
+// -----------------------------------------------------------------------------
+// Assinatura e versão do APK de release
+// -----------------------------------------------------------------------------
+// O Android só instala uma atualização "por cima" de um app já instalado quando o
+// APK novo é assinado com a MESMA chave do APK antigo e tem versionCode >= ao
+// instalado. Se a chave muda a cada build (como o keystore de DEBUG, que é recriado
+// em cada runner novo do GitHub Actions), a instalação falha com "pacote já existe /
+// conflita com um pacote existente".
+//
+// Por isso o release é assinado com uma chave FIXA, informada por variáveis de
+// ambiente (no CI elas vêm dos GitHub Secrets; veja .github/workflows/test.yml).
+// Nunca coloque senhas nem o arquivo de keystore dentro do repositório.
+//
+//   ANDROID_KEYSTORE_PATH      caminho do arquivo de keystore (.keystore / .jks)
+//   ANDROID_KEYSTORE_PASSWORD  senha do keystore
+//   ANDROID_KEY_ALIAS          alias da chave dentro do keystore
+//   ANDROID_KEY_PASSWORD       senha da chave
+//   APP_VERSION_CODE           inteiro que sempre cresce a cada build (padrão: 1)
+//   APP_VERSION_NAME           versão exibida ao usuário (padrão: "1.0")
+//
+// Sem as variáveis de keystore, `assembleRelease` gera um APK NÃO assinado
+// (app-release-unsigned.apk), que o Android se recusa a instalar.
+def releaseKeystorePath = System.getenv('ANDROID_KEYSTORE_PATH')
+if (releaseKeystorePath && !file(releaseKeystorePath).exists()) {
+    throw new GradleException("ANDROID_KEYSTORE_PATH aponta para um arquivo que não existe: ${releaseKeystorePath}")
+}
+def hasReleaseKeystore = releaseKeystorePath != null && !releaseKeystorePath.trim().isEmpty()
+def appVersionCode = (System.getenv('APP_VERSION_CODE') ?: '1').toInteger()
+def appVersionName = System.getenv('APP_VERSION_NAME') ?: '1.0'
+
 android {
     namespace "com.topanimes.player"
     compileSdk rootProject.ext.compileSdkVersion
@@ -7,8 +37,8 @@ android {
         applicationId "com.topanimes.player"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode appVersionCode
+        versionName appVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,10 +46,23 @@ android {
             ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        release {
+            if (hasReleaseKeystore) {
+                storeFile file(releaseKeystorePath)
+                storePassword System.getenv('ANDROID_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANDROID_KEY_ALIAS')
+                keyPassword System.getenv('ANDROID_KEY_PASSWORD')
+            }
+        }
+    }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            if (hasReleaseKeystore) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 }

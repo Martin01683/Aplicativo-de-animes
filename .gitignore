@@ -10,3 +10,8 @@ coverage/
 dev-dist/
 .aistudio/
 downloads/*.apk
+
+# Android signing keys — NEVER commit (use GitHub Secrets, see .github/workflows/test.yml)
+*.keystore
+*.jks
+keystore.properties

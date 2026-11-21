@@ -13,6 +13,7 @@ interface WorkflowStep {
   uses?: string;
   run?: string;
   if?: string;
+  env?: Record<string, string>;
 }
 
 interface WorkflowJob {
@@ -20,7 +21,9 @@ interface WorkflowJob {
   if?: string;
   needs?: string | string[];
   with?: Record<string, unknown>;
+  secrets?: string | Record<string, string>;
   permissions?: Record<string, string>;
+  env?: Record<string, string>;
   steps?: WorkflowStep[];
 }
 
@@ -56,6 +59,13 @@ describe('.github/workflows/build.yml - build & publish orchestration', () => {
     assert.equal(jobs[0].uses, './.github/workflows/test.yml');
     assert.deepEqual(jobs[0].with, { publish: true });
     assert.deepEqual(jobs[0].permissions, { contents: 'write' });
+  });
+
+  // Reusable workflows do not receive the caller's secrets automatically. Without this the
+  // release signing key never reaches test.yml and the APK cannot be signed.
+  it('passes the repository secrets (signing key) to the reusable workflow', () => {
+    const [job] = Object.values(workflow.jobs);
+    assert.equal(job.secrets, 'inherit');
   });
 
   it('does not duplicate Gradle or artifact download steps', () => {
@@ -105,7 +115,7 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
   it('builds the Android APK only after validate-and-test passes', () => {
     assert.equal(buildApkJob.needs, 'validate-and-test');
     const stepNames = (buildApkJob.steps ?? []).map((s) => s.name ?? '');
-    assert.ok(stepNames.includes('Build Debug APK'));
+    assert.ok(stepNames.includes('Build Release APK'));
     assert.ok(stepNames.includes('Upload APK artifact'));
   });
 
@@ -128,5 +138,71 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
     assert.deepEqual(publishJob.permissions, { contents: 'write' });
     assert.equal(validateJob.permissions, undefined);
     assert.equal(buildApkJob.permissions, undefined);
+  });
+
+  // Regression: installing a new APK over the old one failed with "package already exists"
+  // because the CI published the DEBUG build, which is signed with a debug keystore that is
+  // regenerated on every fresh GitHub runner (so every APK had a different signature).
+  describe('release APK signing', () => {
+    const raw = loadWorkflowRaw('test.yml');
+    const buildSteps = buildApkJob.steps ?? [];
+    const SIGNING_SECRETS = [
+      'ANDROID_KEYSTORE_BASE64',
+      'ANDROID_KEYSTORE_PASSWORD',
+      'ANDROID_KEY_ALIAS',
+      'ANDROID_KEY_PASSWORD',
+    ];
+
+    it('builds the release variant and never the debug one', () => {
+      assert.match(raw, /gradlew assembleRelease/);
+      assert.doesNotMatch(raw, /assembleDebug/);
+      assert.doesNotMatch(raw, /outputs\/apk\/debug/);
+    });
+
+    it('publishes the release APK (TopAnimes.apk), not the debug one', () => {
+      const publish = (publishJob.steps ?? []).find((s) => s.name === 'Publish APK Release');
+      assert.ok(publish?.run);
+      assert.match(publish.run, /gh release (upload|create) .*TopAnimes\.apk/);
+      assert.doesNotMatch(publish.run, /gh release (upload|create)[^\n]*TopAnimes-debug\.apk/);
+    });
+
+    it('removes the legacy debug APK from the existing release', () => {
+      const publish = (publishJob.steps ?? []).find((s) => s.name === 'Publish APK Release');
+      assert.match(publish?.run ?? '', /gh release delete-asset .*TopAnimes-debug\.apk/);
+    });
+
+    it('requires all four signing secrets before building', () => {
+      const prepare = buildSteps.find((s) => s.name === 'Prepare release signing key');
+      assert.ok(prepare, 'missing "Prepare release signing key" step');
+      for (const name of SIGNING_SECRETS) {
+        assert.equal(prepare.env?.[name], `\${{ secrets.${name} }}`);
+      }
+      const names = buildSteps.map((s) => s.name ?? '');
+      assert.ok(names.indexOf('Prepare release signing key') < names.indexOf('Build Release APK'));
+    });
+
+    it('passes the key passwords to Gradle through secrets, never as literals', () => {
+      const build = buildSteps.find((s) => s.name === 'Build Release APK');
+      assert.ok(build);
+      assert.equal(build.env?.ANDROID_KEYSTORE_PASSWORD, '${{ secrets.ANDROID_KEYSTORE_PASSWORD }}');
+      assert.equal(build.env?.ANDROID_KEY_ALIAS, '${{ secrets.ANDROID_KEY_ALIAS }}');
+      assert.equal(build.env?.ANDROID_KEY_PASSWORD, '${{ secrets.ANDROID_KEY_PASSWORD }}');
+    });
+
+    it('keeps the signing secrets away from npm install and from job-wide env', () => {
+      assert.equal(buildApkJob.env, undefined);
+      const install = buildSteps.find((s) => s.name === 'Install npm dependencies');
+      assert.ok(install);
+      assert.equal(install.env, undefined);
+    });
+
+    it('verifies the APK is signed and not debuggable before uploading it', () => {
+      const names = buildSteps.map((s) => s.name ?? '');
+      const verifyIdx = names.indexOf('Verify release APK (signed, not debuggable)');
+      assert.ok(verifyIdx > names.indexOf('Build Release APK'));
+      assert.ok(verifyIdx < names.indexOf('Upload APK artifact'));
+      assert.match(buildSteps[verifyIdx].run ?? '', /apksigner/);
+      assert.match(buildSteps[verifyIdx].run ?? '', /application-debuggable/);
+    });
   });
 });
