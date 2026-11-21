@@ -635,6 +635,12 @@ export function AnimePlayer({
   }, [advanceFallbackOrFail, loadingEpisode, useNativeVlc]);
 
   const disposedEffectRef = useRef(false);
+  const volumeRef = useRef(volume);
+  const mutedRef = useRef(muted);
+  const loopRef = useRef(loop);
+  volumeRef.current = volume;
+  mutedRef.current = muted;
+  loopRef.current = loop;
 
   // Initialize Video + HLS (Web player only; Android APK delegates to embedded LibVLC)
   useEffect(() => {
@@ -669,9 +675,9 @@ export function AnimePlayer({
     const useHls =
       activeStream.format === 'hls' || /\.m3u8(?:$|\?)/i.test(activeStream.url);
 
-    video.volume = volume;
-    video.muted = muted;
-    video.loop = loop;
+    video.volume = volumeRef.current;
+    video.muted = mutedRef.current;
+    video.loop = loopRef.current;
     video.playbackRate = 1;
     if (useCorsAttr) {
       video.crossOrigin = 'anonymous';
@@ -1253,7 +1259,7 @@ export function AnimePlayer({
   };
 
   // Hold-to-2x pointer handlers on the video stage
-  const startHoldSpeed = () => {
+  const startHoldSpeed = useCallback(() => {
     if (useNativeVlc) return;
     if (holdTimerRef.current) window.clearTimeout(holdTimerRef.current);
     holdActiveRef.current = false;
@@ -1263,9 +1269,9 @@ export function AnimePlayer({
       setHoldSpeedActive(true);
       if (videoRef.current) videoRef.current.playbackRate = 2;
     }, 450);
-  };
+  }, [speed, useNativeVlc]);
 
-  const cancelHoldSpeed = () => {
+  const cancelHoldSpeed = useCallback(() => {
     if (holdTimerRef.current) {
       window.clearTimeout(holdTimerRef.current);
       holdTimerRef.current = null;
@@ -1275,7 +1281,7 @@ export function AnimePlayer({
       setHoldSpeedActive(false);
       if (videoRef.current) videoRef.current.playbackRate = preHoldSpeedRef.current;
     }
-  };
+  }, []);
 
   const handleStageTap = (clientX: number) => {
     if (useNativeVlc) {
@@ -1455,9 +1461,11 @@ export function AnimePlayer({
       window.removeEventListener('keyup', onKeyUp);
     };
   }, [
+    cancelHoldSpeed,
     desktopShortcutsEnabled,
     seekBy,
     showControlsTemporarily,
+    startHoldSpeed,
     subEntries,
     toggleFullscreen,
     toggleMute,

@@ -437,7 +437,7 @@ async function resolveEmbedUrl(rawEmbedUrl: string): Promise<ResolvedEmbed> {
   if (/abyssplayer\.com|abyss\.to|abysscdn\.com|short\.icu/i.test(cleanEmbed)) {
     return {
       embedUrl: cleanEmbed,
-      provider: 'aniplay',
+      provider: 'Aniplay',
       status: 'embed-only',
       streams: [],
       subtitles: [],

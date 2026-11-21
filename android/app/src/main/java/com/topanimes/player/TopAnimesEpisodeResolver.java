@@ -310,7 +310,7 @@ public final class TopAnimesEpisodeResolver {
         String lowerEmbed = cleanEmbed.toLowerCase(Locale.ROOT);
         if (lowerEmbed.contains("abyssplayer.com") || lowerEmbed.contains("abyss.to")
             || lowerEmbed.contains("abysscdn.com") || lowerEmbed.contains("short.icu")) {
-            return new ResolvedEmbedData(false, "aniplay", baseReferer, false, Collections.emptyList(), Collections.emptyList(), "Servidor indisponível.");
+            return new ResolvedEmbedData(false, "Aniplay", baseReferer, false, Collections.emptyList(), Collections.emptyList(), "Servidor indisponível.");
         }
 
         String fetchTarget = cleanEmbed;
@@ -647,8 +647,7 @@ public final class TopAnimesEpisodeResolver {
             String label = "Servidor " + nume;
             Matcher titleM = Pattern.compile("class=[\"'][^\"']*title[^\"']*[\"'][^>]*>([\\s\\S]*?)<", Pattern.CASE_INSENSITIVE).matcher(inner);
             if (titleM.find()) {
-                String parsedLabel = cleanHtmlText(titleM.group(1));
-                if (!parsedLabel.isEmpty()) label = parsedLabel;
+                label = formatServerLabel(cleanHtmlText(titleM.group(1)), label);
             }
             if ("abyss".equals(classifyProviderKind(label, ""))) continue;
 
@@ -748,8 +747,7 @@ public final class TopAnimesEpisodeResolver {
             String label = "Servidor " + nume;
             Matcher titleM = Pattern.compile("class=[\"'][^\"']*title[^\"']*[\"'][^>]*>([\\s\\S]*?)<", Pattern.CASE_INSENSITIVE).matcher(inner);
             if (titleM.find()) {
-                String parsed = cleanHtmlText(titleM.group(1));
-                if (!parsed.isEmpty()) label = parsed;
+                label = formatServerLabel(cleanHtmlText(titleM.group(1)), label);
             }
 
             String embedUrl = sourceMap.get(nume);
@@ -769,6 +767,13 @@ public final class TopAnimesEpisodeResolver {
             }
         }
         return options;
+    }
+
+    private static String formatServerLabel(String raw, String fallback) {
+        if (raw == null) return fallback;
+        String clean = raw.trim();
+        if (clean.isEmpty()) return fallback;
+        return clean.substring(0, 1).toUpperCase(Locale.ROOT) + clean.substring(1);
     }
 
     private static String classifyProviderKind(String label, String embedUrl) {

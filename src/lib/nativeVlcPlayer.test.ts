@@ -206,6 +206,7 @@ describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () 
     assert.match(resolverJava, /action=doo_player_ajax&post=/);
     assert.match(resolverJava, /private static String postFormText\(/);
     assert.match(resolverJava, /metilinksemvoce\|viewanalitycs\|agl004\|videoad\|autotop\|canalfutebol/);
+    assert.match(resolverJava, /private static String formatServerLabel\(String raw, String fallback\)/);
   });
 
   it('supports HTTP POST in LocalProxyPlugin.fetchPage for native DooPlay AJAX requests', () => {

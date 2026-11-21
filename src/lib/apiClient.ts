@@ -539,7 +539,7 @@ async function resolveNativeEmbedUrl(
   if (/abyssplayer\.com|abyss\.to|abysscdn\.com|short\.icu/i.test(cleanEmbed)) {
     return {
       embedUrl: cleanEmbed,
-      provider: 'aniplay',
+      provider: 'Aniplay',
       status: 'embed-only',
       streams: [],
       subtitles: [],

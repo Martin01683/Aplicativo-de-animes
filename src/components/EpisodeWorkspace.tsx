@@ -27,6 +27,7 @@ import {
   type VideoScaleMode,
 } from '../lib/playbackProgress';
 import { pickBestFailoverServer } from '../lib/serverFailover';
+import { formatServerLabel } from '../lib/topanimesParser';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
@@ -97,9 +98,9 @@ export function EpisodeWorkspace({
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
   const playableOptions = useMemo(
     () =>
-      episode.options.filter(
-        (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
-      ),
+      episode.options
+        .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
+        .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) })),
     [episode.options]
   );
 
@@ -140,9 +141,9 @@ export function EpisodeWorkspace({
 
   // Reset selected server whenever episode changes
   useEffect(() => {
-    const filtered = episode.options.filter(
-      (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
-    );
+    const filtered = episode.options
+      .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
+      .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) }));
     setSelectedOption(pickInitialOption(filtered));
     setResolvedState(null);
     setFailoverExhaustedMsg('');
@@ -478,7 +479,7 @@ export function EpisodeWorkspace({
                 failoverExhaustedMsg ||
                 (!isTransitioning && !hasResolvedStreams
                   ? resolved?.errorMessage ||
-                    'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou ruplay) para assistir no player.'
+                    'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou Ruplay) para assistir no player.'
                   : '')
               }
               skipIntroSeconds={skipIntroSeconds}
@@ -518,7 +519,7 @@ export function EpisodeWorkspace({
               <p className="max-w-md text-sm leading-relaxed text-slate-300">
                 {failoverExhaustedMsg ||
                   resolved?.errorMessage ||
-                  'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou ruplay) para assistir no player.'}
+                  'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou Ruplay) para assistir no player.'}
               </p>
             </div>
           )}

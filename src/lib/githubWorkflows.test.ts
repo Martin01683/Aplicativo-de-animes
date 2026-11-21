@@ -212,5 +212,25 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
       assert.match(buildSteps[verifyIdx].run ?? '', /apksigner/);
       assert.match(buildSteps[verifyIdx].run ?? '', /application-debuggable/);
     });
+
+    it('uses Node 24 compatible GitHub Actions without deprecated v4 action tags', () => {
+      assert.doesNotMatch(raw, /actions\/checkout@v4\b/);
+      assert.doesNotMatch(raw, /actions\/setup-node@v4\b/);
+      assert.doesNotMatch(raw, /actions\/setup-java@v4\b/);
+      assert.doesNotMatch(raw, /gradle\/actions\/setup-gradle@v4\b/);
+      assert.doesNotMatch(raw, /actions\/upload-artifact@v4\b/);
+      assert.doesNotMatch(raw, /actions\/download-artifact@v4\b/);
+    });
+
+    it('generates an automatic git changelog for every published GitHub Release', () => {
+      const publishSteps = publishJob.steps ?? [];
+      const checkoutStep = publishSteps.find((s) => s.uses?.startsWith('actions/checkout'));
+      assert.ok(checkoutStep, 'publish-release must checkout git history to generate changelog');
+      const publish = publishSteps.find((s) => s.name === 'Publish APK Release');
+      assert.ok(publish?.run);
+      assert.match(publish.run, /git log --no-merges/);
+      assert.match(publish.run, /## Changelog/);
+      assert.match(publish.run, /--notes-file "\$NOTES_FILE"/);
+    });
   });
 });

@@ -466,9 +466,9 @@ export function SettingsModal({
                       </div>
 
                       {latestRelease.notes && (
-                        <p className="line-clamp-3 break-words text-xs leading-relaxed text-slate-400">
+                        <div className="max-h-40 overflow-y-auto whitespace-pre-line break-words rounded-lg border border-white/8 bg-[#151921]/80 px-3 py-2.5 text-xs leading-relaxed text-slate-300">
                           {latestRelease.notes}
-                        </p>
+                        </div>
                       )}
 
                       {(downloadingAppUpdate ||

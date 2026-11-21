@@ -45,12 +45,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
@@ -82,21 +82,21 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
       - name: Setup Java 17 (Temurin)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
 
       # Nenhum secret é exposto nos passos de npm: os scripts de instalação das
       # dependências rodam sem acesso à chave de assinatura.
@@ -170,7 +170,7 @@ jobs:
         run: cp android/app/build/outputs/apk/release/app-release.apk TopAnimes.apk
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TopAnimes-apk
           path: TopAnimes.apk
@@ -190,8 +190,14 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout git history for changelog
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Download APK artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: TopAnimes-apk
 
@@ -199,6 +205,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
           BASE_TAG="v1.0.${{ github.run_number }}"
           TAG="$BASE_TAG"
@@ -209,10 +216,66 @@ jobs:
           # Versões antigas publicavam TopAnimes-debug.apk no release legado; garante limpeza sem apagar APKs assinados anteriores.
           gh release delete-asset "latest-apk" TopAnimes-debug.apk --yes 2>/dev/null || true
 
-          NOTES="Build automático (release assinado) gerado após validação de segurança, lint, testes unitários e compilação Android (${{ github.sha }})."
-          NOTES="$NOTES"$'\n\n'"Instalação: baixe TopAnimes.apk e instale por cima da versão anterior. Se aparecer \"pacote já existe\" / \"conflita com um pacote existente\", desinstale o app UMA vez (se a versão anterior foi assinada com outra chave) e instale de novo; as próximas atualizações instalam por cima normalmente."
+          PREV_TAG="$(git tag --list 'v*' --merged "$TARGET_SHA" --sort=-v:refname | grep -vxF "$TAG" | head -n 1 || true)"
+          if [ -n "$PREV_TAG" ]; then
+            COMMIT_RANGE="${PREV_TAG}..${TARGET_SHA}"
+          else
+            COMMIT_RANGE="$TARGET_SHA"
+          fi
+
+          FEATS=""
+          FIXES=""
+          OTHERS=""
+          while IFS=$'\x1f' read -r hash subject; do
+            [ -z "$hash" ] && continue
+            clean="$(printf '%s' "$subject" | sed -E 's/^[a-zA-Z]+(\([^)]+\))?!?:[[:space:]]*//')"
+            clean="$(printf '%s' "$clean" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')"
+            line="- ${clean} (\`${hash}\`)"
+            case "$subject" in
+              feat:*|feat\(*\):*|feat!:*|feat\(*\)!:*)
+                FEATS="${FEATS}${line}"$'\n'
+                ;;
+              fix:*|fix\(*\):*|fix!:*|fix\(*\)!:*)
+                FIXES="${FIXES}${line}"$'\n'
+                ;;
+              *)
+                OTHERS="${OTHERS}${line}"$'\n'
+                ;;
+            esac
+          done < <(git log --no-merges --format='%h%x1f%s' "$COMMIT_RANGE")
+
+          NOTES_FILE="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "## Changelog"
+            echo ""
+            if [ -n "$FEATS" ]; then
+              echo "### Novidades"
+              printf '%s\n' "$FEATS"
+            fi
+            if [ -n "$FIXES" ]; then
+              echo "### Correções"
+              printf '%s\n' "$FIXES"
+            fi
+            if [ -n "$OTHERS" ]; then
+              echo "### Melhorias e Manutenção"
+              printf '%s\n' "$OTHERS"
+            fi
+            if [ -z "$FEATS" ] && [ -z "$FIXES" ] && [ -z "$OTHERS" ]; then
+              echo "- Build de manutenção sem novos commits desde a versão anterior."
+              echo ""
+            fi
+            if [ -n "$PREV_TAG" ]; then
+              echo "**Comparação completa:** https://github.com/${GH_REPO}/compare/${PREV_TAG}...${TAG}"
+              echo ""
+            fi
+            echo "---"
+            echo ""
+            echo "Build automático (release assinado) gerado após validação de segurança, lint, testes unitários e compilação Android (${TARGET_SHA})."
+            echo ""
+            echo 'Instalação: baixe TopAnimes.apk e instale por cima da versão anterior. Se aparecer "pacote já existe" / "conflita com um pacote existente", desinstale o app UMA vez (se a versão anterior foi assinada com outra chave) e instale de novo; as próximas atualizações instalam por cima normalmente.'
+          } > "$NOTES_FILE"
 
           gh release create "$TAG" TopAnimes.apk \
-            --target "${{ github.sha }}" \
+            --target "$TARGET_SHA" \
             --title "TopAnimes $TAG" \
-            --notes "$NOTES"
+            --notes-file "$NOTES_FILE"

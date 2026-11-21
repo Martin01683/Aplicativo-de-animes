@@ -7,6 +7,7 @@ import {
   extractDooPlayNonce,
   extractMissingDooPlayerOptions,
   extractStreamsFromEmbed,
+  formatServerLabel,
   parseAnimePageHtml,
   parseCalendarPageHtml,
   parseCatalogArchiveHtml,
@@ -115,8 +116,11 @@ describe('topanimesParser', () => {
     assert.equal(ep.options.length, 4);
     assert.deepEqual(
       ep.options.map((o) => o.label),
-      ['KojimaCDN', 'Zuplay', 'Vidstreaming', 'ruplay']
+      ['KojimaCDN', 'Zuplay', 'Vidstreaming', 'Ruplay']
     );
+    assert.equal(formatServerLabel('ruplay'), 'Ruplay');
+    assert.equal(formatServerLabel('aniplay'), 'Aniplay');
+    assert.equal(formatServerLabel('KojimaCDN'), 'KojimaCDN');
     assert.equal(ep.options[3].embedUrl, 'https://csst.online/embed/1095810');
   });
 

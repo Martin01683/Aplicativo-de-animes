@@ -59,6 +59,12 @@ function cleanText(val: string | undefined): string {
   return String(val || '').replace(/\s+/g, ' ').trim();
 }
 
+export function formatServerLabel(raw: string | undefined, fallback = 'Servidor'): string {
+  const cleaned = cleanText(raw);
+  if (!cleaned) return fallback;
+  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+}
+
 export function inferAudioType(text: string): AudioType {
   const upper = text.toUpperCase();
   if (/\bDUB\b|DUBLAD[OA]/i.test(upper)) return 'DUB';
@@ -733,7 +739,7 @@ export function extractMissingDooPlayerOptions(html: string): MissingDooPlayerOp
     const post = cleanText(li.attr('data-post'));
     const type = cleanText(li.attr('data-type')) || 'tv';
     if (!nume || !post || nume === 'trailer' || resolvedNumes.has(nume)) return;
-    const label = cleanText(li.find('.title').text()) || `Servidor ${nume}`;
+    const label = formatServerLabel(li.find('.title').text(), `Servidor ${nume}`);
     if (classifyProviderKind(label, '') === 'abyss') return;
     missing.push({ post, nume, type, label });
   });
@@ -1060,7 +1066,7 @@ export function parseEpisodePageHtml(html: string, pageUrl: string): EpisodeDeta
     const li = $(el);
     const nume = cleanText(li.attr('data-nume'));
     if (!nume || nume === 'trailer') return;
-    const label = cleanText(li.find('.title').text()) || `Servidor ${nume}`;
+    const label = formatServerLabel(li.find('.title').text(), `Servidor ${nume}`);
     const embedUrl = sourceMap.get(nume) || '';
     if (!embedUrl) return;
     const providerKind = classifyProviderKind(label, embedUrl);
