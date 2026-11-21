@@ -1245,7 +1245,7 @@ export default function App() {
                   }
                 }}
                 onToast={showToast}
-                skipIntroSeconds={settings.skipIntroSeconds}
+                skipIntroSeconds={85}
                 autoPlayNextEpisode={settings.autoPlayNextEpisode}
               />
             ) : null}

@@ -23,13 +23,11 @@ import {
   APP_UPDATE_INTERVAL_OPTIONS,
   EPISODE_CHECK_INTERVAL_OPTIONS,
   formatRelativeTimestamp,
-  SKIP_INTRO_OPTIONS,
   type AppSettings,
   type AppSettingsMeta,
   type AppUpdateIntervalHours,
   type DefaultAudioFilter,
   type EpisodeCheckIntervalMinutes,
-  type SkipIntroSeconds,
 } from '../lib/settings';
 import type { NavSection } from './Header';
 
@@ -351,8 +349,8 @@ export function SettingsModal({
                 />
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
-                <label htmlFor="app-update-interval-select" className="min-w-0 flex-1">
+              <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+                <label htmlFor="app-update-interval-select" className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
                     Frequência de verificação do app
                   </span>
@@ -369,7 +367,7 @@ export function SettingsModal({
                       appUpdateIntervalHours: Number(e.target.value) as AppUpdateIntervalHours,
                     })
                   }
-                  className="min-h-[40px] rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none disabled:opacity-50"
+                  className="min-h-[40px] w-full shrink-0 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none disabled:opacity-50 sm:w-auto"
                 >
                   {APP_UPDATE_INTERVAL_OPTIONS.map((opt) => (
                     <option key={opt.value} value={opt.value}>
@@ -614,36 +612,6 @@ export function SettingsModal({
                       }`}
                     >
                       {opt.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
-                <div className="w-full min-w-0 sm:flex-1">
-                  <span className="block text-sm font-medium text-slate-200">
-                    Tempo do botão Pular Abertura
-                  </span>
-                  <span className="mt-0.5 block text-xs text-slate-400">
-                    Avança essa quantidade de segundos ao tocar no atalho de abertura do player.
-                  </span>
-                </div>
-                <div className="flex shrink-0 items-center gap-1 rounded-lg border border-white/10 bg-[#151921] p-1">
-                  {SKIP_INTRO_OPTIONS.map((sec) => (
-                    <button
-                      key={sec}
-                      type="button"
-                      onClick={() =>
-                        onUpdateSettings({ skipIntroSeconds: sec as SkipIntroSeconds })
-                      }
-                      aria-pressed={settings.skipIntroSeconds === sec}
-                      className={`min-h-[34px] whitespace-nowrap rounded-md px-2.5 py-1 font-mono text-xs font-medium tabular-nums transition-colors ${
-                        settings.skipIntroSeconds === sec
-                          ? 'bg-[#f97316] text-[#0d0f12]'
-                          : 'text-slate-300 hover:text-white'
-                      }`}
-                    >
-                      +{sec}s
                     </button>
                   ))}
                 </div>
