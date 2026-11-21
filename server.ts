@@ -1,5 +1,6 @@
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -978,9 +979,16 @@ async function createAppServer(): Promise<void> {
     }
   });
 
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: disableHmr ? false : { server: httpServer },
+        ws: { server: httpServer },
+      },
       appType: 'custom',
     });
     app.use(vite.middlewares);
@@ -994,6 +1002,9 @@ async function createAppServer(): Promise<void> {
         const templatePath = path.resolve(__dirname, 'index.html');
         let html = fs.readFileSync(templatePath, 'utf-8');
         html = await vite.transformIndexHtml(req.originalUrl, html);
+        if (disableHmr) {
+          html = html.replace(/<script\s+type="module"\s+src="\/@vite\/client"><\/script>\s*/i, '');
+        }
         res.status(200).set({ 'Content-Type': 'text/html' }).end(html);
       } catch (e) {
         vite.ssrFixStacktrace(e as Error);
@@ -1008,7 +1019,7 @@ async function createAppServer(): Promise<void> {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`TopVLC server running on http://0.0.0.0:${PORT}`);
   });
 }

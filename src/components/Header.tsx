@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bell, BellRing, CheckCheck, Download, Loader2, PlayCircle, RefreshCw } from 'lucide-react';
+import { Bell, BellRing, CheckCheck, Loader2, PlayCircle, RefreshCw } from 'lucide-react';
 import type { FavoriteAlertEntry } from '../lib/types';
 
 export type NavSection = 'releases' | 'calendar' | 'catalog' | 'library';
@@ -16,7 +16,6 @@ interface HeaderProps {
   onMarkAllRead: () => void;
   onOpenAlert: (alert: FavoriteAlertEntry) => void;
   onRequestPushNotifications: () => void;
-  apkDownloadUrl?: string | null;
 }
 
 const NAV_ITEMS: Array<{ id: NavSection; label: string }> = [
@@ -38,7 +37,6 @@ export function Header({
   onMarkAllRead,
   onOpenAlert,
   onRequestPushNotifications,
-  apkDownloadUrl,
 }: HeaderProps) {
   const [openPopover, setOpenPopover] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -106,19 +104,7 @@ export function Header({
           })}
         </nav>
 
-        <div className="flex items-center gap-2">
-          {apkDownloadUrl && (
-            <a
-              href={apkDownloadUrl}
-              download="TopAnimes.apk"
-              className="inline-flex h-10 items-center gap-1.5 rounded-lg border border-[#f97316]/40 bg-[#f97316]/15 px-3 text-xs font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/25 hover:text-white"
-            >
-              <Download className="h-3.5 w-3.5" />
-              <span className="hidden sm:inline">Baixar APK</span>
-              <span className="sm:hidden">APK</span>
-            </a>
-          )}
-          <div ref={popoverRef} className="relative">
+        <div ref={popoverRef} className="relative">
           <button
             type="button"
             onClick={() => setOpenPopover((prev) => !prev)}
@@ -268,7 +254,6 @@ export function Header({
               </div>
             </div>
           )}
-          </div>
         </div>
       </div>
     </header>

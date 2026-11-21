@@ -6,7 +6,7 @@ import { EpisodeWorkspace } from './components/EpisodeWorkspace';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
-import { apiFetch, isNativeAndroidApp } from './lib/apiClient';
+import { apiFetch } from './lib/apiClient';
 import {
   buildFavoriteBaseline,
   detectNewFavoriteEpisodes,
@@ -152,7 +152,6 @@ export default function App() {
   );
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
   const [toast, setToast] = useState<string>('');
-  const [apkDownloadUrl, setApkDownloadUrl] = useState<string | null>(null);
 
   const favoritesRef = useRef(favorites);
   const baselinesRef = useRef(baselines);
@@ -328,14 +327,6 @@ export default function App() {
 
   useEffect(() => {
     fetchCatalog();
-    if (!isNativeAndroidApp()) {
-      apiFetch('/api/apk-info')
-        .then((r) => (r.ok ? r.json() : null))
-        .then((data: { available?: boolean; url?: string } | null) => {
-          if (data?.available && data.url) setApkDownloadUrl(data.url);
-        })
-        .catch(() => {});
-    }
   }, [fetchCatalog]);
 
   useEffect(() => {
@@ -765,7 +756,6 @@ export default function App() {
         onMarkAllRead={handleMarkAllAlertsRead}
         onOpenAlert={handleOpenAlert}
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
-        apkDownloadUrl={apkDownloadUrl}
       />
 
       {!isOnline && (
