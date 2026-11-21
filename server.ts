@@ -1034,8 +1034,8 @@ async function createAppServer(): Promise<void> {
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: disableHmr ? false : { server: httpServer },
-        ws: { server: httpServer },
+        hmr: !disableHmr,
+        ws: disableHmr ? false : { server: httpServer },
       },
       appType: 'custom',
     });
