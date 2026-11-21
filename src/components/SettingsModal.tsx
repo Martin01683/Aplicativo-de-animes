@@ -613,8 +613,8 @@ export function SettingsModal({
             </div>
 
             <div className="divide-y divide-white/8 rounded-xl border border-white/10 bg-[#0d0f12]/70">
-              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
-                <label htmlFor="default-section-select" className="min-w-0 flex-1">
+              <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+                <label htmlFor="default-section-select" className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
                     Aba inicial ao abrir o aplicativo
                   </span>
@@ -628,7 +628,7 @@ export function SettingsModal({
                   onChange={(e) =>
                     onUpdateSettings({ defaultSection: e.target.value as NavSection })
                   }
-                  className="min-h-[40px] rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
+                  className="min-h-[40px] w-full shrink-0 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none sm:w-auto"
                 >
                   <option value="releases">Lançamentos</option>
                   <option value="calendar">Calendário</option>
@@ -637,8 +637,8 @@ export function SettingsModal({
                 </select>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
-                <div className="min-w-0 flex-1">
+              <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+                <div className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
                     Filtro padrão de áudio em Lançamentos
                   </span>
@@ -646,7 +646,7 @@ export function SettingsModal({
                     Filtra automaticamente os episódios exibidos na tela inicial.
                   </span>
                 </div>
-                <div className="flex items-center gap-1 rounded-lg border border-white/10 bg-[#151921] p-1">
+                <div className="grid w-full shrink-0 grid-cols-3 gap-1 rounded-lg border border-white/10 bg-[#151921] p-1 sm:flex sm:w-auto sm:items-center">
                   {(
                     [
                       { id: 'ALL', label: 'Todos' },
@@ -659,7 +659,7 @@ export function SettingsModal({
                       type="button"
                       onClick={() => onUpdateSettings({ defaultAudioFilter: opt.id })}
                       aria-pressed={settings.defaultAudioFilter === opt.id}
-                      className={`min-h-[34px] whitespace-nowrap rounded-md px-3 py-1 text-xs font-medium transition-colors ${
+                      className={`min-h-[36px] whitespace-nowrap rounded-md px-3 py-1 text-center text-xs font-medium transition-colors ${
                         settings.defaultAudioFilter === opt.id
                           ? 'bg-[#f97316] text-[#0d0f12]'
                           : 'text-slate-300 hover:text-white'
@@ -671,8 +671,8 @@ export function SettingsModal({
                 </div>
               </div>
 
-              <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
-                <label htmlFor="video-scale-select" className="min-w-0 flex-1">
+              <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+                <label htmlFor="video-scale-select" className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
                     Escala de tela padrão
                   </span>
@@ -686,7 +686,7 @@ export function SettingsModal({
                   onChange={(e) =>
                     onUpdateSettings({ videoScale: e.target.value as VideoScaleMode })
                   }
-                  className="min-h-[40px] rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
+                  className="min-h-[40px] w-full shrink-0 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none sm:w-auto"
                 >
                   {VIDEO_SCALE_OPTIONS.map((opt) => (
                     <option key={opt.id} value={opt.id}>
