@@ -672,7 +672,9 @@ export default function App() {
         !cancelled &&
         shouldRunScheduledAppUpdateCheck(
           settingsRef.current,
-          settingsMetaRef.current.lastAppUpdateCheckAt
+          settingsMetaRef.current.lastAppUpdateCheckAt,
+          Date.now(),
+          { isStartup: true }
         )
       ) {
         void checkForAppUpdates({ manual: false, triggerAutoDownload: true });

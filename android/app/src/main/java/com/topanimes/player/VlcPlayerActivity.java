@@ -2381,7 +2381,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
             String speedLabel = currentSpeed == 1.0f ? "Normal" : (currentSpeed + "×");
             addSettingsRow("Velocidade", speedLabel, false, v -> renderSettingsTab("speed"));
 
-            addSettingsRow("Legendas & Áudio", "Configurar", false, v -> renderSettingsTab("subs"));
+            addSettingsRow("Legendas", getActiveSubtitleSummary(), false, v -> renderSettingsTab("subs"));
+            addSettingsRow("Áudio", getActiveAudioSummary(), false, v -> renderSettingsTab("audio"));
             addSettingsRow("Escala de Tela", SCALE_LABELS[currentScaleIdx], false, v -> renderSettingsTab("scale"));
 
             View div = new View(this);
@@ -2477,15 +2478,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
 
         if ("subs".equals(tab)) {
-            settingsHeaderTitle.setText("Legendas & Áudio");
+            settingsHeaderTitle.setText("Legendas");
             if (mediaPlayer != null) {
                 MediaPlayer.TrackDescription[] spuTracks = mediaPlayer.getSpuTracks();
                 if (spuTracks != null && spuTracks.length > 0) {
                     int activeSpu = mediaPlayer.getSpuTrack();
                     for (MediaPlayer.TrackDescription t : spuTracks) {
                         boolean active = t.id == activeSpu;
-                        String name = t.name != null ? t.name : "Legenda";
-                        addSettingsRow("Legenda: " + name, active ? "✓" : "", active, v -> {
+                        String name = formatSubtitleTrackName(t);
+                        addSettingsRow(name, active ? "✓" : "", active, v -> {
                             userDisabledSubtitles = (t.id == -1);
                             if (mediaPlayer != null) mediaPlayer.setSpuTrack(t.id);
                             closeSettingsMenu();
@@ -2494,26 +2495,90 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 } else {
                     addSettingsRow("Nenhuma faixa de legenda", "", false, v -> {});
                 }
-
-                MediaPlayer.TrackDescription[] audioTracks = mediaPlayer.getAudioTracks();
-                if (audioTracks != null && audioTracks.length > 1) {
-                    int activeAudio = mediaPlayer.getAudioTrack();
-                    for (MediaPlayer.TrackDescription t : audioTracks) {
-                        boolean active = t.id == activeAudio;
-                        String name = t.name != null ? t.name : "Áudio";
-                        addSettingsRow("Áudio: " + name, active ? "✓" : "", active, v -> {
-                            preferredAudioTrackId = t.id;
-                            if (mediaPlayer != null) mediaPlayer.setAudioTrack(t.id);
-                            closeSettingsMenu();
-                        });
-                    }
-                }
+            } else {
+                addSettingsRow("Nenhuma faixa de legenda", "", false, v -> {});
             }
             addSettingsRow("Carregar legenda local (.srt / .vtt / .ass)", "", false, v -> {
                 closeSettingsMenu();
                 subtitleFilePicker.launch(new String[] { "*/*" });
             });
+            return;
         }
+
+        if ("audio".equals(tab)) {
+            settingsHeaderTitle.setText("Áudio");
+            if (mediaPlayer != null) {
+                MediaPlayer.TrackDescription[] audioTracks = mediaPlayer.getAudioTracks();
+                if (audioTracks != null && audioTracks.length > 0) {
+                    int activeAudio = mediaPlayer.getAudioTrack();
+                    for (MediaPlayer.TrackDescription t : audioTracks) {
+                        boolean active = t.id == activeAudio;
+                        String name = formatAudioTrackName(t);
+                        addSettingsRow(name, active ? "✓" : "", active, v -> {
+                            preferredAudioTrackId = t.id;
+                            if (mediaPlayer != null) mediaPlayer.setAudioTrack(t.id);
+                            closeSettingsMenu();
+                        });
+                    }
+                } else {
+                    addSettingsRow("Faixa padrão", "✓", true, v -> closeSettingsMenu());
+                }
+            } else {
+                addSettingsRow("Nenhuma faixa de áudio", "", false, v -> {});
+            }
+        }
+    }
+
+    private String getActiveSubtitleSummary() {
+        if (mediaPlayer == null) return "Desativada";
+        int activeSpu = mediaPlayer.getSpuTrack();
+        if (activeSpu == -1) return "Desativada";
+        MediaPlayer.TrackDescription[] tracks = mediaPlayer.getSpuTracks();
+        if (tracks != null) {
+            for (MediaPlayer.TrackDescription t : tracks) {
+                if (t.id == activeSpu) {
+                    String name = formatSubtitleTrackName(t);
+                    return name.isEmpty() ? "Ativa" : name;
+                }
+            }
+        }
+        return "Desativada";
+    }
+
+    private String getActiveAudioSummary() {
+        if (mediaPlayer == null) return "Padrão";
+        int activeAudio = mediaPlayer.getAudioTrack();
+        if (activeAudio == -1) return "Mudo";
+        MediaPlayer.TrackDescription[] tracks = mediaPlayer.getAudioTracks();
+        if (tracks != null) {
+            for (MediaPlayer.TrackDescription t : tracks) {
+                if (t.id == activeAudio) {
+                    String name = formatAudioTrackName(t);
+                    return name.isEmpty() ? "Padrão" : name;
+                }
+            }
+        }
+        return "Padrão";
+    }
+
+    private static String formatSubtitleTrackName(MediaPlayer.TrackDescription track) {
+        if (track == null) return "Legenda";
+        if (track.id == -1) return "Desativada";
+        String name = track.name != null ? track.name.trim() : "";
+        if (name.isEmpty() || "disable".equalsIgnoreCase(name)) {
+            return "Legenda";
+        }
+        return name;
+    }
+
+    private static String formatAudioTrackName(MediaPlayer.TrackDescription track) {
+        if (track == null) return "Áudio";
+        if (track.id == -1) return "Desativado (Mudo)";
+        String name = track.name != null ? track.name.trim() : "";
+        if (name.isEmpty() || "disable".equalsIgnoreCase(name)) {
+            return "Áudio";
+        }
+        return name;
     }
 
     private void switchServerInFullscreen(TopAnimesEpisodeResolver.ServerOption opt) {
@@ -2614,6 +2679,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
             val.setTextColor(Color.parseColor(active ? "#FB923C" : "#94A3B8"));
             val.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
             val.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
+            val.setMaxLines(1);
+            val.setEllipsize(TextUtils.TruncateAt.END);
+            val.setMaxWidth(dp(120));
             LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT

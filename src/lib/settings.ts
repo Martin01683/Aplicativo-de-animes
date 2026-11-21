@@ -6,7 +6,7 @@ import {
 } from './playbackProgress';
 
 export type EpisodeCheckIntervalMinutes = 0 | 1 | 5 | 15 | 30 | 60;
-export type AppUpdateIntervalHours = 0 | 6 | 24 | 168;
+export type AppUpdateIntervalHours = 6 | 24 | 168;
 export type DefaultAudioFilter = 'ALL' | 'DUB' | 'LEG';
 export type SkipIntroSeconds = 30 | 60 | 85 | 90;
 
@@ -15,6 +15,7 @@ export interface AppSettings {
   checkEpisodesOnStartup: boolean;
   notifyNewEpisodes: boolean;
   autoCheckAppUpdates: boolean;
+  checkAppUpdatesOnStartup: boolean;
   appUpdateIntervalHours: AppUpdateIntervalHours;
   autoDownloadAppUpdates: boolean;
   defaultSection: NavSection;
@@ -34,6 +35,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   checkEpisodesOnStartup: true,
   notifyNewEpisodes: true,
   autoCheckAppUpdates: true,
+  checkAppUpdatesOnStartup: true,
   appUpdateIntervalHours: 24,
   autoDownloadAppUpdates: false,
   defaultSection: 'releases',
@@ -65,7 +67,6 @@ export const APP_UPDATE_INTERVAL_OPTIONS: Array<{
   value: AppUpdateIntervalHours;
   label: string;
 }> = [
-  { value: 0, label: 'Sempre ao abrir o app' },
   { value: 6, label: 'A cada 6 horas' },
   { value: 24, label: 'Diariamente (1x por dia)' },
   { value: 168, label: 'Semanalmente' },
@@ -74,7 +75,7 @@ export const APP_UPDATE_INTERVAL_OPTIONS: Array<{
 export const SKIP_INTRO_OPTIONS: SkipIntroSeconds[] = [30, 60, 85, 90];
 
 const VALID_EPISODE_INTERVALS = new Set<number>([0, 1, 5, 15, 30, 60]);
-const VALID_UPDATE_INTERVALS = new Set<number>([0, 6, 24, 168]);
+const VALID_UPDATE_INTERVALS = new Set<number>([6, 24, 168]);
 const VALID_SECTIONS = new Set<NavSection>(['releases', 'calendar', 'catalog', 'library']);
 const VALID_AUDIO_FILTERS = new Set<DefaultAudioFilter>(['ALL', 'DUB', 'LEG']);
 const VALID_SKIP_SECONDS = new Set<number>([30, 60, 85, 90]);
@@ -91,9 +92,23 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
     ? (Number(input.episodeCheckIntervalMinutes) as EpisodeCheckIntervalMinutes)
     : DEFAULT_APP_SETTINGS.episodeCheckIntervalMinutes;
 
-  const appUpdateIntervalHours = VALID_UPDATE_INTERVALS.has(Number(input.appUpdateIntervalHours))
-    ? (Number(input.appUpdateIntervalHours) as AppUpdateIntervalHours)
+  const rawUpdateInterval = Number(input.appUpdateIntervalHours);
+  const legacyCheckOnStartup =
+    input.appUpdateIntervalHours !== undefined &&
+    input.appUpdateIntervalHours !== null &&
+    input.appUpdateIntervalHours !== '' &&
+    rawUpdateInterval === 0;
+
+  const appUpdateIntervalHours = VALID_UPDATE_INTERVALS.has(rawUpdateInterval)
+    ? (rawUpdateInterval as AppUpdateIntervalHours)
     : DEFAULT_APP_SETTINGS.appUpdateIntervalHours;
+
+  const checkAppUpdatesOnStartup =
+    typeof input.checkAppUpdatesOnStartup === 'boolean'
+      ? input.checkAppUpdatesOnStartup
+      : legacyCheckOnStartup
+        ? true
+        : DEFAULT_APP_SETTINGS.checkAppUpdatesOnStartup;
 
   const defaultSection = VALID_SECTIONS.has(input.defaultSection as NavSection)
     ? (input.defaultSection as NavSection)
@@ -123,6 +138,7 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
       typeof input.autoCheckAppUpdates === 'boolean'
         ? input.autoCheckAppUpdates
         : DEFAULT_APP_SETTINGS.autoCheckAppUpdates,
+    checkAppUpdatesOnStartup,
     appUpdateIntervalHours,
     autoDownloadAppUpdates:
       typeof input.autoDownloadAppUpdates === 'boolean'
@@ -145,12 +161,17 @@ export function getEpisodeCheckIntervalMs(minutes: EpisodeCheckIntervalMinutes):
 }
 
 export function shouldRunScheduledAppUpdateCheck(
-  settings: Pick<AppSettings, 'autoCheckAppUpdates' | 'appUpdateIntervalHours'>,
+  settings: Pick<AppSettings, 'autoCheckAppUpdates' | 'appUpdateIntervalHours'> & {
+    checkAppUpdatesOnStartup?: boolean;
+  },
   lastCheckedAt: string | null,
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  options?: { isStartup?: boolean }
 ): boolean {
+  if (options?.isStartup && settings.checkAppUpdatesOnStartup) {
+    return true;
+  }
   if (!settings.autoCheckAppUpdates) return false;
-  if (settings.appUpdateIntervalHours === 0) return true;
   if (!lastCheckedAt) return true;
   const lastMs = Date.parse(lastCheckedAt);
   if (!Number.isFinite(lastMs)) return true;

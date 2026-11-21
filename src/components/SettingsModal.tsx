@@ -357,6 +357,26 @@ export function SettingsModal({
                 />
               </div>
 
+              <div className="flex items-center justify-between gap-4 px-4 py-3.5">
+                <label
+                  htmlFor="toggle-check-app-update-startup"
+                  className="min-w-0 flex-1 cursor-pointer"
+                >
+                  <span className="block text-sm font-medium text-slate-200">
+                    Verificar atualizações ao abrir o app
+                  </span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Checa automaticamente se há uma nova versão assim que o programa for aberto.
+                  </span>
+                </label>
+                <ToggleSwitch
+                  id="toggle-check-app-update-startup"
+                  checked={settings.checkAppUpdatesOnStartup}
+                  onChange={(val) => onUpdateSettings({ checkAppUpdatesOnStartup: val })}
+                  label="Verificar atualizações ao abrir o app"
+                />
+              </div>
+
               <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
                 <label htmlFor="app-update-interval-select" className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">

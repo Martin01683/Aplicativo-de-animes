@@ -220,6 +220,20 @@ describe('VlcPlayerActivity - Android focus & LibVLC surface lifecycle', () => {
     assert.match(loadEpMatch[0], /userSeekedInCurrentStream = false;/);
     assert.match(loadEpMatch[0], /streamPreparedWallMs = 0L;/);
   });
+
+  it('separates Legendas and Áudio into distinct menus in VlcPlayerActivity', () => {
+    assert.doesNotMatch(activityJava, /Legendas & Áudio/);
+    assert.match(
+      activityJava,
+      /addSettingsRow\("Legendas",\s*getActiveSubtitleSummary\(\),\s*false,\s*v\s*->\s*renderSettingsTab\("subs"\)\)/
+    );
+    assert.match(
+      activityJava,
+      /addSettingsRow\("Áudio",\s*getActiveAudioSummary\(\),\s*false,\s*v\s*->\s*renderSettingsTab\("audio"\)\)/
+    );
+    assert.match(activityJava, /if\s*\("subs"\.equals\(tab\)\)[\s\S]*?settingsHeaderTitle\.setText\("Legendas"\)/);
+    assert.match(activityJava, /if\s*\("audio"\.equals\(tab\)\)[\s\S]*?settingsHeaderTitle\.setText\("Áudio"\)/);
+  });
 });
 
 describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () => {

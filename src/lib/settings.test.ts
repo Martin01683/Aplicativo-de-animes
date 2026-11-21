@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  APP_UPDATE_INTERVAL_OPTIONS,
   DEFAULT_APP_SETTINGS,
   formatRelativeTimestamp,
   getEpisodeCheckIntervalMs,
@@ -31,12 +32,13 @@ test('sanitizeAppSettings falls back cleanly on invalid or partial input', () =>
   );
 });
 
-test('sanitizeAppSettings preserves valid user values', () => {
+test('sanitizeAppSettings preserves valid user values and migrates legacy startup interval', () => {
   const result = sanitizeAppSettings({
     episodeCheckIntervalMinutes: 15,
     checkEpisodesOnStartup: false,
     notifyNewEpisodes: false,
     autoCheckAppUpdates: true,
+    checkAppUpdatesOnStartup: false,
     appUpdateIntervalHours: 6,
     autoDownloadAppUpdates: true,
     defaultSection: 'library',
@@ -49,6 +51,7 @@ test('sanitizeAppSettings preserves valid user values', () => {
   assert.equal(result.episodeCheckIntervalMinutes, 15);
   assert.equal(result.checkEpisodesOnStartup, false);
   assert.equal(result.notifyNewEpisodes, false);
+  assert.equal(result.checkAppUpdatesOnStartup, false);
   assert.equal(result.appUpdateIntervalHours, 6);
   assert.equal(result.autoDownloadAppUpdates, true);
   assert.equal(result.defaultSection, 'library');
@@ -56,6 +59,17 @@ test('sanitizeAppSettings preserves valid user values', () => {
   assert.equal(result.skipIntroSeconds, 90);
   assert.equal(result.autoPlayNextEpisode, true);
   assert.equal(result.videoScale, 'fill');
+
+  // Legacy appUpdateIntervalHours: 0 migrates to checkAppUpdatesOnStartup: true + 24h periodic interval
+  const migrated = sanitizeAppSettings({ appUpdateIntervalHours: 0 });
+  assert.equal(migrated.checkAppUpdatesOnStartup, true);
+  assert.equal(migrated.appUpdateIntervalHours, 24);
+
+  // Dropdown options must only contain periodic frequencies (startup check is a separate toggle)
+  assert.deepEqual(
+    APP_UPDATE_INTERVAL_OPTIONS.map((opt) => opt.value),
+    [6, 24, 168]
+  );
 });
 
 test('getEpisodeCheckIntervalMs returns null for manual mode and ms otherwise', () => {
@@ -65,39 +79,55 @@ test('getEpisodeCheckIntervalMs returns null for manual mode and ms otherwise', 
   assert.equal(getEpisodeCheckIntervalMs(60), 3_600_000);
 });
 
-test('shouldRunScheduledAppUpdateCheck respects autoCheck toggle and interval window', () => {
+test('shouldRunScheduledAppUpdateCheck separates startup check from periodic interval window', () => {
   const now = Date.parse('2026-11-21T12:00:00.000Z');
 
+  // Both toggles disabled -> never runs
   assert.equal(
     shouldRunScheduledAppUpdateCheck(
-      { autoCheckAppUpdates: false, appUpdateIntervalHours: 0 },
+      { autoCheckAppUpdates: false, checkAppUpdatesOnStartup: false, appUpdateIntervalHours: 24 },
       null,
-      now
+      now,
+      { isStartup: true }
     ),
     false
   );
 
+  // Startup toggle enabled runs on startup even if periodic autoCheck is disabled or recently checked
   assert.equal(
     shouldRunScheduledAppUpdateCheck(
-      { autoCheckAppUpdates: true, appUpdateIntervalHours: 0 },
+      { autoCheckAppUpdates: false, checkAppUpdatesOnStartup: true, appUpdateIntervalHours: 24 },
       '2026-11-21T11:59:00.000Z',
-      now
+      now,
+      { isStartup: true }
     ),
     true
   );
 
+  // Startup toggle must NOT trigger periodic background checks while the app stays open
   assert.equal(
     shouldRunScheduledAppUpdateCheck(
-      { autoCheckAppUpdates: true, appUpdateIntervalHours: 24 },
+      { autoCheckAppUpdates: true, checkAppUpdatesOnStartup: true, appUpdateIntervalHours: 24 },
       '2026-11-21T06:00:00.000Z',
       now
     ),
     false
   );
 
+  // Periodic interval check with startup disabled waits for the configured window
   assert.equal(
     shouldRunScheduledAppUpdateCheck(
-      { autoCheckAppUpdates: true, appUpdateIntervalHours: 24 },
+      { autoCheckAppUpdates: true, checkAppUpdatesOnStartup: false, appUpdateIntervalHours: 24 },
+      '2026-11-21T06:00:00.000Z',
+      now,
+      { isStartup: true }
+    ),
+    false
+  );
+
+  assert.equal(
+    shouldRunScheduledAppUpdateCheck(
+      { autoCheckAppUpdates: true, checkAppUpdatesOnStartup: false, appUpdateIntervalHours: 24 },
       '2026-11-20T11:00:00.000Z',
       now
     ),
