@@ -102,16 +102,36 @@ jobs:
           path: TopAnimes-debug.apk
           retention-days: 30
 
+  publish-release:
+    name: Publish APK Release
+    needs: build-apk
+    if: ${{ inputs.publish == true }}
+    runs-on: ubuntu-latest
+    # Least privilege: only this job gets a write token. The top-level
+    # `permissions: contents: read` also applies when this file is called via
+    # workflow_call (a called workflow can only restrict the caller's token, never
+    # elevate it), so write access has to be granted per job. This job runs no
+    # project code (no npm / Gradle), so a compromised dependency can't reach it.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download APK artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TopAnimes-debug-apk
+
       - name: Publish APK Release
-        if: ${{ inputs.publish == true }}
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG="latest-apk"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" TopAnimes-debug.apk --clobber
           else
             gh release create "$TAG" TopAnimes-debug.apk \
+              --target "${{ github.sha }}" \
               --title "TopAnimes Android APK" \
               --notes "Build automático gerado após validação de segurança, lint, testes unitários e compilação Android (${{ github.sha }})."
           fi
