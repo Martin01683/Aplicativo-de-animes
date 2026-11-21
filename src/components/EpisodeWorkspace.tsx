@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
+import { isDesktopShortcutsEnabled } from '../lib/nativeVlcPlayer';
 import type {
   CatalogMediaItem,
   EpisodeDetails,
@@ -36,6 +37,7 @@ export function EpisodeWorkspace({
   onNavigateUrl,
   onToast,
 }: EpisodeWorkspaceProps) {
+  const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
   const playableOptions = episode.options.filter(
     (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
   );
@@ -175,6 +177,10 @@ export function EpisodeWorkspace({
               preferDirect={resolved.preferDirect}
               poster={episode.backdrop || episode.poster}
               subtitles={resolved.subtitles}
+              hasPrev={Boolean(episode.prevUrl)}
+              hasNext={Boolean(episode.nextUrl)}
+              onPrevEpisode={() => episode.prevUrl && onNavigateUrl(episode.prevUrl, 'episode')}
+              onNextEpisode={() => episode.nextUrl && onNavigateUrl(episode.nextUrl, 'episode')}
               onToast={onToast}
             />
           ) : (
@@ -285,9 +291,15 @@ export function EpisodeWorkspace({
 
             <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-white/8 bg-[#0d0f12] px-3.5 py-2.5 text-[11px] leading-relaxed text-slate-400">
               <Keyboard className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#f97316]" />
-              <span>
-                <strong className="text-slate-200">Gestos &amp; Atalhos:</strong> toque duplo nas laterais para ±5s, segure na tela ou Espaço para 2×, botão <strong className="text-slate-200">+85s</strong> pula abertura, e arraste arquivos <span className="font-mono">.ass/.srt/.vtt</span> para carregar legendas locais.
-              </span>
+              {desktopShortcutsEnabled ? (
+                <span>
+                  <strong className="text-slate-200">Gestos &amp; Atalhos:</strong> toque duplo nas laterais para ±5s, segure na tela ou Espaço para 2×, botão <strong className="text-slate-200">+85s</strong> pula abertura, e arraste arquivos <span className="font-mono">.ass/.srt/.vtt</span> para carregar legendas locais.
+                </span>
+              ) : (
+                <span>
+                  <strong className="text-slate-200">Controles Touch (LibVLC):</strong> toque duplo nas laterais para ±5s, segure no vídeo para 2×, botão <strong className="text-slate-200">+85s</strong> pula abertura e gerencie áudio, legendas e qualidade diretamente no player.
+                </span>
+              )}
             </div>
           </section>
         </div>

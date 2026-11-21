@@ -29,6 +29,11 @@ import {
   type ParsedSubtitleScript,
 } from '../lib/subtitleParser';
 import { getStreamProxyUrl } from '../lib/apiClient';
+import {
+  isAndroidNativeVlcSupported,
+  isDesktopShortcutsEnabled,
+  playWithNativeVlc,
+} from '../lib/nativeVlcPlayer';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
 import { MediaPoster } from './MediaPoster';
 
@@ -39,6 +44,10 @@ interface AnimePlayerProps {
   preferDirect?: boolean;
   poster?: string;
   subtitles: SubtitleTrack[];
+  hasPrev?: boolean;
+  hasNext?: boolean;
+  onPrevEpisode?: () => void;
+  onNextEpisode?: () => void;
   onToast: (message: string) => void;
 }
 
@@ -111,9 +120,17 @@ export function AnimePlayer({
   preferDirect = false,
   poster,
   subtitles,
+  hasPrev = false,
+  hasNext = false,
+  onPrevEpisode,
+  onNextEpisode,
   onToast,
 }: AnimePlayerProps) {
   const initialPrefs = useMemo(() => loadPrefs(), []);
+  const useNativeVlc = isAndroidNativeVlcSupported();
+  const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
+  const [nativeResumeMs, setNativeResumeMs] = useState(0);
+  const [nativeLaunching, setNativeLaunching] = useState(false);
 
   // Sort streams by highest height first so highest quality is auto-selected
   const sortedStreams = useMemo(() => {
@@ -196,9 +213,10 @@ export function AnimePlayer({
     savePrefs({ volume, muted, capScale, capColor });
   }, [volume, muted, capScale, capColor]);
 
-  // Reset stream index when stream list changes (pick highest quality index 0)
+  // Reset stream index and native resume timestamp when stream list changes
   useEffect(() => {
     setSelectedStreamIdx(0);
+    setNativeResumeMs(0);
   }, [streams]);
 
   // Reset playback mode whenever stream or preferDirect changes
@@ -236,8 +254,9 @@ export function AnimePlayer({
     }
   }, [subtitles]);
 
-  // Fetch & parse active subtitle track
+  // Fetch & parse active subtitle track (Web player only; Android LibVLC handles subtitles natively)
   useEffect(() => {
+    if (useNativeVlc) return;
     if (activeSubId === 'off') {
       setActiveSubScript(null);
       return;
@@ -315,8 +334,9 @@ export function AnimePlayer({
 
   const disposedEffectRef = useRef(false);
 
-  // Initialize Video + HLS
+  // Initialize Video + HLS (Web player only; Android APK delegates to embedded LibVLC)
   useEffect(() => {
+    if (useNativeVlc) return;
     const video = videoRef.current;
     if (!video || !activeMediaUrl || !activeStream) return;
 
@@ -426,8 +446,9 @@ export function AnimePlayer({
     if (videoRef.current) videoRef.current.playbackRate = speed;
   }, [speed]);
 
-  // Subtitle canvas render loop (rAF + ResizeObserver)
+  // Subtitle canvas render loop (rAF + ResizeObserver, Web only)
   useEffect(() => {
+    if (useNativeVlc) return;
     const canvas = canvasRef.current;
     const video = videoRef.current;
     const stage = stageRef.current;
@@ -768,8 +789,10 @@ export function AnimePlayer({
     }
   };
 
-  // Desktop keyboard shortcuts from userscript
+  // Desktop keyboard shortcuts (disabled on Android APK and Android browsers)
   useEffect(() => {
+    if (!desktopShortcutsEnabled) return;
+
     const isTyping = (target: EventTarget | null) => {
       if (!(target instanceof HTMLElement)) return false;
       const tag = target.tagName;
@@ -865,7 +888,15 @@ export function AnimePlayer({
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
     };
-  }, [seekBy, showControlsTemporarily, subEntries, toggleFullscreen, toggleMute, togglePlay]);
+  }, [
+    desktopShortcutsEnabled,
+    seekBy,
+    showControlsTemporarily,
+    subEntries,
+    toggleFullscreen,
+    toggleMute,
+    togglePlay,
+  ]);
 
   // Clear transient seek ripple badge
   useEffect(() => {
@@ -886,19 +917,168 @@ export function AnimePlayer({
     return subEntries.find((s) => s.id === activeSubId)?.label || 'Ativa';
   }, [activeSubId, subEntries]);
 
+  const launchNativeVlc = useCallback(
+    async (startMs?: number) => {
+      if (!sortedStreams.length || nativeLaunching) return;
+      setNativeLaunching(true);
+      try {
+        const res = await playWithNativeVlc({
+          title,
+          streams: sortedStreams,
+          subtitles,
+          referer: referer || 'https://topanimes.net/',
+          preferDirect,
+          startPositionMs: typeof startMs === 'number' ? startMs : nativeResumeMs,
+          streamIndex: selectedStreamIdx,
+          hasPrev,
+          hasNext,
+        });
+        if (typeof res?.streamIndex === 'number' && sortedStreams[res.streamIndex]) {
+          setSelectedStreamIdx(res.streamIndex);
+        }
+        if (typeof res?.positionMs === 'number' && res.positionMs > 0) {
+          const nearEnd =
+            typeof res.durationMs === 'number' &&
+            res.durationMs > 0 &&
+            res.positionMs >= res.durationMs - 4000;
+          setNativeResumeMs(nearEnd ? 0 : res.positionMs);
+        }
+        if (res?.action === 'prev') {
+          onPrevEpisode?.();
+        } else if (res?.action === 'next') {
+          onNextEpisode?.();
+        }
+      } catch {
+        onToast('Não foi possível abrir o player LibVLC.');
+      } finally {
+        setNativeLaunching(false);
+      }
+    },
+    [
+      hasNext,
+      hasPrev,
+      nativeLaunching,
+      nativeResumeMs,
+      onNextEpisode,
+      onPrevEpisode,
+      onToast,
+      preferDirect,
+      referer,
+      selectedStreamIdx,
+      sortedStreams,
+      subtitles,
+      title,
+    ]
+  );
+
   const progressPct = duration > 0 ? Math.min(100, (currentTime / duration) * 100) : 0;
   const bufferedPct = duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0;
+
+  if (useNativeVlc) {
+    return (
+      <div className="relative aspect-video w-full select-none overflow-hidden rounded-xl border border-white/10 bg-black shadow-2xl">
+        {poster && (
+          <div className="pointer-events-none absolute inset-0">
+            <MediaPoster
+              src={poster}
+              alt={title}
+              aspect="landscape"
+              className="h-full w-full opacity-55"
+            />
+          </div>
+        )}
+        <div className="absolute inset-0 bg-gradient-to-t from-black/90 via-black/45 to-black/60" />
+
+        <div className="relative z-10 flex h-full flex-col justify-between p-3 sm:p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="inline-flex items-center gap-1.5 rounded-md border border-[#f97316]/40 bg-black/70 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c] backdrop-blur-sm">
+              LibVLC Embutido
+            </span>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {subtitles.length > 0 && (
+                <span className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-black/70 px-2 py-1 text-[11px] text-slate-200 backdrop-blur-sm">
+                  <Subtitles className="h-3 w-3 text-[#f97316]" />
+                  <span>{subtitles.length} legenda{subtitles.length > 1 ? 's' : ''}</span>
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={handleDownloadVideo}
+                className="inline-flex items-center gap-1 rounded-md border border-white/15 bg-black/70 px-2.5 py-1 text-[11px] font-medium text-slate-200 backdrop-blur-sm hover:border-white/30"
+              >
+                <Download className="h-3 w-3 text-[#f97316]" />
+                <span>{activeStream?.format === 'hls' ? 'Copiar .m3u8' : 'Baixar MP4'}</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-col items-center gap-2.5 text-center">
+            <button
+              type="button"
+              disabled={nativeLaunching || !activeStream}
+              onClick={() => launchNativeVlc()}
+              aria-label="Reproduzir episódio no LibVLC"
+              className="flex h-16 w-16 items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px]"
+            >
+              <Play className="ml-1 h-7 w-7 fill-current sm:h-8 sm:w-8" />
+            </button>
+            <span className="text-xs font-semibold text-white drop-shadow sm:text-sm">
+              {nativeLaunching
+                ? 'Abrindo LibVLC...'
+                : nativeResumeMs > 3000
+                  ? `Continuar de ${formatTime(nativeResumeMs / 1000)}`
+                  : 'Assistir no Player LibVLC'}
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-1.5">
+              {sortedStreams.map((stream, idx) => (
+                <button
+                  key={stream.url}
+                  type="button"
+                  onClick={() => setSelectedStreamIdx(idx)}
+                  className={`rounded-md border px-2.5 py-1 font-mono text-[11px] font-medium transition-colors ${
+                    selectedStreamIdx === idx
+                      ? 'border-[#f97316] bg-[#f97316]/25 text-white'
+                      : 'border-white/15 bg-black/65 text-slate-300 hover:border-white/30'
+                  }`}
+                >
+                  {stream.label}
+                </button>
+              ))}
+            </div>
+
+            {nativeResumeMs > 3000 && (
+              <button
+                type="button"
+                onClick={() => launchNativeVlc(0)}
+                className="rounded-md border border-white/15 bg-black/65 px-2.5 py-1 text-[11px] text-slate-300 hover:text-white"
+              >
+                Reiniciar do início
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div
       ref={stageRef}
       onMouseMove={showControlsTemporarily}
       onDragOver={(e) => {
+        if (!desktopShortcutsEnabled) return;
         e.preventDefault();
         setDragOver(true);
       }}
       onDragLeave={() => setDragOver(false)}
-      onDrop={handleDrop}
+      onDrop={(e) => {
+        if (!desktopShortcutsEnabled) return;
+        handleDrop(e);
+      }}
       className={`group relative aspect-video w-full select-none overflow-hidden rounded-xl border border-white/10 bg-black shadow-2xl ${
         isFullscreen ? 'rounded-none border-0' : ''
       }`}
@@ -1145,7 +1325,7 @@ export function AnimePlayer({
             <button
               type="button"
               onClick={() => seekBy(-5)}
-              title="Voltar 5 segundos (←)"
+              title={desktopShortcutsEnabled ? 'Voltar 5 segundos (←)' : 'Voltar 5 segundos'}
               className="hidden h-8 items-center gap-1 rounded-md px-2 text-xs font-medium text-slate-200 hover:bg-white/10 sm:inline-flex"
             >
               <RotateCcw className="h-3.5 w-3.5" />
@@ -1155,7 +1335,7 @@ export function AnimePlayer({
             <button
               type="button"
               onClick={() => seekBy(5)}
-              title="Avançar 5 segundos (→)"
+              title={desktopShortcutsEnabled ? 'Avançar 5 segundos (→)' : 'Avançar 5 segundos'}
               className="hidden h-8 items-center gap-1 rounded-md px-2 text-xs font-medium text-slate-200 hover:bg-white/10 sm:inline-flex"
             >
               <RotateCw className="h-3.5 w-3.5" />

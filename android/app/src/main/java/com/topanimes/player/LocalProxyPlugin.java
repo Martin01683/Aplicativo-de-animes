@@ -44,6 +44,23 @@ public class LocalProxyPlugin extends Plugin {
     private static final Pattern URI_ATTR_PATTERN = Pattern.compile("URI=\"([^\"]+)\"", Pattern.CASE_INSENSITIVE);
     private static final Pattern M3U8_EXT_PATTERN = Pattern.compile("\\.m3u8(?:$|\\?)", Pattern.CASE_INSENSITIVE);
 
+    public static volatile String sharedProxyBaseUrl = "";
+
+    public static String buildSharedProxyUrl(String targetUrl, String referer) {
+        String base = sharedProxyBaseUrl;
+        if (base == null || base.isEmpty() || targetUrl == null || targetUrl.isEmpty()) {
+            return targetUrl;
+        }
+        try {
+            String safeReferer = (referer != null && isSafeHttpUrl(referer)) ? referer : "https://topanimes.net/";
+            return base + "/stream-proxy?url="
+                + URLEncoder.encode(targetUrl, "UTF-8")
+                + "&referer=" + URLEncoder.encode(safeReferer, "UTF-8");
+        } catch (Exception e) {
+            return targetUrl;
+        }
+    }
+
     private ServerSocket serverSocket;
     private volatile int proxyPort = -1;
     private volatile boolean running = false;
@@ -76,6 +93,7 @@ public class LocalProxyPlugin extends Plugin {
             executor = Executors.newCachedThreadPool();
             serverSocket = new ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"));
             proxyPort = serverSocket.getLocalPort();
+            sharedProxyBaseUrl = "http://127.0.0.1:" + proxyPort;
             running = true;
 
             Thread acceptThread = new Thread(() -> {
