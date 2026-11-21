@@ -129,3 +129,43 @@ export async function playWithNativeVlc(
 ): Promise<NativeVlcPlayResult> {
   return NativeVlcPlayer.play(options);
 }
+
+export type PlayerGestureSide = 'left' | 'center' | 'right';
+
+export function classifyPlayerTapZone(x: number, width: number): PlayerGestureSide {
+  if (width <= 0) return 'center';
+  const rel = x / width;
+  if (rel < 0.38) return 'left';
+  if (rel > 0.62) return 'right';
+  return 'center';
+}
+
+export function classifyVerticalSwipeAction(downX: number, width: number): 'brightness' | 'volume' {
+  if (width <= 0) return 'brightness';
+  return downX < width * 0.5 ? 'brightness' : 'volume';
+}
+
+export function computeSwipeBrightness(
+  startBrightness: number,
+  deltaY: number,
+  gestureRangePx: number
+): number {
+  const safeRange = Math.max(1, gestureRangePx);
+  const next = startBrightness + -deltaY / safeRange;
+  return Math.max(0.01, Math.min(1, next));
+}
+
+export function computeSwipeVolume(
+  startVolume: number,
+  maxVolume: number,
+  deltaY: number,
+  gestureRangePx: number
+): { volume: number; percent: number; muted: boolean } {
+  const safeMax = Math.max(1, maxVolume);
+  const safeRange = Math.max(1, gestureRangePx);
+  const raw = startVolume + (-deltaY / safeRange) * safeMax;
+  const volume = Math.round(Math.max(0, Math.min(safeMax, raw)));
+  const percent = Math.round((volume * 100) / safeMax);
+  return { volume, percent, muted: volume === 0 };
+}
+

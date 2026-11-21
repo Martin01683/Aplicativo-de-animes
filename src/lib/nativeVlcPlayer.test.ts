@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  classifyPlayerTapZone,
+  classifyVerticalSwipeAction,
+  computeSwipeBrightness,
+  computeSwipeVolume,
   isSameEpisodeUrl,
   resolveSeriesPrevNext,
   shouldEnableDesktopShortcuts,
@@ -85,4 +89,30 @@ describe('nativeVlcPlayer & platform guards', () => {
       nextUrl: 'https://topanimes.net/episodio/a-ep-3/',
     });
   });
+
+  it('classifies left/center/right tap zones and vertical brightness vs volume sides', () => {
+    assert.equal(classifyPlayerTapZone(120, 1000), 'left');
+    assert.equal(classifyPlayerTapZone(500, 1000), 'center');
+    assert.equal(classifyPlayerTapZone(820, 1000), 'right');
+    assert.equal(classifyVerticalSwipeAction(300, 1000), 'brightness');
+    assert.equal(classifyVerticalSwipeAction(600, 1000), 'volume');
+  });
+
+  it('computes clamped brightness and volume deltas cleanly for upward/downward swipes', () => {
+    assert.ok(Math.abs(computeSwipeBrightness(0.5, -100, 400) - 0.75) < 0.001);
+    assert.equal(computeSwipeBrightness(0.1, 200, 400), 0.01);
+    assert.equal(computeSwipeBrightness(0.9, -200, 400), 1);
+
+    assert.deepEqual(computeSwipeVolume(8, 15, -100, 300), {
+      volume: 13,
+      percent: 87,
+      muted: false,
+    });
+    assert.deepEqual(computeSwipeVolume(3, 15, 300, 300), {
+      volume: 0,
+      percent: 0,
+      muted: true,
+    });
+  });
 });
+

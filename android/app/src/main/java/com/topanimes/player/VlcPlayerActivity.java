@@ -15,12 +15,14 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.TextUtils;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -169,6 +171,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private ImageButton btnFullscreen;
     private TextView seekBadge;
     private TextView holdSpeedBadge;
+    private TextView gestureBadge;
 
     private FrameLayout settingsOverlay;
     private LinearLayout settingsHeader;
@@ -225,9 +228,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private boolean subtitlesAttached = false;
     private String settingsTab = "main";
 
+    private static final int GESTURE_NONE = 0;
+    private static final int GESTURE_HOLD_2X = 1;
+    private static final int GESTURE_BRIGHTNESS = 2;
+    private static final int GESTURE_VOLUME = 3;
+
     private boolean holdSpeedActive = false;
+    private int gestureMode = GESTURE_NONE;
+    private float gestureDownX = 0f;
+    private float gestureDownY = 0f;
+    private float gestureStartBrightness = 0.5f;
+    private float gestureStartVolumeFloat = 0f;
+    private int gestureMaxVolume = 15;
     private long lastTapTimeMs = 0L;
     private int lastTapSide = 0;
+    private int seekStreakCount = 0;
+    private int seekStreakSide = 0;
 
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
@@ -236,9 +252,23 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private final Runnable hideSeekBadgeRunnable = () -> {
         if (seekBadge != null) seekBadge.setVisibility(View.GONE);
     };
+    private final Runnable hideGestureBadgeRunnable = () -> {
+        if (gestureBadge != null) gestureBadge.setVisibility(View.GONE);
+    };
+    private final Runnable resetSeekStreakRunnable = () -> {
+        seekStreakCount = 0;
+        seekStreakSide = 0;
+    };
+    private final Runnable singleTapRunnable = () -> {
+        if (gestureMode == GESTURE_NONE && !holdSpeedActive) {
+            setControlsVisible(!controlsVisible);
+        }
+    };
     private final Runnable holdSpeedRunnable = () -> {
-        if (mediaPlayer != null && !playbackFailed && !loadingEpisode) {
+        if (gestureMode == GESTURE_NONE && mediaPlayer != null && !playbackFailed && !loadingEpisode) {
+            gestureMode = GESTURE_HOLD_2X;
             holdSpeedActive = true;
+            uiHandler.removeCallbacks(singleTapRunnable);
             mediaPlayer.setRate(2.0f);
             if (holdSpeedBadge != null) holdSpeedBadge.setVisibility(View.VISIBLE);
         }
@@ -310,6 +340,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         btnFullscreen = findViewById(R.id.vlc_btn_fullscreen);
         seekBadge = findViewById(R.id.vlc_seek_badge);
         holdSpeedBadge = findViewById(R.id.vlc_hold_speed_badge);
+        gestureBadge = findViewById(R.id.vlc_gesture_badge);
 
         settingsOverlay = findViewById(R.id.vlc_settings_overlay);
         settingsHeader = findViewById(R.id.vlc_settings_header);
@@ -925,19 +956,108 @@ public class VlcPlayerActivity extends AppCompatActivity {
         touchLayer.setOnTouchListener((v, event) -> {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_DOWN) {
+                gestureMode = GESTURE_NONE;
+                gestureDownX = event.getX();
+                gestureDownY = event.getY();
                 holdSpeedActive = false;
                 uiHandler.removeCallbacks(holdSpeedRunnable);
                 uiHandler.postDelayed(holdSpeedRunnable, 450L);
                 return true;
             }
-            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+            if (action == MotionEvent.ACTION_POINTER_DOWN) {
                 uiHandler.removeCallbacks(holdSpeedRunnable);
+                uiHandler.removeCallbacks(singleTapRunnable);
                 if (holdSpeedActive) {
                     holdSpeedActive = false;
                     if (holdSpeedBadge != null) holdSpeedBadge.setVisibility(View.GONE);
                     if (mediaPlayer != null) mediaPlayer.setRate(currentSpeed);
+                }
+                return true;
+            }
+            if (action == MotionEvent.ACTION_MOVE) {
+                if (event.getPointerCount() > 1) {
                     return true;
                 }
+                if (holdSpeedActive || gestureMode == GESTURE_HOLD_2X) {
+                    return true;
+                }
+                float dx = event.getX() - gestureDownX;
+                float dy = event.getY() - gestureDownY;
+                float touchSlop = Math.max(ViewConfiguration.get(this).getScaledTouchSlop(), dp(14));
+
+                if (gestureMode == GESTURE_NONE) {
+                    if (Math.hypot(dx, dy) > touchSlop) {
+                        uiHandler.removeCallbacks(holdSpeedRunnable);
+                        uiHandler.removeCallbacks(singleTapRunnable);
+                        lastTapTimeMs = 0L;
+                        lastTapSide = 0;
+
+                        if (Math.abs(dy) >= Math.abs(dx)) {
+                            boolean isLeftSide = gestureDownX < (v.getWidth() * 0.5f);
+                            if (isLeftSide) {
+                                gestureMode = GESTURE_BRIGHTNESS;
+                                gestureStartBrightness = getCurrentWindowBrightness();
+                            } else {
+                                gestureMode = GESTURE_VOLUME;
+                                initGestureVolumeState();
+                            }
+                        }
+                    }
+                }
+
+                if (gestureMode == GESTURE_BRIGHTNESS) {
+                    float range = Math.max(dp(180), v.getHeight() * 0.65f);
+                    float delta = -dy / range;
+                    float target = Math.max(0.01f, Math.min(1.0f, gestureStartBrightness + delta));
+                    WindowManager.LayoutParams lp = getWindow().getAttributes();
+                    if (lp != null) {
+                        lp.screenBrightness = target;
+                        getWindow().setAttributes(lp);
+                    }
+                    showGestureBadge("Brilho: " + Math.round(target * 100f) + "%", false);
+                } else if (gestureMode == GESTURE_VOLUME) {
+                    float range = Math.max(dp(180), v.getHeight() * 0.65f);
+                    float delta = (-dy / range) * gestureMaxVolume;
+                    float nextVolFloat = Math.max(0f, Math.min((float) gestureMaxVolume, gestureStartVolumeFloat + delta));
+                    int targetVol = Math.round(nextVolFloat);
+                    if (audioManager != null) {
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, 0);
+                    }
+                    if (targetVol == 0) {
+                        muted = true;
+                        if (mediaPlayer != null) mediaPlayer.setVolume(0);
+                    } else if (muted) {
+                        muted = false;
+                        if (mediaPlayer != null) mediaPlayer.setVolume(100);
+                    }
+                    if (btnMute != null) {
+                        btnMute.setImageResource(
+                            muted ? R.drawable.ic_player_volume_off : R.drawable.ic_player_volume_on
+                        );
+                    }
+                    int pct = gestureMaxVolume > 0
+                        ? Math.round((targetVol * 100f) / gestureMaxVolume)
+                        : 0;
+                    showGestureBadge(targetVol == 0 ? "Volume: Mudo" : ("Volume: " + pct + "%"), false);
+                }
+                return true;
+            }
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                uiHandler.removeCallbacks(holdSpeedRunnable);
+                if (holdSpeedActive || gestureMode == GESTURE_HOLD_2X) {
+                    holdSpeedActive = false;
+                    gestureMode = GESTURE_NONE;
+                    if (holdSpeedBadge != null) holdSpeedBadge.setVisibility(View.GONE);
+                    if (mediaPlayer != null) mediaPlayer.setRate(currentSpeed);
+                    return true;
+                }
+                if (gestureMode == GESTURE_BRIGHTNESS || gestureMode == GESTURE_VOLUME) {
+                    gestureMode = GESTURE_NONE;
+                    uiHandler.removeCallbacks(hideGestureBadgeRunnable);
+                    uiHandler.postDelayed(hideGestureBadgeRunnable, 700L);
+                    return true;
+                }
+                gestureMode = GESTURE_NONE;
                 if (action == MotionEvent.ACTION_UP) {
                     handleSingleOrDoubleTap(event.getX(), v.getWidth());
                 }
@@ -947,21 +1067,73 @@ public class VlcPlayerActivity extends AppCompatActivity {
         });
     }
 
+    private float getCurrentWindowBrightness() {
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        if (lp != null && lp.screenBrightness >= 0f) {
+            return Math.max(0.01f, Math.min(1.0f, lp.screenBrightness));
+        }
+        try {
+            int sys = Settings.System.getInt(getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 128);
+            return Math.max(0.02f, Math.min(1.0f, sys / 255f));
+        } catch (Exception ignored) {
+            return 0.5f;
+        }
+    }
+
+    private void initGestureVolumeState() {
+        if (audioManager == null) {
+            audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        }
+        if (audioManager != null) {
+            gestureMaxVolume = Math.max(1, audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+            gestureStartVolumeFloat = (float) audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+        } else {
+            gestureMaxVolume = 15;
+            gestureStartVolumeFloat = 8f;
+        }
+    }
+
+    private void showGestureBadge(String text, boolean autoHide) {
+        if (seekBadge != null) seekBadge.setVisibility(View.GONE);
+        if (gestureBadge == null) return;
+        gestureBadge.setText(text);
+        gestureBadge.setVisibility(View.VISIBLE);
+        uiHandler.removeCallbacks(hideGestureBadgeRunnable);
+        if (autoHide) {
+            uiHandler.postDelayed(hideGestureBadgeRunnable, 700L);
+        }
+    }
+
     private void handleSingleOrDoubleTap(float x, int width) {
         float rel = width > 0 ? (x / (float) width) : 0.5f;
-        int side = rel < 0.3f ? -1 : (rel > 0.7f ? 1 : 0);
+        int side = rel < 0.38f ? -1 : (rel > 0.62f ? 1 : 0);
         long now = System.currentTimeMillis();
 
-        if (side != 0 && side == lastTapSide && (now - lastTapTimeMs) < 320L) {
-            seekByMs(side < 0 ? -5000L : 5000L, side < 0 ? "-5s" : "+5s");
-            lastTapTimeMs = 0L;
-            lastTapSide = 0;
+        if (side != 0 && side == lastTapSide && (now - lastTapTimeMs) < 350L) {
+            uiHandler.removeCallbacks(singleTapRunnable);
+            lastTapTimeMs = now;
+            if (seekStreakSide == side) {
+                seekStreakCount++;
+            } else {
+                seekStreakSide = side;
+                seekStreakCount = 1;
+            }
+            int totalSec = seekStreakCount * 5;
+            String badgeLabel = (side < 0 ? "-" : "+") + totalSec + "s";
+            uiHandler.removeCallbacks(resetSeekStreakRunnable);
+            uiHandler.postDelayed(resetSeekStreakRunnable, 850L);
+            seekByMs(side < 0 ? -5000L : 5000L, badgeLabel, false);
             return;
         }
 
         lastTapTimeMs = now;
         lastTapSide = side;
-        setControlsVisible(!controlsVisible);
+        uiHandler.removeCallbacks(singleTapRunnable);
+        if (side == 0) {
+            setControlsVisible(!controlsVisible);
+        } else {
+            uiHandler.postDelayed(singleTapRunnable, 250L);
+        }
     }
 
     private void togglePlayPause() {
@@ -976,6 +1148,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private void toggleMute() {
         muted = !muted;
+        if (!muted && audioManager != null) {
+            int cur = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (cur <= 0) {
+                int max = Math.max(1, audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC));
+                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, max / 5), 0);
+            }
+        }
         if (mediaPlayer != null) {
             mediaPlayer.setVolume(muted ? 0 : 100);
         }
@@ -984,9 +1163,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void seekByMs(long deltaMs, String badgeText) {
+        seekByMs(deltaMs, badgeText, true);
+    }
+
+    private void seekByMs(long deltaMs, String badgeText, boolean refreshAutoHide) {
         if (mediaPlayer == null) return;
-        long total = mediaPlayer.getLength();
-        long current = Math.max(0L, mediaPlayer.getTime());
+        long total = Math.max(lastKnownDurationMs, mediaPlayer.getLength());
+        long rawCurrent = mediaPlayer.getTime();
+        long current = rawCurrent >= 0L ? rawCurrent : Math.max(0L, lastKnownPositionMs);
         long target = current + deltaMs;
         if (target < 0L) target = 0L;
         if (total > 0L && target > total) target = total;
@@ -995,13 +1179,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
         timeCurrentView.setText(formatMs(target));
         seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
 
+        if (gestureBadge != null) gestureBadge.setVisibility(View.GONE);
         if (seekBadge != null) {
             seekBadge.setText(badgeText);
             seekBadge.setVisibility(View.VISIBLE);
             uiHandler.removeCallbacks(hideSeekBadgeRunnable);
             uiHandler.postDelayed(hideSeekBadgeRunnable, 700L);
         }
-        scheduleControlsAutoHide();
+        if (refreshAutoHide || controlsVisible) {
+            scheduleControlsAutoHide();
+        }
     }
 
     private void setControlsVisible(boolean visible) {

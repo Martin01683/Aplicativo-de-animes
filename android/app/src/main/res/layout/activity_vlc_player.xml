@@ -57,6 +57,24 @@
         android:fontFamily="monospace"
         android:visibility="gone" />
 
+    <!-- Brightness / Volume Swipe Feedback Badge -->
+    <TextView
+        android:id="@+id/vlc_gesture_badge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@drawable/bg_player_pill_dark"
+        android:paddingLeft="16dp"
+        android:paddingTop="9dp"
+        android:paddingRight="16dp"
+        android:paddingBottom="9dp"
+        android:text="Brilho: 70%"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:fontFamily="monospace"
+        android:visibility="gone" />
+
     <!-- Buffering / Episode Transition Overlay -->
     <LinearLayout
         android:id="@+id/vlc_loading_container"

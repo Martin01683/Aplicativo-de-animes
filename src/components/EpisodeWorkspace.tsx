@@ -411,7 +411,7 @@ export function EpisodeWorkspace({
                 </span>
               ) : (
                 <span>
-                  <strong className="text-slate-200">Controles Touch (LibVLC):</strong> toque duplo nas laterais para ±5s, segure no vídeo para 2×, botão <strong className="text-slate-200">+{skipIntroSeconds}s</strong> pula abertura e troque de episódio diretamente em tela cheia.
+                  <strong className="text-slate-200">Gestos:</strong> deslize esq./dir. para brilho e volume · toque duplo ±5s · segure 2×.
                 </span>
               )}
             </div>
