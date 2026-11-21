@@ -2,17 +2,20 @@
 
 Todas as alterações relevantes do **TopAnimes** são geradas automaticamente a partir dos commits de cada release.
 
-## [Não lançado]
+## [v1.0.11] — 2026-11-21
 
 ### Novidades
 - Add weekly calendar, autocomplete, A-Z glossary, rich metadata and JW Player/DooPlay AJAX improvements (`ca98d84`)
 
 ### Correções
+- Stack audio filter and catalog selects vertically on mobile in SettingsModal (`2e8e888`)
 - Capitalize server names, auto-generate release changelog, and clear CI/ESLint warnings (`6bd6e59`)
 - Unmask KojimaCDN MPEG-TS segments and prevent LibVLC black screen (`696c129`)
 - Restore LibVLC video surface when returning from another app (`8c111e1`)
 
 ### Melhorias e Manutenção
+- Suppress dev-dist glob warning in VitePWA devOptions (`3313cbe`)
+- Auto-regenerate CHANGELOG.md from git commits on every release (`d81e037`)
 - Fix Vite __dirname and deprecated server.hmr.server warnings (`08573c9`)
 
 ## [v1.0.10] — 2026-11-21
