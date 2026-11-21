@@ -55,6 +55,7 @@ import {
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
+import { shouldAutoAdvanceEpisode } from '../lib/serverFailover';
 import { MediaPoster } from './MediaPoster';
 
 interface AnimePlayerProps {
@@ -79,10 +80,14 @@ interface AnimePlayerProps {
   errorMessage?: string;
   skipIntroSeconds?: number;
   autoPlayNextEpisode?: boolean;
+  hasUntriedFallbackServers?: boolean;
+  resumeAfterFailover?: { timeSec: number; autoStart: boolean; key: number } | null;
   onPrevEpisode?: () => void;
   onNextEpisode?: () => void;
   onSelectEpisode?: (episodeUrl: string) => void;
   onSelectServer?: (nume: string) => void;
+  onServerPlaybackFailed?: (failedNume: string, resumeTimeSec: number) => void;
+  onRetryEpisodePlayback?: () => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
   onToast: (message: string) => void;
 }
@@ -175,10 +180,14 @@ export function AnimePlayer({
   errorMessage: externalErrorMessage = '',
   skipIntroSeconds = 85,
   autoPlayNextEpisode = false,
+  hasUntriedFallbackServers = false,
+  resumeAfterFailover = null,
   onPrevEpisode,
   onNextEpisode,
   onSelectEpisode,
   onSelectServer,
+  onServerPlaybackFailed,
+  onRetryEpisodePlayback,
   onNativeSessionSync,
   onToast,
 }: AnimePlayerProps) {
@@ -227,6 +236,11 @@ export function AnimePlayer({
   const holdActiveRef = useRef(false);
   const preHoldSpeedRef = useRef(1);
   const autoStartNextRef = useRef(false);
+  const hasPlaybackStartedRef = useRef(false);
+  const autoNextTriggeredForUrlRef = useRef<string | null>(null);
+  const serverRetryCountRef = useRef(0);
+  const pendingSeekSecRef = useRef(0);
+  const loadWatchdogTimerRef = useRef<number | null>(null);
   const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
     time: 0,
     side: 'center',
@@ -273,6 +287,27 @@ export function AnimePlayer({
     savePrefs({ volume, muted, capScale, capColor });
   }, [volume, muted, capScale, capColor]);
 
+  // Reset per-episode guards when switching episodes
+  useEffect(() => {
+    autoNextTriggeredForUrlRef.current = null;
+    serverRetryCountRef.current = 0;
+    hasPlaybackStartedRef.current = false;
+    pendingSeekSecRef.current = 0;
+  }, [episodeUrl]);
+
+  // Reset per-server retry counter on server switch
+  useEffect(() => {
+    serverRetryCountRef.current = 0;
+  }, [selectedServerNume]);
+
+  // Preserve resume timestamp & autoplay across automatic server failover
+  useEffect(() => {
+    if (!resumeAfterFailover) return;
+    autoStartNextRef.current = resumeAfterFailover.autoStart;
+    pendingSeekSecRef.current =
+      resumeAfterFailover.timeSec > 1 ? resumeAfterFailover.timeSec : 0;
+  }, [resumeAfterFailover]);
+
   // Reset stream index and native resume timestamp when stream list changes
   useEffect(() => {
     setSelectedStreamIdx(0);
@@ -287,6 +322,7 @@ export function AnimePlayer({
 
   // Reset speed per video
   useEffect(() => {
+    hasPlaybackStartedRef.current = false;
     setSpeed(1);
     setHasVideoFrame(false);
     setErrorMsg('');
@@ -381,8 +417,16 @@ export function AnimePlayer({
     };
   }, [activeSubId, subEntries, referer, capColor, onToast, useNativeVlc]);
 
+  const clearLoadWatchdog = useCallback(() => {
+    if (loadWatchdogTimerRef.current !== null) {
+      window.clearTimeout(loadWatchdogTimerRef.current);
+      loadWatchdogTimerRef.current = null;
+    }
+  }, []);
+
   const advanceFallbackOrFail = useCallback(() => {
-    if (!activeStream) return;
+    clearLoadWatchdog();
+    if (loadingEpisode || !activeStream) return;
     if (playbackMode === 'direct-cors') {
       setPlaybackMode('proxy');
       return;
@@ -396,12 +440,44 @@ export function AnimePlayer({
       setPlaybackMode('direct-nocors');
       return;
     }
+    if (serverRetryCountRef.current < 1) {
+      serverRetryCountRef.current += 1;
+      autoStartNextRef.current = true;
+      setPlaybackMode(preferDirect ? 'direct-cors' : 'proxy');
+      setRetryToken((n) => n + 1);
+      return;
+    }
     setPlaying(false);
     setWaiting(false);
+    const resumeTime = videoRef.current?.currentTime || 0;
+    if (hasUntriedFallbackServers && onServerPlaybackFailed && selectedServerNume) {
+      onServerPlaybackFailed(selectedServerNume, resumeTime);
+      return;
+    }
     setErrorMsg(
       'Não foi possível reproduzir este servidor. Tente novamente ou escolha outro servidor.'
     );
-  }, [activeStream, playbackMode]);
+  }, [
+    activeStream,
+    clearLoadWatchdog,
+    hasUntriedFallbackServers,
+    loadingEpisode,
+    onServerPlaybackFailed,
+    playbackMode,
+    preferDirect,
+    selectedServerNume,
+  ]);
+
+  const armLoadWatchdog = useCallback(() => {
+    if (useNativeVlc || hasPlaybackStartedRef.current || loadingEpisode) return;
+    if (loadWatchdogTimerRef.current !== null) return;
+    loadWatchdogTimerRef.current = window.setTimeout(() => {
+      loadWatchdogTimerRef.current = null;
+      if (!disposedEffectRef.current && !hasPlaybackStartedRef.current && !loadingEpisode) {
+        advanceFallbackOrFail();
+      }
+    }, 10000);
+  }, [advanceFallbackOrFail, loadingEpisode, useNativeVlc]);
 
   const disposedEffectRef = useRef(false);
 
@@ -417,6 +493,7 @@ export function AnimePlayer({
     }
 
     if (!activeMediaUrl || !activeStream || loadingEpisode) {
+      clearLoadWatchdog();
       disposedEffectRef.current = true;
       video.removeAttribute('src');
       video.load();
@@ -430,6 +507,9 @@ export function AnimePlayer({
     setActiveHlsLevel(-1);
 
     const shouldAutoPlay = autoStartNextRef.current;
+    if (shouldAutoPlay) {
+      armLoadWatchdog();
+    }
 
     const useHls =
       activeStream.format === 'hls' || /\.m3u8(?:$|\?)/i.test(activeStream.url);
@@ -499,6 +579,7 @@ export function AnimePlayer({
       return () => {
         disposed = true;
         disposedEffectRef.current = true;
+        clearLoadWatchdog();
         hls.destroy();
         if (hlsRef.current === hls) hlsRef.current = null;
       };
@@ -512,6 +593,7 @@ export function AnimePlayer({
     return () => {
       disposed = true;
       disposedEffectRef.current = true;
+      clearLoadWatchdog();
       video.removeAttribute('src');
       video.load();
     };
@@ -519,6 +601,8 @@ export function AnimePlayer({
     activeMediaUrl,
     activeStream,
     advanceFallbackOrFail,
+    armLoadWatchdog,
+    clearLoadWatchdog,
     loadingEpisode,
     useCorsAttr,
     retryToken,
@@ -1215,30 +1299,72 @@ export function AnimePlayer({
             className="h-full w-full object-contain"
             onPlay={() => {
               setPlaying(true);
+              if (!hasPlaybackStartedRef.current) {
+                armLoadWatchdog();
+              }
               showControlsTemporarily();
             }}
             onPause={() => {
+              clearLoadWatchdog();
               setPlaying(false);
               setControlsVisible(true);
             }}
             onEnded={() => {
+              clearLoadWatchdog();
               setPlaying(false);
               setControlsVisible(true);
-              if (autoPlayNextEpisode && hasNext && onNextEpisode) {
+              if (
+                hasNext &&
+                onNextEpisode &&
+                shouldAutoAdvanceEpisode({
+                  autoPlayNextEpisode,
+                  loadingEpisode,
+                  playbackFailed: Boolean(effectiveErrorMsg),
+                  hasPlaybackStarted: hasPlaybackStartedRef.current,
+                  currentEpisodeUrl: episodeUrl,
+                  nextEpisodeUrl: nextUrl,
+                  alreadyTriggeredForUrl: autoNextTriggeredForUrlRef.current,
+                })
+              ) {
+                autoNextTriggeredForUrlRef.current = episodeUrl || null;
                 onToast('Carregando próximo episódio...');
                 triggerNextEpisode();
+              } else if (!hasPlaybackStartedRef.current && !loadingEpisode && !effectiveErrorMsg) {
+                advanceFallbackOrFail();
               }
             }}
-            onWaiting={() => setWaiting(true)}
+            onWaiting={() => {
+              setWaiting(true);
+              if (!hasPlaybackStartedRef.current) {
+                armLoadWatchdog();
+              }
+            }}
             onPlaying={() => {
+              clearLoadWatchdog();
+              hasPlaybackStartedRef.current = true;
               setWaiting(false);
               setHasVideoFrame(true);
               setErrorMsg('');
+            }}
+            onLoadedMetadata={() => {
+              const v = videoRef.current;
+              if (!v) return;
+              if (pendingSeekSecRef.current > 1) {
+                const cap =
+                  Number.isFinite(v.duration) && v.duration > 2
+                    ? Math.max(0, v.duration - 1.5)
+                    : pendingSeekSecRef.current;
+                v.currentTime = Math.min(pendingSeekSecRef.current, cap);
+                pendingSeekSecRef.current = 0;
+              }
             }}
             onLoadedData={() => setHasVideoFrame(true)}
             onTimeUpdate={() => {
               const v = videoRef.current;
               if (!v) return;
+              if (v.currentTime > 0.25) {
+                hasPlaybackStartedRef.current = true;
+              }
               setCurrentTime(v.currentTime);
               if (v.buffered.length > 0) {
                 setBufferedEnd(v.buffered.end(v.buffered.length - 1));
@@ -1299,19 +1425,6 @@ export function AnimePlayer({
               <p className="truncate text-[11px] text-slate-300/80">{seriesTitle}</p>
             )}
           </div>
-          {seriesEpisodes.length > 0 && (
-            <button
-              type="button"
-              onClick={() => {
-                setMenuOpen(false);
-                setEpisodesOpen((o) => !o);
-              }}
-              className="pointer-events-auto inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-white/15 bg-black/55 px-3 py-1.5 text-xs font-medium text-white backdrop-blur-sm hover:border-[#f97316]/60 hover:bg-black/75"
-            >
-              <ListVideo className="h-3.5 w-3.5 text-[#f97316]" />
-              <span>Episódios ({seriesEpisodes.length})</span>
-            </button>
-          )}
         </div>
       )}
 
@@ -1375,9 +1488,14 @@ export function AnimePlayer({
           <button
             type="button"
             onClick={() => {
+              serverRetryCountRef.current = 0;
               setErrorMsg('');
               setPlaybackMode(preferDirect ? 'direct-cors' : 'proxy');
-              setRetryToken((n) => n + 1);
+              if (onRetryEpisodePlayback && (!activeStream || externalErrorMessage)) {
+                onRetryEpisodePlayback();
+              } else {
+                setRetryToken((n) => n + 1);
+              }
             }}
             className="rounded-lg bg-[#f97316] px-4 py-2 text-xs font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c]"
           >

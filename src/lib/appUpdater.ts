@@ -102,6 +102,12 @@ export function isAllowedGitHubDownloadUrl(rawUrl: string): boolean {
   }
 }
 
+export function normalizeSha256Digest(raw?: string | null): string {
+  if (!raw || typeof raw !== 'string') return '';
+  const cleaned = raw.trim().replace(/^sha256:/i, '').trim();
+  return /^[0-9a-f]{64}$/i.test(cleaned) ? cleaned.toLowerCase() : '';
+}
+
 export function parseGitHubReleasePayload(payload: unknown): RemoteAppRelease | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   const obj = payload as Record<string, unknown>;

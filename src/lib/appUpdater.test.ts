@@ -7,6 +7,7 @@ import {
   extractCommitShaFromNotes,
   formatBytes,
   isAllowedGitHubDownloadUrl,
+  normalizeSha256Digest,
   parseGitHubReleasePayload,
 } from './appUpdater';
 
@@ -138,4 +139,20 @@ test('formatBytes formats APK sizes cleanly', () => {
   assert.equal(formatBytes(92044913), '87.8 MB');
   assert.equal(formatBytes(512_000), '500 KB');
   assert.equal(formatBytes(0), '—');
+});
+
+test('normalizeSha256Digest parses prefixed and raw 64-hex digests and rejects invalid input', () => {
+  assert.equal(
+    normalizeSha256Digest(
+      'sha256:848BA2A9B672E15B1EBB42B3CCBF7F9C3340F5EA3E71370FD36AE213DC00BE3B'
+    ),
+    '848ba2a9b672e15b1ebb42b3ccbf7f9c3340f5ea3e71370fd36ae213dc00be3b'
+  );
+  assert.equal(
+    normalizeSha256Digest('848ba2a9b672e15b1ebb42b3ccbf7f9c3340f5ea3e71370fd36ae213dc00be3b'),
+    '848ba2a9b672e15b1ebb42b3ccbf7f9c3340f5ea3e71370fd36ae213dc00be3b'
+  );
+  assert.equal(normalizeSha256Digest('sha256:short'), '');
+  assert.equal(normalizeSha256Digest(''), '');
+  assert.equal(normalizeSha256Digest(undefined), '');
 });

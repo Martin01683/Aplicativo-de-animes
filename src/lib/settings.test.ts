@@ -9,6 +9,7 @@ import {
 } from './settings';
 
 test('sanitizeAppSettings falls back cleanly on invalid or partial input', () => {
+  assert.equal(DEFAULT_APP_SETTINGS.episodeCheckIntervalMinutes, 15);
   assert.deepEqual(sanitizeAppSettings(null), DEFAULT_APP_SETTINGS);
   assert.deepEqual(sanitizeAppSettings([]), DEFAULT_APP_SETTINGS);
   assert.deepEqual(

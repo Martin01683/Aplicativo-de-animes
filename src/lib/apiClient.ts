@@ -3,6 +3,7 @@ import {
   GITHUB_RELEASES_API_URL,
   GITHUB_RELEASES_LIST_API_URL,
   isAllowedGitHubDownloadUrl,
+  normalizeSha256Digest,
   parseGitHubReleasePayload,
 } from './appUpdater';
 import {
@@ -43,17 +44,17 @@ export interface NativeFetchPageResult {
   body: string;
 }
 
-export interface ApkDownloadProgressEvent {
-  status: 'downloading' | 'installing' | 'error';
-  percent: number;
-  downloadedBytes: number;
-  totalBytes: number;
-  message?: string;
-}
-
 export interface NativeAppBuildInfoResult {
   versionName: string;
   versionCode: number;
+}
+
+export interface ApkDownloadProgressEvent {
+  downloadedBytes: number;
+  totalBytes: number;
+  percent: number;
+  stage: 'downloading' | 'verifying' | 'installing' | 'installed' | 'error';
+  message?: string;
 }
 
 export interface LocalProxyPlugin {
@@ -64,7 +65,8 @@ export interface LocalProxyPlugin {
   downloadAndInstallApk(options: {
     url: string;
     filename?: string;
-  }): Promise<{ started: boolean; installerOpened?: boolean }>;
+    expectedSha256?: string;
+  }): Promise<{ started: boolean; needsPermission?: boolean; message?: string }>;
   addListener(
     eventName: 'apkDownloadProgress',
     listenerFunc: (event: ApkDownloadProgressEvent) => void
@@ -175,25 +177,28 @@ export async function addApkDownloadProgressListener(
 
 export async function downloadAppUpdateApk(
   downloadUrl: string,
-  filename = 'TopAnimes.apk'
-): Promise<{ mode: 'native-installer' | 'browser-download' }> {
+  filename = 'TopAnimes.apk',
+  expectedSha256?: string
+): Promise<{ mode: 'native-installer' | 'permission-required' | 'browser-download'; message?: string }> {
   if (!isAllowedGitHubDownloadUrl(downloadUrl)) {
     throw new Error('URL de download do GitHub inválida ou não permitida.');
   }
   if (isNativeAndroidApp()) {
-    try {
-      const res = await LocalProxy.downloadAndInstallApk({ url: downloadUrl, filename });
-      if (res?.started) {
-        return { mode: 'native-installer' };
-      }
-    } catch {
-      // Fallback to external browser download if native plugin is older
-      const opened = await openExternalOrVlcUrl(downloadUrl);
-      if (opened) {
-        return { mode: 'browser-download' };
-      }
-      throw new Error('Não foi possível baixar ou abrir a atualização no Android.');
+    const cleanSha256 = normalizeSha256Digest(expectedSha256);
+    const res = await LocalProxy.downloadAndInstallApk({
+      url: downloadUrl,
+      filename,
+      expectedSha256: cleanSha256 || undefined,
+    });
+    if (res?.needsPermission) {
+      return {
+        mode: 'permission-required',
+        message:
+          res.message ||
+          "Ative 'Permitir desta fonte' nas configurações do Android e tente novamente.",
+      };
     }
+    return { mode: 'native-installer' };
   }
 
   const anchor = document.createElement('a');

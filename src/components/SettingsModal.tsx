@@ -11,6 +11,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import type { ApkDownloadProgressEvent } from '../lib/apiClient';
 import {
   formatBytes,
   formatShortSha,
@@ -18,7 +19,6 @@ import {
   type AppBuildInfo,
   type AppUpdateCheckResult,
 } from '../lib/appUpdater';
-import type { ApkDownloadProgressEvent } from '../lib/apiClient';
 import {
   APP_UPDATE_INTERVAL_OPTIONS,
   EPISODE_CHECK_INTERVAL_OPTIONS,
@@ -384,7 +384,7 @@ export function SettingsModal({
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
                     {isNativeAndroid
-                      ? 'Inicia o download do novo APK e abre o instalador do Android automaticamente.'
+                      ? 'Baixa o TopAnimes.apk oficial no app, verifica SHA-256 e assinatura e inicia o instalador do sistema.'
                       : 'Inicia automaticamente o download do novo TopAnimes.apk publicado no GitHub.'}
                   </span>
                 </label>
@@ -463,25 +463,50 @@ export function SettingsModal({
                         </p>
                       )}
 
-                      {downloadingAppUpdate && apkDownloadProgress && (
-                        <div className="space-y-1.5">
-                          <div className="flex items-center justify-between text-xs tabular-nums text-slate-300">
-                            <span>
-                              {apkDownloadProgress.status === 'installing'
-                                ? 'Abrindo instalador do Android...'
-                                : 'Baixando TopAnimes.apk...'}
+                      {(downloadingAppUpdate || apkDownloadProgress) && (
+                        <div className="space-y-1.5 rounded-lg border border-white/8 bg-[#151921] p-3">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-medium text-slate-200">
+                              {apkDownloadProgress?.stage === 'verifying'
+                                ? 'Verificando integridade SHA-256 e assinatura...'
+                                : apkDownloadProgress?.stage === 'installing'
+                                  ? 'Abrindo instalador do sistema Android...'
+                                  : apkDownloadProgress?.stage === 'installed'
+                                    ? 'Atualização concluída!'
+                                    : apkDownloadProgress?.stage === 'error'
+                                      ? apkDownloadProgress.message || 'Falha ao atualizar APK.'
+                                      : `Baixando atualização... ${apkDownloadProgress?.percent ?? 0}%`}
                             </span>
-                            <span className="font-mono">
-                              {apkDownloadProgress.percent >= 0
-                                ? `${apkDownloadProgress.percent}%`
-                                : formatBytes(apkDownloadProgress.downloadedBytes)}
-                            </span>
+                            {apkDownloadProgress && apkDownloadProgress.downloadedBytes > 0 && (
+                              <span className="font-mono tabular-nums text-slate-400">
+                                {formatBytes(apkDownloadProgress.downloadedBytes)}
+                                {apkDownloadProgress.totalBytes > 0
+                                  ? ` / ${formatBytes(apkDownloadProgress.totalBytes)}`
+                                  : ''}
+                              </span>
+                            )}
                           </div>
-                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                          <div className="h-2 w-full overflow-hidden rounded-full bg-white/10">
                             <div
-                              className="h-full bg-[#f97316] transition-all"
+                              className={`h-full rounded-full transition-all duration-200 ${
+                                apkDownloadProgress?.stage === 'error'
+                                  ? 'bg-red-500'
+                                  : apkDownloadProgress?.stage === 'installed'
+                                    ? 'bg-emerald-400'
+                                    : 'bg-[#f97316]'
+                              }`}
                               style={{
-                                width: `${Math.max(5, apkDownloadProgress.percent >= 0 ? apkDownloadProgress.percent : 25)}%`,
+                                width: `${Math.min(
+                                  100,
+                                  Math.max(
+                                    apkDownloadProgress?.stage === 'verifying' ||
+                                      apkDownloadProgress?.stage === 'installing' ||
+                                      apkDownloadProgress?.stage === 'installed'
+                                      ? 100
+                                      : 6,
+                                    apkDownloadProgress?.percent ?? 6
+                                  )
+                                )}%`,
                               }}
                             />
                           </div>

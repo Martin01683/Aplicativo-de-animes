@@ -24,7 +24,7 @@ export interface AppSettingsMeta {
 }
 
 export const DEFAULT_APP_SETTINGS: AppSettings = {
-  episodeCheckIntervalMinutes: 5,
+  episodeCheckIntervalMinutes: 15,
   checkEpisodesOnStartup: true,
   notifyNewEpisodes: true,
   autoCheckAppUpdates: true,
@@ -47,8 +47,8 @@ export const EPISODE_CHECK_INTERVAL_OPTIONS: Array<{
   shortLabel: string;
 }> = [
   { value: 1, label: 'A cada 1 minuto', shortLabel: '1 min' },
-  { value: 5, label: 'A cada 5 minutos (Padrão)', shortLabel: '5 min' },
-  { value: 15, label: 'A cada 15 minutos', shortLabel: '15 min' },
+  { value: 5, label: 'A cada 5 minutos', shortLabel: '5 min' },
+  { value: 15, label: 'A cada 15 minutos (Padrão)', shortLabel: '15 min' },
   { value: 30, label: 'A cada 30 minutos', shortLabel: '30 min' },
   { value: 60, label: 'A cada 1 hora', shortLabel: '1 hora' },
   { value: 0, label: 'Somente manual', shortLabel: 'Manual' },

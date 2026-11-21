@@ -36,6 +36,7 @@ import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
@@ -58,14 +59,19 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class VlcPlayerActivity extends AppCompatActivity {
@@ -150,8 +156,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private TextView errorText;
     private TextView titleView;
     private TextView seriesTitleView;
-    private LinearLayout btnTopEpisodes;
-    private TextView topEpisodesText;
     private ImageButton btnPlayCenter;
     private ImageButton btnPlayBottom;
     private ImageButton btnMute;
@@ -195,6 +199,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private final List<TopAnimesEpisodeResolver.EpisodeLink> seriesEpisodes = new ArrayList<>();
     private final List<TopAnimesEpisodeResolver.ServerOption> serverOptions = new ArrayList<>();
     private final Set<String> watchedUrls = new HashSet<>();
+    private final Set<String> failedServerNumes = new HashSet<>();
+    private final Map<String, TopAnimesEpisodeResolver.ResolvedEmbedData> embedProbeCache = new HashMap<>();
     private final Map<String, String> visitedEpisodes = new LinkedHashMap<>();
     private final List<File> cachedSubFiles = new ArrayList<>();
 
@@ -217,6 +223,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private long lastKnownDurationMs = 0L;
     private int skipIntroSeconds = 85;
     private boolean autoPlayNextEpisode = false;
+
+    private static final int MAX_RETRIES_PER_SERVER = 1;
+    private static final long LOAD_WATCHDOG_TIMEOUT_MS = 12000L;
+
+    private volatile long activePlaybackSessionGen = 0L;
+    private long sessionCounter = 0L;
+    private long endReachedHandledSessionGen = -1L;
+    private boolean hasPlaybackStartedForStream = false;
+    private int currentServerRetryCount = 0;
 
     private float currentSpeed = 1.0f;
     private int currentScaleIdx = 0;
@@ -264,6 +279,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
             setControlsVisible(!controlsVisible);
         }
     };
+    private final Runnable loadWatchdogRunnable = () -> {
+        if (isFinishing() || isDestroyed() || loadingEpisode || playbackFailed || hasPlaybackStartedForStream) {
+            return;
+        }
+        Log.w(TAG, "Stream load watchdog expired; triggering transport/server failover");
+        handlePlaybackError();
+    };
     private final Runnable holdSpeedRunnable = () -> {
         if (gestureMode == GESTURE_NONE && mediaPlayer != null && !playbackFailed && !loadingEpisode) {
             gestureMode = GESTURE_HOLD_2X;
@@ -300,6 +322,24 @@ public class VlcPlayerActivity extends AppCompatActivity {
         enterImmersiveMode();
 
         bindViews();
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                if (episodesOverlay != null && episodesOverlay.getVisibility() == View.VISIBLE) {
+                    closeEpisodesDrawer();
+                    return;
+                }
+                if (settingsOverlay != null && settingsOverlay.getVisibility() == View.VISIBLE) {
+                    if (!"main".equals(settingsTab)) {
+                        renderSettingsTab("main");
+                    } else {
+                        closeSettingsMenu();
+                    }
+                    return;
+                }
+                finishWithAction("closed");
+            }
+        });
         parseIntentExtras(getIntent());
         setupAudioFocus();
         initLibVlc();
@@ -319,8 +359,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
         errorText = findViewById(R.id.vlc_error_text);
         titleView = findViewById(R.id.vlc_title);
         seriesTitleView = findViewById(R.id.vlc_series_title);
-        btnTopEpisodes = findViewById(R.id.vlc_btn_top_episodes);
-        topEpisodesText = findViewById(R.id.vlc_top_episodes_text);
         btnPlayCenter = findViewById(R.id.vlc_btn_play_center);
         btnPlayBottom = findViewById(R.id.vlc_btn_play_bottom);
         btnMute = findViewById(R.id.vlc_btn_mute);
@@ -566,10 +604,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
         boolean hasEpisodes = !seriesEpisodes.isEmpty();
         btnEpisodes.setVisibility(hasEpisodes ? View.VISIBLE : View.GONE);
-        btnTopEpisodes.setVisibility(hasEpisodes ? View.VISIBLE : View.GONE);
-        if (hasEpisodes) {
-            topEpisodesText.setText("Episódios (" + seriesEpisodes.size() + ")");
-        }
     }
 
     private void maybeFetchSeriesEpisodesInBackground() {
@@ -606,10 +640,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
         mediaPlayer.setVideoScale(SCALE_OPTIONS[currentScaleIdx]);
 
         mediaPlayer.setEventListener(event -> {
+            final long eventSession = activePlaybackSessionGen;
+            if (eventSession <= 0L) return;
             switch (event.type) {
                 case MediaPlayer.Event.Opening:
                     uiHandler.post(() -> {
-                        if (isFinishing() || isDestroyed()) return;
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
                         showLoading(loadingEpisode ? "Carregando episódio..." : null);
                         errorOverlay.setVisibility(View.GONE);
                     });
@@ -617,7 +653,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 case MediaPlayer.Event.Buffering:
                     float pct = event.getBuffering();
                     uiHandler.post(() -> {
-                        if (isFinishing() || isDestroyed()) return;
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
                         if (pct >= 100f && !loadingEpisode) {
                             hideLoading();
                         } else if (mediaPlayer != null && !mediaPlayer.isPlaying()) {
@@ -627,7 +663,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     break;
                 case MediaPlayer.Event.Playing:
                     uiHandler.post(() -> {
-                        if (isFinishing() || isDestroyed()) return;
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        uiHandler.removeCallbacks(loadWatchdogRunnable);
+                        hasPlaybackStartedForStream = true;
                         playbackFailed = false;
                         loadingEpisode = false;
                         hideLoading();
@@ -652,7 +690,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     break;
                 case MediaPlayer.Event.Paused:
                     uiHandler.post(() -> {
-                        if (isFinishing() || isDestroyed()) return;
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        uiHandler.removeCallbacks(loadWatchdogRunnable);
                         updatePlayPauseIcons(false);
                         setControlsVisible(true);
                     });
@@ -660,9 +699,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 case MediaPlayer.Event.LengthChanged:
                     long len = event.getLengthChanged();
                     if (len > 0) {
-                        lastKnownDurationMs = len;
                         uiHandler.post(() -> {
-                            if (isFinishing() || isDestroyed()) return;
+                            if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                            lastKnownDurationMs = len;
                             seekBar.setMax((int) Math.min(Integer.MAX_VALUE, len));
                             timeDurationView.setText(formatMs(len));
                         });
@@ -670,9 +709,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     break;
                 case MediaPlayer.Event.TimeChanged:
                     long timeMs = event.getTimeChanged();
-                    lastKnownPositionMs = timeMs;
                     uiHandler.post(() -> {
-                        if (isFinishing() || isDestroyed()) return;
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        lastKnownPositionMs = timeMs;
+                        if (timeMs > 500L) {
+                            hasPlaybackStartedForStream = true;
+                            uiHandler.removeCallbacks(loadWatchdogRunnable);
+                        }
                         if (!userScrubbing) {
                             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, timeMs));
                             timeCurrentView.setText(formatMs(timeMs));
@@ -687,10 +730,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     break;
                 case MediaPlayer.Event.EndReached:
                     uiHandler.post(() -> {
-                        if (isFinishing() || isDestroyed()) return;
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        uiHandler.removeCallbacks(loadWatchdogRunnable);
+                        if (loadingEpisode || playbackFailed || endReachedHandledSessionGen == eventSession) return;
+                        endReachedHandledSessionGen = eventSession;
                         updatePlayPauseIcons(false);
-                        if (autoPlayNextEpisode && !nextUrl.isEmpty()) {
+                        if (!hasPlaybackStartedForStream) {
+                            Log.w(TAG, "EndReached fired before playback started; running server failover");
+                            handlePlaybackError();
+                            return;
+                        }
+                        if (autoPlayNextEpisode && !nextUrl.isEmpty() && !isSameEpisodeUrl(episodeUrl, nextUrl)) {
+                            Toast.makeText(VlcPlayerActivity.this, "Carregando próximo episódio...", Toast.LENGTH_SHORT).show();
                             loadEpisodeInFullscreen(nextUrl);
+                        } else if (autoPlayNextEpisode && hasNextFlag && nextUrl.isEmpty()) {
+                            Toast.makeText(VlcPlayerActivity.this, "Carregando próximo episódio...", Toast.LENGTH_SHORT).show();
+                            finishWithAction("next");
                         } else {
                             setControlsVisible(true);
                         }
@@ -698,6 +753,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     break;
                 case MediaPlayer.Event.EncounteredError:
                     uiHandler.post(() -> {
+                        if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        uiHandler.removeCallbacks(loadWatchdogRunnable);
                         if (!loadingEpisode) {
                             handlePlaybackError();
                         }
@@ -735,7 +792,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void prepareAndPlayCurrentStream() {
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
         if (streams.isEmpty()) {
+            activePlaybackSessionGen = -1L;
             playbackFailed = true;
             loadingEpisode = false;
             hideLoading();
@@ -755,10 +814,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
             targetUrl = LocalProxyPlugin.buildSharedProxyUrl(item.url, referer);
         }
 
+        hasPlaybackStartedForStream = false;
         playbackFailed = false;
         subtitlesAttached = false;
         errorOverlay.setVisibility(View.GONE);
         showLoading(loadingEpisode ? "Carregando episódio..." : null);
+
+        activePlaybackSessionGen = ++sessionCounter;
 
         Media media = new Media(libVlc, Uri.parse(targetUrl));
         media.setHWDecoderEnabled(true, false);
@@ -772,9 +834,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
         mediaPlayer.setMedia(media);
         media.release();
         mediaPlayer.play();
+        uiHandler.postDelayed(loadWatchdogRunnable, LOAD_WATCHDOG_TIMEOUT_MS);
     }
 
     private void handlePlaybackError() {
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
         if (!useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
             useProxyForAttempt = true;
             pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
@@ -789,12 +853,178 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return;
         }
 
+        if (currentServerRetryCount < MAX_RETRIES_PER_SERVER) {
+            currentServerRetryCount++;
+            useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
+            pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
+            prepareAndPlayCurrentStream();
+            return;
+        }
+
+        if (!selectedServerNume.isEmpty()) {
+            failedServerNumes.add(selectedServerNume);
+        }
+
+        List<TopAnimesEpisodeResolver.ServerOption> remaining = new ArrayList<>();
+        for (TopAnimesEpisodeResolver.ServerOption opt : serverOptions) {
+            if (!failedServerNumes.contains(opt.nume)) {
+                remaining.add(opt);
+            }
+        }
+
+        if (!remaining.isEmpty()) {
+            triggerBestServerFailover(remaining, Math.max(pendingSeekMs, lastKnownPositionMs));
+            return;
+        }
+
+        activePlaybackSessionGen = -1L;
         playbackFailed = true;
         loadingEpisode = false;
         hideLoading();
-        errorText.setText("Não foi possível reproduzir este servidor no LibVLC. Tente novamente ou troque de servidor.");
+        errorText.setText("Não foi possível reproduzir este episódio em nenhum servidor. Tente novamente.");
         errorOverlay.setVisibility(View.VISIBLE);
         setControlsVisible(true);
+    }
+
+    private static final class ProbeOutcome {
+        final TopAnimesEpisodeResolver.ServerOption option;
+        final int orderIndex;
+        final TopAnimesEpisodeResolver.ResolvedEmbedData resolved;
+
+        ProbeOutcome(
+            TopAnimesEpisodeResolver.ServerOption option,
+            int orderIndex,
+            TopAnimesEpisodeResolver.ResolvedEmbedData resolved
+        ) {
+            this.option = option;
+            this.orderIndex = orderIndex;
+            this.resolved = resolved;
+        }
+    }
+
+    private void triggerBestServerFailover(
+        List<TopAnimesEpisodeResolver.ServerOption> candidates,
+        long resumePositionMs
+    ) {
+        final int gen = episodeLoadGen.incrementAndGet();
+        activePlaybackSessionGen = -1L;
+        loadingEpisode = true;
+        playbackFailed = false;
+        hasPlaybackStartedForStream = false;
+        errorOverlay.setVisibility(View.GONE);
+        showLoading("Buscando servidor com melhor qualidade...");
+        updateEpisodeNavButtons();
+
+        if (mediaPlayer != null) {
+            try {
+                mediaPlayer.stop();
+            } catch (Exception ignored) {
+            }
+        }
+
+        bgExecutor.execute(() -> {
+            CompletionService<ProbeOutcome> ecs = new ExecutorCompletionService<>(bgExecutor);
+            List<Future<ProbeOutcome>> futures = new ArrayList<>();
+            for (int i = 0; i < candidates.size(); i++) {
+                final int idx = i;
+                final TopAnimesEpisodeResolver.ServerOption opt = candidates.get(i);
+                futures.add(ecs.submit(() -> {
+                    TopAnimesEpisodeResolver.ResolvedEmbedData cached;
+                    synchronized (embedProbeCache) {
+                        cached = embedProbeCache.get(opt.embedUrl);
+                    }
+                    if (cached == null) {
+                        cached = TopAnimesEpisodeResolver.resolveEmbed(opt.embedUrl);
+                        synchronized (embedProbeCache) {
+                            embedProbeCache.put(opt.embedUrl, cached);
+                        }
+                    }
+                    return new ProbeOutcome(opt, idx, cached);
+                }));
+            }
+
+            ProbeOutcome best = null;
+            int bestQ = -1;
+            int bestP = -1;
+            long deadlineNs = System.nanoTime() + TimeUnit.SECONDS.toNanos(9);
+
+            for (int received = 0; received < futures.size(); received++) {
+                long remainingMs = Math.max(100L, TimeUnit.NANOSECONDS.toMillis(deadlineNs - System.nanoTime()));
+                if (System.nanoTime() >= deadlineNs) break;
+                try {
+                    Future<ProbeOutcome> done = ecs.poll(remainingMs, TimeUnit.MILLISECONDS);
+                    if (done == null) break;
+                    ProbeOutcome outcome = done.get();
+                    if (outcome != null && outcome.resolved != null
+                        && outcome.resolved.ok && !outcome.resolved.streams.isEmpty()) {
+                        int q = TopAnimesEpisodeResolver.scoreEmbedQuality(outcome.resolved);
+                        int p = TopAnimesEpisodeResolver.providerPriority(outcome.option.providerKind);
+                        if (best == null || q > bestQ
+                            || (q == bestQ && p > bestP)
+                            || (q == bestQ && p == bestP && outcome.orderIndex < best.orderIndex)) {
+                            best = outcome;
+                            bestQ = q;
+                            bestP = p;
+                        }
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+
+            for (Future<ProbeOutcome> f : futures) {
+                if (!f.isDone()) f.cancel(true);
+            }
+
+            final ProbeOutcome winner = best;
+            uiHandler.post(() -> {
+                if (isFinishing() || isDestroyed() || gen != episodeLoadGen.get()) return;
+                if (winner == null) {
+                    for (TopAnimesEpisodeResolver.ServerOption failedOpt : candidates) {
+                        failedServerNumes.add(failedOpt.nume);
+                    }
+                    loadingEpisode = false;
+                    playbackFailed = true;
+                    hideLoading();
+                    errorText.setText("Nenhum servidor disponível conseguiu reproduzir este episódio. Tente novamente.");
+                    errorOverlay.setVisibility(View.VISIBLE);
+                    updateEpisodeNavButtons();
+                    setControlsVisible(true);
+                    return;
+                }
+
+                loadingEpisode = false;
+                currentServerRetryCount = 0;
+                selectedServerNume = winner.option.nume;
+                referer = winner.resolved.referer;
+                preferDirect = winner.resolved.preferDirect;
+                useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
+                pendingSeekMs = resumePositionMs > 2000L ? resumePositionMs : 0L;
+
+                streams.clear();
+                for (TopAnimesEpisodeResolver.StreamCandidate sc : winner.resolved.streams) {
+                    streams.add(new StreamItem(sc.label, sc.url));
+                }
+                currentStreamIdx = 0;
+
+                subtitles.clear();
+                for (TopAnimesEpisodeResolver.SubtitleCandidate sub : winner.resolved.subtitles) {
+                    subtitles.add(new SubtitleItem(sub.label, sub.url, sub.isDefault));
+                }
+
+                updateQualityLabel();
+                updateEpisodeNavButtons();
+
+                String qLabel = TopAnimesEpisodeResolver.getBestQualityLabel(winner.resolved);
+                Toast.makeText(
+                    VlcPlayerActivity.this,
+                    "Falha no servidor — trocado para " + winner.option.label
+                        + (qLabel.isEmpty() ? "" : " (" + qLabel + ")"),
+                    Toast.LENGTH_SHORT
+                ).show();
+
+                prepareAndPlayCurrentStream();
+            });
+        });
     }
 
     private void downloadAndAttachSubtitles() {
@@ -879,6 +1109,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
         btnFullscreen.setOnClickListener(v -> finishWithAction("closed"));
         findViewById(R.id.vlc_btn_close_error).setOnClickListener(v -> finishWithAction("closed"));
         findViewById(R.id.vlc_btn_retry).setOnClickListener(v -> {
+            failedServerNumes.clear();
+            currentServerRetryCount = 0;
+            synchronized (embedProbeCache) {
+                embedProbeCache.clear();
+            }
+            if (streams.isEmpty() && !episodeUrl.isEmpty()) {
+                loadEpisodeInFullscreen(episodeUrl);
+                return;
+            }
             useProxyForAttempt = !preferDirect && !proxyBaseUrl.isEmpty();
             pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
             prepareAndPlayCurrentStream();
@@ -910,7 +1149,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
         });
 
         btnEpisodes.setOnClickListener(v -> openEpisodesDrawer());
-        btnTopEpisodes.setOnClickListener(v -> openEpisodesDrawer());
         findViewById(R.id.vlc_btn_close_episodes).setOnClickListener(v -> closeEpisodesDrawer());
         episodesOverlay.setOnClickListener(v -> closeEpisodesDrawer());
         episodesDrawer.setOnClickListener(v -> {
@@ -1374,6 +1612,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (normalizedTarget.isEmpty()) return;
 
         final int gen = episodeLoadGen.incrementAndGet();
+        activePlaybackSessionGen = -1L;
+        endReachedHandledSessionGen = -1L;
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
+        failedServerNumes.clear();
+        synchronized (embedProbeCache) {
+            embedProbeCache.clear();
+        }
+        currentServerRetryCount = 0;
+        hasPlaybackStartedForStream = false;
         loadingEpisode = true;
         playbackFailed = false;
         pendingSeekMs = 0L;
@@ -1677,6 +1924,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private void switchServerInFullscreen(TopAnimesEpisodeResolver.ServerOption opt) {
         final int gen = episodeLoadGen.incrementAndGet();
         final long resumePos = Math.max(0L, lastKnownPositionMs);
+        activePlaybackSessionGen = -1L;
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
+        failedServerNumes.remove(opt.nume);
+        currentServerRetryCount = 0;
+        hasPlaybackStartedForStream = false;
+        playbackFailed = false;
         loadingEpisode = true;
         errorOverlay.setVisibility(View.GONE);
         showLoading("Trocando para " + opt.label + "...");
@@ -1862,25 +2115,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     @Override
-    public void onBackPressed() {
-        if (episodesOverlay != null && episodesOverlay.getVisibility() == View.VISIBLE) {
-            closeEpisodesDrawer();
-            return;
-        }
-        if (settingsOverlay != null && settingsOverlay.getVisibility() == View.VISIBLE) {
-            if (!"main".equals(settingsTab)) {
-                renderSettingsTab("main");
-            } else {
-                closeSettingsMenu();
-            }
-            return;
-        }
-        finishWithAction("closed");
-    }
-
-    @Override
     protected void onPause() {
         super.onPause();
+        uiHandler.removeCallbacks(loadWatchdogRunnable);
         if (mediaPlayer != null && mediaPlayer.isPlaying()) {
             mediaPlayer.pause();
         }

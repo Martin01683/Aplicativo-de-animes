@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   ChevronLeft,
@@ -15,6 +15,7 @@ import {
   resolveSeriesPrevNext,
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
+import { pickBestFailoverServer } from '../lib/serverFailover';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
@@ -42,6 +43,22 @@ interface EpisodeWorkspaceProps {
   autoPlayNextEpisode?: boolean;
 }
 
+interface ScopedResolvedEmbed {
+  episodeUrl: string;
+  embedUrl: string;
+  data: ResolvedEmbed;
+}
+
+function pickInitialOption(options: PlayerOption[]): PlayerOption | null {
+  return (
+    options.find((o) =>
+      ['kojima', 'zuplay', 'vidstreaming', 'playerjs'].includes(o.providerKind)
+    ) ||
+    options[0] ||
+    null
+  );
+}
+
 export function EpisodeWorkspace({
   episode,
   isFavorite,
@@ -65,22 +82,34 @@ export function EpisodeWorkspace({
     [episode.options]
   );
 
-  const [selectedOption, setSelectedOption] = useState<PlayerOption | null>(() => {
-    return (
-      playableOptions.find((o) =>
-        ['kojima', 'zuplay', 'vidstreaming', 'playerjs'].includes(o.providerKind)
-      ) ||
-      playableOptions[0] ||
-      null
-    );
-  });
-  const [resolved, setResolved] = useState<ResolvedEmbed | null>(null);
+  const [selectedOption, setSelectedOption] = useState<PlayerOption | null>(() =>
+    pickInitialOption(playableOptions)
+  );
+  const [resolvedState, setResolvedState] = useState<ScopedResolvedEmbed | null>(null);
   const [loadingEmbed, setLoadingEmbed] = useState(false);
+  const [failoverExhaustedMsg, setFailoverExhaustedMsg] = useState('');
+  const [resumeAfterFailover, setResumeAfterFailover] = useState<{
+    timeSec: number;
+    autoStart: boolean;
+    key: number;
+  } | null>(null);
+
+  const embedCacheRef = useRef<Map<string, ResolvedEmbed>>(new Map());
+  const failedServersByEpisodeRef = useRef<Map<string, Set<string>>>(new Map());
+  const activeEpisodeUrlRef = useRef(episode.url);
+  activeEpisodeUrlRef.current = episode.url;
 
   const seriesCacheRef = useRef<Map<string, AnimeEpisodeLink[]>>(new Map());
   const [seriesEpisodes, setSeriesEpisodes] = useState<AnimeEpisodeLink[]>(
     initialSeriesEpisodes || []
   );
+
+  const resolved =
+    resolvedState &&
+    isSameEpisodeUrl(resolvedState.episodeUrl, episode.url) &&
+    resolvedState.embedUrl === selectedOption?.embedUrl
+      ? resolvedState.data
+      : null;
 
   // Remember whether the player has mounted at least once in this session so fullscreen stays intact during episode switches
   const hasMountedPlayerRef = useRef(false);
@@ -93,14 +122,10 @@ export function EpisodeWorkspace({
     const filtered = episode.options.filter(
       (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
     );
-    const preferred =
-      filtered.find((o) =>
-        ['kojima', 'zuplay', 'vidstreaming', 'playerjs'].includes(o.providerKind)
-      ) ||
-      filtered[0] ||
-      null;
-    setSelectedOption(preferred);
-    setResolved(null);
+    setSelectedOption(pickInitialOption(filtered));
+    setResolvedState(null);
+    setFailoverExhaustedMsg('');
+    setResumeAfterFailover(null);
   }, [episode]);
 
   // Fetch and cache the series episode list so in-fullscreen episode selection is always populated
@@ -140,38 +165,177 @@ export function EpisodeWorkspace({
     };
   }, [episode.isMovie, episode.seriesUrl, initialSeriesEpisodes]);
 
-  // Resolve chosen server via backend
+  const resolveEmbedCached = useCallback(async (opt: PlayerOption): Promise<ResolvedEmbed> => {
+    const cacheKey = opt.embedUrl;
+    const cached = embedCacheRef.current.get(cacheKey);
+    if (cached) return cached;
+
+    try {
+      const res = await apiFetch(`/api/resolve-embed?url=${encodeURIComponent(opt.embedUrl)}`);
+      const data = (await res.json()) as ResolvedEmbed;
+      embedCacheRef.current.set(cacheKey, data);
+      return data;
+    } catch {
+      return {
+        embedUrl: opt.embedUrl,
+        provider: opt.label,
+        status: 'error',
+        streams: [],
+        subtitles: [],
+        referer: 'https://topanimes.net/',
+        errorMessage: 'Não foi possível contactar o servidor de extração.',
+      };
+    }
+  }, []);
+
+  const findBestAvailableServer = useCallback(
+    async (episodeUrlKey: string, failedSet: Set<string>) => {
+      const remaining = playableOptions
+        .map((option, orderIndex) => ({ option, orderIndex }))
+        .filter((item) => !failedSet.has(item.option.nume));
+
+      if (!remaining.length) return null;
+
+      const settled = await Promise.all(
+        remaining.map(async ({ option, orderIndex }) => ({
+          option,
+          orderIndex,
+          resolved: await resolveEmbedCached(option),
+        }))
+      );
+
+      return pickBestFailoverServer(settled, failedSet);
+    },
+    [playableOptions, resolveEmbedCached]
+  );
+
+  // Resolve chosen server via backend (and auto-failover to best quality server if resolution fails)
   useEffect(() => {
     if (!selectedOption) return;
+    const targetEpisodeUrl = episode.url;
+    const targetOption = selectedOption;
     let cancelled = false;
     setLoadingEmbed(true);
+    setFailoverExhaustedMsg('');
 
-    apiFetch(`/api/resolve-embed?url=${encodeURIComponent(selectedOption.embedUrl)}`)
-      .then((res) => res.json())
-      .then((data: ResolvedEmbed) => {
-        if (cancelled) return;
-        setResolved(data);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setResolved({
-          embedUrl: selectedOption.embedUrl,
-          provider: selectedOption.label,
-          status: 'error',
-          streams: [],
-          subtitles: [],
-          referer: 'https://topanimes.net/',
-          errorMessage: 'Não foi possível contactar o servidor de extração.',
+    const run = async () => {
+      const data = await resolveEmbedCached(targetOption);
+      if (cancelled || !isSameEpisodeUrl(activeEpisodeUrlRef.current, targetEpisodeUrl)) return;
+
+      if (data.status === 'resolved' && data.streams.length > 0) {
+        setResolvedState({
+          episodeUrl: targetEpisodeUrl,
+          embedUrl: targetOption.embedUrl,
+          data,
         });
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingEmbed(false);
-      });
+        return;
+      }
+
+      // Current server failed to resolve playable streams — probe remaining servers in parallel for best quality
+      const epKey = normalizeTopAnimesUrl(targetEpisodeUrl) || targetEpisodeUrl;
+      const failedSet = failedServersByEpisodeRef.current.get(epKey) ?? new Set<string>();
+      failedSet.add(targetOption.nume);
+      failedServersByEpisodeRef.current.set(epKey, failedSet);
+
+      const winner = await findBestAvailableServer(epKey, failedSet);
+      if (cancelled || !isSameEpisodeUrl(activeEpisodeUrlRef.current, targetEpisodeUrl)) return;
+
+      if (winner) {
+        setSelectedOption(winner.option);
+        setResolvedState({
+          episodeUrl: targetEpisodeUrl,
+          embedUrl: winner.option.embedUrl,
+          data: winner.resolved,
+        });
+        onToast(
+          `Servidor indisponível — trocado para ${winner.option.label}${
+            winner.qualityLabel ? ` (${winner.qualityLabel})` : ''
+          }`
+        );
+      } else {
+        setResolvedState({
+          episodeUrl: targetEpisodeUrl,
+          embedUrl: targetOption.embedUrl,
+          data,
+        });
+      }
+    };
+
+    void run().finally(() => {
+      if (!cancelled) setLoadingEmbed(false);
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [selectedOption]);
+  }, [episode.url, findBestAvailableServer, onToast, resolveEmbedCached, selectedOption]);
+
+  const handleServerPlaybackFailed = useCallback(
+    async (failedNume: string, resumeTimeSec: number) => {
+      const targetEpisodeUrl = episode.url;
+      const epKey = normalizeTopAnimesUrl(targetEpisodeUrl) || targetEpisodeUrl;
+      const failedSet = failedServersByEpisodeRef.current.get(epKey) ?? new Set<string>();
+      failedSet.add(failedNume);
+      failedServersByEpisodeRef.current.set(epKey, failedSet);
+
+      setLoadingEmbed(true);
+      try {
+        const winner = await findBestAvailableServer(epKey, failedSet);
+        if (!isSameEpisodeUrl(activeEpisodeUrlRef.current, targetEpisodeUrl)) return;
+
+        if (winner) {
+          setFailoverExhaustedMsg('');
+          setResumeAfterFailover({
+            timeSec: resumeTimeSec > 2 ? resumeTimeSec : 0,
+            autoStart: true,
+            key: Date.now(),
+          });
+          setSelectedOption(winner.option);
+          setResolvedState({
+            episodeUrl: targetEpisodeUrl,
+            embedUrl: winner.option.embedUrl,
+            data: winner.resolved,
+          });
+          onToast(
+            `Falha no servidor — trocado para ${winner.option.label}${
+              winner.qualityLabel ? ` (${winner.qualityLabel})` : ''
+            }`
+          );
+        } else {
+          setFailoverExhaustedMsg(
+            'Nenhum servidor conseguiu reproduzir este episódio. Tente novamente ou selecione outro servidor abaixo.'
+          );
+        }
+      } finally {
+        setLoadingEmbed(false);
+      }
+    },
+    [episode.url, findBestAvailableServer, onToast]
+  );
+
+  const handleManualServerSelect = useCallback(
+    (opt: PlayerOption) => {
+      const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
+      const failedSet = failedServersByEpisodeRef.current.get(epKey);
+      if (failedSet) {
+        failedSet.delete(opt.nume);
+      }
+      setFailoverExhaustedMsg('');
+      setSelectedOption(opt);
+    },
+    [episode.url]
+  );
+
+  const handleRetryAllServers = useCallback(() => {
+    const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
+    failedServersByEpisodeRef.current.delete(epKey);
+    embedCacheRef.current.clear();
+    setFailoverExhaustedMsg('');
+    const first = pickInitialOption(playableOptions);
+    if (first) {
+      setSelectedOption({ ...first });
+    }
+  }, [episode.url, playableOptions]);
 
   const adjacent = useMemo(
     () => resolveSeriesPrevNext(seriesEpisodes, episode.url),
@@ -186,6 +350,12 @@ export function EpisodeWorkspace({
     resolved?.status === 'resolved' && resolved.streams.length > 0;
   const showPlayer = hasResolvedStreams || hasMountedPlayerRef.current;
 
+  const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
+  const currentFailedSet = failedServersByEpisodeRef.current.get(epKey);
+  const hasUntriedFallbackServers = playableOptions.some(
+    (opt) => opt.nume !== selectedOption?.nume && !currentFailedSet?.has(opt.nume)
+  );
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
       {/* Top Breadcrumb & Prev/Next Episode Controls */}
@@ -197,7 +367,7 @@ export function EpisodeWorkspace({
             className="inline-flex items-center gap-1.5 font-medium text-slate-300 transition-colors hover:text-white"
           >
             <ArrowLeft className="h-4 w-4" />
-            <span>Catálogo</span>
+            <span>Voltar</span>
           </button>
           {episode.seriesUrl && (
             <>
@@ -264,11 +434,14 @@ export function EpisodeWorkspace({
               prevUrl={effectivePrevUrl}
               nextUrl={effectiveNextUrl}
               loadingEpisode={isTransitioning}
+              hasUntriedFallbackServers={hasUntriedFallbackServers}
+              resumeAfterFailover={resumeAfterFailover}
               errorMessage={
-                !isTransitioning && !hasResolvedStreams
+                failoverExhaustedMsg ||
+                (!isTransitioning && !hasResolvedStreams
                   ? resolved?.errorMessage ||
                     'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou ruplay) para assistir no player.'
-                  : ''
+                  : '')
               }
               skipIntroSeconds={skipIntroSeconds}
               autoPlayNextEpisode={autoPlayNextEpisode}
@@ -285,8 +458,10 @@ export function EpisodeWorkspace({
               }}
               onSelectServer={(nume) => {
                 const match = playableOptions.find((o) => o.nume === nume);
-                if (match) setSelectedOption(match);
+                if (match) handleManualServerSelect(match);
               }}
+              onServerPlaybackFailed={handleServerPlaybackFailed}
+              onRetryEpisodePlayback={handleRetryAllServers}
               onNativeSessionSync={onNativeSessionSync}
               onToast={onToast}
             />
@@ -300,7 +475,8 @@ export function EpisodeWorkspace({
           ) : (
             <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
               <p className="max-w-md text-sm leading-relaxed text-slate-300">
-                {resolved?.errorMessage ||
+                {failoverExhaustedMsg ||
+                  resolved?.errorMessage ||
                   'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou ruplay) para assistir no player.'}
               </p>
             </div>
@@ -388,7 +564,7 @@ export function EpisodeWorkspace({
                       <button
                         key={opt.nume}
                         type="button"
-                        onClick={() => setSelectedOption(opt)}
+                        onClick={() => handleManualServerSelect(opt)}
                         className={`min-h-[40px] rounded-lg border px-3.5 py-2 text-xs font-medium transition-colors sm:text-sm ${
                           active
                             ? 'border-[#f97316] bg-[#f97316]/15 text-white'

@@ -1,12 +1,17 @@
 package com.topanimes.player;
 
+import android.app.PendingIntent;
+import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
+import android.content.pm.PackageInstaller;
+import android.content.pm.PackageManager;
+import android.content.pm.Signature;
+import android.content.pm.SigningInfo;
 import android.net.Uri;
 import android.os.Build;
+import android.provider.Settings;
 import android.util.Log;
-
-import androidx.core.content.FileProvider;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.Plugin;
@@ -17,10 +22,12 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.ServerSocket;
@@ -30,9 +37,13 @@ import java.net.URL;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
@@ -51,6 +62,14 @@ public class LocalProxyPlugin extends Plugin {
     private static final Pattern M3U8_EXT_PATTERN = Pattern.compile("\\.m3u8(?:$|\\?)", Pattern.CASE_INSENSITIVE);
 
     public static volatile String sharedProxyBaseUrl = "";
+    private static volatile WeakReference<LocalProxyPlugin> activeInstanceRef = new WeakReference<>(null);
+
+    public static void notifyInstallStage(String stage, int percent, String message) {
+        LocalProxyPlugin instance = activeInstanceRef.get();
+        if (instance != null) {
+            instance.emitDownloadProgress(0L, 0L, percent, stage, message);
+        }
+    }
 
     public static String buildSharedProxyUrl(String targetUrl, String referer) {
         String base = sharedProxyBaseUrl;
@@ -75,11 +94,15 @@ public class LocalProxyPlugin extends Plugin {
     @Override
     public void load() {
         super.load();
+        activeInstanceRef = new WeakReference<>(this);
         startProxyServer();
     }
 
     @Override
     protected void handleOnDestroy() {
+        if (activeInstanceRef.get() == this) {
+            activeInstanceRef.clear();
+        }
         running = false;
         if (serverSocket != null) {
             try {
@@ -215,106 +238,311 @@ public class LocalProxyPlugin extends Plugin {
     @PluginMethod
     public void downloadAndInstallApk(PluginCall call) {
         String rawUrl = call.getString("url", "");
-        if (!isAllowedGitHubApkUrl(rawUrl)) {
-            call.reject("URL de atualização inválida ou não permitida.");
+        String expectedSha256 = normalizeSha256Hex(call.getString("expectedSha256", ""));
+        if (!isAllowedInitialGitHubApkUrl(rawUrl)) {
+            call.reject("URL de download do GitHub inválida ou não permitida.");
             return;
         }
-        String rawName = call.getString("filename", "TopAnimes.apk");
-        final String safeName = (rawName != null && rawName.endsWith(".apk"))
-            ? rawName.replaceAll("[^a-zA-Z0-9._-]", "_")
-            : "TopAnimes.apk";
+
+        Context ctx = getContext();
+        String pkgName = ctx.getPackageName();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !ctx.getPackageManager().canRequestPackageInstalls()) {
+            try {
+                Intent permIntent = new Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:" + pkgName)
+                );
+                permIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(permIntent);
+            } catch (Exception e) {
+                Log.w(TAG, "Failed opening unknown app sources settings", e);
+            }
+            JSObject ret = new JSObject();
+            ret.put("started", false);
+            ret.put("needsPermission", true);
+            ret.put("message", "Ative 'Permitir desta fonte' nas configurações e tente novamente.");
+            call.resolve(ret);
+            return;
+        }
 
         if (executor == null || executor.isShutdown()) {
             startProxyServer();
         }
 
         executor.execute(() -> {
+            File stagingApk = new File(ctx.getCacheDir(), "topanimes_update_staging.apk");
             HttpURLConnection conn = null;
+            PackageInstaller.Session session = null;
             try {
-                File updatesDir = new File(getContext().getCacheDir(), "updates");
-                if (!updatesDir.exists() && !updatesDir.mkdirs()) {
-                    throw new IOException("Não foi possível preparar pasta de atualização.");
-                }
-                File apkFile = new File(updatesDir, safeName);
+                emitDownloadProgress(0L, 0L, 0, "downloading", null);
 
-                RedirectResult res = openWithRedirects(rawUrl, "https://github.com/", "application/octet-stream", null, 30000);
-                conn = res.connection;
-                int status = conn.getResponseCode();
-                if (status < 200 || status >= 300) {
-                    throw new IOException("GitHub retornou HTTP " + status + " ao baixar APK.");
+                String currentUrl = rawUrl.trim();
+                for (int hop = 0; hop <= 6; hop++) {
+                    if (!isAllowedGitHubCdnUrl(currentUrl)) {
+                        throw new IOException("Redirecionamento fora dos domínios oficiais do GitHub.");
+                    }
+                    URL parsed = new URL(currentUrl);
+                    conn = (HttpURLConnection) parsed.openConnection();
+                    conn.setInstanceFollowRedirects(false);
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(30000);
+                    conn.setRequestMethod("GET");
+                    conn.setRequestProperty("User-Agent", DEFAULT_UA);
+                    conn.setRequestProperty("Accept", "application/vnd.android.package-archive,application/octet-stream,*/*");
+
+                    int code = conn.getResponseCode();
+                    if (code >= 300 && code < 400) {
+                        String loc = conn.getHeaderField("Location");
+                        conn.disconnect();
+                        conn = null;
+                        if (loc == null || loc.isEmpty()) {
+                            throw new IOException("Redirecionamento vazio ao baixar APK.");
+                        }
+                        currentUrl = new URL(parsed, loc).toString();
+                        continue;
+                    }
+                    if (code < 200 || code >= 300) {
+                        throw new IOException("GitHub retornou HTTP " + code + " ao baixar APK.");
+                    }
+                    break;
                 }
 
-                long totalBytes = -1;
+                if (conn == null) {
+                    throw new IOException("Excesso de redirecionamentos ao baixar APK.");
+                }
+
+                long totalBytes = -1L;
                 try {
                     String cl = conn.getHeaderField("Content-Length");
                     if (cl != null) totalBytes = Long.parseLong(cl.trim());
                 } catch (NumberFormatException ignored) {
                 }
 
+                MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+                long downloaded = 0L;
+                long lastEmitAt = 0L;
+                byte[] buf = new byte[32768];
+
                 try (InputStream in = new BufferedInputStream(conn.getInputStream());
-                     FileOutputStream out = new FileOutputStream(apkFile)) {
-                    byte[] buf = new byte[32768];
-                    long downloaded = 0;
-                    int read;
-                    int lastPercent = -1;
-                    while ((read = in.read(buf)) != -1) {
-                        out.write(buf, 0, read);
-                        downloaded += read;
-                        int percent = totalBytes > 0 ? (int) Math.min(100, (downloaded * 100L) / totalBytes) : -1;
-                        if (percent != lastPercent && (percent < 0 || percent == 100 || percent - lastPercent >= 2)) {
-                            lastPercent = percent;
-                            emitDownloadProgress("downloading", percent, downloaded, totalBytes, null);
+                     FileOutputStream fos = new FileOutputStream(stagingApk)) {
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        fos.write(buf, 0, n);
+                        sha256.update(buf, 0, n);
+                        downloaded += n;
+                        long now = System.currentTimeMillis();
+                        if (now - lastEmitAt >= 120L) {
+                            lastEmitAt = now;
+                            int pct = totalBytes > 0L
+                                ? (int) Math.min(99L, (downloaded * 100L) / totalBytes)
+                                : 0;
+                            emitDownloadProgress(downloaded, totalBytes, pct, "downloading", null);
                         }
                     }
-                    out.flush();
-                    emitDownloadProgress("installing", 100, downloaded, totalBytes > 0 ? totalBytes : downloaded, null);
+                    fos.getFD().sync();
                 }
 
-                Uri apkUri = FileProvider.getUriForFile(
-                    getContext(),
-                    getContext().getPackageName() + ".fileprovider",
-                    apkFile
+                emitDownloadProgress(downloaded, totalBytes, 100, "verifying", null);
+
+                if (!expectedSha256.isEmpty()) {
+                    String actualSha256 = bytesToHex(sha256.digest());
+                    if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
+                        throw new IOException("Falha na verificação SHA-256 do APK baixado.");
+                    }
+                }
+
+                verifySelfUpdateArchive(ctx, stagingApk);
+
+                emitDownloadProgress(downloaded, totalBytes, 100, "installing", null);
+
+                PackageInstaller installer = ctx.getPackageManager().getPackageInstaller();
+                PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL
                 );
-                Intent installIntent = new Intent(Intent.ACTION_VIEW);
-                installIntent.setDataAndType(apkUri, "application/vnd.android.package-archive");
-                installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-                getContext().startActivity(installIntent);
+                params.setAppPackageName(pkgName);
+                params.setSize(stagingApk.length());
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    params.setInstallReason(PackageManager.INSTALL_REASON_USER);
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED);
+                }
+
+                int sessionId = installer.createSession(params);
+                session = installer.openSession(sessionId);
+
+                try (InputStream apkIn = new BufferedInputStream(new FileInputStream(stagingApk));
+                     OutputStream sessionOut = session.openWrite("TopAnimes.apk", 0L, stagingApk.length())) {
+                    int read;
+                    while ((read = apkIn.read(buf)) != -1) {
+                        sessionOut.write(buf, 0, read);
+                    }
+                    session.fsync(sessionOut);
+                }
+
+                // Remove temporary file right away once copied into PackageManager's session
+                //noinspection ResultOfMethodCallIgnored
+                stagingApk.delete();
+
+                Intent callbackIntent = new Intent(ctx, ApkInstallReceiver.class);
+                int piFlags = PendingIntent.FLAG_UPDATE_CURRENT;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    piFlags |= PendingIntent.FLAG_MUTABLE;
+                }
+                PendingIntent pendingIntent = PendingIntent.getBroadcast(
+                    ctx,
+                    sessionId,
+                    callbackIntent,
+                    piFlags
+                );
+                session.commit(pendingIntent.getIntentSender());
+                session.close();
+                session = null;
 
                 JSObject ret = new JSObject();
                 ret.put("started", true);
-                ret.put("installerOpened", true);
+                ret.put("needsPermission", false);
                 call.resolve(ret);
             } catch (Exception e) {
-                String msg = e.getMessage() != null ? e.getMessage() : "Falha ao baixar atualização.";
-                emitDownloadProgress("error", 0, 0, 0, msg);
+                Log.e(TAG, "Self-update failed", e);
+                if (session != null) {
+                    try {
+                        session.abandon();
+                    } catch (Exception ignored) {
+                    }
+                }
+                String msg = e.getMessage() != null ? e.getMessage() : "Falha ao baixar e validar atualização.";
+                emitDownloadProgress(0L, 0L, 0, "error", msg);
                 call.reject(msg);
             } finally {
                 if (conn != null) conn.disconnect();
+                if (stagingApk.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    stagingApk.delete();
+                }
             }
         });
     }
 
-    private void emitDownloadProgress(String status, int percent, long downloadedBytes, long totalBytes, String message) {
-        JSObject data = new JSObject();
-        data.put("status", status);
-        data.put("percent", percent);
-        data.put("downloadedBytes", downloadedBytes);
-        data.put("totalBytes", totalBytes);
-        if (message != null) {
-            data.put("message", message);
+    private void emitDownloadProgress(
+        long downloadedBytes,
+        long totalBytes,
+        int percent,
+        String stage,
+        String message
+    ) {
+        JSObject payload = new JSObject();
+        payload.put("downloadedBytes", downloadedBytes);
+        payload.put("totalBytes", totalBytes);
+        payload.put("percent", percent);
+        payload.put("stage", stage);
+        if (message != null && !message.isEmpty()) {
+            payload.put("message", message);
         }
-        notifyListeners("apkDownloadProgress", data);
+        notifyListeners("apkDownloadProgress", payload);
     }
 
-    private static boolean isAllowedGitHubApkUrl(String rawUrl) {
-        if (!isSafeHttpUrl(rawUrl)) return false;
+    private static void verifySelfUpdateArchive(Context ctx, File apkFile) throws IOException {
+        PackageManager pm = ctx.getPackageManager();
+        String expectedPkg = ctx.getPackageName();
+
+        int archiveFlags = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+            ? PackageManager.GET_SIGNING_CERTIFICATES
+            : getLegacySignaturesFlag();
+        PackageInfo archiveInfo = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(), archiveFlags);
+        if (archiveInfo == null || !expectedPkg.equals(archiveInfo.packageName)) {
+            throw new IOException("Pacote inválido ou incompatível com " + expectedPkg + ".");
+        }
+
+        Set<String> installedCerts;
+        try {
+            PackageInfo installedInfo = pm.getPackageInfo(expectedPkg, archiveFlags);
+            installedCerts = extractCertSha256s(installedInfo);
+        } catch (Exception e) {
+            installedCerts = Collections.emptySet();
+        }
+        Set<String> archiveCerts = extractCertSha256s(archiveInfo);
+
+        if (!installedCerts.isEmpty() && !archiveCerts.isEmpty()
+            && Collections.disjoint(installedCerts, archiveCerts)) {
+            throw new IOException("Assinatura digital da atualização não corresponde à versão instalada.");
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static int getLegacySignaturesFlag() {
+        return PackageManager.GET_SIGNATURES;
+    }
+
+    private static Set<String> extractCertSha256s(PackageInfo info) {
+        Set<String> hashes = new HashSet<>();
+        if (info == null) return hashes;
+        try {
+            Signature[] sigs = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                SigningInfo si = info.signingInfo;
+                if (si != null) {
+                    sigs = si.hasMultipleSigners() ? si.getApkContentsSigners() : si.getSigningCertificateHistory();
+                }
+            } else {
+                @SuppressWarnings("deprecation")
+                Signature[] legacy = info.signatures;
+                sigs = legacy;
+            }
+            if (sigs != null) {
+                MessageDigest md = MessageDigest.getInstance("SHA-256");
+                for (Signature s : sigs) {
+                    if (s != null) {
+                        hashes.add(bytesToHex(md.digest(s.toByteArray())));
+                        md.reset();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return hashes;
+    }
+
+    private static String normalizeSha256Hex(String raw) {
+        if (raw == null) return "";
+        String clean = raw.trim().replaceFirst("(?i)^sha256:", "").trim();
+        return clean.matches("^[0-9a-fA-F]{64}$") ? clean.toLowerCase(Locale.ROOT) : "";
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) {
+            sb.append(String.format(Locale.ROOT, "%02x", b & 0xff));
+        }
+        return sb.toString();
+    }
+
+    private static boolean isAllowedInitialGitHubApkUrl(String rawUrl) {
+        if (!isAllowedGitHubCdnUrl(rawUrl)) return false;
         try {
             URI uri = URI.create(rawUrl.trim());
-            if (!"https".equalsIgnoreCase(uri.getScheme())) return false;
             String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
-            return host.equals("github.com")
+            String path = uri.getPath() != null ? uri.getPath().toLowerCase(Locale.ROOT) : "";
+            if ("github.com".equals(host) || "www.github.com".equals(host)) {
+                return path.startsWith("/martin01683/aplicativo-de-animes/releases/");
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean isAllowedGitHubCdnUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase(Locale.ROOT) : "";
+            if (!"https".equals(scheme)) return false;
+            String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            return "github.com".equals(host)
                 || host.endsWith(".github.com")
-                || host.equals("githubusercontent.com")
+                || "githubusercontent.com".equals(host)
                 || host.endsWith(".githubusercontent.com");
         } catch (Exception e) {
             return false;

@@ -33,6 +33,11 @@ import {
 } from './lib/favoriteAlerts';
 import { isSameEpisodeUrl } from './lib/nativeVlcPlayer';
 import {
+  pushRouteFrame,
+  resolveBackNavigationStep,
+  type AppRouteFrame,
+} from './lib/navigationHistory';
+import {
   DEFAULT_APP_SETTINGS,
   getEpisodeCheckIntervalMs,
   shouldRunScheduledAppUpdateCheck,
@@ -75,10 +80,13 @@ import type {
   WatchHistoryEntry,
 } from './lib/types';
 
-type ActiveRoute =
-  | { view: 'catalog' }
-  | { view: 'anime'; url: string }
-  | { view: 'episode'; url: string };
+type ActiveRoute = AppRouteFrame;
+
+declare global {
+  interface Window {
+    __topAnimesHandleAndroidBack?: () => boolean;
+  }
+}
 
 interface ArchiveCategoryBucket {
   items: CatalogMediaItem[];
@@ -127,7 +135,8 @@ export default function App() {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  const [route, setRoute] = useState<ActiveRoute>({ view: 'catalog' });
+  const [routeStack, setRouteStack] = useState<ActiveRoute[]>([{ view: 'catalog' }]);
+  const route = routeStack[routeStack.length - 1] ?? { view: 'catalog' };
   const [activeSection, setActiveSection] = useState<NavSection>(() => loadAppSettings().defaultSection);
 
   const [catalog, setCatalog] = useState<HomeCatalog | null>(null);
@@ -201,6 +210,7 @@ export default function App() {
   );
   const [swUpdateAvailable, setSwUpdateAvailable] = useState(false);
   const waitingSwRef = useRef<ServiceWorker | null>(null);
+  const pendingUpdateReleaseRef = useRef<RemoteAppRelease | null>(null);
 
   const favoritesRef = useRef(favorites);
   const baselinesRef = useRef(baselines);
@@ -211,6 +221,11 @@ export default function App() {
   const buildInfoRef = useRef(buildInfo);
   const acknowledgedReleaseKeyRef = useRef(acknowledgedReleaseKey);
   const routeRef = useRef(route);
+  const routeStackRef = useRef(routeStack);
+  const animeDetailsCacheRef = useRef<Map<string, AnimeDetails>>(new Map());
+  const episodeDetailsCacheRef = useRef<Map<string, EpisodeDetails>>(new Map());
+  const navRequestGenRef = useRef(0);
+  const handlingPopstateRef = useRef(false);
   const initialCheckDoneRef = useRef(false);
   const autoDownloadTriggeredForRef = useRef<string | null>(null);
 
@@ -223,6 +238,7 @@ export default function App() {
   buildInfoRef.current = buildInfo;
   acknowledgedReleaseKeyRef.current = acknowledgedReleaseKey;
   routeRef.current = route;
+  routeStackRef.current = routeStack;
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -359,6 +375,22 @@ export default function App() {
     [dispatchDeviceNotifications, showToast]
   );
 
+  const markReleaseAcknowledged = useCallback((targetRelease: RemoteAppRelease | null | undefined) => {
+    if (!targetRelease) return;
+    const key = buildReleaseIdentityKey(targetRelease);
+    setAcknowledgedReleaseKey(key);
+    saveAcknowledgedReleaseKey(key);
+    setAppUpdateResult((prev) =>
+      prev
+        ? {
+            ...prev,
+            hasUpdate: false,
+            reason: 'up-to-date',
+          }
+        : prev
+    );
+  }, []);
+
   const handleDownloadAppUpdate = useCallback(
     async (explicitRelease?: RemoteAppRelease | null) => {
       const targetRelease = explicitRelease || appUpdateResult?.latestRelease;
@@ -367,41 +399,44 @@ export default function App() {
         showToast('Nenhum arquivo de atualização encontrado nesta release.');
         return;
       }
+      pendingUpdateReleaseRef.current = targetRelease || null;
       setDownloadingAppUpdate(true);
-      setApkDownloadProgress({
-        status: 'downloading',
-        percent: 0,
-        downloadedBytes: 0,
-        totalBytes: asset.sizeBytes,
-      });
+      setApkDownloadProgress(
+        isNativeAndroidApp()
+          ? { downloadedBytes: 0, totalBytes: asset.sizeBytes || 0, percent: 0, stage: 'downloading' }
+          : null
+      );
       try {
-        const res = await downloadAppUpdateApk(asset.downloadUrl, asset.name || 'TopAnimes.apk');
-        if (targetRelease) {
-          const key = buildReleaseIdentityKey(targetRelease);
-          setAcknowledgedReleaseKey(key);
-          saveAcknowledgedReleaseKey(key);
-          setAppUpdateResult((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  hasUpdate: false,
-                  reason: 'up-to-date',
-                }
-              : prev
+        const result = await downloadAppUpdateApk(
+          asset.downloadUrl,
+          asset.name || 'TopAnimes.apk',
+          asset.digest
+        );
+        if (result.mode === 'permission-required') {
+          showToast(
+            result.message ||
+              "Ative 'Permitir desta fonte' nas configurações do Android e tente novamente."
           );
+          setApkDownloadProgress(null);
+          return;
         }
-        if (res.mode === 'native-installer') {
-          showToast('Atualização baixada! Conclua a instalação no Android.');
-        } else {
+        if (result.mode === 'browser-download') {
+          markReleaseAcknowledged(targetRelease);
           showToast(`Download iniciado: ${asset.name}`);
+          return;
         }
+        showToast('Verificação concluída — confirme a instalação no sistema Android.');
       } catch (err) {
-        showToast(err instanceof Error ? err.message : 'Falha ao baixar atualização.');
+        const msg = err instanceof Error ? err.message : 'Falha ao iniciar download da atualização.';
+        setApkDownloadProgress((prev) =>
+          prev ? { ...prev, stage: 'error', message: msg } : null
+        );
+        showToast(msg);
       } finally {
         setDownloadingAppUpdate(false);
       }
     },
-    [appUpdateResult, showToast]
+    [appUpdateResult, markReleaseAcknowledged, showToast]
   );
 
   const checkForAppUpdates = useCallback(
@@ -536,10 +571,9 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [checkFavoriteUpdates, settings.episodeCheckIntervalMinutes]);
 
-  // Load native Android version info + download progress listener, and run scheduled GitHub update check
+  // Load native Android version info and run scheduled GitHub update check
   useEffect(() => {
     let cancelled = false;
-    let progressHandle: { remove: () => Promise<void> } | null = null;
 
     const initUpdates = async () => {
       if (isNativeAndroidApp()) {
@@ -551,15 +585,6 @@ export default function App() {
             androidVersionCode: nativeInfo.versionCode,
           }));
         }
-        progressHandle = await addApkDownloadProgressListener((evt) => {
-          if (!cancelled) {
-            setApkDownloadProgress(evt);
-            if (evt.status === 'error') {
-              setDownloadingAppUpdate(false);
-              if (evt.message) showToast(evt.message);
-            }
-          }
-        });
       }
 
       if (
@@ -580,11 +605,33 @@ export default function App() {
     return () => {
       cancelled = true;
       window.clearTimeout(startupTimer);
-      if (progressHandle) {
-        void progressHandle.remove();
-      }
     };
-  }, [checkForAppUpdates, showToast]);
+  }, [checkForAppUpdates]);
+
+  // Listen to native APK download / verification / PackageInstaller stage events
+  useEffect(() => {
+    if (!isNativeAndroidApp()) return;
+    let active = true;
+    const handlePromise = addApkDownloadProgressListener((event) => {
+      if (!active) return;
+      setApkDownloadProgress(event);
+      if (event.stage === 'installed') {
+        setDownloadingAppUpdate(false);
+        markReleaseAcknowledged(pendingUpdateReleaseRef.current);
+        showToast('Atualização instalada com sucesso!');
+      } else if (event.stage === 'error') {
+        setDownloadingAppUpdate(false);
+        if (event.message) {
+          showToast(event.message);
+        }
+      }
+    });
+
+    return () => {
+      active = false;
+      void handlePromise.then((handle) => handle?.remove());
+    };
+  }, [markReleaseAcknowledged, showToast]);
 
   // Periodic background check for GitHub app updates when interval > 0
   useEffect(() => {
@@ -828,7 +875,8 @@ export default function App() {
         setSearchTotalPages(1);
         return;
       }
-      setRoute({ view: 'catalog' });
+      navRequestGenRef.current += 1;
+      setRouteStack([{ view: 'catalog' }]);
       setSearchQuery(query);
       setSearching(true);
       setSearchPage(1);
@@ -872,6 +920,50 @@ export default function App() {
     }
   }, [loadingMoreSearch, searchPage, searchQuery, searchTotalPages, showToast]);
 
+  const loadAnimeDetailsForRoute = useCallback(async (url: string, reqGen: number) => {
+    const cacheKey = normalizeTopAnimesUrl(url) || url;
+    const cached = animeDetailsCacheRef.current.get(cacheKey);
+    if (cached) {
+      setAnimeDetails(cached);
+      setLoadingDetail(false);
+      setDetailError('');
+      return;
+    }
+
+    setLoadingDetail(true);
+    setDetailError('');
+    setAnimeDetails(null);
+    try {
+      const res = await apiFetch(`/api/anime?url=${encodeURIComponent(url)}`);
+      const data = await res.json();
+      if (navRequestGenRef.current !== reqGen) return;
+      if (!res.ok) throw new Error(data.error || 'Erro ao carregar anime');
+      const details = data as AnimeDetails;
+      animeDetailsCacheRef.current.set(cacheKey, details);
+      setAnimeDetails(details);
+    } catch (err) {
+      if (navRequestGenRef.current !== reqGen) return;
+      setDetailError(
+        err instanceof Error ? err.message : 'Falha ao carregar episódios.'
+      );
+    } finally {
+      if (navRequestGenRef.current === reqGen) {
+        setLoadingDetail(false);
+      }
+    }
+  }, []);
+
+  const pushBrowserHistoryIfNeeded = useCallback((prevLen: number, nextLen: number) => {
+    if (isNativeAndroidApp() || handlingPopstateRef.current) return;
+    if (nextLen > prevLen && typeof window !== 'undefined' && window.history?.pushState) {
+      try {
+        window.history.pushState({ topAnimesStackDepth: nextLen }, '');
+      } catch {
+        // Ignore browser history restrictions
+      }
+    }
+  }, []);
+
   const openMediaUrl = useCallback(
     async (url: string, explicitKind?: MediaKind) => {
       const inferredKind: MediaKind =
@@ -882,37 +974,53 @@ export default function App() {
             ? 'episode'
             : 'anime');
 
-      setLoadingDetail(true);
-      setDetailError('');
+      const reqGen = ++navRequestGenRef.current;
+      const nextFrame: ActiveRoute =
+        inferredKind === 'anime' ? { view: 'anime', url } : { view: 'episode', url };
+
+      const prevStack = routeStackRef.current;
+      const nextStack = pushRouteFrame(prevStack, nextFrame);
+      routeStackRef.current = nextStack;
+      setRouteStack(nextStack);
+      pushBrowserHistoryIfNeeded(prevStack.length, nextStack.length);
 
       if (inferredKind === 'anime') {
-        setRoute({ view: 'anime', url });
-        setAnimeDetails(null);
-        try {
-          const res = await apiFetch(`/api/anime?url=${encodeURIComponent(url)}`);
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.error || 'Erro ao carregar anime');
-          setAnimeDetails(data as AnimeDetails);
-        } catch (err) {
-          setDetailError(
-            err instanceof Error ? err.message : 'Falha ao carregar episódios.'
-          );
-        } finally {
-          setLoadingDetail(false);
-        }
+        await loadAnimeDetailsForRoute(url, reqGen);
         return;
       }
 
+      const epCacheKey = normalizeTopAnimesUrl(url) || url;
+      const cachedEp = episodeDetailsCacheRef.current.get(epCacheKey);
       const preserveExistingEpisode = routeRef.current.view === 'episode';
-      setRoute({ view: 'episode', url });
+
+      setDetailError('');
+      if (cachedEp) {
+        setEpisodeDetails(cachedEp);
+        setLoadingDetail(false);
+        const updatedHistory = pushHistoryEntry({
+          url: cachedEp.url,
+          title: cachedEp.title,
+          seriesTitle: cachedEp.seriesTitle,
+          seriesUrl: cachedEp.seriesUrl,
+          poster: cachedEp.backdrop || cachedEp.poster,
+          kind: cachedEp.isMovie ? 'movie' : 'episode',
+          watchedAt: new Date().toISOString(),
+        });
+        setHistory(updatedHistory);
+        return;
+      }
+
+      setLoadingDetail(true);
       if (!preserveExistingEpisode) {
         setEpisodeDetails(null);
       }
       try {
         const res = await apiFetch(`/api/episode?url=${encodeURIComponent(url)}`);
         const data = await res.json();
+        if (navRequestGenRef.current !== reqGen) return;
         if (!res.ok) throw new Error(data.error || 'Erro ao carregar episódio');
         const ep = data as EpisodeDetails;
+        episodeDetailsCacheRef.current.set(epCacheKey, ep);
         setEpisodeDetails(ep);
         const updatedHistory = pushHistoryEntry({
           url: ep.url,
@@ -925,14 +1033,17 @@ export default function App() {
         });
         setHistory(updatedHistory);
       } catch (err) {
+        if (navRequestGenRef.current !== reqGen) return;
         setDetailError(
           err instanceof Error ? err.message : 'Falha ao extrair players.'
         );
       } finally {
-        setLoadingDetail(false);
+        if (navRequestGenRef.current === reqGen) {
+          setLoadingDetail(false);
+        }
       }
     },
-    []
+    [loadAnimeDetailsForRoute, pushBrowserHistoryIfNeeded]
   );
 
   const toggleFavorite = useCallback(
@@ -1028,13 +1139,90 @@ export default function App() {
   );
 
   const handleSelectSection = (section: NavSection) => {
+    navRequestGenRef.current += 1;
     setActiveSection(section);
     setSearchQuery('');
     setSearchResults(null);
     setSearchPage(1);
     setSearchTotalPages(1);
-    setRoute({ view: 'catalog' });
+    setRouteStack([{ view: 'catalog' }]);
   };
+
+  const navigateBackStep = useCallback((): boolean => {
+    const step = resolveBackNavigationStep({
+      settingsOpen,
+      routeStack: routeStackRef.current,
+      hasSearchResults: searchResults !== null,
+      hasCatalogFilters: Boolean(selectedGenre || selectedYear),
+      activeSection,
+      defaultSection: settings.defaultSection,
+    });
+
+    switch (step.type) {
+      case 'close-settings':
+        setSettingsOpen(false);
+        return true;
+      case 'pop-route': {
+        const reqGen = ++navRequestGenRef.current;
+        routeStackRef.current = step.nextStack;
+        setRouteStack(step.nextStack);
+        setLoadingDetail(false);
+        setDetailError('');
+        if (step.target.view === 'anime') {
+          void loadAnimeDetailsForRoute(step.target.url, reqGen);
+        }
+        return true;
+      }
+      case 'clear-search':
+        setSearchQuery('');
+        setSearchResults(null);
+        setSearchPage(1);
+        setSearchTotalPages(1);
+        return true;
+      case 'clear-catalog-filters':
+        handleClearCatalogFilters();
+        return true;
+      case 'switch-section':
+        setActiveSection(step.section as NavSection);
+        return true;
+      case 'at-root':
+      default:
+        return false;
+    }
+  }, [
+    activeSection,
+    handleClearCatalogFilters,
+    loadAnimeDetailsForRoute,
+    searchResults,
+    selectedGenre,
+    selectedYear,
+    settings.defaultSection,
+    settingsOpen,
+  ]);
+
+  const navigateBackStepRef = useRef(navigateBackStep);
+  navigateBackStepRef.current = navigateBackStep;
+
+  // Expose Android native back handler and sync browser popstate on Web
+  useEffect(() => {
+    window.__topAnimesHandleAndroidBack = () => navigateBackStepRef.current();
+
+    const onPopState = () => {
+      if (isNativeAndroidApp()) return;
+      handlingPopstateRef.current = true;
+      try {
+        navigateBackStepRef.current();
+      } finally {
+        handlingPopstateRef.current = false;
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+
+    return () => {
+      delete window.__topAnimesHandleAndroidBack;
+      window.removeEventListener('popstate', onPopState);
+    };
+  }, []);
 
   const handleOpenRandom = useCallback(async () => {
     if (loadingRandom) return;
@@ -1157,7 +1345,7 @@ export default function App() {
                   <p className="text-sm text-red-200">{detailError}</p>
                   <button
                     type="button"
-                    onClick={() => setRoute({ view: 'catalog' })}
+                    onClick={() => setRouteStack([{ view: 'catalog' }])}
                     className="mt-4 rounded-lg bg-[#f97316] px-4 py-2 text-xs font-semibold text-[#0d0f12]"
                   >
                     Voltar ao catálogo
@@ -1171,7 +1359,7 @@ export default function App() {
                 watchedUrls={watchedUrls}
                 onToggleFavorite={toggleFavorite}
                 onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
-                onBack={() => setRoute({ view: 'catalog' })}
+                onBack={() => navigateBackStep()}
               />
             ) : null}
           </>
@@ -1190,7 +1378,7 @@ export default function App() {
                   <p className="text-sm text-red-200">{detailError}</p>
                   <button
                     type="button"
-                    onClick={() => setRoute({ view: 'catalog' })}
+                    onClick={() => setRouteStack([{ view: 'catalog' }])}
                     className="mt-4 rounded-lg bg-[#f97316] px-4 py-2 text-xs font-semibold text-[#0d0f12]"
                   >
                     Voltar ao catálogo
@@ -1214,7 +1402,7 @@ export default function App() {
                 }
                 loadingEpisode={loadingDetail}
                 onToggleFavorite={toggleFavorite}
-                onBack={() => setRoute({ view: 'catalog' })}
+                onBack={() => navigateBackStep()}
                 onNavigateUrl={openMediaUrl}
                 onNativeSessionSync={(result) => {
                   if (Array.isArray(result.visitedEpisodes) && result.visitedEpisodes.length > 0) {

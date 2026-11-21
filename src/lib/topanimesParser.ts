@@ -616,12 +616,12 @@ export function parseEpisodePageHtml(html: string, pageUrl: string): EpisodeDeta
     const text = cleanText(anchor.text());
     const href = normalizeTopAnimesUrl(anchor.attr('href') || '');
     if (!href) return;
-    if (/anterior/i.test(text) || idx === 0) {
+    if (/\/animes\//i.test(href) && !/anterior|pr[oó]ximo/i.test(text)) {
+      seriesUrl = href;
+    } else if (/anterior/i.test(text) || idx === 0) {
       prevUrl = href;
     } else if (/pr[oó]ximo/i.test(text) || idx === 2) {
       nextUrl = href;
-    } else if (/\/animes\//i.test(href)) {
-      seriesUrl = href;
     }
   });
 

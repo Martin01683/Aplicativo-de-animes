@@ -182,21 +182,20 @@ public final class TopAnimesEpisodeResolver {
         String prevUrl = "";
         String nextUrl = "";
 
-        Matcher pagBlock = Pattern.compile("class=[\"'][^\"']*pag_episodes[^\"']*[\"'][^>]*>([\\s\\S]*?)</div>", Pattern.CASE_INSENSITIVE).matcher(html);
-        if (pagBlock.find()) {
-            String block = pagBlock.group(1);
-            Matcher links = Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)</a>", Pattern.CASE_INSENSITIVE).matcher(block);
+        String pagBlock = extractDivInnerHtmlByClass(html, "pag_episodes");
+        if (!pagBlock.isEmpty()) {
+            Matcher links = Pattern.compile("<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>([\\s\\S]*?)</a>", Pattern.CASE_INSENSITIVE).matcher(pagBlock);
             int idx = 0;
             while (links.find()) {
                 String href = normalizeTopAnimesUrl(links.group(1));
                 String text = cleanHtmlText(links.group(2)).toLowerCase(Locale.ROOT);
                 if (!href.isEmpty()) {
-                    if (text.contains("anterior") || idx == 0) {
+                    if (href.toLowerCase(Locale.ROOT).contains("/animes/")) {
+                        seriesUrl = href;
+                    } else if (text.contains("anterior") || (idx == 0 && !text.contains("próximo") && !text.contains("proximo"))) {
                         prevUrl = href;
                     } else if (text.contains("próximo") || text.contains("proximo") || idx == 2) {
                         nextUrl = href;
-                    } else if (href.toLowerCase(Locale.ROOT).contains("/animes/")) {
-                        seriesUrl = href;
                     }
                 }
                 idx++;
@@ -230,14 +229,34 @@ public final class TopAnimesEpisodeResolver {
         List<ServerOption> ordered = orderOptionsForAttempt(options, preferredNume);
         ResolvedEmbedData bestEmbed = null;
         String chosenNume = ordered.get(0).nume;
-        for (ServerOption opt : ordered) {
+        int bestQualityScore = -1;
+        int bestProviderPrio = -1;
+
+        for (int i = 0; i < ordered.size(); i++) {
+            ServerOption opt = ordered.get(i);
             ResolvedEmbedData attempt = resolveEmbed(opt.embedUrl);
             if (attempt.ok && !attempt.streams.isEmpty()) {
-                bestEmbed = attempt;
-                chosenNume = opt.nume;
-                break;
-            }
-            if (bestEmbed == null) {
+                // If user's preferred server works right away, use it without extra round-trips
+                if (i == 0 && preferredNume != null && preferredNume.equals(opt.nume)) {
+                    bestEmbed = attempt;
+                    chosenNume = opt.nume;
+                    break;
+                }
+                int qScore = scoreEmbedQuality(attempt);
+                int pScore = providerPriority(opt.providerKind);
+                if (bestEmbed == null || !bestEmbed.ok || bestEmbed.streams.isEmpty()
+                    || qScore > bestQualityScore
+                    || (qScore == bestQualityScore && pScore > bestProviderPrio)) {
+                    bestEmbed = attempt;
+                    chosenNume = opt.nume;
+                    bestQualityScore = qScore;
+                    bestProviderPrio = pScore;
+                }
+                // On the first primary (non-preferred) attempt, stop only if it's already Full HD+; otherwise inspect fallbacks for best quality
+                if (i == 0 && qScore >= 1080) {
+                    break;
+                }
+            } else if (bestEmbed == null) {
                 bestEmbed = attempt;
             }
         }
@@ -423,6 +442,90 @@ public final class TopAnimesEpisodeResolver {
             Log.w(TAG, "Failed fetching series episodes: " + e.getMessage());
             return Collections.emptyList();
         }
+    }
+
+    public static int providerPriority(String providerKind) {
+        if ("kojima".equals(providerKind)) return 5;
+        if ("zuplay".equals(providerKind)) return 4;
+        if ("vidstreaming".equals(providerKind)) return 3;
+        if ("playerjs".equals(providerKind)) return 2;
+        if ("blogger".equals(providerKind) || "other".equals(providerKind)) return 1;
+        return 0;
+    }
+
+    public static int scoreEmbedQuality(ResolvedEmbedData data) {
+        if (data == null || !data.ok || data.streams == null || data.streams.isEmpty()) {
+            return 0;
+        }
+        int best = 0;
+        for (StreamCandidate sc : data.streams) {
+            int score;
+            if (sc.height > 0) {
+                score = sc.height;
+            } else if ("hls".equals(sc.format)
+                || (sc.url != null && sc.url.toLowerCase(Locale.ROOT).contains(".m3u8"))) {
+                score = 720;
+            } else {
+                score = 1;
+            }
+            if (score > best) best = score;
+        }
+        return best;
+    }
+
+    public static String getBestQualityLabel(ResolvedEmbedData data) {
+        if (data == null || !data.ok || data.streams == null || data.streams.isEmpty()) {
+            return "";
+        }
+        int bestScore = 0;
+        String bestLabel = "";
+        for (StreamCandidate sc : data.streams) {
+            int score;
+            if (sc.height > 0) {
+                score = sc.height;
+            } else if ("hls".equals(sc.format)
+                || (sc.url != null && sc.url.toLowerCase(Locale.ROOT).contains(".m3u8"))) {
+                score = 720;
+            } else {
+                score = 1;
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestLabel = (sc.label != null && !sc.label.isEmpty())
+                    ? sc.label
+                    : (sc.height > 0 ? (sc.height + "p") : "Auto");
+            }
+        }
+        return bestLabel;
+    }
+
+    private static String extractDivInnerHtmlByClass(String html, String classToken) {
+        if (html == null || html.isEmpty() || classToken == null || classToken.isEmpty()) {
+            return "";
+        }
+        Matcher openMatcher = Pattern.compile(
+            "<div[^>]*class=[\"'][^\"']*\\b" + Pattern.quote(classToken) + "\\b[^\"']*[\"'][^>]*>",
+            Pattern.CASE_INSENSITIVE
+        ).matcher(html);
+        if (!openMatcher.find()) {
+            return "";
+        }
+        int contentStart = openMatcher.end();
+        Matcher tagMatcher = Pattern.compile("</?div\\b[^>]*>", Pattern.CASE_INSENSITIVE).matcher(html);
+        tagMatcher.region(contentStart, html.length());
+        int depth = 1;
+        while (tagMatcher.find()) {
+            String tag = tagMatcher.group().toLowerCase(Locale.ROOT);
+            if (tag.startsWith("</")) {
+                depth--;
+                if (depth == 0) {
+                    return html.substring(contentStart, tagMatcher.start());
+                }
+            } else {
+                depth++;
+            }
+        }
+        return html.substring(contentStart, Math.min(html.length(), contentStart + 2500));
     }
 
     private static List<ServerOption> orderOptionsForAttempt(List<ServerOption> options, String preferredNume) {

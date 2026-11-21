@@ -32,6 +32,10 @@
             android:launchMode="singleTop"
             android:theme="@style/AppTheme.NoActionBar" />
 
+        <receiver
+            android:name=".ApkInstallReceiver"
+            android:exported="false" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
