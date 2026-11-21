@@ -2,6 +2,14 @@
 
 Todas as alterações relevantes do **TopAnimes** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.12] — 2026-11-21
+
+### Correções
+- Show subtitle/audio track language instead of raw LibVLC 'Track N' (`18b6535`)
+- Prevent infinite startup update check loop and repeated toast (`b0affed`)
+- Separate subtitle/audio player menus and startup update check toggle (`0dc4d38`)
+- Prevent runaway auto-advance on premature stream EOF (`bec1673`)
+
 ## [v1.0.11] — 2026-11-21
 
 ### Novidades
