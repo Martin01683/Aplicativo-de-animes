@@ -284,6 +284,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private boolean playbackEnded = false;
     private boolean loadingEpisode = false;
     private boolean subtitlesAttached = false;
+    // LibVLC exposes external subtitle slaves as "Track N" (no language/description). We keep the
+    // scraper/user label of every slave we attach (FIFO, same order as addSlave) and bind it to the
+    // SPU ES id reported by the next MediaPlayer.Event.ESAdded of type Text.
+    private final java.util.ArrayDeque<String> pendingSlaveSubtitleLabels = new java.util.ArrayDeque<>();
+    private final Map<Integer, String> slaveSubtitleLabelsById = new HashMap<>();
     private String settingsTab = "main";
 
     private boolean isActivityStarted = false;
@@ -399,7 +404,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 localSubtitleUri = uri;
                 userDisabledSubtitles = false;
                 if (mediaPlayer != null && isActivityStarted && subtitlesAttached) {
-                    mediaPlayer.addSlave(IMedia.Slave.Type.Subtitle, uri, true);
+                    attachSubtitleSlave(uri, true, "Legenda local");
                 }
                 Toast.makeText(this, "Legenda local carregada no LibVLC.", Toast.LENGTH_SHORT).show();
             }
@@ -776,6 +781,19 @@ public class VlcPlayerActivity extends AppCompatActivity {
             final long eventSession = activePlaybackSessionGen;
             if (eventSession <= 0L) return;
             switch (event.type) {
+                case MediaPlayer.Event.ESAdded:
+                    final int esType = event.getEsChangedType();
+                    final int esId = event.getEsChangedID();
+                    uiHandler.post(() -> {
+                        if (eventSession != activePlaybackSessionGen) return;
+                        if (esType != IMedia.Track.Type.Text) return;
+                        if (slaveSubtitleLabelsById.containsKey(esId)) return;
+                        String label = pendingSlaveSubtitleLabels.pollFirst();
+                        if (label != null) {
+                            slaveSubtitleLabelsById.put(esId, label);
+                        }
+                    });
+                    break;
                 case MediaPlayer.Event.Opening:
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
@@ -1248,6 +1266,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         playbackFailed = false;
         loadingEpisode = false;
         subtitlesAttached = false;
+        pendingSlaveSubtitleLabels.clear();
+        slaveSubtitleLabelsById.clear();
         updateEpisodeNavButtons();
         errorOverlay.setVisibility(View.GONE);
         showLoading(null);
@@ -1497,9 +1517,27 @@ public class VlcPlayerActivity extends AppCompatActivity {
         });
     }
 
+    /**
+     * Attaches an external subtitle file to LibVLC and remembers its human label so the track menu
+     * can show it instead of LibVLC's generic "Track N" name.
+     */
+    private void attachSubtitleSlave(Uri uri, boolean select, String label) {
+        if (mediaPlayer == null || uri == null) return;
+        String cleanLabel = label != null ? label.trim() : "";
+        pendingSlaveSubtitleLabels.addLast(cleanLabel.isEmpty() ? "Legenda externa" : cleanLabel);
+        if (!mediaPlayer.addSlave(IMedia.Slave.Type.Subtitle, uri, select)) {
+            pendingSlaveSubtitleLabels.pollLast();
+        }
+    }
+
+    private static String subtitleItemLabel(SubtitleItem sub, int index) {
+        String label = sub != null && sub.label != null ? sub.label.trim() : "";
+        return label.isEmpty() ? "Legenda " + (index + 1) : label;
+    }
+
     private void downloadAndAttachSubtitles(final long expectedSession) {
         if (localSubtitleUri != null && mediaPlayer != null && isActivityStarted) {
-            mediaPlayer.addSlave(IMedia.Slave.Type.Subtitle, localSubtitleUri, !userDisabledSubtitles);
+            attachSubtitleSlave(localSubtitleUri, !userDisabledSubtitles, "Legenda local");
         }
         if (subtitles.isEmpty()) return;
 
@@ -1516,11 +1554,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             if (cached != null && cached.exists()) {
                 if (mediaPlayer != null && isActivityStarted && expectedSession == activePlaybackSessionGen) {
                     boolean selectDefault = !userDisabledSubtitles && !hasLocalSub && (sub.isDefault || i == 0);
-                    mediaPlayer.addSlave(
-                        IMedia.Slave.Type.Subtitle,
-                        Uri.fromFile(cached),
-                        selectDefault
-                    );
+                    attachSubtitleSlave(Uri.fromFile(cached), selectDefault, subtitleItemLabel(sub, i));
                 }
             } else {
                 pendingIndices.add(i);
@@ -1542,15 +1576,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             cachedSubFiles.add(downloaded);
                         }
                         final boolean selectDefault = !userDisabledSubtitles && !hasLocalSub && (sub.isDefault || idx == 0);
+                        final String subLabel = subtitleItemLabel(sub, idx);
                         uiHandler.post(() -> {
                             if (mediaPlayer != null && isActivityStarted
                                 && expectedSession == activePlaybackSessionGen
                                 && !isFinishing() && !isDestroyed()) {
-                                mediaPlayer.addSlave(
-                                    IMedia.Slave.Type.Subtitle,
-                                    Uri.fromFile(downloaded),
-                                    selectDefault
-                                );
+                                attachSubtitleSlave(Uri.fromFile(downloaded), selectDefault, subLabel);
                             }
                         });
                     }
@@ -2483,9 +2514,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 MediaPlayer.TrackDescription[] spuTracks = mediaPlayer.getSpuTracks();
                 if (spuTracks != null && spuTracks.length > 0) {
                     int activeSpu = mediaPlayer.getSpuTrack();
+                    Map<Integer, String> spuLabels = buildTrackLabels(spuTracks, false);
                     for (MediaPlayer.TrackDescription t : spuTracks) {
                         boolean active = t.id == activeSpu;
-                        String name = formatSubtitleTrackName(t);
+                        String name = spuLabels.get(t.id);
                         addSettingsRow(name, active ? "✓" : "", active, v -> {
                             userDisabledSubtitles = (t.id == -1);
                             if (mediaPlayer != null) mediaPlayer.setSpuTrack(t.id);
@@ -2511,9 +2543,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 MediaPlayer.TrackDescription[] audioTracks = mediaPlayer.getAudioTracks();
                 if (audioTracks != null && audioTracks.length > 0) {
                     int activeAudio = mediaPlayer.getAudioTrack();
+                    Map<Integer, String> audioLabels = buildTrackLabels(audioTracks, true);
                     for (MediaPlayer.TrackDescription t : audioTracks) {
                         boolean active = t.id == activeAudio;
-                        String name = formatAudioTrackName(t);
+                        String name = audioLabels.get(t.id);
                         addSettingsRow(name, active ? "✓" : "", active, v -> {
                             preferredAudioTrackId = t.id;
                             if (mediaPlayer != null) mediaPlayer.setAudioTrack(t.id);
@@ -2534,15 +2567,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         int activeSpu = mediaPlayer.getSpuTrack();
         if (activeSpu == -1) return "Desativada";
         MediaPlayer.TrackDescription[] tracks = mediaPlayer.getSpuTracks();
-        if (tracks != null) {
-            for (MediaPlayer.TrackDescription t : tracks) {
-                if (t.id == activeSpu) {
-                    String name = formatSubtitleTrackName(t);
-                    return name.isEmpty() ? "Ativa" : name;
-                }
-            }
-        }
-        return "Desativada";
+        String name = buildTrackLabels(tracks, false).get(activeSpu);
+        return name != null && !name.isEmpty() ? name : "Desativada";
     }
 
     private String getActiveAudioSummary() {
@@ -2550,35 +2576,192 @@ public class VlcPlayerActivity extends AppCompatActivity {
         int activeAudio = mediaPlayer.getAudioTrack();
         if (activeAudio == -1) return "Mudo";
         MediaPlayer.TrackDescription[] tracks = mediaPlayer.getAudioTracks();
-        if (tracks != null) {
-            for (MediaPlayer.TrackDescription t : tracks) {
-                if (t.id == activeAudio) {
-                    String name = formatAudioTrackName(t);
-                    return name.isEmpty() ? "Padrão" : name;
+        String name = buildTrackLabels(tracks, true).get(activeAudio);
+        return name != null && !name.isEmpty() ? name : "Padrão";
+    }
+
+    private static final Locale PT_BR = new Locale("pt", "BR");
+    private static final java.util.regex.Pattern VLC_TRACK_NAME =
+        java.util.regex.Pattern.compile("^(.*?)(?:\\s*-\\s*\\[([^\\]]+)\\])?$");
+    private static final java.util.regex.Pattern VLC_GENERIC_TRACK =
+        java.util.regex.Pattern.compile("^(?:track|faixa|pista)\\s*(\\d+)$", java.util.regex.Pattern.CASE_INSENSITIVE);
+    private static final java.util.regex.Pattern LANG_CODE =
+        java.util.regex.Pattern.compile("^[a-z]{2,3}(?:[-_][a-z0-9]{2,4})?$", java.util.regex.Pattern.CASE_INSENSITIVE);
+    private static final Map<String, String> LANG_ALIASES = new HashMap<>();
+    static {
+        String[][] aliases = {
+            // ISO 639-2 (B/T) -> ISO 639-1
+            { "por", "pt" }, { "pob", "pt-BR" }, { "pt_br", "pt-BR" }, { "ptbr", "pt-BR" },
+            { "eng", "en" }, { "jpn", "ja" }, { "jap", "ja" }, { "spa", "es" }, { "fre", "fr" },
+            { "fra", "fr" }, { "ger", "de" }, { "deu", "de" }, { "ita", "it" }, { "rus", "ru" },
+            { "chi", "zh" }, { "zho", "zh" }, { "kor", "ko" }, { "ara", "ar" }, { "hin", "hi" },
+            { "tha", "th" }, { "vie", "vi" }, { "ind", "id" }, { "may", "ms" }, { "msa", "ms" },
+            { "pol", "pl" }, { "tur", "tr" }, { "dut", "nl" }, { "nld", "nl" }, { "swe", "sv" },
+            { "heb", "he" }, { "gre", "el" }, { "ell", "el" }, { "ukr", "uk" }, { "cze", "cs" },
+            { "ces", "cs" }, { "hun", "hu" }, { "rum", "ro" }, { "ron", "ro" }, { "fin", "fi" },
+            { "dan", "da" }, { "nor", "no" }, { "nob", "nb" }, { "cat", "ca" }, { "fil", "fil" },
+            { "tgl", "tl" },
+            // English names produced by LibVLC's LanguageGetName()
+            { "portuguese", "pt" }, { "brazilian portuguese", "pt-BR" }, { "portuguese (brazil)", "pt-BR" },
+            { "english", "en" }, { "japanese", "ja" }, { "spanish", "es" },
+            { "spanish; castilian", "es" }, { "castilian", "es" }, { "french", "fr" }, { "german", "de" },
+            { "italian", "it" }, { "russian", "ru" }, { "chinese", "zh" }, { "korean", "ko" },
+            { "arabic", "ar" }, { "hindi", "hi" }, { "thai", "th" }, { "vietnamese", "vi" },
+            { "indonesian", "id" }, { "malay", "ms" }, { "polish", "pl" }, { "turkish", "tr" },
+            { "dutch", "nl" }, { "dutch; flemish", "nl" }, { "swedish", "sv" }, { "hebrew", "he" },
+            { "greek", "el" }, { "greek, modern (1453-)", "el" }, { "ukrainian", "uk" },
+            { "czech", "cs" }, { "hungarian", "hu" }, { "romanian", "ro" }, { "finnish", "fi" },
+            { "danish", "da" }, { "norwegian", "no" }, { "catalan", "ca" }, { "filipino", "fil" },
+            { "tagalog", "tl" },
+        };
+        for (String[] a : aliases) LANG_ALIASES.put(a[0], a[1]);
+        for (String c : new String[] { "pt", "en", "ja", "es", "fr", "de", "it", "ru", "zh", "ko", "ar" }) {
+            LANG_ALIASES.put(c, c);
+        }
+    }
+
+    private static final java.util.regex.Pattern LANG_REGION_CODE =
+        java.util.regex.Pattern.compile("^[a-z]{2,3}[-_](?:[a-z]{2}|\\d{3})$", java.util.regex.Pattern.CASE_INSENSITIVE);
+
+    static String languageDisplayName(String raw) {
+        return languageDisplayName(raw, false);
+    }
+
+    /**
+     * Converts a language code ("por", "pt-BR", "jpn") or LibVLC English language name
+     * ("Japanese") into a Portuguese display name ("Japonês", "Português (Brasil)").
+     * Returns null when the value is empty, undetermined or not recognised as a language.
+     * In strict mode (free text such as track titles / scraper labels) only well-known codes and
+     * names are accepted, so strings like "SDH" or "CC" are not mistaken for languages.
+     */
+    static String languageDisplayName(String raw, boolean strict) {
+        if (raw == null) return null;
+        String value = raw.trim();
+        if (value.isEmpty()) return null;
+        String key = value.toLowerCase(Locale.ROOT);
+        if (key.equals("und") || key.equals("unknown") || key.equals("mis") || key.equals("zxx")
+            || key.equals("mul") || key.equals("qaa")) {
+            return null;
+        }
+        String tag = LANG_ALIASES.get(key);
+        if (tag == null) {
+            if (!LANG_CODE.matcher(value).matches()) return null;
+            String[] parts = key.split("[-_]");
+            if (strict && (!LANG_REGION_CODE.matcher(value).matches() || !LANG_ALIASES.containsKey(parts[0]))) {
+                return null;
+            }
+            String base = LANG_ALIASES.containsKey(parts[0]) ? LANG_ALIASES.get(parts[0]) : parts[0];
+            tag = parts.length > 1 ? base + "-" + parts[1].toUpperCase(Locale.ROOT) : base;
+        }
+        Locale locale = Locale.forLanguageTag(tag);
+        String lang = locale.getDisplayLanguage(PT_BR);
+        if (lang == null || lang.isEmpty() || lang.equalsIgnoreCase(locale.getLanguage())) {
+            return null;
+        }
+        String display = lang;
+        String country = locale.getDisplayCountry(PT_BR);
+        if (country != null && !country.isEmpty()) display += " (" + country + ")";
+        return display.substring(0, 1).toUpperCase(PT_BR) + display.substring(1);
+    }
+
+    /** Builds user-facing labels (keyed by ES id) for every track in the list. */
+    private Map<Integer, String> buildTrackLabels(MediaPlayer.TrackDescription[] tracks, boolean audio) {
+        Map<Integer, String> labels = new LinkedHashMap<>();
+        if (tracks == null) return labels;
+
+        // LibVLC media tracks carry the raw language code/description for embedded streams.
+        Map<Integer, IMedia.Track> mediaTracks = new HashMap<>();
+        IMedia media = mediaPlayer != null ? mediaPlayer.getMedia() : null;
+        if (media != null) {
+            try {
+                int count = media.getTrackCount();
+                for (int i = 0; i < count; i++) {
+                    IMedia.Track mt = media.getTrack(i);
+                    if (mt != null) mediaTracks.put(mt.id, mt);
                 }
+            } catch (Exception e) {
+                Log.w(TAG, "Failed reading media tracks", e);
+            } finally {
+                media.release();
             }
         }
-        return "Padrão";
+
+        int position = 0;
+        Map<String, Integer> seen = new HashMap<>();
+        for (MediaPlayer.TrackDescription t : tracks) {
+            if (t == null) continue;
+            if (t.id == -1) {
+                labels.put(t.id, audio ? "Desativado (Mudo)" : "Desativada");
+                continue;
+            }
+            position++;
+            String label = audio ? null : slaveSubtitleLabelsById.get(t.id);
+            if (label != null) {
+                String asLanguage = languageDisplayName(label, true);
+                if (asLanguage != null) label = asLanguage;
+            } else {
+                label = describeEmbeddedTrack(t, mediaTracks.get(t.id), position, audio);
+            }
+            Integer dupCount = seen.get(label);
+            if (dupCount != null) {
+                seen.put(label, dupCount + 1);
+                label = label + " (" + (dupCount + 1) + ")";
+            } else {
+                seen.put(label, 1);
+            }
+            labels.put(t.id, label);
+        }
+        return labels;
     }
 
-    private static String formatSubtitleTrackName(MediaPlayer.TrackDescription track) {
-        if (track == null) return "Legenda";
-        if (track.id == -1) return "Desativada";
-        String name = track.name != null ? track.name.trim() : "";
-        if (name.isEmpty() || "disable".equalsIgnoreCase(name)) {
-            return "Legenda";
+    private static String describeEmbeddedTrack(
+        MediaPlayer.TrackDescription track,
+        IMedia.Track mediaTrack,
+        int position,
+        boolean audio
+    ) {
+        String rawName = track.name != null ? track.name.trim() : "";
+        String description = "";
+        String languageFromName = null;
+        int trackNumber = position;
+        java.util.regex.Matcher m = VLC_TRACK_NAME.matcher(rawName);
+        if (m.matches()) {
+            description = m.group(1) != null ? m.group(1).trim() : "";
+            languageFromName = m.group(2);
         }
-        return name;
-    }
+        java.util.regex.Matcher generic = VLC_GENERIC_TRACK.matcher(description);
+        if (generic.matches()) {
+            try {
+                trackNumber = Integer.parseInt(generic.group(1));
+            } catch (NumberFormatException ignored) {
+            }
+            description = "";
+        }
+        if ("disable".equalsIgnoreCase(description)) description = "";
 
-    private static String formatAudioTrackName(MediaPlayer.TrackDescription track) {
-        if (track == null) return "Áudio";
-        if (track.id == -1) return "Desativado (Mudo)";
-        String name = track.name != null ? track.name.trim() : "";
-        if (name.isEmpty() || "disable".equalsIgnoreCase(name)) {
-            return "Áudio";
+        String language = null;
+        if (mediaTrack != null) {
+            language = languageDisplayName(mediaTrack.language);
+            if (description.isEmpty() && mediaTrack.description != null) {
+                description = mediaTrack.description.trim();
+            }
         }
-        return name;
+        if (language == null) language = languageDisplayName(languageFromName);
+        if (language == null && !description.isEmpty()) {
+            // Some muxers store the language only in the track title (e.g. "Portuguese", "jpn").
+            String descAsLanguage = languageDisplayName(description, true);
+            if (descAsLanguage != null) {
+                language = descAsLanguage;
+                description = "";
+            }
+        }
+
+        if (language != null) {
+            if (description.isEmpty() || description.equalsIgnoreCase(language)) return language;
+            return language + " — " + description;
+        }
+        if (!description.isEmpty()) return description;
+        return (audio ? "Faixa " : "Legenda ") + trackNumber + " · idioma não informado";
     }
 
     private void switchServerInFullscreen(TopAnimesEpisodeResolver.ServerOption opt) {

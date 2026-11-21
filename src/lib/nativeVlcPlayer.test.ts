@@ -234,6 +234,26 @@ describe('VlcPlayerActivity - Android focus & LibVLC surface lifecycle', () => {
     assert.match(activityJava, /if\s*\("subs"\.equals\(tab\)\)[\s\S]*?settingsHeaderTitle\.setText\("Legendas"\)/);
     assert.match(activityJava, /if\s*\("audio"\.equals\(tab\)\)[\s\S]*?settingsHeaderTitle\.setText\("Áudio"\)/);
   });
+
+  it('labels subtitle/audio tracks with language instead of raw LibVLC "Track N"', () => {
+    // Every external subtitle goes through attachSubtitleSlave so its label is remembered.
+    const rawAddSlaveCalls = activityJava.match(/mediaPlayer\.addSlave\(/g) ?? [];
+    assert.equal(rawAddSlaveCalls.length, 1, 'only attachSubtitleSlave may call mediaPlayer.addSlave');
+    assert.match(
+      activityJava,
+      /private void attachSubtitleSlave\(Uri uri, boolean select, String label\)[\s\S]*?pendingSlaveSubtitleLabels\.addLast/
+    );
+    // ESAdded binds the next pending label to the new Text ES id.
+    assert.match(
+      activityJava,
+      /case MediaPlayer\.Event\.ESAdded:[\s\S]*?IMedia\.Track\.Type\.Text[\s\S]*?slaveSubtitleLabelsById\.put\(esId, label\)/
+    );
+    // Menus and summaries use the language-aware label builder.
+    assert.match(activityJava, /buildTrackLabels\(spuTracks, false\)/);
+    assert.match(activityJava, /buildTrackLabels\(audioTracks, true\)/);
+    assert.match(activityJava, /idioma não informado/);
+    assert.doesNotMatch(activityJava, /formatSubtitleTrackName|formatAudioTrackName/);
+  });
 });
 
 describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () => {
