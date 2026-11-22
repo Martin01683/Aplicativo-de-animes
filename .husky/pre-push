@@ -1,2 +1,2 @@
-npm run validate || exit 1
+npm run prepush:check || exit 1
 echo "✅ All checks passed! Proceeding with push..."
