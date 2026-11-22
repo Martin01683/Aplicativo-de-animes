@@ -31,6 +31,14 @@ import java.util.regex.Pattern;
 public final class TopAnimesEpisodeResolver {
     private static final String TAG = "TopAnimesEpResolver";
     private static final String TOPANIMES_ORIGIN = "https://topanimes.net";
+    private static final String HINATASOUL_ORIGIN = "https://www.hinatasoul.com";
+    private static final String HINATASOUL_R2_ORIGIN =
+        "https://173fe263eae04670ecfcebf237fd6480.r2.cloudflarestorage.com";
+    private static final String TABOOLA_AD_SCRIPT_URL = "https://cdn.taboola.com/libtrc/unpkg/tfa.js";
+    private static final String ADBLOCK2_SIGNER_URL = "https://ads.animeyabu.net/adblock2.php";
+    private static final String HINATASOUL_PLAYER_REFERER = "https://www.anitube22.vip/";
+    private static volatile String cachedTaboolaPayload = "";
+    private static volatile long cachedTaboolaExpiresAtMs = 0L;
     private static final String DEFAULT_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -169,6 +177,9 @@ public final class TopAnimesEpisodeResolver {
     }
 
     public static ResolvedEpisodeData resolveEpisode(String rawEpisodeUrl, String preferredNume) throws Exception {
+        if (isHinataSoulUrl(rawEpisodeUrl)) {
+            return resolveHinataSoulEpisode(rawEpisodeUrl);
+        }
         String episodeUrl = normalizeTopAnimesUrl(rawEpisodeUrl);
         if (episodeUrl.isEmpty()) {
             throw new IOException("URL de episódio inválida.");
@@ -299,6 +310,9 @@ public final class TopAnimesEpisodeResolver {
     }
 
     public static ResolvedEmbedData resolveEmbed(String rawEmbedUrl) {
+        if (isHinataSoulEmbedUrl(rawEmbedUrl)) {
+            return resolveHinataSoulEmbed(rawEmbedUrl);
+        }
         String cleanEmbed = unwrapAvisoUrl(rawEmbedUrl);
         if (cleanEmbed.isEmpty()) cleanEmbed = rawEmbedUrl != null ? rawEmbedUrl.trim() : "";
         String baseReferer = TOPANIMES_ORIGIN + "/";
@@ -387,6 +401,9 @@ public final class TopAnimesEpisodeResolver {
     }
 
     public static List<EpisodeLink> fetchSeriesEpisodes(String rawSeriesUrl) {
+        if (isHinataSoulUrl(rawSeriesUrl)) {
+            return fetchHinataSoulSeriesEpisodes(rawSeriesUrl);
+        }
         String seriesUrl = normalizeTopAnimesUrl(rawSeriesUrl);
         if (seriesUrl.isEmpty()) return Collections.emptyList();
         try {
@@ -446,6 +463,7 @@ public final class TopAnimesEpisodeResolver {
     }
 
     public static int providerPriority(String providerKind) {
+        if ("hinatasoul".equals(providerKind)) return 6;
         if ("kojima".equals(providerKind)) return 5;
         if ("zuplay".equals(providerKind)) return 4;
         if ("vidstreaming".equals(providerKind)) return 3;
@@ -537,7 +555,8 @@ public final class TopAnimesEpisodeResolver {
             }
         }
         for (ServerOption o : options) {
-            if (!ordered.contains(o) && ("kojima".equals(o.providerKind) || "zuplay".equals(o.providerKind)
+            if (!ordered.contains(o) && ("hinatasoul".equals(o.providerKind)
+                || "kojima".equals(o.providerKind) || "zuplay".equals(o.providerKind)
                 || "vidstreaming".equals(o.providerKind) || "playerjs".equals(o.providerKind))) {
                 ordered.add(o);
             }
@@ -1220,6 +1239,382 @@ public final class TopAnimesEpisodeResolver {
             return new URL(new URL(baseUrl), raw.trim()).toString();
         } catch (Exception e) {
             return raw.trim();
+        }
+    }
+
+    public static boolean isHinataSoulUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            return "hinatasoul.com".equals(host) || "www.hinatasoul.com".equals(host);
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    public static boolean isHinataSoulEmbedUrl(String rawUrl) {
+        if (isHinataSoulUrl(rawUrl)) return true;
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            String path = uri.getPath() != null ? uri.getPath().toLowerCase(Locale.ROOT) : "";
+            if ((host.equals("anitube22.vip") || host.endsWith(".anitube22.vip")) && path.contains("playerricas")) {
+                return true;
+            }
+            if (host.equals("173fe263eae04670ecfcebf237fd6480.r2.cloudflarestorage.com")) {
+                return true;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
+    }
+
+    public static String normalizeHinataSoulUrl(String rawUrl) {
+        if (rawUrl == null) return "";
+        String trimmed = rawUrl.trim();
+        if (trimmed.isEmpty() || "#".equals(trimmed) || trimmed.startsWith("javascript:")) return "";
+        try {
+            URL resolved = new URL(new URL(HINATASOUL_ORIGIN + "/"), trimmed);
+            String host = resolved.getHost() != null ? resolved.getHost().toLowerCase(Locale.ROOT) : "";
+            if ("hinatasoul.com".equals(host) || "www.hinatasoul.com".equals(host)) {
+                String path = resolved.getPath() != null ? resolved.getPath() : "";
+                if (path.length() > 1) {
+                    path = path.replaceAll("/+$", "");
+                }
+                String q = resolved.getQuery();
+                return HINATASOUL_ORIGIN + path + (q != null && !q.isEmpty() ? ("?" + q) : "");
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private static ResolvedEpisodeData resolveHinataSoulEpisode(String rawEpisodeUrl) throws Exception {
+        String episodeUrl = normalizeHinataSoulUrl(rawEpisodeUrl);
+        if (episodeUrl.isEmpty()) {
+            throw new IOException("URL de episódio Hinata Soul inválida.");
+        }
+
+        String html = fetchText(episodeUrl, HINATASOUL_ORIGIN + "/", 11000);
+        String title = "Episódio";
+        Matcher titleM = Pattern.compile(
+            "<h1[^>]*class=[\"'][^\"']*epTituloNome[^\"']*[\"'][^>]*>([\\s\\S]*?)</h1>",
+            Pattern.CASE_INSENSITIVE
+        ).matcher(html);
+        if (titleM.find()) {
+            String t = cleanHtmlText(titleM.group(1));
+            if (!t.isEmpty()) title = t;
+        }
+
+        String seriesUrl = "";
+        String prevUrl = "";
+        String nextUrl = "";
+        String ctrlBlock = extractDivInnerHtmlByClass(html, "controlesBox");
+        if (!ctrlBlock.isEmpty()) {
+            Matcher aM = Pattern.compile(
+                "<a[^>]+href=[\"']([^\"']+)[\"']([^>]*)>([\\s\\S]*?)</a>",
+                Pattern.CASE_INSENSITIVE
+            ).matcher(ctrlBlock);
+            while (aM.find()) {
+                String href = normalizeHinataSoulUrl(aM.group(1));
+                if (href.isEmpty()) continue;
+                String attrs = aM.group(2) != null ? aM.group(2).toLowerCase(Locale.ROOT) : "";
+                String text = cleanHtmlText(aM.group(3)).toLowerCase(Locale.ROOT);
+                if (attrs.contains("lista") || href.contains("/animes/") || href.contains("/anime-dublado/")
+                    || href.contains("/donghua/") || href.contains("/doramas/") || href.contains("/tokusatsus/")) {
+                    seriesUrl = href;
+                } else if (attrs.contains("anterior") || text.contains("anterior")) {
+                    prevUrl = href;
+                } else if (attrs.contains("próximo") || attrs.contains("proximo")
+                    || text.contains("próximo") || text.contains("proximo")) {
+                    nextUrl = href;
+                }
+            }
+        }
+
+        List<ServerOption> options = new ArrayList<>();
+        options.add(new ServerOption("hinatasoul:1", "Hinata Soul · Full HD / HD / SD", episodeUrl, "hinatasoul"));
+
+        ResolvedEmbedData embed = resolveHinataSoulFromHtml(episodeUrl, html);
+        return new ResolvedEpisodeData(
+            episodeUrl,
+            title,
+            seriesUrl,
+            prevUrl,
+            nextUrl,
+            options,
+            "hinatasoul:1",
+            embed.referer,
+            embed.preferDirect,
+            embed.streams,
+            embed.subtitles,
+            embed.ok ? "" : embed.errorMessage
+        );
+    }
+
+    private static ResolvedEmbedData resolveHinataSoulEmbed(String rawEmbedUrl) {
+        String clean = rawEmbedUrl != null ? rawEmbedUrl.trim() : "";
+        if (!isSafeHttpUrl(clean)) {
+            return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_ORIGIN + "/", false,
+                Collections.emptyList(), Collections.emptyList(), "URL Hinata Soul inválida.");
+        }
+        try {
+            if (isHinataSoulUrl(clean)) {
+                String norm = normalizeHinataSoulUrl(clean);
+                String html = fetchText(norm, HINATASOUL_ORIGIN + "/", 12000);
+                return resolveHinataSoulFromHtml(norm, html);
+            }
+            String vid = clean;
+            if (clean.contains("playerricas")) {
+                Matcher um = Pattern.compile("[?&]url=([^&]+)").matcher(clean);
+                if (um.find()) {
+                    vid = URLDecoder.decode(um.group(1), "UTF-8");
+                }
+            }
+            if (!vid.contains(".r2.cloudflarestorage.com/")) {
+                return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_PLAYER_REFERER, false,
+                    Collections.emptyList(), Collections.emptyList(), "Stream Hinata Soul não encontrado.");
+            }
+            String baseVid = vid.contains("?") ? vid.substring(0, vid.indexOf('?')) : vid;
+            String adPayload = fetchTaboolaAdPayload();
+            if (adPayload.isEmpty()) {
+                return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_PLAYER_REFERER, false,
+                    Collections.emptyList(), Collections.emptyList(), "Falha ao validar player do Hinata Soul.");
+            }
+            String signed = signHinataSoulR2Url(baseVid, adPayload);
+            if (signed.isEmpty()) {
+                return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_PLAYER_REFERER, false,
+                    Collections.emptyList(), Collections.emptyList(), "Falha ao assinar stream do Hinata Soul.");
+            }
+            int h = baseVid.contains("/zful/") ? 1080 : (baseVid.matches("(?i).*/z(?:111|222|333|444)/.*") ? 720 : 480);
+            String lbl = h >= 1080 ? "1080p (Full HD)" : (h >= 720 ? "720p (HD)" : "480p (SD)");
+            return new ResolvedEmbedData(
+                true,
+                "Hinata Soul",
+                HINATASOUL_PLAYER_REFERER,
+                false,
+                Collections.singletonList(new StreamCandidate(lbl, h, signed, "mp4")),
+                Collections.emptyList(),
+                ""
+            );
+        } catch (Exception e) {
+            return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_ORIGIN + "/", false,
+                Collections.emptyList(), Collections.emptyList(),
+                e.getMessage() != null ? e.getMessage() : "Falha ao consultar Hinata Soul.");
+        }
+    }
+
+    private static ResolvedEmbedData resolveHinataSoulFromHtml(String pageUrl, String html) {
+        Matcher contentM = Pattern.compile(
+            "itemprop=[\"']contentURL[\"'][^>]+content=[\"']([^\"']+)[\"']",
+            Pattern.CASE_INSENSITIVE
+        ).matcher(html);
+        if (!contentM.find()) {
+            contentM = Pattern.compile(
+                "content=[\"']([^\"']+)[\"'][^>]+itemprop=[\"']contentURL[\"']",
+                Pattern.CASE_INSENSITIVE
+            ).matcher(html);
+            if (!contentM.find()) {
+                return new ResolvedEmbedData(false, "Hinata Soul", pageUrl, false,
+                    Collections.emptyList(), Collections.emptyList(), "Nenhum vídeo encontrado no Hinata Soul.");
+            }
+        }
+        String contentUrl = contentM.group(1).trim();
+        Matcher pathM = Pattern.compile("/([a-z0-9_-]+)/(\\d+\\.mp4)(?:$|\\?)", Pattern.CASE_INSENSITIVE).matcher(contentUrl);
+        if (!pathM.find()) {
+            return new ResolvedEmbedData(false, "Hinata Soul", pageUrl, false,
+                Collections.emptyList(), Collections.emptyList(), "Formato de vídeo Hinata Soul não reconhecido.");
+        }
+        String sdPrefix = pathM.group(1).toLowerCase(Locale.ROOT);
+        String fileName = pathM.group(2);
+        String sdBucket = sdPrefix.startsWith("z") ? sdPrefix : ("z" + sdPrefix);
+        String hdBucket = "iphoneb".equals(sdPrefix) ? "z222"
+            : (("iphonea".equals(sdPrefix) || "iphone".equals(sdPrefix)) ? "z111"
+                : ("iphoned".equals(sdPrefix) ? "z444" : "z333"));
+
+        boolean hasFhd = false;
+        boolean hasHd = false;
+        boolean hasSd = false;
+        Matcher abaM = Pattern.compile(
+            "<div[^>]*class=[\"'][^\"']*\\bAba\\b[^\"']*[\"'][^>]*>([\\s\\S]*?)</div>",
+            Pattern.CASE_INSENSITIVE
+        ).matcher(html);
+        while (abaM.find()) {
+            String lbl = cleanHtmlText(abaM.group(1)).toUpperCase(Locale.ROOT).replaceAll("\\s+", "");
+            if (lbl.contains("FULLHD") || lbl.contains("1080") || lbl.contains("FHD")) hasFhd = true;
+            else if (lbl.contains("720") || "HD".equals(lbl)) hasHd = true;
+            else if (lbl.contains("480") || "SD".equals(lbl)) hasSd = true;
+        }
+        if (!hasFhd && !hasHd && !hasSd) {
+            hasHd = true;
+            hasSd = true;
+        }
+
+        String adPayload = fetchTaboolaAdPayload();
+        if (adPayload.isEmpty()) {
+            return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_PLAYER_REFERER, false,
+                Collections.emptyList(), Collections.emptyList(), "Falha ao validar player do Hinata Soul.");
+        }
+
+        List<StreamCandidate> streams = new ArrayList<>();
+        if (hasFhd) {
+            String signed = signHinataSoulR2Url(HINATASOUL_R2_ORIGIN + "/zful/" + fileName, adPayload);
+            if (!signed.isEmpty()) streams.add(new StreamCandidate("1080p (Full HD)", 1080, signed, "mp4"));
+        }
+        if (hasHd) {
+            String signed = signHinataSoulR2Url(HINATASOUL_R2_ORIGIN + "/" + hdBucket + "/" + fileName, adPayload);
+            if (!signed.isEmpty()) streams.add(new StreamCandidate("720p (HD)", 720, signed, "mp4"));
+        }
+        if (hasSd) {
+            String signed = signHinataSoulR2Url(HINATASOUL_R2_ORIGIN + "/" + sdBucket + "/" + fileName, adPayload);
+            if (!signed.isEmpty()) streams.add(new StreamCandidate("480p (SD)", 480, signed, "mp4"));
+        }
+
+        if (streams.isEmpty()) {
+            return new ResolvedEmbedData(false, "Hinata Soul", HINATASOUL_PLAYER_REFERER, false,
+                Collections.emptyList(), Collections.emptyList(), "Não foi possível assinar os streams do Hinata Soul.");
+        }
+
+        return new ResolvedEmbedData(
+            true,
+            "Hinata Soul",
+            HINATASOUL_PLAYER_REFERER,
+            false,
+            streams,
+            Collections.emptyList(),
+            ""
+        );
+    }
+
+    private static String fetchTaboolaAdPayload() {
+        long now = System.currentTimeMillis();
+        if (!cachedTaboolaPayload.isEmpty() && cachedTaboolaExpiresAtMs > now) {
+            return cachedTaboolaPayload;
+        }
+        try {
+            String body = fetchText(TABOOLA_AD_SCRIPT_URL, HINATASOUL_PLAYER_REFERER, 8000);
+            if (body != null && body.length() > 100) {
+                cachedTaboolaPayload = body;
+                cachedTaboolaExpiresAtMs = now + 30L * 60L * 1000L;
+                return body;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed fetching Taboola payload: " + e.getMessage());
+        }
+        return "";
+    }
+
+    private static String parseAdblock2Publicidade(String rawJson) {
+        if (rawJson == null || rawJson.trim().isEmpty()) return "";
+        try {
+            JSONArray arr = new JSONArray(rawJson.trim());
+            if (arr.length() > 0) {
+                JSONObject obj = arr.optJSONObject(0);
+                if (obj != null) {
+                    String val = obj.optString("publicidade", "").trim();
+                    if (val.startsWith("?")) return val;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private static String signHinataSoulR2Url(String r2Url, String adPayload) {
+        try {
+            String form = "category=client&type=premium&ad=" + URLEncoder.encode(adPayload, "UTF-8")
+                + "&url=" + URLEncoder.encode(r2Url, "UTF-8");
+            String step1 = postFormText(ADBLOCK2_SIGNER_URL, HINATASOUL_PLAYER_REFERER, form, 10000);
+            String token = parseAdblock2Publicidade(step1);
+            if (token.isEmpty()) return "";
+
+            String step2Url = ADBLOCK2_SIGNER_URL
+                + "?token=" + URLEncoder.encode(token, "UTF-8")
+                + "&url=" + URLEncoder.encode(r2Url, "UTF-8");
+            String step2 = fetchText(step2Url, HINATASOUL_PLAYER_REFERER, 10000);
+            String suffix = parseAdblock2Publicidade(step2);
+            if (suffix.isEmpty()) return "";
+            String finalUrl = r2Url + suffix;
+            return isSafeHttpUrl(finalUrl) ? finalUrl : "";
+        } catch (Exception e) {
+            Log.w(TAG, "Failed signing Hinata Soul R2 stream: " + e.getMessage());
+            return "";
+        }
+    }
+
+    private static List<EpisodeLink> fetchHinataSoulSeriesEpisodes(String rawSeriesUrl) {
+        String seriesUrl = normalizeHinataSoulUrl(rawSeriesUrl);
+        if (seriesUrl.isEmpty()) return Collections.emptyList();
+        try {
+            String html = fetchText(seriesUrl, HINATASOUL_ORIGIN + "/", 10000);
+            List<EpisodeLink> list = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            extractHinataSoulEpisodesFromHtml(html, list, seen);
+
+            int maxPage = 1;
+            Matcher pagM = Pattern.compile("/page/(\\d+)", Pattern.CASE_INSENSITIVE).matcher(html);
+            while (pagM.find()) {
+                try {
+                    int p = Integer.parseInt(pagM.group(1));
+                    if (p > maxPage) maxPage = p;
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            String baseSeries = seriesUrl.replaceFirst("(?i)/page/\\d+$", "");
+            int capped = Math.min(maxPage, 6);
+            for (int p = 2; p <= capped; p++) {
+                try {
+                    String pageHtml = fetchText(baseSeries + "/page/" + p, seriesUrl, 8000);
+                    extractHinataSoulEpisodesFromHtml(pageHtml, list, seen);
+                } catch (Exception ignored) {
+                }
+            }
+            return list;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed fetching Hinata Soul series episodes: " + e.getMessage());
+            return Collections.emptyList();
+        }
+    }
+
+    private static void extractHinataSoulEpisodesFromHtml(
+        String html,
+        List<EpisodeLink> out,
+        Set<String> seen
+    ) {
+        String scope = html;
+        int cboxIdx = html.indexOf("class=\"cbox\"");
+        if (cboxIdx > 0) scope = html.substring(0, cboxIdx);
+
+        Matcher itemM = Pattern.compile(
+            "<a[^>]+href=[\"']([^\"']*/videos/\\d+[^\"']*)[\"'][^>]*>([\\s\\S]*?)</a>",
+            Pattern.CASE_INSENSITIVE
+        ).matcher(scope);
+        while (itemM.find()) {
+            String epUrl = normalizeHinataSoulUrl(itemM.group(1));
+            if (epUrl.isEmpty() || !seen.add(epUrl)) continue;
+            String inner = itemM.group(2);
+            String numLabel = "";
+            Matcher numM = Pattern.compile(
+                "class=[\"'][^\"']*ultimosEpisodiosHomeItemInfosNum[^\"']*[\"'][^>]*>([\\s\\S]*?)</div>",
+                Pattern.CASE_INSENSITIVE
+            ).matcher(inner);
+            if (numM.find()) {
+                numLabel = cleanHtmlText(numM.group(1));
+            }
+            int epNum = -1;
+            Matcher digitsM = Pattern.compile("(?:epis[oó]dio|ep\\.?)\\s*0*(\\d+)", Pattern.CASE_INSENSITIVE)
+                .matcher(numLabel.isEmpty() ? cleanHtmlText(inner) : numLabel);
+            if (digitsM.find()) {
+                try {
+                    epNum = Integer.parseInt(digitsM.group(1));
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            String epTitle = !numLabel.isEmpty() ? numLabel : (epNum > 0 ? ("Episódio " + epNum) : "Episódio");
+            String shortLabel = epNum > 0 ? ("EP " + epNum) : epTitle;
+            out.add(new EpisodeLink(shortLabel, epNum, epTitle, epUrl));
         }
     }
 

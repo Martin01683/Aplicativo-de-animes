@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   Search,
   X,
@@ -14,14 +14,18 @@ import {
   Shuffle,
   Sparkles,
   Film,
-  Calendar,
   Star,
+  Tv,
+  ArrowRight,
+  SlidersHorizontal,
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
 import { isItemFavorited } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
+  countAnimeEpisodesInHistory,
   formatPlaybackTimestamp,
+  getHistoryEntrySeriesName,
   isEpisodeCompleted,
 } from '../lib/playbackProgress';
 import type {
@@ -32,6 +36,7 @@ import type {
   CatalogMediaItem,
   FavoriteAlertEntry,
   HomeCatalog,
+  LiveChartScheduleMode,
   MediaKind,
   SearchResultItem,
   SearchSuggestResponse,
@@ -39,6 +44,7 @@ import type {
   WatchHistoryEntry,
 } from '../lib/types';
 import type { NavSection } from './Header';
+import { LiveChartCalendar } from './LiveChartCalendar';
 import { MediaPoster } from './MediaPoster';
 
 const GLOSSARY_TERMS = [
@@ -106,7 +112,9 @@ interface CatalogViewProps {
   filteredCatalog: ArchiveCategoryState;
   weeklyCalendarDays: CalendarDaySection[];
   selectedCalendarDay: string;
+  calendarScheduleMode: LiveChartScheduleMode;
   loadingWeeklyCalendar: boolean;
+  calendarError: string;
   favorites: CatalogMediaItem[];
   history: WatchHistoryEntry[];
   alerts: FavoriteAlertEntry[];
@@ -126,6 +134,8 @@ interface CatalogViewProps {
   onClearCatalogFilters: () => void;
   onLoadMoreFiltered: () => void;
   onSelectCalendarDay: (dayId: string) => void;
+  onChangeCalendarScheduleMode: (mode: LiveChartScheduleMode) => void;
+  onRefreshCalendar: () => void;
   onOpenItem: (url: string, kind: MediaKind) => void;
   onToggleFavorite: (item: CatalogMediaItem) => void;
   onCheckFavoriteUpdates: () => void;
@@ -133,12 +143,14 @@ interface CatalogViewProps {
   onOpenAlert: (alert: FavoriteAlertEntry) => void;
   onRequestPushNotifications: () => void;
   onClearHistory: () => void;
+  onRemoveHistoryEntry: (entry: WatchHistoryEntry) => void;
+  onRemoveHistoryAnime: (entry: WatchHistoryEntry) => void;
   onSelectSection: (section: NavSection) => void;
   defaultAudioFilter: 'ALL' | 'DUB' | 'LEG';
   watchedEpisodeKeys?: Set<string>;
 }
 
-const ARCHIVE_TABS: Array<{ id: CatalogArchiveCategory; label: string }> = [
+const BASE_ARCHIVE_TABS: Array<{ id: CatalogArchiveCategory; label: string }> = [
   { id: 'animes', label: 'Animes' },
   { id: 'movies', label: 'Filmes' },
   { id: 'dublado', label: 'Dublados' },
@@ -147,6 +159,19 @@ const ARCHIVE_TABS: Array<{ id: CatalogArchiveCategory; label: string }> = [
   { id: 'cartoon', label: 'Cartoon' },
   { id: 'live-action', label: 'Live Action' },
 ];
+
+function kindDisplayLabel(kind: MediaKind): string {
+  switch (kind) {
+    case 'movie':
+      return 'Filme';
+    case 'series':
+      return 'Série';
+    case 'episode':
+      return 'Episódio';
+    default:
+      return 'Anime';
+  }
+}
 
 export function CatalogView({
   catalog,
@@ -175,7 +200,9 @@ export function CatalogView({
   filteredCatalog,
   weeklyCalendarDays,
   selectedCalendarDay,
+  calendarScheduleMode,
   loadingWeeklyCalendar,
+  calendarError,
   favorites,
   history,
   alerts,
@@ -195,6 +222,8 @@ export function CatalogView({
   onClearCatalogFilters,
   onLoadMoreFiltered,
   onSelectCalendarDay,
+  onChangeCalendarScheduleMode,
+  onRefreshCalendar,
   onOpenItem,
   onToggleFavorite,
   onCheckFavoriteUpdates,
@@ -202,15 +231,19 @@ export function CatalogView({
   onOpenAlert,
   onRequestPushNotifications,
   onClearHistory,
+  onRemoveHistoryEntry,
+  onRemoveHistoryAnime,
   onSelectSection,
   defaultAudioFilter,
   watchedEpisodeKeys,
 }: CatalogViewProps) {
   const [searchInput, setSearchInput] = useState(searchQuery);
   const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>(defaultAudioFilter);
+  const [glossaryExpanded, setGlossaryExpanded] = useState(false);
   const [suggestions, setSuggestions] = useState<SearchResultItem[]>([]);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
   const [suggestOpen, setSuggestOpen] = useState(false);
+  const [openHistoryMenuKey, setOpenHistoryMenuKey] = useState<string | null>(null);
   const searchBoxRef = useRef<HTMLDivElement>(null);
   const suggestReqGenRef = useRef(0);
 
@@ -223,6 +256,10 @@ export function CatalogView({
   }, [searchQuery]);
 
   useEffect(() => {
+    if (selectedGlossary) setGlossaryExpanded(true);
+  }, [selectedGlossary]);
+
+  useEffect(() => {
     const handleOutside = (e: MouseEvent) => {
       if (searchBoxRef.current && !searchBoxRef.current.contains(e.target as Node)) {
         setSuggestOpen(false);
@@ -231,6 +268,24 @@ export function CatalogView({
     document.addEventListener('mousedown', handleOutside);
     return () => document.removeEventListener('mousedown', handleOutside);
   }, []);
+
+  useEffect(() => {
+    if (!openHistoryMenuKey) return;
+    const handleOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-history-menu-root]')) return;
+      setOpenHistoryMenuKey(null);
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpenHistoryMenuKey(null);
+    };
+    document.addEventListener('mousedown', handleOutside);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleOutside);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [openHistoryMenuKey]);
 
   useEffect(() => {
     const trimmed = searchInput.trim();
@@ -258,7 +313,7 @@ export function CatalogView({
             setLoadingSuggestions(false);
           }
         });
-    }, 300);
+    }, 280);
 
     return () => window.clearTimeout(timer);
   }, [searchInput, suggestOpen]);
@@ -269,18 +324,49 @@ export function CatalogView({
     onSearch(searchInput.trim());
   };
 
-  const filterByAudio = (items: CatalogMediaItem[]) => {
+  const filterByAudio = (items: CatalogMediaItem[]): CatalogMediaItem[] => {
     if (audioFilter === 'ALL') return items;
     return items.filter((item) => {
-      const effective: AudioType = item.audioType;
-      return effective === audioFilter;
+      const effectiveAudio: AudioType = item.audioType ?? 'LEG';
+      return effectiveAudio === audioFilter;
     });
   };
+
+  const archiveTabs = useMemo(() => {
+    const hasServerSeries =
+      Boolean(catalog?.series && catalog.series.length > 0) ||
+      archiveState.series.items.length > 0;
+    if (!hasServerSeries) return BASE_ARCHIVE_TABS;
+    return [
+      BASE_ARCHIVE_TABS[0],
+      BASE_ARCHIVE_TABS[1],
+      { id: 'series' as CatalogArchiveCategory, label: 'Séries' },
+      ...BASE_ARCHIVE_TABS.slice(2),
+    ];
+  }, [archiveState.series.items.length, catalog?.series]);
+
+  const continueWatchingItems = useMemo(() => {
+    return history
+      .filter((entry) => {
+        const pos = entry.positionSec ?? 0;
+        const dur = entry.durationSec ?? 0;
+        const completed =
+          Boolean(entry.completed) || (dur > 0 && isEpisodeCompleted(pos, dur, false));
+        return !completed && pos >= 10;
+      })
+      .slice(0, 4);
+  }, [history]);
 
   const renderCard = (
     item: CatalogMediaItem,
     aspect: 'portrait' | 'landscape',
-    progressMeta?: { label?: string; pct?: number }
+    progressMeta?: { label?: string; pct?: number },
+    historyMenu?: {
+      menuKey: string;
+      entry: WatchHistoryEntry;
+      animeEpisodeCount: number;
+      animeName: string;
+    }
   ) => {
     const metaParts: string[] = [];
     if (progressMeta?.label) {
@@ -292,33 +378,47 @@ export function CatalogView({
       metaParts.push('Visto');
     }
     if (item.episodeLabel) metaParts.push(item.episodeLabel);
-    if (item.audioType === 'DUB') metaParts.push('Dublado');
-    else if (item.audioType === 'LEG') metaParts.push('Legendado');
-    if (item.quality) metaParts.push(item.quality);
     if (item.year) metaParts.push(item.year);
+    if (item.quality) metaParts.push(item.quality);
     if (item.rating && Number.parseFloat(item.rating) > 0) metaParts.push(`★ ${item.rating}`);
-    if (item.statusBadge) metaParts.push(item.statusBadge);
-    else if (item.isHiatus) metaParts.push('Hiato');
+    if (item.isHiatus && item.statusBadge) metaParts.push(item.statusBadge);
+    if (item.sourceServerName) metaParts.push(item.sourceServerName);
 
     const favActive = isItemFavorited(item.url, favorites);
+    const isHistoryMenuOpen = Boolean(
+      historyMenu && openHistoryMenuKey === historyMenu.menuKey
+    );
 
     return (
       <div
-        key={item.url}
-        className="group relative flex flex-col overflow-hidden rounded-xl border border-white/10 bg-[#151921] transition-colors hover:border-[#f97316]/60"
+        key={`${item.url}-${item.id}`}
+        className={`group relative flex flex-col rounded-xl border border-white/10 bg-[#151921] transition-colors hover:border-[#f97316]/60 ${
+          isHistoryMenuOpen ? 'z-20 overflow-visible' : 'overflow-hidden'
+        }`}
       >
         <button
           type="button"
           onClick={() => onOpenItem(item.url, item.kind)}
           className="flex flex-1 flex-col text-left"
         >
-          <div className="relative w-full border-b border-white/8">
+          <div className="relative w-full overflow-hidden rounded-t-xl border-b border-white/8">
             <MediaPoster
               src={item.poster}
               alt={item.title}
               aspect={aspect}
               className="w-full"
             />
+            {item.audioType && (
+              <span
+                className={`pointer-events-none absolute left-2 top-2 rounded-md border px-1.5 py-0.5 text-[10px] font-bold tracking-wide backdrop-blur-md ${
+                  item.audioType === 'DUB'
+                    ? 'border-emerald-400/45 bg-emerald-500/80 text-[#052e16]'
+                    : 'border-white/15 bg-[#0d0f12]/80 text-slate-200'
+                }`}
+              >
+                {item.audioType}
+              </span>
+            )}
             {typeof progressMeta?.pct === 'number' && progressMeta.pct > 0 && (
               <div className="absolute inset-x-0 bottom-0 h-1 bg-black/60">
                 <div
@@ -328,8 +428,8 @@ export function CatalogView({
               </div>
             )}
           </div>
-          <div className="flex flex-1 flex-col justify-between p-3.5">
-            <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-white group-hover:text-[#f97316]">
+          <div className="flex flex-1 flex-col justify-between p-3">
+            <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-white group-hover:text-[#fb923c]">
               {item.title}
             </h3>
             {metaParts.length > 0 && (
@@ -339,6 +439,75 @@ export function CatalogView({
             )}
           </div>
         </button>
+
+        {historyMenu && (
+          <div data-history-menu-root className="absolute right-12 top-2 z-20">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpenHistoryMenuKey((prev) =>
+                  prev === historyMenu.menuKey ? null : historyMenu.menuKey
+                );
+              }}
+              aria-expanded={isHistoryMenuOpen}
+              aria-haspopup="menu"
+              aria-label={`Remover ${item.title} do histórico`}
+              title="Remover do histórico"
+              className={`flex h-8 w-8 items-center justify-center rounded-full border backdrop-blur-md transition-colors ${
+                isHistoryMenuOpen
+                  ? 'border-rose-500/70 bg-rose-500/85 text-white'
+                  : 'border-white/15 bg-[#0d0f12]/75 text-slate-200 hover:border-rose-400/70 hover:text-rose-300'
+              }`}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+
+            {isHistoryMenuOpen && (
+              <div
+                role="menu"
+                aria-label="Opções de remoção do histórico"
+                onClick={(e) => e.stopPropagation()}
+                className="absolute right-0 top-10 z-30 w-56 rounded-xl border border-white/15 bg-[#0d0f12]/95 p-1.5 text-xs text-slate-200 shadow-2xl backdrop-blur-md"
+              >
+                <div className="truncate border-b border-white/10 px-2.5 pb-1.5 pt-1 text-[11px] font-medium text-slate-400">
+                  {historyMenu.animeName}
+                </div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setOpenHistoryMenuKey(null);
+                    onRemoveHistoryEntry(historyMenu.entry);
+                  }}
+                  className="mt-1 flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-slate-200 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  <X className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                  <span>Remover este episódio</span>
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    setOpenHistoryMenuKey(null);
+                    onRemoveHistoryAnime(historyMenu.entry);
+                  }}
+                  className="flex w-full items-center justify-between gap-2 rounded-lg px-2.5 py-2 text-left text-rose-300 transition-colors hover:bg-rose-500/15 hover:text-rose-200"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                    <span>Todos deste anime</span>
+                  </span>
+                  {historyMenu.animeEpisodeCount > 1 && (
+                    <span className="rounded bg-rose-500/20 px-1.5 py-0.5 font-mono text-[10px] font-semibold tabular-nums text-rose-200">
+                      {historyMenu.animeEpisodeCount}
+                    </span>
+                  )}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
 
         <button
           type="button"
@@ -358,7 +527,7 @@ export function CatalogView({
               : 'border-white/15 bg-[#0d0f12]/75 text-slate-200 hover:border-rose-400/70 hover:text-rose-300'
           }`}
         >
-          <Heart className={`h-4 w-4 ${favActive ? 'fill-white' : ''}`} />
+          <Heart className={`h-3.5 w-3.5 ${favActive ? 'fill-white' : ''}`} />
         </button>
       </div>
     );
@@ -370,38 +539,23 @@ export function CatalogView({
     : archiveState[archiveCategory];
   const activeGenreLabel = catalogFilters.genres.find((g) => g.slug === selectedGenre)?.label;
 
-  const effectiveCalendarDays: CalendarDaySection[] =
-    weeklyCalendarDays.length > 0
-      ? weeklyCalendarDays
-      : catalog
-        ? [{ id: 'hoje', label: 'Hoje', isToday: true, items: catalog.calendar }]
-        : [];
-  const activeCalendarDay =
-    effectiveCalendarDays.find((d) => d.id === selectedCalendarDay) ||
-    effectiveCalendarDays[0] ||
-    null;
-
   const showSuggestDropdown =
     suggestOpen && searchInput.trim().length >= 2 && (loadingSuggestions || suggestions.length > 0);
+  const showGlobalSearchBar = activeSection !== 'calendar' || searchResults !== null;
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-      {/* Control Strip: Search & Random Discovery */}
-      <section className="mb-7 rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
-        <form onSubmit={handleSearchSubmit} className="flex flex-col gap-2">
-          <label
-            htmlFor="catalog-search-input"
-            className="text-xs font-medium text-slate-400"
-          >
-            Buscar anime, episódio ou filme
-          </label>
-          <div className="flex flex-wrap gap-2 sm:flex-nowrap">
+      {/* Compact Search Bar (shown outside Calendar so Calendar stays ultra clean) */}
+      {showGlobalSearchBar && (
+        <section className="mb-6">
+          <form onSubmit={handleSearchSubmit} className="flex flex-wrap gap-2 sm:flex-nowrap">
             <div ref={searchBoxRef} className="relative min-w-0 flex-1">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+              <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
               <input
                 id="catalog-search-input"
                 type="text"
                 autoComplete="off"
+                aria-label="Buscar nos servidores disponíveis"
                 value={searchInput}
                 onFocus={() => {
                   if (searchInput.trim().length >= 2) setSuggestOpen(true);
@@ -415,8 +569,8 @@ export function CatalogView({
                     setSuggestOpen(false);
                   }
                 }}
-                placeholder="Ex: Kusuriya, Frieren, Naruto, Dublado..."
-                className="w-full rounded-lg border border-white/12 bg-[#0d0f12] py-2.5 pl-9 pr-9 text-sm text-white placeholder:text-slate-500 focus:border-[#f97316] focus:outline-none"
+                placeholder="Buscar anime nos servidores..."
+                className="w-full rounded-xl border border-white/12 bg-[#151921] py-2.5 pl-10 pr-9 text-sm text-white placeholder:text-slate-500 focus:border-[#f97316] focus:outline-none"
               />
               {(searchInput || searchResults !== null) && (
                 <button
@@ -443,7 +597,7 @@ export function CatalogView({
                   {loadingSuggestions && suggestions.length === 0 ? (
                     <div className="flex items-center gap-2 px-3.5 py-3 text-xs text-slate-400">
                       <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
-                      <span>Buscando sugestões...</span>
+                      <span>Buscando nos servidores...</span>
                     </div>
                   ) : (
                     <div className="max-h-80 divide-y divide-white/8 overflow-y-auto">
@@ -469,13 +623,13 @@ export function CatalogView({
                               {item.title}
                             </p>
                             <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
-                              <span>{item.kind === 'movie' ? 'Filme' : 'Anime'}</span>
+                              <span>{kindDisplayLabel(item.kind)}</span>
                               {item.audioType && (
                                 <span
                                   className={
                                     item.audioType === 'DUB'
-                                      ? 'text-emerald-400'
-                                      : 'text-rose-400'
+                                      ? 'font-semibold text-emerald-400'
+                                      : 'text-slate-300'
                                   }
                                 >
                                   {item.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
@@ -486,6 +640,11 @@ export function CatalogView({
                                 <span className="inline-flex items-center gap-0.5 tabular-nums text-amber-400">
                                   <Star className="h-3 w-3 fill-amber-400" />
                                   {item.rating}
+                                </span>
+                              )}
+                              {item.sourceServerName && (
+                                <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-slate-300">
+                                  {item.sourceServerName}
                                 </span>
                               )}
                             </div>
@@ -508,10 +667,11 @@ export function CatalogView({
                 </div>
               )}
             </div>
+
             <div className="flex w-full gap-2 sm:w-auto">
               <button
                 type="submit"
-                className="flex-1 shrink-0 rounded-lg bg-[#f97316] px-5 py-2.5 text-sm font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c] sm:flex-initial"
+                className="flex-1 shrink-0 rounded-xl bg-[#f97316] px-5 py-2.5 text-sm font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c] sm:flex-initial"
               >
                 Buscar
               </button>
@@ -519,8 +679,8 @@ export function CatalogView({
                 type="button"
                 disabled={loadingRandom}
                 onClick={onOpenRandom}
-                aria-label="Abrir anime aleatório"
-                className="inline-flex flex-1 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-[#0d0f12] px-3.5 py-2.5 text-sm font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white disabled:opacity-50 sm:flex-initial"
+                aria-label="Abrir título aleatório"
+                className="inline-flex flex-1 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-white/12 bg-[#151921] px-3.5 py-2.5 text-sm font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white disabled:opacity-50 sm:flex-initial"
               >
                 {loadingRandom ? (
                   <Loader2 className="h-4 w-4 animate-spin text-[#f97316]" />
@@ -530,9 +690,9 @@ export function CatalogView({
                 <span>Aleatório</span>
               </button>
             </div>
-          </div>
-        </form>
-      </section>
+          </form>
+        </section>
+      )}
 
       {/* Search Results View */}
       {searchResults !== null ? (
@@ -544,8 +704,8 @@ export function CatalogView({
               </h1>
               <p className="mt-0.5 text-xs tabular-nums text-slate-400">
                 {searching
-                  ? 'Consultando catálogo...'
-                  : `${searchResults.length} resultado(s) exibido(s)${
+                  ? 'Consultando servidores disponíveis...'
+                  : `${searchResults.length} título(s) disponível(is)${
                       searchTotalPages > 1
                         ? ` · Página ${searchPage} de ${searchTotalPages}`
                         : ''
@@ -560,7 +720,7 @@ export function CatalogView({
               }}
               className="rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white"
             >
-              Voltar ao catálogo
+              Voltar
             </button>
           </div>
 
@@ -576,7 +736,7 @@ export function CatalogView({
           ) : searchResults.length === 0 ? (
             <div className="rounded-xl border border-white/10 bg-[#151921] p-10 text-center">
               <p className="text-sm text-slate-300">
-                Nenhum título encontrado para &ldquo;{searchQuery}&rdquo;.
+                Nenhum título disponível nos servidores para &ldquo;{searchQuery}&rdquo;.
               </p>
               <button
                 type="button"
@@ -586,7 +746,7 @@ export function CatalogView({
                 }}
                 className="mt-4 rounded-lg bg-[#f97316] px-4 py-2 text-xs font-semibold text-[#0d0f12]"
               >
-                Ver lançamentos recentes
+                Voltar ao início
               </button>
             </div>
           ) : (
@@ -602,6 +762,8 @@ export function CatalogView({
                       poster: item.poster,
                       audioType: item.audioType,
                       year: item.year,
+                      rating: item.rating,
+                      sourceServerName: item.sourceServerName,
                     },
                     'portrait'
                   )
@@ -632,16 +794,29 @@ export function CatalogView({
             </>
           )}
         </section>
+      ) : activeSection === 'calendar' ? (
+        /* LiveChart.me Weekly Anime Schedule */
+        <LiveChartCalendar
+          days={weeklyCalendarDays}
+          selectedDayId={selectedCalendarDay}
+          scheduleMode={calendarScheduleMode}
+          loading={loadingWeeklyCalendar}
+          error={calendarError}
+          favorites={favorites}
+          onSelectDay={onSelectCalendarDay}
+          onChangeScheduleMode={onChangeCalendarScheduleMode}
+          onRefresh={onRefreshCalendar}
+          onOpenItem={onOpenItem}
+          onToggleFavorite={onToggleFavorite}
+        />
       ) : activeSection === 'library' ? (
-        /* Library View (New Episode Alerts, History & Favorites) */
+        /* Library View (Notifications, Favorites, Watch History) */
         <div className="space-y-10">
           <section>
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
               <div className="flex items-center gap-2">
                 <Bell className="h-4 w-4 text-[#f97316]" />
-                <h1 className="text-xl font-bold text-white">
-                  Notificações dos Favoritos
-                </h1>
+                <h1 className="text-xl font-bold text-white">Notificações dos Favoritos</h1>
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {notificationPermission !== 'unsupported' &&
@@ -659,7 +834,7 @@ export function CatalogView({
                 {notificationPermission === 'denied' && (
                   <span className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-[#151921] px-3 py-1.5 text-xs text-slate-400">
                     <Bell className="h-3.5 w-3.5 text-slate-500" />
-                    <span>Alertas apenas no app (bloqueado no navegador)</span>
+                    <span>Alertas apenas no app</span>
                   </span>
                 )}
 
@@ -674,9 +849,7 @@ export function CatalogView({
                   ) : (
                     <RefreshCw className="h-3.5 w-3.5 text-[#f97316]" />
                   )}
-                  <span>
-                    {checkingAlerts ? 'Verificando...' : 'Verificar novos episódios'}
-                  </span>
+                  <span>{checkingAlerts ? 'Verificando...' : 'Verificar novos episódios'}</span>
                 </button>
 
                 {alerts.some((a) => !a.read) && (
@@ -686,7 +859,7 @@ export function CatalogView({
                     className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white"
                   >
                     <CheckCheck className="h-3.5 w-3.5 text-emerald-400" />
-                    <span>Marcar tudo como lido</span>
+                    <span>Marcar lidas</span>
                   </button>
                 )}
               </div>
@@ -695,7 +868,7 @@ export function CatalogView({
             {alerts.length === 0 ? (
               <div className="rounded-xl border border-white/10 bg-[#151921] px-4 py-3.5 text-xs leading-relaxed text-slate-400">
                 {favorites.length === 0
-                  ? 'Favorite qualquer anime pelo coração nos cards ou pelo botão Favoritar na página do anime para receber avisos quando sair episódio novo.'
+                  ? 'Favorite qualquer título pelo coração nos cards ou na página de detalhes para receber avisos de novos episódios.'
                   : 'Nenhum episódio novo detectado desde a última verificação.'}
               </div>
             ) : (
@@ -748,7 +921,7 @@ export function CatalogView({
 
             {favorites.length === 0 ? (
               <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
-                Você ainda não favoritou nenhum anime ou filme. Use o botão de coração nos cards ou o botão Favoritar na página do anime.
+                Você ainda não favoritou nenhum título.
               </div>
             ) : (
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
@@ -785,7 +958,7 @@ export function CatalogView({
                   onClick={() => onSelectSection('releases')}
                   className="mt-4 rounded-lg bg-[#f97316] px-4 py-2 text-xs font-semibold text-[#0d0f12]"
                 >
-                  Explorar lançamentos
+                  Explorar início
                 </button>
               </div>
             ) : (
@@ -814,7 +987,13 @@ export function CatalogView({
                       audioType: null,
                     },
                     'landscape',
-                    { label: progressLabel, pct: progressPct }
+                    { label: progressLabel, pct: progressPct },
+                    {
+                      menuKey: `hist-${entry.url}`,
+                      entry,
+                      animeEpisodeCount: countAnimeEpisodesInHistory(history, entry),
+                      animeName: getHistoryEntrySeriesName(entry),
+                    }
                   );
                 })}
               </div>
@@ -844,153 +1023,206 @@ export function CatalogView({
         </div>
       ) : catalog ? (
         <>
+          {/* Home View: Available on Active Servers (like main branch, neatly organized) */}
           {activeSection === 'releases' && (
-            <section>
-              <div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
-                <div>
-                  <h1 className="text-xl font-bold text-white">
-                    Novos Lançamentos
-                  </h1>
-                  <p className="mt-0.5 text-xs text-slate-400">
-                    Toque em qualquer episódio para assistir direto no player próprio
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-1.5">
-                  {(['ALL', 'DUB', 'LEG'] as const).map((mode) => (
-                    <button
-                      key={mode}
-                      type="button"
-                      onClick={() => setAudioFilter(mode)}
-                      className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                        audioFilter === mode
-                          ? 'border-[#f97316] bg-[#f97316]/15 text-white'
-                          : 'border-white/10 bg-[#151921] text-slate-400 hover:text-white'
-                      }`}
-                    >
-                      {mode === 'ALL'
-                        ? 'Todos'
-                        : mode === 'DUB'
-                          ? 'Dublados'
-                          : 'Legendados'}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                {filterByAudio(releases).map((item) =>
-                  renderCard(item, 'landscape')
-                )}
-              </div>
-
-              {releasesPage < releasesTotalPages && (
-                <div className="mt-7 flex justify-center">
-                  <button
-                    type="button"
-                    disabled={loadingMoreReleases}
-                    onClick={onLoadMoreReleases}
-                    className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-[#151921] px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-[#f97316]/60 disabled:opacity-50"
-                  >
-                    {loadingMoreReleases ? (
-                      <Loader2 className="h-4 w-4 animate-spin text-[#f97316]" />
-                    ) : (
-                      <ChevronDown className="h-4 w-4 text-[#f97316]" />
-                    )}
-                    <span>
-                      {loadingMoreReleases
-                        ? 'Carregando episódios...'
-                        : `Carregar mais lançamentos (página ${releasesPage + 1} de ${releasesTotalPages})`}
-                    </span>
-                  </button>
-                </div>
-              )}
-            </section>
-          )}
-
-          {activeSection === 'calendar' && (
-            <section>
-              <div className="mb-5 space-y-4 border-b border-white/10 pb-4">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div>
+            <div className="space-y-10">
+              {/* Continue Watching Strip */}
+              {continueWatchingItems.length > 0 && (
+                <section>
+                  <div className="mb-4 flex items-center justify-between gap-2 border-b border-white/10 pb-2.5">
                     <div className="flex items-center gap-2">
-                      <Calendar className="h-4 w-4 text-[#f97316]" />
-                      <h1 className="text-xl font-bold text-white">
-                        Calendário Semanal
-                      </h1>
+                      <Clock className="h-4 w-4 text-[#f97316]" />
+                      <h2 className="text-base font-bold text-white">Continuar Assistindo</h2>
                     </div>
-                    <p className="mt-0.5 text-xs text-slate-400">
-                      Séries em exibição semanal — filtre por dia da semana e abra para escolher o episódio
-                    </p>
+                    <button
+                      type="button"
+                      onClick={() => onSelectSection('library')}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#fb923c] hover:underline"
+                    >
+                      <span>Ver histórico</span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
                   </div>
-
-                  {loadingWeeklyCalendar && (
-                    <span className="inline-flex items-center gap-1.5 text-xs text-slate-400">
-                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
-                      <span>Atualizando semana...</span>
-                    </span>
-                  )}
-                </div>
-
-                {effectiveCalendarDays.length > 1 && (
-                  <div
-                    role="tablist"
-                    aria-label="Dias da semana"
-                    className="flex flex-wrap items-center gap-1.5"
-                  >
-                    {effectiveCalendarDays.map((day) => {
-                      const active = activeCalendarDay?.id === day.id;
-                      return (
-                        <button
-                          key={day.id}
-                          type="button"
-                          role="tab"
-                          aria-selected={active}
-                          onClick={() => onSelectCalendarDay(day.id)}
-                          className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-                            active
-                              ? 'border-[#f97316] bg-[#f97316]/15 text-white'
-                              : 'border-white/10 bg-[#151921] text-slate-400 hover:text-white'
-                          }`}
-                        >
-                          {day.label}
-                          <span className="ml-1.5 tabular-nums opacity-75">
-                            ({day.items.length})
-                          </span>
-                        </button>
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                    {continueWatchingItems.map((entry) => {
+                      const pos = entry.positionSec ?? 0;
+                      const dur = entry.durationSec ?? 0;
+                      const pct = dur > 0 ? Math.min(99, (pos / dur) * 100) : 15;
+                      return renderCard(
+                        {
+                          id: `cw-${entry.url}`,
+                          title: entry.title,
+                          url: entry.url,
+                          kind: entry.kind,
+                          poster: entry.poster,
+                          audioType: null,
+                        },
+                        'landscape',
+                        { label: `Parou em ${formatPlaybackTimestamp(pos)}`, pct },
+                        {
+                          menuKey: `cw-${entry.url}`,
+                          entry,
+                          animeEpisodeCount: countAnimeEpisodesInHistory(history, entry),
+                          animeName: getHistoryEntrySeriesName(entry),
+                        }
                       );
                     })}
                   </div>
-                )}
-              </div>
-
-              {loadingWeeklyCalendar && !activeCalendarDay ? (
-                <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                  {Array.from({ length: 10 }).map((_, i) => (
-                    <div
-                      key={i}
-                      className="aspect-[2/3] animate-pulse rounded-xl border border-white/8 bg-[#151921]"
-                    />
-                  ))}
-                </div>
-              ) : !activeCalendarDay || activeCalendarDay.items.length === 0 ? (
-                <div className="rounded-xl border border-white/10 bg-[#151921] p-10 text-center text-sm text-slate-400">
-                  Nenhum anime listado para este dia no momento.
-                </div>
-              ) : (
-                <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                  {activeCalendarDay.items.map((item) => renderCard(item, 'portrait'))}
-                </div>
+                </section>
               )}
-            </section>
+
+              {/* New Episode Releases from Active Servers */}
+              <section>
+                <div className="mb-5 flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
+                  <div>
+                    <h1 className="text-xl font-bold text-white">Novos Lançamentos</h1>
+                    <p className="mt-0.5 text-xs text-slate-400">
+                      Episódios disponíveis nos servidores — toque para assistir direto no player
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    {(['ALL', 'DUB', 'LEG'] as const).map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setAudioFilter(mode)}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                          audioFilter === mode
+                            ? 'border-[#f97316] bg-[#f97316]/15 text-white'
+                            : 'border-white/10 bg-[#151921] text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {mode === 'ALL'
+                          ? 'Todos'
+                          : mode === 'DUB'
+                            ? 'Dublados'
+                            : 'Legendados'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {filterByAudio(releases).length === 0 ? (
+                  <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
+                    Nenhum episódio encontrado para o filtro selecionado.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                    {filterByAudio(releases).map((item) => renderCard(item, 'landscape'))}
+                  </div>
+                )}
+
+                {releasesPage < releasesTotalPages && (
+                  <div className="mt-7 flex justify-center">
+                    <button
+                      type="button"
+                      disabled={loadingMoreReleases}
+                      onClick={onLoadMoreReleases}
+                      className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-[#151921] px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-[#f97316]/60 disabled:opacity-50"
+                    >
+                      {loadingMoreReleases ? (
+                        <Loader2 className="h-4 w-4 animate-spin text-[#f97316]" />
+                      ) : (
+                        <ChevronDown className="h-4 w-4 text-[#f97316]" />
+                      )}
+                      <span>
+                        {loadingMoreReleases
+                          ? 'Carregando episódios...'
+                          : `Carregar mais lançamentos (página ${releasesPage + 1} de ${releasesTotalPages})`}
+                      </span>
+                    </button>
+                  </div>
+                )}
+              </section>
+
+              {/* Recent Animes Available on Servers */}
+              {catalog.animes.length > 0 && (
+                <section>
+                  <div className="mb-4 flex items-center justify-between gap-2 border-b border-white/10 pb-2.5">
+                    <div className="flex items-center gap-2">
+                      <Tv className="h-4 w-4 text-[#f97316]" />
+                      <h2 className="text-lg font-bold text-white">Animes Recentes</h2>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectArchiveCategory('animes');
+                        onSelectSection('catalog');
+                      }}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#fb923c] hover:underline"
+                    >
+                      <span>Ver catálogo</span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                    {catalog.animes.slice(0, 10).map((item) => renderCard(item, 'portrait'))}
+                  </div>
+                </section>
+              )}
+
+              {/* Recent Movies Available on Servers */}
+              {catalog.movies.length > 0 && (
+                <section>
+                  <div className="mb-4 flex items-center justify-between gap-2 border-b border-white/10 pb-2.5">
+                    <div className="flex items-center gap-2">
+                      <Film className="h-4 w-4 text-[#f97316]" />
+                      <h2 className="text-lg font-bold text-white">Filmes Recentes</h2>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectArchiveCategory('movies');
+                        onSelectSection('catalog');
+                      }}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#fb923c] hover:underline"
+                    >
+                      <span>Ver filmes</span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                    {catalog.movies.slice(0, 10).map((item) => renderCard(item, 'portrait'))}
+                  </div>
+                </section>
+              )}
+
+              {/* Server Series */}
+              {catalog.series && catalog.series.length > 0 && (
+                <section>
+                  <div className="mb-4 flex items-center justify-between gap-2 border-b border-white/10 pb-2.5">
+                    <div className="flex items-center gap-2">
+                      <Tv className="h-4 w-4 text-emerald-400" />
+                      <h2 className="text-lg font-bold text-white">Séries nos Servidores</h2>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onSelectArchiveCategory('series');
+                        onSelectSection('catalog');
+                      }}
+                      className="inline-flex items-center gap-1 text-xs font-medium text-[#fb923c] hover:underline"
+                    >
+                      <span>Ver séries</span>
+                      <ArrowRight className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                    {catalog.series.slice(0, 10).map((item) => renderCard(item, 'portrait'))}
+                  </div>
+                </section>
+              )}
+            </div>
           )}
 
+          {/* Catalog View: Clean Server Archive (like main branch, uncluttered) */}
           {activeSection === 'catalog' && (
-            <section className="space-y-8">
-              <div className="space-y-4 border-b border-white/10 pb-4">
+            <section className="space-y-7">
+              <div className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <h1 className="text-xl font-bold text-white">Animes &amp; Filmes</h1>
+                    <h1 className="text-xl font-bold text-white">Catálogo</h1>
                     <p className="mt-0.5 text-xs tabular-nums text-slate-400">
                       {hasActiveFilter
                         ? `${
@@ -1005,15 +1237,15 @@ export function CatalogView({
                               : ''
                           }`
                         : displayedArchive.totalPages > 1
-                          ? `Exibindo ${displayedArchive.items.length} título(s) · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
-                          : 'Navegue por categoria, gênero, ano ou índice alfabético A–Z'}
+                          ? `Disponíveis nos servidores · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
+                          : 'Animes disponíveis nos servidores integrados'}
                     </p>
                   </div>
 
+                  {/* Category Tabs */}
                   <div className="flex flex-wrap items-center gap-1.5">
-                    {ARCHIVE_TABS.map((tab) => {
+                    {archiveTabs.map((tab) => {
                       const active = !hasActiveFilter && archiveCategory === tab.id;
-                      const count = archiveState[tab.id].items.length;
                       return (
                         <button
                           key={tab.id}
@@ -1022,90 +1254,104 @@ export function CatalogView({
                           className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                             active
                               ? 'border-[#f97316] bg-[#f97316]/15 text-white'
-                              : 'border-white/10 bg-[#151921] text-slate-400 hover:text-white'
+                              : 'border-white/10 bg-[#0d0f12] text-slate-400 hover:text-white'
                           }`}
                         >
                           {tab.label}
-                          {count > 0 ? ` (${count})` : ''}
                         </button>
                       );
                     })}
                   </div>
                 </div>
 
-                {/* Genre & Year Filter Bar */}
-                {(catalogFilters.genres.length > 0 || catalogFilters.years.length > 0 || hasActiveFilter) && (
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    {catalogFilters.genres.length > 0 && (
-                      <select
-                        aria-label="Filtrar por gênero"
-                        value={selectedGenre}
-                        onChange={(e) => onSelectGenre(e.target.value)}
-                        className="rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
-                      >
-                        <option value="">Por Gênero</option>
-                        {catalogFilters.genres.map((g) => (
-                          <option key={g.slug} value={g.slug}>
-                            {g.label}
-                          </option>
-                        ))}
-                      </select>
-                    )}
+                {/* Compact Filter Row + Collapsible A-Z Index */}
+                <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-white/8 pt-3.5">
+                  {catalogFilters.genres.length > 0 && (
+                    <select
+                      aria-label="Filtrar por gênero"
+                      value={selectedGenre}
+                      onChange={(e) => onSelectGenre(e.target.value)}
+                      className="rounded-lg border border-white/12 bg-[#0d0f12] px-3 py-1.5 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
+                    >
+                      <option value="">Gênero</option>
+                      {catalogFilters.genres.map((g) => (
+                        <option key={g.slug} value={g.slug}>
+                          {g.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
 
-                    {catalogFilters.years.length > 0 && (
-                      <select
-                        aria-label="Filtrar por ano"
-                        value={selectedYear}
-                        onChange={(e) => onSelectYear(e.target.value)}
-                        className="rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
-                      >
-                        <option value="">Por Ano</option>
-                        {catalogFilters.years.map((y) => (
-                          <option key={y.slug} value={y.slug}>
-                            {y.label}
-                          </option>
-                        ))}
-                      </select>
-                    )}
+                  {catalogFilters.years.length > 0 && (
+                    <select
+                      aria-label="Filtrar por ano"
+                      value={selectedYear}
+                      onChange={(e) => onSelectYear(e.target.value)}
+                      className="rounded-lg border border-white/12 bg-[#0d0f12] px-3 py-1.5 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none"
+                    >
+                      <option value="">Ano</option>
+                      {catalogFilters.years.map((y) => (
+                        <option key={y.slug} value={y.slug}>
+                          {y.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
 
-                    {hasActiveFilter && (
-                      <button
-                        type="button"
-                        onClick={onClearCatalogFilters}
-                        className="inline-flex items-center gap-1 rounded-lg border border-[#f97316]/40 bg-[#f97316]/12 px-3 py-2 text-xs font-medium text-[#fb923c] hover:bg-[#f97316]/20"
-                      >
-                        <X className="h-3.5 w-3.5" />
-                        <span>Limpar filtros</span>
-                      </button>
-                    )}
+                  <button
+                    type="button"
+                    onClick={() => setGlossaryExpanded((prev) => !prev)}
+                    aria-expanded={glossaryExpanded}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+                      glossaryExpanded || selectedGlossary
+                        ? 'border-[#f97316]/50 bg-[#f97316]/12 text-[#fb923c]'
+                        : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    <SlidersHorizontal className="h-3.5 w-3.5" />
+                    <span>{selectedGlossary ? `Índice: ${selectedGlossary}` : 'Índice A–Z'}</span>
+                  </button>
+
+                  {hasActiveFilter && (
+                    <button
+                      type="button"
+                      onClick={onClearCatalogFilters}
+                      className="inline-flex items-center gap-1 rounded-lg border border-[#f97316]/40 bg-[#f97316]/12 px-3 py-1.5 text-xs font-medium text-[#fb923c] hover:bg-[#f97316]/20"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                      <span>Limpar filtros</span>
+                    </button>
+                  )}
+                </div>
+
+                {glossaryExpanded && (
+                  <div
+                    className="mt-3 flex flex-wrap items-center gap-1 border-t border-white/8 pt-3"
+                    aria-label="Navegação alfabética A-Z"
+                  >
+                    {GLOSSARY_TERMS.map((letter) => {
+                      const active = selectedGlossary === letter;
+                      return (
+                        <button
+                          key={letter}
+                          type="button"
+                          onClick={() => onSelectGlossary(active ? '' : letter)}
+                          aria-pressed={active}
+                          className={`flex h-7 min-w-[28px] items-center justify-center rounded-md border px-1.5 text-xs font-semibold transition-colors ${
+                            active
+                              ? 'border-[#f97316] bg-[#f97316] text-[#0d0f12]'
+                              : 'border-white/10 bg-[#0d0f12] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                          }`}
+                        >
+                          {letter}
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
-
-                {/* Alphabetical A-Z Glossary Strip */}
-                <div className="flex flex-wrap items-center gap-1" aria-label="Navegação alfabética A-Z">
-                  <span className="mr-1 text-[11px] font-medium text-slate-400">A–Z:</span>
-                  {GLOSSARY_TERMS.map((letter) => {
-                    const active = selectedGlossary === letter;
-                    return (
-                      <button
-                        key={letter}
-                        type="button"
-                        onClick={() => onSelectGlossary(active ? '' : letter)}
-                        aria-pressed={active}
-                        className={`flex h-7 min-w-[28px] items-center justify-center rounded-md border px-1.5 text-xs font-semibold transition-colors ${
-                          active
-                            ? 'border-[#f97316] bg-[#f97316] text-[#0d0f12]'
-                            : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
-                        }`}
-                      >
-                        {letter}
-                      </button>
-                    );
-                  })}
-                </div>
               </div>
 
-              {/* Em Destaque Strip on Animes Tab */}
+              {/* Featured Animes Strip */}
               {!hasActiveFilter &&
                 archiveCategory === 'animes' &&
                 featuredAnimes.length > 0 && (
@@ -1120,7 +1366,7 @@ export function CatalogView({
                   </div>
                 )}
 
-              {/* Filmes em Destaque Widescreen Slider Cards on Filmes Tab */}
+              {/* Featured Movies Strip */}
               {!hasActiveFilter &&
                 archiveCategory === 'movies' &&
                 sliderMovies.length > 0 && (
@@ -1129,8 +1375,8 @@ export function CatalogView({
                       <Film className="h-4 w-4 text-[#f97316]" />
                       <h2 className="text-base font-semibold text-white">Filmes em Destaque</h2>
                     </div>
-                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
-                      {sliderMovies.slice(0, 5).map((movie) => {
+                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                      {sliderMovies.slice(0, 6).map((movie) => {
                         const favItem: CatalogMediaItem = {
                           id: movie.id,
                           title: movie.title,
@@ -1158,12 +1404,12 @@ export function CatalogView({
                                 className="w-full border-b border-white/8"
                               />
                               <div className="p-3">
-                                <h3 className="line-clamp-1 text-sm font-semibold text-white group-hover:text-[#f97316]">
+                                <h3 className="line-clamp-1 text-sm font-semibold text-white group-hover:text-[#fb923c]">
                                   {movie.title}
                                 </h3>
                                 {movie.year && (
-                                  <p className="mt-1 text-xs tabular-nums text-slate-400">
-                                    {movie.year} · Filme
+                                  <p className="mt-0.5 text-xs tabular-nums text-slate-400">
+                                    {movie.year}
                                   </p>
                                 )}
                               </div>
@@ -1186,7 +1432,7 @@ export function CatalogView({
                                   : 'border-white/15 bg-[#0d0f12]/75 text-slate-200 hover:border-rose-400/70 hover:text-rose-300'
                               }`}
                             >
-                              <Heart className={`h-4 w-4 ${favActive ? 'fill-white' : ''}`} />
+                              <Heart className={`h-3.5 w-3.5 ${favActive ? 'fill-white' : ''}`} />
                             </button>
                           </div>
                         );
@@ -1210,16 +1456,14 @@ export function CatalogView({
                 </div>
               ) : (
                 <div>
-                  <h2 className="mb-3 text-base font-semibold text-white">
+                  <h2 className="mb-3.5 text-base font-semibold text-white">
                     {hasActiveFilter
                       ? selectedGlossary
                         ? `Títulos com "${selectedGlossary}"`
                         : selectedGenre
-                          ? `Animes de ${activeGenreLabel || selectedGenre}`
+                          ? `Gênero: ${activeGenreLabel || selectedGenre}`
                           : `Lançamentos de ${selectedYear}`
-                      : archiveCategory === 'movies'
-                        ? 'Catálogo de Filmes'
-                        : 'Adicionado recentemente'}
+                      : archiveTabs.find((t) => t.id === archiveCategory)?.label || 'Catálogo'}
                   </h2>
                   <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
                     {displayedArchive.items.map((item) => renderCard(item, 'portrait'))}

@@ -1,7 +1,7 @@
 <?xml version='1.0' encoding='utf-8'?>
 <resources>
-    <string name="app_name">TopAnimes</string>
-    <string name="title_activity_main">TopAnimes</string>
+    <string name="app_name">Anisync</string>
+    <string name="title_activity_main">Anisync</string>
     <string name="package_name">com.topanimes.player</string>
     <string name="custom_url_scheme">com.topanimes.player</string>
 </resources>

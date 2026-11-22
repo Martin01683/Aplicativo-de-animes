@@ -1,17 +1,21 @@
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Bell,
   CheckCircle2,
+  Database,
   Download,
   ExternalLink,
   Film,
+  Globe,
+  KeyRound,
   Loader2,
   RefreshCw,
   RotateCcw,
+  Server,
   Trash2,
   X,
 } from 'lucide-react';
-import type { ApkDownloadProgressEvent } from '../lib/apiClient';
+import { apiFetch, type ApkDownloadProgressEvent } from '../lib/apiClient';
 import {
   formatBytes,
   formatShortSha,
@@ -33,10 +37,17 @@ import {
   type DefaultAudioFilter,
   type EpisodeCheckIntervalMinutes,
 } from '../lib/settings';
+import {
+  EPISODE_SOURCE_KIND_META,
+  type EpisodeSourceConfig,
+  type SourceTestResult,
+} from '../lib/sources/types';
+import type { CatalogSourceCredentials } from '../lib/types';
 import type { NavSection } from './Header';
 
 interface SettingsModalProps {
   open: boolean;
+  focusSection?: 'sources' | 'catalog' | 'general';
   onClose: () => void;
   settings: AppSettings;
   settingsMeta: AppSettingsMeta;
@@ -104,6 +115,7 @@ function ToggleSwitch({ id, checked, onChange, disabled = false, label }: Toggle
 
 export function SettingsModal({
   open,
+  focusSection = 'general',
   onClose,
   settings,
   settingsMeta,
@@ -132,6 +144,11 @@ export function SettingsModal({
   onClearHistory,
   onClearAlerts,
 }: SettingsModalProps) {
+  const sourcesSectionRef = useRef<HTMLElement>(null);
+  const [showCredsPanel, setShowCredsPanel] = useState(false);
+  const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
+  const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
+
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
@@ -142,6 +159,12 @@ export function SettingsModal({
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, onClose]);
+
+  useEffect(() => {
+    if (open && focusSection === 'sources') {
+      sourcesSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [open, focusSection]);
 
   if (!open) return null;
 
@@ -166,6 +189,41 @@ export function SettingsModal({
     }
   };
 
+  const handleTestSource = async (source: EpisodeSourceConfig) => {
+    setTestingSourceId(source.id);
+    try {
+      const res = await apiFetch('/api/sources/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source }),
+      });
+      const data = (await res.json()) as SourceTestResult;
+      setTestResults((prev) => ({ ...prev, [source.id]: data }));
+    } catch (err) {
+      setTestResults((prev) => ({
+        ...prev,
+        [source.id]: {
+          ok: false,
+          sourceId: source.id,
+          sourceName: source.name,
+          message: err instanceof Error ? err.message : 'Falha ao testar fonte.',
+          latencyMs: 0,
+        },
+      }));
+    } finally {
+      setTestingSourceId(null);
+    }
+  };
+
+  const updateCredentialField = (key: keyof CatalogSourceCredentials, value: string) => {
+    onUpdateSettings({
+      catalogCredentials: {
+        ...settings.catalogCredentials,
+        [key]: value.trim() || undefined,
+      },
+    });
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 backdrop-blur-sm sm:items-center sm:p-4"
@@ -182,10 +240,10 @@ export function SettingsModal({
         <div className="flex items-center justify-between gap-4 border-b border-white/10 px-5 py-4 sm:px-6">
           <div>
             <h2 id="settings-modal-title" className="text-lg font-bold text-white">
-              Configurações do Aplicativo
+              Configurações do Anisync
             </h2>
             <p className="mt-0.5 text-xs text-slate-400">
-              Frequência de busca, atualizações do GitHub e preferências de reprodução
+              Servidores de vídeo, metadados TheTVDB, calendário LiveChart.me e player
             </p>
           </div>
           <button
@@ -200,7 +258,172 @@ export function SettingsModal({
 
         {/* Scrollable Body */}
         <div className="flex-1 space-y-7 overflow-y-auto px-5 py-5 sm:px-6 sm:py-6">
-          {/* 1. Frequência de Busca de Novidades */}
+          {/* 1. Fontes de Episódios e Servidores (Sites & Nuvem) */}
+          <section
+            ref={sourcesSectionRef}
+            aria-labelledby="settings-episode-sources-heading"
+            className="space-y-4"
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Server className="h-4 w-4 text-[#f97316]" />
+                <h3 id="settings-episode-sources-heading" className="text-base font-semibold text-white">
+                  Servidores &amp; Fontes de Vídeo
+                </h3>
+              </div>
+            </div>
+
+            <p className="text-xs leading-relaxed text-slate-400">
+              O Início, o Catálogo, a Busca e os Episódios consultam os servidores integrados abaixo.
+            </p>
+
+            {/* Configured Episode Sources List */}
+            <div className="divide-y divide-white/8 rounded-xl border border-white/10 bg-[#0d0f12]/70">
+              {settings.episodeSources.map((src) => {
+                const testResult = testResults[src.id];
+                return (
+                  <div key={src.id} className="space-y-2 px-4 py-3.5">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="inline-flex items-center gap-1 text-sm font-semibold text-white">
+                            <Globe className="h-3.5 w-3.5 text-[#f97316]" />
+                            {src.name}
+                          </span>
+                          <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
+                            {EPISODE_SOURCE_KIND_META[src.kind]?.label || src.kind}
+                          </span>
+                          {src.builtIn && (
+                            <span className="rounded bg-[#f97316]/15 px-1.5 py-0.5 text-[10px] font-medium text-[#fb923c]">
+                              Integrado
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-1 truncate font-mono text-[11px] text-slate-400">
+                          {src.baseUrl}
+                        </p>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-slate-400">
+                          {src.supportsMedia.map((m) => (
+                            <span key={m} className="rounded border border-white/10 px-1.5 py-0.5">
+                              {m === 'anime' ? 'Animes' : m === 'series' ? 'Séries' : 'Filmes'}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="flex shrink-0 items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={testingSourceId === src.id}
+                          onClick={() => void handleTestSource(src)}
+                          className="rounded-md border border-white/10 bg-[#151921] px-2 py-1 text-[11px] font-medium text-slate-300 hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
+                        >
+                          {testingSourceId === src.id ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                          ) : (
+                            'Testar'
+                          )}
+                        </button>
+                      </div>
+                    </div>
+
+                    {testResult && (
+                      <p
+                        className={`text-[11px] font-medium ${
+                          testResult.ok ? 'text-emerald-300' : 'text-amber-300'
+                        }`}
+                      >
+                        {testResult.message}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          {/* 2. Metadados (TheTVDB) & Calendário (LiveChart.me) */}
+          <section aria-labelledby="settings-catalog-sources-heading" className="space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Database className="h-4 w-4 text-[#f97316]" />
+                <h3 id="settings-catalog-sources-heading" className="text-base font-semibold text-white">
+                  Informações &amp; Calendário
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowCredsPanel((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:border-[#f97316]/50 hover:text-white"
+              >
+                <KeyRound className="h-3.5 w-3.5 text-[#f97316]" />
+                <span>{showCredsPanel ? 'Ocultar chave TheTVDB' : 'Chave TheTVDB (opcional)'}</span>
+              </button>
+            </div>
+
+            <div className="divide-y divide-white/8 rounded-xl border border-white/10 bg-[#0d0f12]/70">
+              <div className="flex items-center justify-between gap-4 px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-slate-200">TheTVDB</span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Sinopses em PT-BR, estúdios, gêneros, temporadas e detalhes de animes.
+                  </span>
+                </div>
+                <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
+                  Ativo
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-4 px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-slate-200">LiveChart.me</span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Calendário semanal com horários, contagem regressiva, Dub/Sub e plataformas oficiais.
+                  </span>
+                </div>
+                <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
+                  Ativo
+                </span>
+              </div>
+            </div>
+
+            {showCredsPanel && (
+              <div className="space-y-3 rounded-xl border border-white/10 bg-[#0d0f12]/80 p-4">
+                <p className="text-xs leading-relaxed text-slate-400">
+                  O TheTVDB já funciona automaticamente sem chave. Caso possua uma chave pessoal da API v4 do TheTVDB, informe abaixo para consultas autenticadas:
+                </p>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <label htmlFor="cred-tvdb-key" className="mb-1 block text-xs font-medium text-slate-300">
+                      TheTVDB v4 API Key
+                    </label>
+                    <input
+                      id="cred-tvdb-key"
+                      type="password"
+                      value={settings.catalogCredentials.tvdbApiKey || ''}
+                      onChange={(e) => updateCredentialField('tvdbApiKey', e.target.value)}
+                      placeholder="Opcional"
+                      className="w-full rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs text-white focus:border-[#f97316] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="cred-tvdb-pin" className="mb-1 block text-xs font-medium text-slate-300">
+                      TheTVDB Subscriber PIN
+                    </label>
+                    <input
+                      id="cred-tvdb-pin"
+                      type="password"
+                      value={settings.catalogCredentials.tvdbPin || ''}
+                      onChange={(e) => updateCredentialField('tvdbPin', e.target.value)}
+                      placeholder="Opcional"
+                      className="w-full rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs text-white focus:border-[#f97316] focus:outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </section>
+
+          {/* 3. Frequência de Busca de Novidades */}
           <section aria-labelledby="settings-news-heading" className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center gap-2">
@@ -223,7 +446,7 @@ export function SettingsModal({
                 Intervalo de verificação automática de novos episódios
               </label>
               <p className="text-xs text-slate-400">
-                Define de quanto em quanto tempo o aplicativo consulta o catálogo e os animes favoritados para detectar episódios recém-lançados.
+                Define de quanto em quanto tempo o Anisync consulta o catálogo e seus favoritos para detectar episódios recém-lançados.
               </p>
               <div className="grid grid-cols-3 gap-2 pt-1 sm:grid-cols-6">
                 {EPISODE_CHECK_INTERVAL_OPTIONS.map((opt) => {
@@ -324,7 +547,7 @@ export function SettingsModal({
             </div>
           </section>
 
-          {/* 2. Atualizações do Sistema (GitHub Releases) */}
+          {/* 4. Atualizações do Sistema (GitHub Releases) */}
           <section aria-labelledby="settings-updates-heading" className="space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center gap-2">
@@ -412,8 +635,8 @@ export function SettingsModal({
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
                     {isNativeAndroid
-                      ? 'Baixa o TopAnimes.apk oficial no app, verifica SHA-256 e assinatura e inicia o instalador do sistema.'
-                      : 'Inicia automaticamente o download do novo TopAnimes.apk publicado no GitHub.'}
+                      ? 'Baixa o Anisync.apk oficial no app, verifica SHA-256 e assinatura e inicia o instalador do sistema.'
+                      : 'Inicia automaticamente o download do novo Anisync.apk publicado no GitHub.'}
                   </span>
                 </label>
                 <ToggleSwitch
@@ -623,12 +846,12 @@ export function SettingsModal({
             </div>
           </section>
 
-          {/* 3. Catálogo, Player e Dados Locais */}
+          {/* 5. Preferências de Reprodução e Dados Locais */}
           <section aria-labelledby="settings-player-heading" className="space-y-4">
             <div className="flex items-center gap-2 border-b border-white/8 pb-2.5">
               <Film className="h-4 w-4 text-[#f97316]" />
               <h3 id="settings-player-heading" className="text-base font-semibold text-white">
-                Catálogo e Reprodução
+                Preferências e Reprodução
               </h3>
             </div>
 
@@ -636,7 +859,7 @@ export function SettingsModal({
               <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
                 <label htmlFor="default-section-select" className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
-                    Aba inicial ao abrir o aplicativo
+                    Aba inicial ao abrir o Anisync
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
                     Escolha qual tela abrir primeiro ao iniciar.
@@ -650,9 +873,9 @@ export function SettingsModal({
                   }
                   className="min-h-[40px] w-full shrink-0 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 focus:border-[#f97316] focus:outline-none sm:w-auto"
                 >
-                  <option value="releases">Lançamentos</option>
+                  <option value="releases">Início</option>
                   <option value="calendar">Calendário</option>
-                  <option value="catalog">Animes &amp; Filmes</option>
+                  <option value="catalog">Catálogo</option>
                   <option value="library">Minha Lista</option>
                 </select>
               </div>
@@ -660,10 +883,10 @@ export function SettingsModal({
               <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
-                    Filtro padrão de áudio em Lançamentos
+                    Preferência de áudio nas fontes
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
-                    Filtra automaticamente os episódios exibidos na tela inicial.
+                    Prioriza servidores dublados ou legendados quando disponíveis nas fontes.
                   </span>
                 </div>
                 <div className="grid w-full shrink-0 grid-cols-3 gap-1 rounded-lg border border-white/10 bg-[#151921] p-1 sm:flex sm:w-auto sm:items-center">

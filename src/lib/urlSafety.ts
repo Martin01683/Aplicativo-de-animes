@@ -1,4 +1,5 @@
 const TOPANIMES_HOSTS = new Set(['topanimes.net', 'www.topanimes.net']);
+const HINATASOUL_HOSTS = new Set(['hinatasoul.com', 'www.hinatasoul.com']);
 
 const IPV4_PRIVATE_PATTERNS = [
   /^0\./,
@@ -75,6 +76,38 @@ export function normalizeTopAnimesUrl(rawUrl: string, fallbackBase = 'https://to
   } catch {
     return '';
   }
+}
+
+export function isHinataSoulUrl(rawUrl: string): boolean {
+  if (!isSafeExternalHttpUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    return HINATASOUL_HOSTS.has(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeHinataSoulUrl(
+  rawUrl: string,
+  fallbackBase = 'https://www.hinatasoul.com'
+): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const trimmed = rawUrl.trim();
+  if (!trimmed || trimmed === '#' || trimmed.startsWith('javascript:')) return '';
+  try {
+    const resolved = new URL(trimmed, fallbackBase);
+    if (!isHinataSoulUrl(resolved.href)) return '';
+    const cleanPath =
+      resolved.pathname.length > 1 ? resolved.pathname.replace(/\/+$/, '') : resolved.pathname;
+    return `https://www.hinatasoul.com${cleanPath}${resolved.search}`;
+  } catch {
+    return '';
+  }
+}
+
+export function isSupportedServerSiteUrl(rawUrl: string): boolean {
+  return isTopAnimesUrl(rawUrl) || isHinataSoulUrl(rawUrl);
 }
 
 /**

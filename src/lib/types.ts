@@ -1,15 +1,50 @@
 export type AudioType = 'DUB' | 'LEG' | null;
-export type MediaKind = 'episode' | 'anime' | 'movie';
+export type MediaKind = 'episode' | 'anime' | 'series' | 'movie';
+export type CatalogSourceId = 'thetvdb' | 'livechart' | 'server';
+export type LiveChartScheduleMode = 'streams' | 'dub' | 'jp';
+
 export type CatalogArchiveCategory =
   | 'animes'
   | 'movies'
+  | 'series'
   | 'dublado'
   | 'legendado'
   | 'donghua'
   | 'cartoon'
   | 'live-action';
+
 export type StreamFormat = 'hls' | 'mp4' | 'unknown';
 export type VlcPlatform = 'windows' | 'mac' | 'linux';
+
+export interface ExternalMediaIds {
+  tvdbId?: number;
+  tvdbSlug?: string;
+  livechartId?: number;
+  imdbId?: string;
+}
+
+export interface CatalogSourceCredentials {
+  tvdbApiKey?: string;
+  tvdbPin?: string;
+}
+
+export interface CatalogPreferences {
+  credentials?: CatalogSourceCredentials;
+}
+
+export interface ScheduleReleaseInfo {
+  livechartId: number;
+  releaseLabel: string;
+  hasDub: boolean;
+  hasSub: boolean;
+  isJapaneseBroadcast: boolean;
+  serviceName?: string;
+  serviceUrl?: string;
+  totalEpisodes?: number;
+  englishTitle?: string;
+  nativeTitle?: string;
+  format?: string;
+}
 
 export interface CatalogMediaItem {
   id: string;
@@ -24,11 +59,21 @@ export interface CatalogMediaItem {
   year?: string;
   isHiatus?: boolean;
   statusBadge?: string;
+  catalogSource?: CatalogSourceId;
+  sourceServerName?: string;
+  externalIds?: ExternalMediaIds;
+  mediaFormat?: string;
+  synopsis?: string;
+  genres?: string[];
+  airingAt?: number;
+  scheduleMeta?: ScheduleReleaseInfo;
 }
 
 export interface CalendarDaySection {
   id: string;
   label: string;
+  dateIso?: string;
+  dateLabel?: string;
   isToday: boolean;
   items: CatalogMediaItem[];
 }
@@ -36,7 +81,9 @@ export interface CalendarDaySection {
 export interface WeeklyCalendarResponse {
   days: CalendarDaySection[];
   sourceMode: 'live' | 'snapshot';
+  scheduleMode?: LiveChartScheduleMode;
   fetchedAt: string;
+  catalogSources?: CatalogSourceId[];
 }
 
 export interface GlossaryResponse {
@@ -64,6 +111,10 @@ export interface SliderMovieItem {
   url: string;
   backdrop: string;
   year?: string;
+  kind?: MediaKind;
+  rating?: string;
+  catalogSource?: CatalogSourceId;
+  externalIds?: ExternalMediaIds;
 }
 
 export interface HomeCatalog {
@@ -71,6 +122,8 @@ export interface HomeCatalog {
   releases: CatalogMediaItem[];
   animes: CatalogMediaItem[];
   movies: CatalogMediaItem[];
+  series?: CatalogMediaItem[];
+  sourcesUsed?: CatalogSourceId[];
   sourceMode: 'live' | 'snapshot';
   fetchedAt: string;
 }
@@ -82,6 +135,7 @@ export interface PaginatedCatalogResponse {
   filters?: CatalogFilters;
   currentPage: number;
   totalPages: number;
+  catalogSource?: CatalogSourceId | 'all';
   sourceMode?: 'live' | 'snapshot';
 }
 
@@ -95,6 +149,10 @@ export interface SearchResultItem {
   rating?: string;
   excerpt?: string;
   audioType: AudioType;
+  catalogSource?: CatalogSourceId;
+  sourceServerName?: string;
+  externalIds?: ExternalMediaIds;
+  mediaFormat?: string;
 }
 
 export interface SearchSuggestResponse {
@@ -120,13 +178,29 @@ export interface AnimeEpisodeLink {
   url: string;
   date?: string;
   thumb?: string;
+  overview?: string;
+  durationMinutes?: number;
+  rating?: string;
+}
+
+export interface ExternalDatabaseLinkItem {
+  source: CatalogSourceId;
+  label: string;
+  url: string;
 }
 
 export interface AnimeDetails {
   title: string;
   alternativeTitle?: string;
+  alternativeTitles?: string[];
   originalTitle?: string;
   url: string;
+  kind?: MediaKind;
+  catalogSource?: CatalogSourceId;
+  sourceServerName?: string;
+  externalIds?: ExternalMediaIds;
+  enrichmentSources?: CatalogSourceId[];
+  externalLinks?: ExternalDatabaseLinkItem[];
   poster: string;
   backdrop: string;
   synopsis: string;
@@ -139,18 +213,47 @@ export interface AnimeDetails {
   seasonsCount?: string;
   episodesTotalCount?: string;
   averageDuration?: string;
+  status?: string;
+  studio?: string;
+  network?: string;
+  originalCountry?: string;
+  originalLanguage?: string;
   myAnimeListUrl?: string;
   allSeasonsUrl?: string;
   genres: string[];
   audioType: AudioType;
   episodes: AnimeEpisodeLink[];
+  relations?: CatalogMediaItem[];
 }
+
+export type MediaDetails = AnimeDetails;
+
+export type PlayerProviderKind =
+  | 'kojima'
+  | 'zuplay'
+  | 'vidstreaming'
+  | 'playerjs'
+  | 'hinatasoul'
+  | 'abyss'
+  | 'blogger'
+  | 'direct'
+  | 'other';
 
 export interface PlayerOption {
   nume: string;
   label: string;
   embedUrl: string;
-  providerKind: 'kojima' | 'zuplay' | 'vidstreaming' | 'playerjs' | 'abyss' | 'blogger' | 'other';
+  providerKind: PlayerProviderKind;
+  sourceId?: string;
+  sourceName?: string;
+  sourceKind?: string;
+  audioType?: AudioType;
+  matchedPageUrl?: string;
+  directStreamUrl?: string;
+  directFormat?: StreamFormat;
+  directReferer?: string;
+  directSubtitles?: SubtitleTrack[];
+  qualityLabel?: string;
 }
 
 export interface StreamQuality {
@@ -178,12 +281,32 @@ export interface ResolvedEmbed {
   errorMessage?: string;
 }
 
+export interface EpisodeSourceReportSummary {
+  sourceId: string;
+  sourceName: string;
+  sourceKind: string;
+  status: 'found' | 'not-found' | 'error' | 'skipped';
+  optionsCount: number;
+  matchedTitle?: string;
+  matchedUrl?: string;
+  errorMessage?: string;
+  durationMs: number;
+}
+
 export interface EpisodeDetails {
   title: string;
   seriesTitle: string;
   seriesUrl?: string;
   url: string;
   episodeLabel?: string;
+  mediaType?: 'anime' | 'series' | 'movie';
+  seasonNumber?: number;
+  episodeNumber?: number;
+  originalTitle?: string;
+  alternativeTitles?: string[];
+  year?: string;
+  catalogSource?: CatalogSourceId;
+  externalIds?: ExternalMediaIds;
   poster: string;
   backdrop: string;
   synopsis: string;
@@ -191,6 +314,7 @@ export interface EpisodeDetails {
   prevUrl?: string;
   nextUrl?: string;
   options: PlayerOption[];
+  sourceReports?: EpisodeSourceReportSummary[];
   isMovie: boolean;
   sourceMode?: 'live' | 'snapshot';
 }
@@ -245,4 +369,3 @@ export interface FavoriteLatestInfo {
   episodeNumber: number | null;
   poster?: string;
 }
-

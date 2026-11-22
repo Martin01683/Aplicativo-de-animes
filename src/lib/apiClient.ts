@@ -1,64 +1,20 @@
 import { Capacitor, registerPlugin, type PluginListenerHandle } from '@capacitor/core';
 import {
-  GITHUB_RELEASES_API_URL,
-  GITHUB_RELEASES_LIST_API_URL,
   isAllowedGitHubDownloadUrl,
   normalizeSha256Digest,
-  parseGitHubReleasePayload,
   type ApkDownloadProgressState,
-} from './appUpdater';
-import {
-  normalizeTopAnimesUrl,
-  pickLatestAnimeEpisode,
-} from './favoriteAlerts';
-import {
-  classifyProviderKind,
-  extractDooPlayAjaxConfig,
-  extractDooPlayNonce,
-  extractMissingDooPlayerOptions,
-  extractStreamsFromEmbed,
-  inferMediaKindFromUrl,
-  parseAnimePageHtml,
-  parseCalendarPageHtml,
-  parseCatalogArchiveHtml,
-  parseDooPlayerAjaxResponse,
-  parseEpisodePageHtml,
-  parseEpisodesArchiveHtml,
-  parseHomeHtml,
-  parseSearchPageHtml,
-  parseWpGlossaryJson,
-  parseWpSearchJson,
-} from './topanimesParser';
-import type {
-  CatalogArchiveCategory,
-  CatalogFilters,
-  CatalogMediaItem,
-  EpisodeDetails,
-  FavoriteLatestInfo,
-  HomeCatalog,
-  PlayerOption,
-  ResolvedEmbed,
-  SearchResultItem,
-  WeeklyCalendarResponse,
-} from './types';
-import { isSafeExternalHttpUrl, isTopAnimesUrl, unwrapAvisoUrl } from './urlSafety';
+} from './appUpdater.ts';
+import type { HttpFetchOptions, HttpFetchResult, HttpFetcher } from './httpTypes.ts';
+import { dispatchAnisyncApiRequest } from './anisyncApiRouter.ts';
+import { loadAppSettings } from './storage.ts';
+import type { CatalogPreferences } from './types.ts';
+import { isSafeExternalHttpUrl } from './urlSafety.ts';
 
-export interface NativeFetchPageOptions {
+export type NativeFetchPageOptions = HttpFetchOptions & {
   url: string;
-  referer?: string;
-  accept?: string;
-  timeoutMs?: number;
-  method?: 'GET' | 'POST';
-  body?: string;
-  contentType?: string;
-}
+};
 
-export interface NativeFetchPageResult {
-  status: number;
-  ok: boolean;
-  finalUrl: string;
-  body: string;
-}
+export type NativeFetchPageResult = HttpFetchResult;
 
 export interface NativeAppBuildInfoResult {
   versionName: string;
@@ -86,18 +42,9 @@ export interface LocalProxyPlugin {
 
 const LocalProxy = registerPlugin<LocalProxyPlugin>('LocalProxy');
 
-const TOPANIMES_ORIGIN = 'https://topanimes.net';
-const HOME_SNAPSHOT_URL = '/assets/aistudio/captura-topanimes.net-20261120-185536_c8f54b4e.html';
-const EPISODE_SNAPSHOT_URL = '/assets/aistudio/captura-topanimes.net-20261120-185622_7446cc49.html';
-const EPISODES_ARCHIVE_SNAPSHOT_URL = '/assets/aistudio/captura-topanimes.net-20261120-193317_58010c0a.html';
-const ANIME_ARCHIVE_SNAPSHOT_URL = '/assets/aistudio/captura-topanimes.net-20261120-194623_978b4a6c.html';
-const MOVIES_ARCHIVE_SNAPSHOT_URL = '/assets/aistudio/captura-topanimes.net-20261120-194902_e963a754.html';
+const DEFAULT_STREAM_REFERER = 'https://topanimes.net/';
 
 let cachedProxyBaseUrl = '';
-let cachedHome: { value: HomeCatalog; expiresAt: number } | null = null;
-let cachedCalendar: { value: WeeklyCalendarResponse; expiresAt: number } | null = null;
-let cachedDooPlayNonce: { value: string; expiresAt: number } | null = null;
-let cachedFallbackFilters: CatalogFilters | null = null;
 
 export function isNativeAndroidApp(): boolean {
   try {
@@ -134,10 +81,10 @@ async function ensureProxyBaseUrl(): Promise<string> {
   return '';
 }
 
-export function getStreamProxyUrl(targetUrl: string, referer = `${TOPANIMES_ORIGIN}/`): string {
+export function getStreamProxyUrl(targetUrl: string, referer = DEFAULT_STREAM_REFERER): string {
   const params = new URLSearchParams({
     url: targetUrl,
-    referer: referer || `${TOPANIMES_ORIGIN}/`,
+    referer: referer || DEFAULT_STREAM_REFERER,
   });
   if (isNativeAndroidApp() && cachedProxyBaseUrl) {
     return `${cachedProxyBaseUrl}/stream-proxy?${params.toString()}`;
@@ -147,7 +94,7 @@ export function getStreamProxyUrl(targetUrl: string, referer = `${TOPANIMES_ORIG
 
 export async function getStreamProxyUrlAsync(
   targetUrl: string,
-  referer = `${TOPANIMES_ORIGIN}/`
+  referer = DEFAULT_STREAM_REFERER
 ): Promise<string> {
   if (isNativeAndroidApp() && !cachedProxyBaseUrl) {
     await ensureProxyBaseUrl();
@@ -200,7 +147,7 @@ export async function cancelAppUpdateDownload(): Promise<boolean> {
 
 export async function downloadAppUpdateApk(
   downloadUrl: string,
-  filename = 'TopAnimes.apk',
+  filename = 'Anisync.apk',
   expectedSha256?: string
 ): Promise<{
   mode: 'native-installer' | 'permission-required' | 'browser-download' | 'cancelled';
@@ -249,18 +196,7 @@ export interface ApiJsonResponse {
   body: unknown;
 }
 
-export type PageFetcher = (
-  url: string,
-  options?: {
-    referer?: string;
-    accept?: string;
-    timeoutMs?: number;
-    method?: 'GET' | 'POST';
-    body?: string;
-    contentType?: string;
-  }
-) => Promise<NativeFetchPageResult>;
-
+export type PageFetcher = HttpFetcher;
 export type SnapshotFetcher = (assetPath: string) => Promise<string | null>;
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -270,27 +206,7 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-async function defaultSnapshotFetcher(assetPath: string): Promise<string | null> {
-  try {
-    const res = await window.fetch(assetPath);
-    if (!res.ok) return null;
-    return await res.text();
-  } catch {
-    return null;
-  }
-}
-
-async function nativePageFetcher(
-  url: string,
-  options: {
-    referer?: string;
-    accept?: string;
-    timeoutMs?: number;
-    method?: 'GET' | 'POST';
-    body?: string;
-    contentType?: string;
-  } = {}
-): Promise<NativeFetchPageResult> {
+const nativePageFetcher: PageFetcher = async (url, options = {}) => {
   if (!isSafeExternalHttpUrl(url)) {
     throw new Error('URL externa inválida ou bloqueada por segurança.');
   }
@@ -302,340 +218,55 @@ async function nativePageFetcher(
     method: options.method,
     body: options.body,
     contentType: options.contentType,
+    headers: options.headers,
   });
-}
+};
 
-function rememberNativeDooPlayNonce(html: string, useCache: boolean): string | null {
-  const found = extractDooPlayNonce(html);
-  if (found && useCache) {
-    cachedDooPlayNonce = { value: found, expiresAt: Date.now() + 25 * 60 * 1000 };
-  }
-  return found;
-}
-
-async function getNativeDooPlayNonce(
-  fetchPage: PageFetcher,
-  forceRefresh: boolean,
-  useCache: boolean
-): Promise<string | null> {
-  if (useCache && !forceRefresh && cachedDooPlayNonce && cachedDooPlayNonce.expiresAt > Date.now()) {
-    return cachedDooPlayNonce.value;
-  }
+function getStoredRuntimePreferences(): {
+  catalogPrefs?: CatalogPreferences;
+} {
+  if (typeof localStorage === 'undefined') return {};
   try {
-    const res = await fetchPage(`${TOPANIMES_ORIGIN}/`, {
-      referer: `${TOPANIMES_ORIGIN}/`,
-      timeoutMs: 8000,
-    });
-    if (res.ok) {
-      return rememberNativeDooPlayNonce(res.body, useCache);
-    }
-  } catch {
-    // Ignore nonce fetch errors
-  }
-  return null;
-}
-
-async function getNativeWeeklyCalendar(
-  fetchPage: PageFetcher,
-  readSnapshot: SnapshotFetcher,
-  useCache: boolean
-): Promise<WeeklyCalendarResponse> {
-  if (useCache && cachedCalendar && cachedCalendar.expiresAt > Date.now()) {
-    return cachedCalendar.value;
-  }
-
-  try {
-    const res = await fetchPage(`${TOPANIMES_ORIGIN}/calendario/`, {
-      referer: `${TOPANIMES_ORIGIN}/`,
-      timeoutMs: 10000,
-    });
-    if (res.ok) {
-      rememberNativeDooPlayNonce(res.body, useCache);
-      const parsed = parseCalendarPageHtml(res.body, 'live');
-      if (parsed.days.length > 0) {
-        if (useCache) {
-          cachedCalendar = { value: parsed, expiresAt: Date.now() + 5 * 60 * 1000 };
-        }
-        return parsed;
-      }
-    }
-  } catch {
-    // Fall back to home calendar
-  }
-
-  const home = await getNativeHomeCatalog(fetchPage, readSnapshot);
-  const fallback: WeeklyCalendarResponse = {
-    days: [
-      {
-        id: 'hoje',
-        label: 'Hoje',
-        isToday: true,
-        items: home.calendar,
+    const settings = loadAppSettings();
+    return {
+      catalogPrefs: {
+        credentials: settings.catalogCredentials,
       },
-    ],
-    sourceMode: 'snapshot',
-    fetchedAt: new Date().toISOString(),
-  };
-  if (useCache) {
-    cachedCalendar = { value: fallback, expiresAt: Date.now() + 60 * 1000 };
-  }
-  return fallback;
-}
-
-async function hydrateNativeEpisodeOptions(
-  html: string,
-  pageUrl: string,
-  parsed: EpisodeDetails,
-  fetchPage: PageFetcher
-): Promise<EpisodeDetails> {
-  const missing = extractMissingDooPlayerOptions(html);
-  if (missing.length === 0) return parsed;
-
-  const cfg = extractDooPlayAjaxConfig(html);
-  const existingByNume = new Map<string, PlayerOption>();
-  for (const opt of parsed.options) {
-    existingByNume.set(opt.nume, opt);
-  }
-
-  const hydratedList = await Promise.all(
-    missing.map(async (item): Promise<PlayerOption | null> => {
-      const preferWpJson = cfg.playMethod === 'wp_json';
-      for (let attempt = 0; attempt < 2; attempt += 1) {
-        const useWpJson = (attempt === 0) === preferWpJson;
-        try {
-          let body = '';
-          if (useWpJson) {
-            const target = `${cfg.playerApi}${encodeURIComponent(item.post)}/${encodeURIComponent(
-              item.type
-            )}/${encodeURIComponent(item.nume)}`;
-            const res = await fetchPage(target, {
-              referer: pageUrl,
-              accept: 'application/json,text/html,*/*;q=0.9',
-              timeoutMs: 8000,
-            });
-            if (res.ok) body = res.body;
-          } else {
-            const formBody = new URLSearchParams({
-              action: 'doo_player_ajax',
-              post: item.post,
-              nume: item.nume,
-              type: item.type,
-            }).toString();
-            const res = await fetchPage(cfg.ajaxUrl, {
-              method: 'POST',
-              body: formBody,
-              referer: pageUrl,
-              accept: 'application/json,text/html,*/*;q=0.9',
-              timeoutMs: 8000,
-            });
-            if (res.ok) body = res.body;
-          }
-
-          const embedUrl = parseDooPlayerAjaxResponse(body, pageUrl);
-          if (embedUrl) {
-            const providerKind = classifyProviderKind(item.label, embedUrl);
-            if (providerKind === 'abyss') return null;
-            return {
-              nume: item.nume,
-              label: item.label,
-              embedUrl,
-              providerKind,
-            };
-          }
-        } catch {
-          // Try alternate DooPlay method
-        }
-      }
-      return null;
-    })
-  );
-
-  let changed = false;
-  for (const opt of hydratedList) {
-    if (!opt || existingByNume.has(opt.nume)) continue;
-    existingByNume.set(opt.nume, opt);
-    changed = true;
-  }
-
-  if (!changed) return parsed;
-
-  const merged = Array.from(existingByNume.values()).sort((a, b) => {
-    const na = Number.parseInt(a.nume, 10);
-    const nb = Number.parseInt(b.nume, 10);
-    if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
-    return a.nume.localeCompare(b.nume);
-  });
-
-  return {
-    ...parsed,
-    options: merged,
-  };
-}
-
-async function getFallbackCatalogFilters(
-  readSnapshot: SnapshotFetcher
-): Promise<CatalogFilters | undefined> {
-  if (cachedFallbackFilters) return cachedFallbackFilters;
-  const html = await readSnapshot(ANIME_ARCHIVE_SNAPSHOT_URL);
-  if (!html) return undefined;
-  cachedFallbackFilters = parseCatalogArchiveHtml(html, 'anime').filters;
-  return cachedFallbackFilters;
-}
-
-async function getNativeHomeCatalog(
-  fetchPage: PageFetcher,
-  readSnapshot: SnapshotFetcher
-): Promise<HomeCatalog> {
-  if (cachedHome && cachedHome.expiresAt > Date.now()) {
-    return cachedHome.value;
-  }
-
-  try {
-    const res = await fetchPage(`${TOPANIMES_ORIGIN}/`, {
-      referer: `${TOPANIMES_ORIGIN}/`,
-      timeoutMs: 9000,
-    });
-    if (res.ok) {
-      rememberNativeDooPlayNonce(res.body, true);
-      const parsed = parseHomeHtml(res.body, 'live');
-      if (parsed.releases.length > 0 || parsed.animes.length > 0) {
-        cachedHome = { value: parsed, expiresAt: Date.now() + 3 * 60 * 1000 };
-        return parsed;
-      }
-    }
+    };
   } catch {
-    // Fall back to bundled snapshot
+    return {};
   }
-
-  const snapHtml = await readSnapshot(HOME_SNAPSHOT_URL);
-  if (snapHtml) {
-    const parsed = parseHomeHtml(snapHtml, 'snapshot');
-    cachedHome = { value: parsed, expiresAt: Date.now() + 60 * 1000 };
-    return parsed;
-  }
-
-  throw new Error('Não foi possível carregar o catálogo do TopAnimes.');
 }
 
-async function resolveNativeEmbedUrl(
-  rawEmbedUrl: string,
-  fetchPage: PageFetcher
-): Promise<ResolvedEmbed> {
-  const cleanEmbed = unwrapAvisoUrl(rawEmbedUrl) || rawEmbedUrl;
-  const baseReferer = `${TOPANIMES_ORIGIN}/`;
-
-  if (!isSafeExternalHttpUrl(cleanEmbed)) {
-    return {
-      embedUrl: rawEmbedUrl,
-      provider: 'Desconhecido',
-      status: 'error',
-      streams: [],
-      subtitles: [],
-      referer: baseReferer,
-      errorMessage: 'URL do servidor bloqueada ou inválida.',
-    };
-  }
-
-  if (/abyssplayer\.com|abyss\.to|abysscdn\.com|short\.icu/i.test(cleanEmbed)) {
-    return {
-      embedUrl: cleanEmbed,
-      provider: 'Aniplay',
-      status: 'embed-only',
-      streams: [],
-      subtitles: [],
-      referer: baseReferer,
-      errorMessage: 'Servidor indisponível neste player.',
-    };
-  }
-
-  let fetchTarget = cleanEmbed;
-  if (/sk-boyceta\.booonceivu\.shop/i.test(cleanEmbed)) {
-    const u = new URL(cleanEmbed);
-    u.searchParams.set('mode', 'to-salvando-seu-ip');
-    fetchTarget = u.href;
-  }
-
+function encodeBase64Json(value: unknown): string | null {
   try {
-    const res = await fetchPage(fetchTarget, {
-      referer: baseReferer,
-      timeoutMs: 12000,
-    });
-    if (!res.ok) {
-      return {
-        embedUrl: cleanEmbed,
-        provider: 'Servidor',
-        status: 'error',
-        streams: [],
-        subtitles: [],
-        referer: baseReferer,
-        errorMessage: `Servidor respondeu com HTTP ${res.status}.`,
-      };
+    const json = JSON.stringify(value);
+    if (typeof btoa === 'function') {
+      return btoa(unescape(encodeURIComponent(json)));
     }
-
-    let extracted = extractStreamsFromEmbed(cleanEmbed, res.body);
-
-    if (!extracted.streams.length) {
-      const zuplayPathMatch = cleanEmbed.match(/^https?:\/\/csst\.online\/embed\/(video\/[^?#]+)/i);
-      if (zuplayPathMatch?.[1]) {
-        const zuplayFallbackUrl = `https://ru-boyceta.booonceivu.shop/?id=${encodeURIComponent(zuplayPathMatch[1])}`;
-        const zRes = await fetchPage(zuplayFallbackUrl, {
-          referer: baseReferer,
-          timeoutMs: 12000,
-        });
-        if (zRes.ok) {
-          extracted = extractStreamsFromEmbed(zuplayFallbackUrl, zRes.body);
-        }
-      }
-    }
-
-    if (!extracted.streams.length) {
-      return {
-        embedUrl: cleanEmbed,
-        provider: extracted.provider,
-        status: 'embed-only',
-        streams: [],
-        subtitles: extracted.subtitles,
-        poster: extracted.poster,
-        referer: cleanEmbed,
-        errorMessage:
-          'Nenhum link direto .m3u8/.mp4 encontrado neste servidor. Tente outro servidor abaixo.',
-      };
-    }
-
-    const streamReferer = /csst\.online/i.test(cleanEmbed)
-      ? 'https://www.incvideo1.online/'
-      : /antivirus|booonceivu/i.test(cleanEmbed)
-        ? baseReferer
-        : cleanEmbed;
-
-    const firstUrl = extracted.streams[0]?.url || '';
-    const preferDirect =
-      /(?:^|\.)(?:booonceivu\.shop|123flmsfree\.com|321moviesfree\.com)$/i.test(
-        new URL(firstUrl).hostname
-      );
-
-    return {
-      embedUrl: cleanEmbed,
-      provider: extracted.provider,
-      status: 'resolved',
-      streams: extracted.streams,
-      subtitles: extracted.subtitles,
-      poster: extracted.poster,
-      referer: streamReferer,
-      preferDirect,
-    };
-  } catch (err) {
-    return {
-      embedUrl: cleanEmbed,
-      provider: 'Servidor',
-      status: 'error',
-      streams: [],
-      subtitles: [],
-      referer: baseReferer,
-      errorMessage: err instanceof Error ? err.message : 'Falha ao consultar o servidor.',
-    };
+    return Buffer.from(json, 'utf8').toString('base64');
+  } catch {
+    return null;
   }
 }
+
+function encodeCatalogConfigHeader(prefs?: CatalogPreferences): string | null {
+  if (!prefs) return null;
+  const hasCreds = Object.values(prefs.credentials || {}).some((v) => Boolean(v));
+  if (!hasCreds) return null;
+  return encodeBase64Json(prefs);
+}
+
+const defaultBrowserSnapshotReader: SnapshotFetcher = async (assetFileName: string) => {
+  if (typeof window === 'undefined' || typeof window.fetch !== 'function') return null;
+  try {
+    const res = await window.fetch(`/assets/aistudio/${encodeURIComponent(assetFileName)}`);
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+};
 
 export async function routeNativeApiRequest(
   pathWithQuery: string,
@@ -643,634 +274,56 @@ export async function routeNativeApiRequest(
   deps: {
     fetchPage?: PageFetcher;
     readSnapshot?: SnapshotFetcher;
+    catalogPrefs?: CatalogPreferences;
   } = {}
 ): Promise<ApiJsonResponse> {
-  const fetchPage = deps.fetchPage || nativePageFetcher;
-  const readSnapshot = deps.readSnapshot || defaultSnapshotFetcher;
+  const fetchHttp = deps.fetchPage || nativePageFetcher;
   const useCache = !deps.fetchPage;
-  const url = new URL(pathWithQuery, 'http://localhost');
-  const pathname = url.pathname;
+  const stored = !deps.fetchPage ? getStoredRuntimePreferences() : {};
 
-  if (pathname === '/api/health') {
-    return { status: 200, body: { ok: true, service: 'topvlc-android' } };
-  }
-
-  if (pathname === '/api/apk-info') {
-    return { status: 200, body: { available: false } };
-  }
-
-  if (pathname === '/api/app-update/check') {
+  let jsonBody: unknown = undefined;
+  if (typeof init?.body === 'string' && init.body.trim()) {
     try {
-      let response = await fetchPage(GITHUB_RELEASES_API_URL, {
-        accept: 'application/vnd.github+json',
-        timeoutMs: 10000,
-      });
-
-      let payload: unknown = null;
-      if (response.ok) {
-        payload = JSON.parse(response.body);
-      } else if (response.status === 404) {
-        response = await fetchPage(GITHUB_RELEASES_LIST_API_URL, {
-          accept: 'application/vnd.github+json',
-          timeoutMs: 10000,
-        });
-        if (response.ok) {
-          const list = JSON.parse(response.body) as unknown[];
-          payload = Array.isArray(list) ? list[0] : null;
-        }
-      }
-
-      if (!response.ok && response.status !== 404) {
-        return {
-          status: 502,
-          body: { error: `GitHub retornou HTTP ${response.status} ao verificar atualizações.` },
-        };
-      }
-
-      return {
-        status: 200,
-        body: {
-          checkedAt: new Date().toISOString(),
-          release: parseGitHubReleasePayload(payload),
-        },
-      };
-    } catch (err) {
-      return {
-        status: 502,
-        body: {
-          error:
-            err instanceof Error
-              ? err.message
-              : 'Não foi possível consultar atualizações no GitHub agora.',
-        },
-      };
-    }
-  }
-
-  if (pathname === '/api/home') {
-    try {
-      const catalog = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      return { status: 200, body: catalog };
-    } catch (err) {
-      return {
-        status: 502,
-        body: { error: err instanceof Error ? err.message : 'Erro ao carregar catálogo.' },
-      };
-    }
-  }
-
-  if (pathname === '/api/calendar') {
-    try {
-      const calendar = await getNativeWeeklyCalendar(fetchPage, readSnapshot, useCache);
-      return { status: 200, body: calendar };
-    } catch (err) {
-      return {
-        status: 502,
-        body: {
-          error: err instanceof Error ? err.message : 'Erro ao carregar calendário semanal.',
-        },
-      };
-    }
-  }
-
-  if (pathname === '/api/search-suggest') {
-    const query = (url.searchParams.get('q') || '').trim();
-    if (query.length < 2) {
-      return { status: 200, body: { query, results: [], sourceMode: 'live' } };
-    }
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const nonce = await getNativeDooPlayNonce(fetchPage, attempt > 0, useCache);
-        if (!nonce) break;
-        const apiUrl = `${TOPANIMES_ORIGIN}/wp-json/dooplay/search/?keyword=${encodeURIComponent(
-          query
-        )}&nonce=${encodeURIComponent(nonce)}`;
-        const response = await fetchPage(apiUrl, {
-          referer: `${TOPANIMES_ORIGIN}/`,
-          accept: 'application/json,*/*;q=0.9',
-          timeoutMs: 7000,
-        });
-        if (!response.ok) {
-          if (attempt === 0) continue;
-          break;
-        }
-        const rawJson = JSON.parse(response.body) as Record<string, unknown>;
-        if (rawJson && typeof rawJson === 'object' && 'error' in rawJson) {
-          if (attempt === 0 && /nonce|invalid|security/i.test(String(rawJson.error || ''))) {
-            continue;
-          }
-          return { status: 200, body: { query, results: [], sourceMode: 'live' } };
-        }
-        const results = parseWpSearchJson(
-          rawJson as Parameters<typeof parseWpSearchJson>[0]
-        ).slice(0, 10);
-        return { status: 200, body: { query, results, sourceMode: 'live' } };
-      } catch {
-        if (attempt === 0) continue;
-      }
-    }
-
-    try {
-      const catalog = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      const needle = query.toLowerCase();
-      const pool = [...catalog.animes, ...catalog.calendar, ...catalog.movies, ...catalog.releases];
-      const seen = new Set<string>();
-      const results: SearchResultItem[] = [];
-      for (const item of pool) {
-        if (seen.has(item.url)) continue;
-        if (item.title.toLowerCase().includes(needle)) {
-          seen.add(item.url);
-          results.push({
-            id: item.id,
-            title: item.title,
-            url: item.url,
-            kind: item.kind,
-            poster: item.poster,
-            year: item.year,
-            rating: item.rating,
-            audioType: item.audioType,
-          });
-          if (results.length >= 8) break;
-        }
-      }
-      return { status: 200, body: { query, results, sourceMode: 'fallback' } };
+      jsonBody = JSON.parse(init.body);
     } catch {
-      return { status: 200, body: { query, results: [], sourceMode: 'fallback' } };
+      jsonBody = undefined;
     }
   }
 
-  if (pathname === '/api/glossary') {
-    const rawTerm = (url.searchParams.get('term') || '').trim().toLowerCase();
-    const isNumericBucket = rawTerm === '#' || rawTerm === '09' || rawTerm === '0-9';
-    const apiTerm = isNumericBucket ? '09' : /^[a-z]$/.test(rawTerm) ? rawTerm : '';
-    const displayTerm = isNumericBucket ? '#' : apiTerm.toUpperCase();
-    const rawType = (url.searchParams.get('type') || 'all').trim().toLowerCase();
-    const type = ['all', 'tvshows', 'movies'].includes(rawType) ? rawType : 'all';
-
-    if (!apiTerm) {
-      return { status: 400, body: { error: 'Informe uma letra válida (A-Z ou #).' } };
+  return dispatchAnisyncApiRequest(
+    pathWithQuery,
+    {
+      method: init?.method || 'GET',
+      jsonBody,
+    },
+    {
+      fetchHttp,
+      serviceName: 'anisync-android',
+      catalogPrefs: deps.catalogPrefs || stored.catalogPrefs,
+      snapshotReader: deps.readSnapshot || defaultBrowserSnapshotReader,
+      useCache,
     }
-
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const nonce = await getNativeDooPlayNonce(fetchPage, attempt > 0, useCache);
-        if (!nonce) break;
-        const apiUrl = `${TOPANIMES_ORIGIN}/wp-json/dooplay/glossary/?term=${encodeURIComponent(
-          apiTerm
-        )}&nonce=${encodeURIComponent(nonce)}&type=${encodeURIComponent(type)}`;
-        const response = await fetchPage(apiUrl, {
-          referer: `${TOPANIMES_ORIGIN}/animes/`,
-          accept: 'application/json,*/*;q=0.9',
-          timeoutMs: 8000,
-        });
-        if (!response.ok) {
-          if (attempt === 0) continue;
-          break;
-        }
-        const rawJson = JSON.parse(response.body) as Record<string, unknown>;
-        if (rawJson && typeof rawJson === 'object' && 'error' in rawJson) {
-          if (attempt === 0 && /nonce|invalid|security/i.test(String(rawJson.error || ''))) {
-            continue;
-          }
-          return { status: 200, body: { term: displayTerm, type, items: [], sourceMode: 'live' } };
-        }
-        const items = parseWpGlossaryJson(rawJson as Parameters<typeof parseWpGlossaryJson>[0]);
-        return { status: 200, body: { term: displayTerm, type, items, sourceMode: 'live' } };
-      } catch {
-        if (attempt === 0) continue;
-      }
-    }
-
-    try {
-      const catalog = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      const pool: CatalogMediaItem[] =
-        type === 'movies'
-          ? catalog.movies
-          : type === 'tvshows'
-            ? [...catalog.animes, ...catalog.calendar]
-            : [...catalog.animes, ...catalog.calendar, ...catalog.movies];
-      const seen = new Set<string>();
-      const items = pool.filter((item) => {
-        if (seen.has(item.url)) return false;
-        const firstChar = item.title.trim().charAt(0).toLowerCase();
-        const matches = isNumericBucket ? /^[^a-z]$/.test(firstChar) : firstChar === apiTerm;
-        if (!matches) return false;
-        seen.add(item.url);
-        return true;
-      });
-      return { status: 200, body: { term: displayTerm, type, items, sourceMode: 'fallback' } };
-    } catch {
-      return { status: 200, body: { term: displayTerm, type, items: [], sourceMode: 'fallback' } };
-    }
-  }
-
-  if (pathname === '/api/episodes') {
-    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
-    const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
-    const targetUrl =
-      page > 1
-        ? `${TOPANIMES_ORIGIN}/episodio/page/${page}/`
-        : `${TOPANIMES_ORIGIN}/episodio/`;
-
-    try {
-      const response = await fetchPage(targetUrl, {
-        referer: `${TOPANIMES_ORIGIN}/`,
-        timeoutMs: 9000,
-      });
-      if (response.ok) {
-        const parsed = parseEpisodesArchiveHtml(response.body);
-        return { status: 200, body: { ...parsed, sourceMode: 'live' } };
-      }
-    } catch {
-      // Fall back below
-    }
-
-    if (page === 1) {
-      const snapHtml = await readSnapshot(EPISODES_ARCHIVE_SNAPSHOT_URL);
-      if (snapHtml) {
-        const parsed = parseEpisodesArchiveHtml(snapHtml);
-        return { status: 200, body: { ...parsed, sourceMode: 'snapshot' } };
-      }
-    }
-
-    try {
-      const home = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      return {
-        status: 200,
-        body: {
-          items: page === 1 ? home.releases : [],
-          currentPage: page,
-          totalPages: 1,
-          sourceMode: 'snapshot',
-        },
-      };
-    } catch (err) {
-      return {
-        status: 502,
-        body: { error: err instanceof Error ? err.message : 'Erro ao carregar episódios.' },
-      };
-    }
-  }
-
-  if (pathname === '/api/catalog') {
-    const rawCategory = (url.searchParams.get('category') || 'animes').toLowerCase();
-    const validCategories: CatalogArchiveCategory[] = [
-      'animes',
-      'movies',
-      'dublado',
-      'legendado',
-      'donghua',
-      'cartoon',
-      'live-action',
-    ];
-    const category: CatalogArchiveCategory = validCategories.includes(
-      rawCategory as CatalogArchiveCategory
-    )
-      ? (rawCategory as CatalogArchiveCategory)
-      : 'animes';
-
-    const rawGenre = (url.searchParams.get('genre') || '').trim().toLowerCase();
-    const genre = /^[a-z0-9-]+$/.test(rawGenre) ? rawGenre : '';
-    const rawYear = (url.searchParams.get('year') || '').trim();
-    const year = /^\d{4}$/.test(rawYear) ? rawYear : '';
-    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
-    const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
-
-    const basePathMap: Record<CatalogArchiveCategory, string> = {
-      animes: '/animes/',
-      movies: '/filmes/',
-      dublado: '/tipo/dublado/',
-      legendado: '/tipo/legendado/',
-      donghua: '/tipo/donghua/',
-      cartoon: '/tipo/cartoon/',
-      'live-action': '/tipo/live-action/',
-    };
-
-    const basePath = genre
-      ? `/genero/${genre}/`
-      : year
-        ? `/l/${year}/`
-        : basePathMap[category];
-
-    const targetUrl =
-      page > 1
-        ? `${TOPANIMES_ORIGIN}${basePath}page/${page}/`
-        : `${TOPANIMES_ORIGIN}${basePath}`;
-
-    const defaultKind = !genre && !year && category === 'movies' ? 'movie' : 'anime';
-    const forcedAudio =
-      !genre && !year && category === 'dublado'
-        ? 'DUB'
-        : !genre && !year && category === 'legendado'
-          ? 'LEG'
-          : null;
-
-    try {
-      const response = await fetchPage(targetUrl, {
-        referer: `${TOPANIMES_ORIGIN}/`,
-        timeoutMs: 9000,
-      });
-      if (response.ok) {
-        const parsed = parseCatalogArchiveHtml(response.body, defaultKind, forcedAudio);
-        const fallbackFilters = await getFallbackCatalogFilters(readSnapshot);
-        const filters =
-          parsed.filters.genres.length > 0 ? parsed.filters : fallbackFilters;
-        return { status: 200, body: { ...parsed, filters, sourceMode: 'live' } };
-      }
-    } catch {
-      // Fall back below
-    }
-
-    if (!genre && !year && page === 1) {
-      if (category === 'animes') {
-        const html = await readSnapshot(ANIME_ARCHIVE_SNAPSHOT_URL);
-        if (html) {
-          const parsed = parseCatalogArchiveHtml(html, 'anime', null);
-          return { status: 200, body: { ...parsed, sourceMode: 'snapshot' } };
-        }
-      }
-      if (category === 'movies') {
-        const html = await readSnapshot(MOVIES_ARCHIVE_SNAPSHOT_URL);
-        if (html) {
-          const parsed = parseCatalogArchiveHtml(html, 'movie', null);
-          return {
-            status: 200,
-            body: {
-              ...parsed,
-              filters: await getFallbackCatalogFilters(readSnapshot),
-              sourceMode: 'snapshot',
-            },
-          };
-        }
-      }
-    }
-
-    try {
-      const home = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      const pool =
-        category === 'movies'
-          ? home.movies
-          : category === 'dublado'
-            ? [...home.animes, ...home.calendar].filter((i) => i.audioType === 'DUB')
-            : category === 'legendado'
-              ? [...home.animes, ...home.calendar].filter((i) => i.audioType !== 'DUB')
-              : home.animes;
-      return {
-        status: 200,
-        body: {
-          items: page === 1 ? pool : [],
-          featured: [],
-          sliderMovies: [],
-          filters: await getFallbackCatalogFilters(readSnapshot),
-          currentPage: page,
-          totalPages: 1,
-          sourceMode: 'snapshot',
-        },
-      };
-    } catch (err) {
-      return {
-        status: 502,
-        body: { error: err instanceof Error ? err.message : 'Erro ao carregar catálogo.' },
-      };
-    }
-  }
-
-  if (pathname === '/api/random') {
-    try {
-      const response = await fetchPage(`${TOPANIMES_ORIGIN}/aleatorio`, {
-        referer: `${TOPANIMES_ORIGIN}/`,
-        timeoutMs: 8000,
-      });
-      const finalUrl = normalizeTopAnimesUrl(response.finalUrl || '');
-      if (
-        response.ok &&
-        finalUrl &&
-        isTopAnimesUrl(finalUrl) &&
-        /\/(?:animes|filmes)\/[^/]+/i.test(finalUrl)
-      ) {
-        return { status: 200, body: { url: finalUrl, kind: inferMediaKindFromUrl(finalUrl) } };
-      }
-    } catch {
-      // Fallback below
-    }
-
-    try {
-      const home = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      const pool = [...home.animes, ...home.movies, ...home.calendar].filter((item) =>
-        /\/(?:animes|filmes)\/[^/]+/i.test(item.url)
-      );
-      if (pool.length > 0) {
-        const chosen = pool[Math.floor(Math.random() * pool.length)];
-        return { status: 200, body: { url: chosen.url, kind: chosen.kind } };
-      }
-    } catch {
-      // Fall through
-    }
-
-    return { status: 502, body: { error: 'Não foi possível sortear um anime agora.' } };
-  }
-
-  if (pathname === '/api/search') {
-    const query = (url.searchParams.get('q') || '').trim();
-    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
-    const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
-
-    if (!query) {
-      return {
-        status: 200,
-        body: { query: '', results: [], currentPage: 1, totalPages: 1, sourceMode: 'live' },
-      };
-    }
-
-    try {
-      const searchUrl =
-        page > 1
-          ? `${TOPANIMES_ORIGIN}/page/${page}/?s=${encodeURIComponent(query)}`
-          : `${TOPANIMES_ORIGIN}/?s=${encodeURIComponent(query)}`;
-      const response = await fetchPage(searchUrl, {
-        referer: `${TOPANIMES_ORIGIN}/`,
-        timeoutMs: 9000,
-      });
-      if (response.ok) {
-        const parsed = parseSearchPageHtml(response.body);
-        return {
-          status: 200,
-          body: {
-            query,
-            results: parsed.results,
-            currentPage: parsed.currentPage,
-            totalPages: parsed.totalPages,
-            sourceMode: 'live',
-          },
-        };
-      }
-    } catch {
-      // Fallback below
-    }
-
-    try {
-      const catalog = await getNativeHomeCatalog(fetchPage, readSnapshot);
-      const needle = query.toLowerCase();
-      const pool = [...catalog.releases, ...catalog.animes, ...catalog.calendar, ...catalog.movies];
-      const seen = new Set<string>();
-      const results: SearchResultItem[] = [];
-      for (const item of pool) {
-        if (seen.has(item.url)) continue;
-        if (
-          item.title.toLowerCase().includes(needle) ||
-          (item.episodeLabel && item.episodeLabel.toLowerCase().includes(needle))
-        ) {
-          seen.add(item.url);
-          results.push({
-            id: item.id,
-            title: item.episodeLabel ? `${item.title} — ${item.episodeLabel}` : item.title,
-            url: item.url,
-            kind: item.kind,
-            poster: item.poster,
-            year: item.year,
-            audioType: item.audioType,
-          });
-        }
-      }
-      return {
-        status: 200,
-        body: {
-          query,
-          results: page === 1 ? results : [],
-          currentPage: page,
-          totalPages: 1,
-          sourceMode: 'snapshot',
-        },
-      };
-    } catch (err) {
-      return {
-        status: 502,
-        body: { error: err instanceof Error ? err.message : 'Erro ao buscar no catálogo.' },
-      };
-    }
-  }
-
-  if (pathname === '/api/anime') {
-    const target = (url.searchParams.get('url') || '').trim();
-    if (!isTopAnimesUrl(target)) {
-      return { status: 400, body: { error: 'Informe uma URL válida de topanimes.net.' } };
-    }
-    try {
-      const response = await fetchPage(target, {
-        referer: `${TOPANIMES_ORIGIN}/`,
-        timeoutMs: 10000,
-      });
-      if (!response.ok) {
-        return { status: response.status, body: { error: `TopAnimes retornou HTTP ${response.status}.` } };
-      }
-      return { status: 200, body: parseAnimePageHtml(response.body, target) };
-    } catch (err) {
-      return {
-        status: 502,
-        body: { error: err instanceof Error ? err.message : 'Falha ao carregar os episódios do anime.' },
-      };
-    }
-  }
-
-  if (pathname === '/api/favorites/check') {
-    let rawUrls: unknown[] = [];
-    if (typeof init?.body === 'string') {
-      try {
-        const parsed = JSON.parse(init.body) as { urls?: unknown };
-        if (Array.isArray(parsed?.urls)) rawUrls = parsed.urls;
-      } catch {
-        // ignore invalid body
-      }
-    }
-    const safeUrls = rawUrls
-      .filter((u): u is string => typeof u === 'string' && isTopAnimesUrl(u) && !/\/filmes\//i.test(u))
-      .map((u) => normalizeTopAnimesUrl(u))
-      .filter((u, idx, arr) => Boolean(u) && arr.indexOf(u) === idx)
-      .slice(0, 10);
-
-    const latestByUrl: Record<string, FavoriteLatestInfo> = {};
-    for (let i = 0; i < safeUrls.length; i += 3) {
-      const chunk = safeUrls.slice(i, i + 3);
-      await Promise.all(
-        chunk.map(async (animeUrl) => {
-          try {
-            const response = await fetchPage(animeUrl, {
-              referer: `${TOPANIMES_ORIGIN}/`,
-              timeoutMs: 7000,
-            });
-            if (!response.ok) return;
-            const anime = parseAnimePageHtml(response.body, animeUrl);
-            const latest = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster);
-            if (latest) {
-              latestByUrl[animeUrl] = latest;
-            }
-          } catch {
-            // Skip unreachable titles silently
-          }
-        })
-      );
-    }
-
-    return { status: 200, body: { latestByUrl } };
-  }
-
-  if (pathname === '/api/episode') {
-    const target = (url.searchParams.get('url') || '').trim();
-    if (!isTopAnimesUrl(target)) {
-      return {
-        status: 400,
-        body: { error: 'Informe uma URL válida de episódio ou filme em topanimes.net.' },
-      };
-    }
-
-    try {
-      const response = await fetchPage(target, {
-        referer: `${TOPANIMES_ORIGIN}/`,
-        timeoutMs: 10000,
-      });
-      if (response.ok) {
-        rememberNativeDooPlayNonce(response.body, useCache);
-        const parsed = await hydrateNativeEpisodeOptions(
-          response.body,
-          target,
-          parseEpisodePageHtml(response.body, target),
-          fetchPage
-        );
-        return { status: 200, body: { ...parsed, sourceMode: 'live' } };
-      }
-    } catch {
-      // Check snapshot fallback below
-    }
-
-    if (target.includes('kusuriya-no-hitorigoto-3-episodio-8')) {
-      const snapHtml = await readSnapshot(EPISODE_SNAPSHOT_URL);
-      if (snapHtml) {
-        const parsed = parseEpisodePageHtml(snapHtml, target);
-        return { status: 200, body: { ...parsed, sourceMode: 'snapshot' } };
-      }
-    }
-
-    return { status: 502, body: { error: 'Não foi possível extrair os servidores deste episódio.' } };
-  }
-
-  if (pathname === '/api/resolve-embed') {
-    const target = (url.searchParams.get('url') || '').trim();
-    if (!target) {
-      return { status: 400, body: { error: 'Parâmetro url obrigatório.' } };
-    }
-    const resolved = await resolveNativeEmbedUrl(target, fetchPage);
-    return { status: 200, body: resolved };
-  }
-
-  return { status: 404, body: { error: `Rota desconhecida: ${pathname}` } };
+  );
 }
 
 export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
-  if (!isNativeAndroidApp() || !input.startsWith('/api/')) {
+  if (!input.startsWith('/api/')) {
     return window.fetch(input, init);
   }
-  await ensureProxyBaseUrl();
-  const result = await routeNativeApiRequest(input, init);
-  return jsonResponse(result.body, result.status);
+
+  if (isNativeAndroidApp()) {
+    await ensureProxyBaseUrl();
+    const result = await routeNativeApiRequest(input, init);
+    return jsonResponse(result.body, result.status);
+  }
+
+  const stored = getStoredRuntimePreferences();
+  const catalogHeader = encodeCatalogConfigHeader(stored.catalogPrefs);
+  if (!catalogHeader) {
+    return window.fetch(input, init);
+  }
+
+  const headers = new Headers(init?.headers || {});
+  headers.set('X-Anisync-Catalog-Config', catalogHeader);
+  return window.fetch(input, { ...init, headers });
 }

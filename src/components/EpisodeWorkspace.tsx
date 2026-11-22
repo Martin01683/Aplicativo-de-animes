@@ -6,6 +6,8 @@ import {
   ChevronRight,
   Heart,
   Keyboard,
+  Loader2,
+  RefreshCw,
   Server,
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
@@ -37,6 +39,7 @@ import type {
   PlayerOption,
   ResolvedEmbed,
 } from '../lib/types';
+import { isSafeExternalHttpUrl } from '../lib/urlSafety';
 import { AnimePlayer } from './AnimePlayer';
 import { MediaPoster } from './MediaPoster';
 
@@ -47,10 +50,13 @@ interface EpisodeWorkspaceProps {
   progressMap?: EpisodeProgressMap;
   initialSeriesEpisodes?: AnimeEpisodeLink[];
   loadingEpisode?: boolean;
+  loadingExtraServers?: boolean;
+  loadingExtraServerNames?: string[];
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
   onToggleEpisodeWatched?: (episode: EpisodeDetails, watched: boolean) => void;
   onBack: () => void;
-  onNavigateUrl: (url: string, kind: 'episode' | 'anime' | 'movie') => void;
+  onNavigateUrl: (url: string, kind: 'episode' | 'anime' | 'series' | 'movie') => void;
+  onRefreshSources?: () => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
   onPlaybackProgress?: () => void;
   onToast: (message: string) => void;
@@ -68,8 +74,11 @@ interface ScopedResolvedEmbed {
 
 function pickInitialOption(options: PlayerOption[]): PlayerOption | null {
   return (
+    options.find((o) => Boolean(o.directStreamUrl)) ||
     options.find((o) =>
-      ['kojima', 'zuplay', 'vidstreaming', 'playerjs'].includes(o.providerKind)
+      ['hinatasoul', 'kojima', 'zuplay', 'vidstreaming', 'playerjs', 'direct'].includes(
+        o.providerKind
+      )
     ) ||
     options[0] ||
     null
@@ -83,10 +92,13 @@ export function EpisodeWorkspace({
   progressMap,
   initialSeriesEpisodes,
   loadingEpisode = false,
+  loadingExtraServers = false,
+  loadingExtraServerNames = [],
   onToggleFavorite,
   onToggleEpisodeWatched,
   onBack,
   onNavigateUrl,
+  onRefreshSources,
   onNativeSessionSync,
   onPlaybackProgress,
   onToast,
@@ -96,13 +108,12 @@ export function EpisodeWorkspace({
   onChangeVideoScale,
 }: EpisodeWorkspaceProps) {
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
-  const playableOptions = useMemo(
-    () =>
-      episode.options
-        .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
-        .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) })),
-    [episode.options]
-  );
+
+  const playableOptions = useMemo(() => {
+    return episode.options
+      .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
+      .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) }));
+  }, [episode.options]);
 
   const [selectedOption, setSelectedOption] = useState<PlayerOption | null>(() =>
     pickInitialOption(playableOptions)
@@ -133,22 +144,47 @@ export function EpisodeWorkspace({
       ? resolvedState.data
       : null;
 
-  // Remember whether the player has mounted at least once in this session so fullscreen stays intact during episode switches
   const hasMountedPlayerRef = useRef(false);
   if (resolved?.status === 'resolved' && resolved.streams.length > 0) {
     hasMountedPlayerRef.current = true;
   }
 
-  // Reset selected server whenever episode changes
+  const lastResetEpisodeUrlRef = useRef(episode.url);
+
+  // Reset selected server when switching episodes, while preserving playback when
+  // background cross-server options arrive for the SAME episode.
   useEffect(() => {
-    const filtered = episode.options
-      .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
-      .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) }));
-    setSelectedOption(pickInitialOption(filtered));
-    setResolvedState(null);
-    setFailoverExhaustedMsg('');
-    setResumeAfterFailover(null);
-  }, [episode]);
+    if (!isSameEpisodeUrl(lastResetEpisodeUrlRef.current, episode.url)) {
+      lastResetEpisodeUrlRef.current = episode.url;
+      setSelectedOption(pickInitialOption(playableOptions));
+      setResolvedState(null);
+      setFailoverExhaustedMsg('');
+      setResumeAfterFailover(null);
+      return;
+    }
+
+    setSelectedOption((current) => {
+      if (
+        current &&
+        playableOptions.some(
+          (o) => o.nume === current.nume && o.embedUrl === current.embedUrl
+        )
+      ) {
+        return current;
+      }
+      return pickInitialOption(playableOptions);
+    });
+
+    if (failoverExhaustedMsg) {
+      const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
+      const failedSet = failedServersByEpisodeRef.current.get(epKey);
+      const freshOption = playableOptions.find((o) => !failedSet?.has(o.nume));
+      if (freshOption) {
+        setFailoverExhaustedMsg('');
+        setSelectedOption(freshOption);
+      }
+    }
+  }, [episode.url, failoverExhaustedMsg, playableOptions]);
 
   // Fetch and cache the series episode list so in-fullscreen episode selection is always populated
   useEffect(() => {
@@ -171,7 +207,7 @@ export function EpisodeWorkspace({
     }
 
     let cancelled = false;
-    apiFetch(`/api/anime?url=${encodeURIComponent(episode.seriesUrl)}`)
+    apiFetch(`/api/media?url=${encodeURIComponent(episode.seriesUrl)}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data: AnimeDetails | null) => {
         if (cancelled || !data || !Array.isArray(data.episodes)) return;
@@ -188,6 +224,33 @@ export function EpisodeWorkspace({
   }, [episode.isMovie, episode.seriesUrl, initialSeriesEpisodes]);
 
   const resolveEmbedCached = useCallback(async (opt: PlayerOption): Promise<ResolvedEmbed> => {
+    // Short-circuit immediately for pre-resolved direct streams
+    if (opt.directStreamUrl && isSafeExternalHttpUrl(opt.directStreamUrl)) {
+      const format =
+        opt.directFormat ||
+        (/\.m3u8(?:$|\?)/i.test(opt.directStreamUrl)
+          ? 'hls'
+          : /\.(?:mp4|mkv|webm|m4v)(?:$|\?)/i.test(opt.directStreamUrl)
+            ? 'mp4'
+            : 'unknown');
+      return {
+        embedUrl: opt.embedUrl || opt.directStreamUrl,
+        provider: opt.label,
+        status: 'resolved',
+        streams: [
+          {
+            label: opt.qualityLabel || (format === 'hls' ? 'HLS' : 'Direto'),
+            height: 1080,
+            url: opt.directStreamUrl,
+            format,
+          },
+        ],
+        subtitles: opt.directSubtitles || [],
+        referer: opt.directReferer || opt.directStreamUrl,
+        preferDirect: true,
+      };
+    }
+
     const cacheKey = opt.embedUrl;
     const cached = embedCacheRef.current.get(cacheKey);
     if (isEmbedCacheEntryValid(cached)) {
@@ -214,14 +277,14 @@ export function EpisodeWorkspace({
         status: 'error',
         streams: [],
         subtitles: [],
-        referer: 'https://topanimes.net/',
+        referer: opt.directReferer || 'https://topanimes.net/',
         errorMessage: 'Não foi possível contactar o servidor de extração.',
       };
     }
   }, []);
 
   const findBestAvailableServer = useCallback(
-    async (episodeUrlKey: string, failedSet: Set<string>) => {
+    async (_episodeUrlKey: string, failedSet: Set<string>) => {
       const remaining = playableOptions
         .map((option, orderIndex) => ({ option, orderIndex }))
         .filter((item) => !failedSet.has(item.option.nume));
@@ -263,7 +326,6 @@ export function EpisodeWorkspace({
         return;
       }
 
-      // Current server failed to resolve playable streams — probe remaining servers in parallel for best quality
       const epKey = normalizeTopAnimesUrl(targetEpisodeUrl) || targetEpisodeUrl;
       const failedSet = failedServersByEpisodeRef.current.get(epKey) ?? new Set<string>();
       failedSet.add(targetOption.nume);
@@ -310,7 +372,6 @@ export function EpisodeWorkspace({
       failedSet.add(failedNume);
       failedServersByEpisodeRef.current.set(epKey, failedSet);
 
-      // Invalidate any cached signed stream URL (e.g. expired BunnyCDN token) for the failed server
       const failedOpt = playableOptions.find((o) => o.nume === failedNume);
       if (failedOpt) {
         embedCacheRef.current.delete(failedOpt.embedUrl);
@@ -341,7 +402,7 @@ export function EpisodeWorkspace({
           );
         } else {
           setFailoverExhaustedMsg(
-            'Nenhum servidor conseguiu reproduzir este episódio. Tente novamente ou selecione outro servidor abaixo.'
+            'Nenhum servidor conseguiu reproduzir este episódio. Tente outro servidor ou clique em Rebuscar.'
           );
         }
       } finally {
@@ -395,6 +456,9 @@ export function EpisodeWorkspace({
     (opt) => opt.nume !== selectedOption?.nume && !currentFailedSet?.has(opt.nume)
   );
 
+  const parentMediaKind: 'anime' | 'series' | 'movie' =
+    episode.mediaType || (episode.isMovie ? 'movie' : 'anime');
+
   return (
     <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
       {/* Top Breadcrumb & Prev/Next Episode Controls */}
@@ -413,7 +477,7 @@ export function EpisodeWorkspace({
               <span>/</span>
               <button
                 type="button"
-                onClick={() => onNavigateUrl(episode.seriesUrl!, 'anime')}
+                onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind)}
                 className="truncate font-medium text-slate-300 transition-colors hover:text-[#f97316]"
               >
                 {episode.seriesTitle}
@@ -428,26 +492,28 @@ export function EpisodeWorkspace({
           )}
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            disabled={!effectivePrevUrl || isTransitioning}
-            onClick={() => effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')}
-            className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <ChevronLeft className="h-4 w-4" />
-            <span>Anterior</span>
-          </button>
-          <button
-            type="button"
-            disabled={!effectiveNextUrl || isTransitioning}
-            onClick={() => effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')}
-            className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            <span>Próximo</span>
-            <ChevronRight className="h-4 w-4" />
-          </button>
-        </div>
+        {!episode.isMovie && (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              disabled={!effectivePrevUrl || isTransitioning}
+              onClick={() => effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')}
+              className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <ChevronLeft className="h-4 w-4" />
+              <span>Anterior</span>
+            </button>
+            <button
+              type="button"
+              disabled={!effectiveNextUrl || isTransitioning}
+              onClick={() => effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')}
+              className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <span>Próximo</span>
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Main Cinema Player + Metadata Layout */}
@@ -479,7 +545,7 @@ export function EpisodeWorkspace({
                 failoverExhaustedMsg ||
                 (!isTransitioning && !hasResolvedStreams
                   ? resolved?.errorMessage ||
-                    'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou Ruplay) para assistir no player.'
+                    'Selecione outro servidor abaixo ou tente novamente em instantes.'
                   : '')
               }
               skipIntroSeconds={skipIntroSeconds}
@@ -511,20 +577,21 @@ export function EpisodeWorkspace({
             <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
               <div className="h-10 w-10 animate-spin rounded-full border-3 border-white/15 border-t-[#f97316]" />
               <p className="mt-3 text-sm font-medium text-slate-300">
-                Extraindo vídeo e legendas...
+                Consultando fontes e extraindo vídeo...
               </p>
             </div>
           ) : (
-            <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
+            <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
+              <Server className="h-9 w-9 text-[#f97316]/80" />
               <p className="max-w-md text-sm leading-relaxed text-slate-300">
                 {failoverExhaustedMsg ||
                   resolved?.errorMessage ||
-                  'Selecione outro servidor abaixo (KojimaCDN, Zuplay, Vidstreaming ou Ruplay) para assistir no player.'}
+                  'Nenhum servidor encontrado automaticamente para este título.'}
               </p>
             </div>
           )}
 
-          {/* Title, Favorite & Server Switcher Card */}
+          {/* Title, Favorite & Aggregated Server Switcher Card */}
           <section className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
             <div className="flex flex-wrap items-start justify-between gap-3 border-b border-white/8 pb-4">
               <div className="min-w-0">
@@ -562,6 +629,7 @@ export function EpisodeWorkspace({
                   type="button"
                   onClick={() => {
                     const epNum =
+                      episode.episodeNumber ??
                       extractEpisodeNumber(episode.episodeLabel || '') ??
                       extractEpisodeNumber(episode.title) ??
                       extractEpisodeNumber(episode.url);
@@ -570,9 +638,11 @@ export function EpisodeWorkspace({
                         id: episode.seriesUrl || episode.url,
                         title: episode.seriesTitle,
                         url: episode.seriesUrl || episode.url,
-                        kind: episode.isMovie ? 'movie' : 'anime',
+                        kind: parentMediaKind,
                         poster: episode.poster || episode.backdrop,
                         audioType: null,
+                        catalogSource: episode.catalogSource,
+                        externalIds: episode.externalIds,
                       },
                       episode.isMovie
                         ? null
@@ -602,22 +672,74 @@ export function EpisodeWorkspace({
               </div>
             </div>
 
+            {/* Aggregated Sources & Server Selector */}
             <div className="pt-4">
-              <div className="mb-2.5 flex items-center justify-between gap-2 text-xs font-medium text-slate-400">
+              <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-slate-400">
                 <span className="inline-flex items-center gap-2">
                   <Server className="h-3.5 w-3.5 text-[#f97316]" />
-                  <span>Servidores</span>
+                  <span>Servidores das Fontes ({playableOptions.length})</span>
                 </span>
-                {resolved?.status === 'resolved' && (
-                  <span className="text-[11px] text-emerald-400">
-                    {resolved.provider}
-                  </span>
+                {onRefreshSources && (
+                  <button
+                    type="button"
+                    disabled={loadingEpisode}
+                    onClick={onRefreshSources}
+                    className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#0d0f12] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
+                  >
+                    <RefreshCw className={`h-3 w-3 text-[#f97316] ${loadingEpisode ? 'animate-spin' : ''}`} />
+                    <span>Rebuscar</span>
+                  </button>
                 )}
               </div>
 
-              {playableOptions.length === 0 ? (
-                <p className="text-sm text-amber-300">
-                  Nenhum servidor de vídeo compatível foi encontrado nesta página.
+              {/* Per-Source Resolution Reports */}
+              {((episode.sourceReports && episode.sourceReports.length > 0) ||
+                loadingExtraServers) && (
+                <div className="mb-3 flex flex-wrap gap-1.5">
+                  {(episode.sourceReports || [])
+                    .filter((r) => r.status !== 'skipped')
+                    .map((rep) => (
+                      <span
+                        key={rep.sourceId}
+                        title={rep.errorMessage || rep.matchedTitle || rep.sourceName}
+                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${
+                          rep.status === 'found'
+                            ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
+                            : rep.status === 'error'
+                              ? 'border-red-500/35 bg-red-500/10 text-red-300'
+                              : 'border-white/10 bg-[#0d0f12] text-slate-400'
+                        }`}
+                      >
+                        <span>{rep.sourceName}</span>
+                        <span className="font-mono text-[10px] opacity-80">
+                          {rep.status === 'found'
+                            ? `${rep.optionsCount} srv`
+                            : rep.status === 'error'
+                              ? 'erro'
+                              : '0'}
+                        </span>
+                      </span>
+                    ))}
+                  {loadingExtraServers && (
+                    <span
+                      role="status"
+                      aria-live="polite"
+                      className="inline-flex items-center gap-1.5 rounded-full border border-[#f97316]/35 bg-[#f97316]/10 px-2.5 py-0.5 text-[11px] font-medium text-[#fb923c]"
+                    >
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      <span>
+                        {loadingExtraServerNames.length > 0
+                          ? `${loadingExtraServerNames.join(', ')} carregando...`
+                          : 'Carregando mais servidores...'}
+                      </span>
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {playableOptions.length === 0 && !loadingExtraServers ? (
+                <p className="text-sm text-amber-300/90">
+                  Nenhum servidor encontrado nos servidores integrados para este título. Toque em Rebuscar para tentar novamente.
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-2">
@@ -638,6 +760,19 @@ export function EpisodeWorkspace({
                       </button>
                     );
                   })}
+                  {loadingExtraServers && (
+                    <span
+                      aria-hidden="true"
+                      className="inline-flex min-h-[40px] items-center gap-2 rounded-lg border border-dashed border-[#f97316]/35 bg-[#0d0f12]/70 px-3.5 py-2 text-xs font-medium text-slate-300 sm:text-sm"
+                    >
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                      <span>
+                        {loadingExtraServerNames.length > 0
+                          ? `Buscando ${loadingExtraServerNames.join(', ')}...`
+                          : 'Buscando mais servidores...'}
+                      </span>
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -668,7 +803,7 @@ export function EpisodeWorkspace({
             />
             <div className="p-5">
               <div className="text-xs font-medium text-[#f97316]">
-                {episode.isMovie ? 'Filme' : 'Episódio'}
+                {episode.isMovie ? 'Filme' : episode.mediaType === 'series' ? 'Série' : 'Episódio'}
               </div>
               <h2 className="mt-1 text-base font-semibold text-white">
                 {episode.seriesTitle}
@@ -681,10 +816,10 @@ export function EpisodeWorkspace({
               {episode.seriesUrl && (
                 <button
                   type="button"
-                  onClick={() => onNavigateUrl(episode.seriesUrl!, 'anime')}
+                  onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind)}
                   className="mt-4 w-full rounded-lg border border-white/12 bg-[#0d0f12] px-3 py-2.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
                 >
-                  Ver todos os episódios
+                  {episode.isMovie ? 'Ver detalhes do filme' : 'Ver todos os episódios'}
                 </button>
               )}
             </div>

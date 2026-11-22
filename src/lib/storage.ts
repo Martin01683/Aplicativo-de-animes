@@ -3,6 +3,8 @@ import {
   canonicalEpisodeProgressKey,
   computeProgressSnapshot,
   getResumePositionSec,
+  removeHistoryAnimeFromList,
+  removeHistoryEpisodeFromList,
   sanitizeEpisodeProgressMap,
   upsertEpisodeProgressMap,
   type EpisodePlaybackProgress,
@@ -22,18 +24,32 @@ import type {
   WatchHistoryEntry,
 } from './types';
 
-const FAVORITES_KEY = 'topvlc:favorites:v1';
-const HISTORY_KEY = 'topvlc:history:v1';
-const PROGRESS_KEY = 'topvlc:progress:v1';
-const ALERTS_KEY = 'topvlc:alerts:v1';
-const BASELINES_KEY = 'topvlc:fav_baselines:v1';
-const SETTINGS_KEY = 'topvlc:settings:v1';
-const SETTINGS_META_KEY = 'topvlc:settings_meta:v1';
-const ACK_RELEASE_KEY = 'topvlc:ack_release:v1';
+const FAVORITES_KEY = 'anisync:favorites:v1';
+const LEGACY_FAVORITES_KEY = 'topvlc:favorites:v1';
+const HISTORY_KEY = 'anisync:history:v1';
+const LEGACY_HISTORY_KEY = 'topvlc:history:v1';
+const PROGRESS_KEY = 'anisync:progress:v1';
+const LEGACY_PROGRESS_KEY = 'topvlc:progress:v1';
+const ALERTS_KEY = 'anisync:alerts:v1';
+const LEGACY_ALERTS_KEY = 'topvlc:alerts:v1';
+const BASELINES_KEY = 'anisync:fav_baselines:v1';
+const LEGACY_BASELINES_KEY = 'topvlc:fav_baselines:v1';
+const SETTINGS_KEY = 'anisync:settings:v1';
+const LEGACY_SETTINGS_KEY = 'topvlc:settings:v1';
+const SETTINGS_META_KEY = 'anisync:settings_meta:v1';
+const LEGACY_SETTINGS_META_KEY = 'topvlc:settings_meta:v1';
+const ACK_RELEASE_KEY = 'anisync:ack_release:v1';
+const LEGACY_ACK_RELEASE_KEY = 'topvlc:ack_release:v1';
+
+function readWithLegacyFallback(primaryKey: string, legacyKey: string): string | null {
+  const primary = localStorage.getItem(primaryKey);
+  if (primary !== null) return primary;
+  return localStorage.getItem(legacyKey);
+}
 
 export function loadFavorites(): CatalogMediaItem[] {
   try {
-    const raw = localStorage.getItem(FAVORITES_KEY);
+    const raw = readWithLegacyFallback(FAVORITES_KEY, LEGACY_FAVORITES_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -52,7 +68,7 @@ export function saveFavorites(items: CatalogMediaItem[]): void {
 
 export function loadHistory(): WatchHistoryEntry[] {
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
+    const raw = readWithLegacyFallback(HISTORY_KEY, LEGACY_HISTORY_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -94,14 +110,80 @@ export function pushHistoryEntry(entry: WatchHistoryEntry): WatchHistoryEntry[] 
 export function clearHistory(): void {
   try {
     localStorage.removeItem(HISTORY_KEY);
+    localStorage.removeItem(LEGACY_HISTORY_KEY);
   } catch {
     // ignore
   }
 }
 
+function persistHistoryList(items: WatchHistoryEntry[]): void {
+  try {
+    if (items.length === 0) {
+      localStorage.removeItem(HISTORY_KEY);
+      localStorage.removeItem(LEGACY_HISTORY_KEY);
+    } else {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(items));
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function clearEpisodesProgressUrls(urls: string[]): EpisodeProgressMap {
+  const currentMap = loadEpisodeProgressMap();
+  if (urls.length === 0) return currentMap;
+  let changed = false;
+  const next = { ...currentMap };
+  for (const url of urls) {
+    const key = canonicalEpisodeProgressKey(url);
+    if (key && next[key]) {
+      delete next[key];
+      changed = true;
+    }
+  }
+  if (changed) {
+    saveEpisodeProgressMap(next);
+  }
+  return changed ? next : currentMap;
+}
+
+export function removeHistoryEpisode(url: string): {
+  history: WatchHistoryEntry[];
+  progressMap: EpisodeProgressMap;
+  removedCount: number;
+} {
+  const { nextHistory, removedUrls } = removeHistoryEpisodeFromList(loadHistory(), url);
+  persistHistoryList(nextHistory);
+  const progressMap = clearEpisodesProgressUrls(
+    removedUrls.length > 0 ? removedUrls : [url]
+  );
+  return {
+    history: nextHistory,
+    progressMap,
+    removedCount: removedUrls.length,
+  };
+}
+
+export function removeHistoryAnime(entry: WatchHistoryEntry): {
+  history: WatchHistoryEntry[];
+  progressMap: EpisodeProgressMap;
+  removedCount: number;
+} {
+  const { nextHistory, removedUrls } = removeHistoryAnimeFromList(loadHistory(), entry);
+  persistHistoryList(nextHistory);
+  const progressMap = clearEpisodesProgressUrls(
+    removedUrls.length > 0 ? removedUrls : [entry.url]
+  );
+  return {
+    history: nextHistory,
+    progressMap,
+    removedCount: removedUrls.length,
+  };
+}
+
 export function loadEpisodeProgressMap(): EpisodeProgressMap {
   try {
-    const raw = localStorage.getItem(PROGRESS_KEY);
+    const raw = readWithLegacyFallback(PROGRESS_KEY, LEGACY_PROGRESS_KEY);
     if (!raw) return {};
     return sanitizeEpisodeProgressMap(JSON.parse(raw));
   } catch {
@@ -219,6 +301,7 @@ export function setEpisodesWatched(
 export function clearAllEpisodeProgress(): void {
   try {
     localStorage.removeItem(PROGRESS_KEY);
+    localStorage.removeItem(LEGACY_PROGRESS_KEY);
   } catch {
     // ignore
   }
@@ -226,7 +309,7 @@ export function clearAllEpisodeProgress(): void {
 
 export function loadFavoriteAlerts(): FavoriteAlertEntry[] {
   try {
-    const raw = localStorage.getItem(ALERTS_KEY);
+    const raw = readWithLegacyFallback(ALERTS_KEY, LEGACY_ALERTS_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed : [];
@@ -246,6 +329,7 @@ export function saveFavoriteAlerts(alerts: FavoriteAlertEntry[]): void {
 export function clearFavoriteAlerts(): void {
   try {
     localStorage.removeItem(ALERTS_KEY);
+    localStorage.removeItem(LEGACY_ALERTS_KEY);
   } catch {
     // ignore
   }
@@ -253,7 +337,7 @@ export function clearFavoriteAlerts(): void {
 
 export function loadFavoriteBaselines(): FavoriteBaselineMap {
   try {
-    const raw = localStorage.getItem(BASELINES_KEY);
+    const raw = readWithLegacyFallback(BASELINES_KEY, LEGACY_BASELINES_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
@@ -272,8 +356,8 @@ export function saveFavoriteBaselines(baselines: FavoriteBaselineMap): void {
 
 export function loadAppSettings(): AppSettings {
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return { ...DEFAULT_APP_SETTINGS };
+    const raw = readWithLegacyFallback(SETTINGS_KEY, LEGACY_SETTINGS_KEY);
+    if (!raw) return sanitizeAppSettings(null);
     return sanitizeAppSettings(JSON.parse(raw));
   } catch {
     return { ...DEFAULT_APP_SETTINGS };
@@ -290,7 +374,7 @@ export function saveAppSettings(settings: AppSettings): void {
 
 export function loadAppSettingsMeta(): AppSettingsMeta {
   try {
-    const raw = localStorage.getItem(SETTINGS_META_KEY);
+    const raw = readWithLegacyFallback(SETTINGS_META_KEY, LEGACY_SETTINGS_META_KEY);
     if (!raw) return { ...DEFAULT_APP_SETTINGS_META };
     const parsed = JSON.parse(raw) as Partial<AppSettingsMeta>;
     return {
@@ -314,7 +398,7 @@ export function saveAppSettingsMeta(meta: AppSettingsMeta): void {
 
 export function loadAcknowledgedReleaseKey(): string | null {
   try {
-    return localStorage.getItem(ACK_RELEASE_KEY) || null;
+    return readWithLegacyFallback(ACK_RELEASE_KEY, LEGACY_ACK_RELEASE_KEY) || null;
   } catch {
     return null;
   }
@@ -324,6 +408,7 @@ export function saveAcknowledgedReleaseKey(key: string | null): void {
   try {
     if (!key) {
       localStorage.removeItem(ACK_RELEASE_KEY);
+      localStorage.removeItem(LEGACY_ACK_RELEASE_KEY);
     } else {
       localStorage.setItem(ACK_RELEASE_KEY, key);
     }

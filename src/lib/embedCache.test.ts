@@ -74,4 +74,16 @@ describe('embedCache', () => {
     const errored = makeResolvedEmbed([], 'error');
     assert.equal(createEmbedCacheEntry(errored, nowMs), null);
   });
+
+  it('extracts expiration timestamps from Cloudflare R2 / AWS SigV4 X-Amz-Date + X-Amz-Expires URLs', () => {
+    const earliest = extractEarliestStreamExpiresAtMs([
+      {
+        label: '1080p (Full HD)',
+        height: 1080,
+        url: 'https://173fe263eae04670ecfcebf237fd6480.r2.cloudflarestorage.com/zful/538184.mp4?X-Amz-Date=20261122T010000Z&X-Amz-Expires=3600&X-Amz-Signature=abc',
+        format: 'mp4',
+      },
+    ]);
+    assert.equal(earliest, Date.UTC(2026, 10, 22, 2, 0, 0));
+  });
 });

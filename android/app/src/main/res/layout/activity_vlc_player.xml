@@ -225,20 +225,6 @@
             </LinearLayout>
         </LinearLayout>
 
-        <!-- Center Circular Orange Play/Pause Button (same look as Web AnimePlayer) -->
-        <ImageButton
-            android:id="@+id/vlc_btn_play_center"
-            android:layout_width="70dp"
-            android:layout_height="70dp"
-            android:layout_centerInParent="true"
-            android:background="@drawable/bg_player_circle_orange"
-            android:contentDescription="Reproduzir ou pausar"
-            android:elevation="8dp"
-            android:padding="19dp"
-            android:scaleType="fitCenter"
-            android:src="@drawable/ic_player_pause"
-            app:tint="#0D0F12" />
-
         <!-- Bottom Gradient HUD (matches Web AnimePlayer bottom bar) -->
         <LinearLayout
             android:id="@+id/vlc_bottom_bar"
@@ -517,6 +503,21 @@
                 </LinearLayout>
             </LinearLayout>
         </LinearLayout>
+
+        <!-- Center Circular Orange Play/Pause Button (last child so it always sits above top/bottom bars) -->
+        <ImageButton
+            android:id="@+id/vlc_btn_play_center"
+            android:layout_width="70dp"
+            android:layout_height="70dp"
+            android:layout_centerInParent="true"
+            android:background="@drawable/bg_player_circle_orange"
+            android:contentDescription="Reproduzir ou pausar"
+            android:elevation="8dp"
+            android:padding="19dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/ic_player_pause"
+            android:visibility="gone"
+            app:tint="#0D0F12" />
     </RelativeLayout>
 
     <!-- In-Player Dark Settings Menu Overlay (bottom-right, matches Web Settings Popover) -->

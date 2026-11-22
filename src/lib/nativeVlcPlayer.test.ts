@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -286,6 +286,129 @@ describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () 
     assert.match(proxyJava, /String rawMethod = call\.getString\("method",\s*"GET"\)/);
     assert.match(proxyJava, /String requestBody = call\.getString\("body",\s*null\)/);
     assert.match(proxyJava, /conn\.setDoOutput\(true\)/);
+  });
+
+  it('supports Hinata Soul episode, embed, and series episode resolution in TopAnimesEpisodeResolver', () => {
+    assert.match(resolverJava, /public static boolean isHinataSoulUrl\(String rawUrl\)/);
+    assert.match(resolverJava, /private static ResolvedEpisodeData resolveHinataSoulEpisode\(/);
+    assert.match(resolverJava, /private static ResolvedEmbedData resolveHinataSoulEmbed\(/);
+    assert.match(resolverJava, /private static List<EpisodeLink> fetchHinataSoulSeriesEpisodes\(/);
+    assert.match(resolverJava, /ads\.animeyabu\.net\/adblock2\.php/);
+  });
+
+  it('keeps the centered Android play button unobstructed in AnimePlayer and VlcPlayerActivity', () => {
+    const animePlayerTsx = readFileSync(
+      resolve(ROOT, 'src/components/AnimePlayer.tsx'),
+      'utf8'
+    );
+    const headerTsx = readFileSync(resolve(ROOT, 'src/components/Header.tsx'), 'utf8');
+    const vlcLayoutXml = readFileSync(
+      resolve(ROOT, 'android/app/src/main/res/layout/activity_vlc_player.xml'),
+      'utf8'
+    );
+    const activityJava = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java'),
+      'utf8'
+    );
+
+    // Center Play button sits above the bottom HUD (z-[35] when menus are closed) with touch-manipulation
+    assert.match(
+      animePlayerTsx,
+      /aria-label="Reproduzir episódio"[\s\S]*?touch-manipulation[\s\S]*?menuOpen \|\| episodesOpen \? 'z-20' : 'z-\[35\]'/
+    );
+    // Outer bottom HUD gradient must be pointer-events-none so it never swallows taps over the center play button on mobile
+    assert.match(
+      animePlayerTsx,
+      /pointer-events-none absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t/
+    );
+    // Synchronous launch guard prevents duplicate native activity launches on rapid taps
+    assert.match(animePlayerTsx, /nativeLaunchingRef\.current/);
+
+    // Native fullscreen layout places vlc_btn_play_center after vlc_bottom_bar so it always stays on top
+    const bottomBarIdx = vlcLayoutXml.indexOf('android:id="@+id/vlc_bottom_bar"');
+    const centerBtnIdx = vlcLayoutXml.indexOf('android:id="@+id/vlc_btn_play_center"');
+    assert.ok(bottomBarIdx > 0 && centerBtnIdx > bottomBarIdx, 'vlc_btn_play_center must follow vlc_bottom_bar');
+
+    // Native togglePlayPause cancels stale single-tap HUD toggles and updates icons immediately
+    const toggleMatch = activityJava.match(/private void togglePlayPause\(\)[\s\S]*?\r?\n {4}\}/);
+    assert.ok(toggleMatch, 'missing togglePlayPause()');
+    assert.match(toggleMatch[0], /uiHandler\.removeCallbacks\(singleTapRunnable\)/);
+    assert.match(toggleMatch[0], /mediaPlayer\.play\(\);[\s\S]*?updatePlayPauseIcons\(true\)/);
+
+    // Header brand subtitle only shows Animes (no Séries / Filmes)
+    assert.doesNotMatch(headerTsx, /Animes\s*·\s*Séries\s*·\s*Filmes/);
+  });
+
+  it('pauses on headphone unplug/disconnect and owns Android MediaSession + media keys so external VLC is not triggered', () => {
+    const activityJava = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java'),
+      'utf8'
+    );
+    const animeDetailTsx = readFileSync(
+      resolve(ROOT, 'src/components/AnimeDetailView.tsx'),
+      'utf8'
+    );
+
+    // Becoming noisy receiver for wired/Bluetooth disconnect
+    assert.match(activityJava, /AudioManager\.ACTION_AUDIO_BECOMING_NOISY/);
+    assert.match(activityJava, /Context\.RECEIVER_NOT_EXPORTED/);
+    assert.match(activityJava, /registerBecomingNoisyReceiver\(\)/);
+    assert.match(activityJava, /unregisterBecomingNoisyReceiver\(\)/);
+
+    // Active MediaSession + PlaybackState so Bluetooth earbud play/pause does not wake external VLC
+    assert.match(activityJava, /private void setupMediaSession\(\)/);
+    assert.match(activityJava, /new MediaSession\(this,\s*TAG\)/);
+    assert.match(activityJava, /mediaSession\.setPlaybackState\(playbackState\)/);
+    assert.match(activityJava, /mediaSession\.setActive\(true\)/);
+    assert.match(activityJava, /private void releaseMediaSession\(\)/);
+
+    // Media key consumption in onKeyDown + onKeyUp
+    assert.match(activityJava, /public boolean onKeyDown\(int keyCode,\s*KeyEvent event\)/);
+    assert.match(activityJava, /public boolean onKeyUp\(int keyCode,\s*KeyEvent event\)/);
+    assert.match(activityJava, /KeyEvent\.KEYCODE_MEDIA_PLAY/);
+    assert.match(activityJava, /KeyEvent\.KEYCODE_MEDIA_PAUSE/);
+    assert.match(activityJava, /KeyEvent\.KEYCODE_HEADSETHOOK/);
+
+    // Episode list shows "Parou em" below the title on mobile instead of crowding the title row
+    assert.match(
+      animeDetailTsx,
+      /font-medium text-\[#fb923c\] sm:hidden[\s\S]*?Parou em \{formatPlaybackTimestamp\(resumeSec\)\}/
+    );
+    assert.match(
+      animeDetailTsx,
+      /hidden text-xs font-medium tabular-nums text-\[#fb923c\] sm:inline[\s\S]*?Parou em \{formatPlaybackTimestamp\(resumeSec\)\}/
+    );
+  });
+
+  it('configures Anisync brand name and sole standard launcher icon in AndroidManifest', () => {
+    const manifestXml = readFileSync(
+      resolve(ROOT, 'android/app/src/main/AndroidManifest.xml'),
+      'utf8'
+    );
+    const stringsXml = readFileSync(
+      resolve(ROOT, 'android/app/src/main/res/values/strings.xml'),
+      'utf8'
+    );
+    const bgColorsXml = readFileSync(
+      resolve(ROOT, 'android/app/src/main/res/values/ic_launcher_background.xml'),
+      'utf8'
+    );
+
+    assert.match(stringsXml, /<string name="app_name">Anisync<\/string>/);
+    assert.match(stringsXml, /<string name="title_activity_main">Anisync<\/string>/);
+    assert.match(
+      manifestXml,
+      /<activity[\s\S]*?android:name="\.MainActivity"[\s\S]*?android\.intent\.category\.LAUNCHER/
+    );
+    assert.doesNotMatch(manifestXml, /<activity-alias/);
+    assert.match(bgColorsXml, /<color name="ic_launcher_background">#0e1115<\/color>/);
+    assert.ok(existsSync(resolve(ROOT, 'public/pwa-192x192.png')));
+    assert.ok(existsSync(resolve(ROOT, 'public/pwa-512x512.png')));
+    assert.ok(
+      existsSync(
+        resolve(ROOT, 'android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png')
+      )
+    );
   });
 });
 

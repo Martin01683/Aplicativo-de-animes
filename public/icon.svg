@@ -2,14 +2,52 @@
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0%" stop-color="#151921" />
-      <stop offset="100%" stop-color="#0d0f12" />
+      <stop offset="100%" stop-color="#0e1115" />
     </linearGradient>
-    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#fb7185" />
-      <stop offset="100%" stop-color="#e53935" />
+    <linearGradient id="play" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fb923c" />
+      <stop offset="50%" stop-color="#f97316" />
+      <stop offset="100%" stop-color="#ea580c" />
     </linearGradient>
   </defs>
-  <rect width="512" height="512" rx="108" fill="url(#bg)" />
-  <circle cx="256" cy="256" r="148" fill="url(#accent)" />
-  <path d="M214 176 L342 256 L214 336 Z" fill="#ffffff" />
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <!-- Outer synchronized orbital arcs -->
+  <path
+    d="M 122 256 A 134 134 0 0 1 356 166"
+    fill="none"
+    stroke="#fff7ed"
+    stroke-width="20"
+    stroke-linecap="round"
+  />
+  <path
+    d="M 390 256 A 134 134 0 0 1 156 346"
+    fill="none"
+    stroke="#fff7ed"
+    stroke-width="20"
+    stroke-linecap="round"
+  />
+  <!-- Inner synchronized orange arcs -->
+  <path
+    d="M 152 192 A 122 122 0 0 1 374 286"
+    fill="none"
+    stroke="url(#play)"
+    stroke-width="22"
+    stroke-linecap="round"
+  />
+  <path
+    d="M 360 320 A 122 122 0 0 1 138 226"
+    fill="none"
+    stroke="url(#play)"
+    stroke-width="22"
+    stroke-linecap="round"
+  />
+  <!-- Central rounded hollow Play triangle -->
+  <path
+    d="M 218 194 L 314 256 L 218 318 Z"
+    fill="none"
+    stroke="url(#play)"
+    stroke-width="34"
+    stroke-linejoin="round"
+    stroke-linecap="round"
+  />
 </svg>

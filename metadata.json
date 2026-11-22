@@ -1,6 +1,6 @@
 {
-  "name": "TopVLC — TopAnimes no VLC",
-  "description": "Navegue pelos lançamentos, animes e filmes do TopAnimes, remova protetores e reproduza diretamente no VLC Media Player com playlists .M3U e legendas.",
+  "name": "Anisync — Animes",
+  "description": "Catálogo direto dos servidores integrados com metadados do TheTVDB e calendário semanal de animes do LiveChart.me.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

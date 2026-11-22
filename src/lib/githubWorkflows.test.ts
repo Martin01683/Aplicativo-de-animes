@@ -159,10 +159,10 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
       assert.doesNotMatch(raw, /outputs\/apk\/debug/);
     });
 
-    it('publishes the release APK (TopAnimes.apk), not the debug one', () => {
+    it('publishes the release APK (Anisync.apk), not the debug one', () => {
       const publish = (publishJob.steps ?? []).find((s) => s.name === 'Publish APK Release');
       assert.ok(publish?.run);
-      assert.match(publish.run, /gh release (upload|create) .*TopAnimes\.apk/);
+      assert.match(publish.run, /gh release (upload|create) .*Anisync\.apk/);
       assert.doesNotMatch(publish.run, /gh release (upload|create)[^\n]*TopAnimes-debug\.apk/);
     });
 
@@ -175,7 +175,7 @@ describe('.github/workflows/test.yml - CI, secret scan, and Android APK build', 
       const publish = (publishJob.steps ?? []).find((s) => s.name === 'Publish APK Release');
       const script = publish?.run ?? '';
       assert.match(script, /v1\.0\.\$\{\{\s*github\.run_number\s*\}\}/);
-      assert.match(script, /gh release create "\$TAG" TopAnimes\.apk/);
+      assert.match(script, /gh release create "\$TAG" Anisync\.apk/);
       assert.doesNotMatch(script, /gh release upload\b[^\n]*--clobber/);
     });
 

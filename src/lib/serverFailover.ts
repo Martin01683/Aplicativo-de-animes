@@ -2,6 +2,8 @@ import { isSameEpisodeUrl } from './nativeVlcPlayer';
 import type { PlayerOption, ResolvedEmbed, StreamQuality } from './types';
 
 const PROVIDER_TIEBREAKER: Record<PlayerOption['providerKind'], number> = {
+  direct: 8,
+  hinatasoul: 6,
   kojima: 5,
   zuplay: 4,
   vidstreaming: 3,

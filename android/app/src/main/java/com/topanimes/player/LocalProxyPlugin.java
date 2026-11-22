@@ -205,12 +205,28 @@ public class LocalProxyPlugin extends Plugin {
             call.reject("URL inválida ou não permitida.");
             return;
         }
-        String referer = call.getString("referer", "https://topanimes.net/");
+        String referer = call.getString("referer", "");
         String accept = call.getString("accept", "text/html,application/xhtml+xml,application/json,*/*;q=0.9");
         String rawMethod = call.getString("method", "GET");
-        String method = "POST".equalsIgnoreCase(rawMethod) ? "POST" : "GET";
+        String method = "POST".equalsIgnoreCase(rawMethod)
+            ? "POST"
+            : "PROPFIND".equalsIgnoreCase(rawMethod)
+                ? "PROPFIND"
+                : "GET";
         String requestBody = call.getString("body", null);
         String contentType = call.getString("contentType", null);
+        JSObject rawHeaders = call.getObject("headers", null);
+        Map<String, String> customHeaders = new HashMap<>();
+        if (rawHeaders != null) {
+            java.util.Iterator<String> keys = rawHeaders.keys();
+            while (keys.hasNext()) {
+                String k = keys.next();
+                String v = rawHeaders.optString(k, "");
+                if (k != null && !v.isEmpty()) {
+                    customHeaders.put(k, v);
+                }
+            }
+        }
         int timeoutMs = call.getInt("timeoutMs", 12000);
 
         if (executor == null || executor.isShutdown()) {
@@ -228,7 +244,8 @@ public class LocalProxyPlugin extends Plugin {
                     timeoutMs,
                     method,
                     requestBody,
-                    contentType
+                    contentType,
+                    customHeaders
                 );
                 conn = res.connection;
                 int status = conn.getResponseCode();
@@ -967,7 +984,7 @@ public class LocalProxyPlugin extends Plugin {
         String rangeHeader,
         int timeoutMs
     ) throws IOException {
-        return openWithRedirects(rawUrl, referer, accept, rangeHeader, timeoutMs, "GET", null, null);
+        return openWithRedirects(rawUrl, referer, accept, rangeHeader, timeoutMs, "GET", null, null, null);
     }
 
     private static RedirectResult openWithRedirects(
@@ -978,10 +995,15 @@ public class LocalProxyPlugin extends Plugin {
         int timeoutMs,
         String initialMethod,
         String requestBody,
-        String contentType
+        String contentType,
+        Map<String, String> customHeaders
     ) throws IOException {
         String currentUrl = rawUrl;
-        String currentMethod = "POST".equalsIgnoreCase(initialMethod) ? "POST" : "GET";
+        String currentMethod = "POST".equalsIgnoreCase(initialMethod)
+            ? "POST"
+            : "PROPFIND".equalsIgnoreCase(initialMethod)
+                ? "PROPFIND"
+                : "GET";
         String currentBody = "POST".equals(currentMethod) ? requestBody : null;
         for (int hop = 0; hop <= 4; hop++) {
             if (!isSafeHttpUrl(currentUrl)) {
@@ -1001,6 +1023,7 @@ public class LocalProxyPlugin extends Plugin {
             boolean isFileVideo = host.contains("filevideo1.com");
             boolean isTikTokCdn = host.equals("tiktokcdn.com") || host.endsWith(".tiktokcdn.com");
             if (referer != null
+                && !referer.isEmpty()
                 && isSafeHttpUrl(referer)
                 && !(isFileVideo && referer.toLowerCase(Locale.ROOT).contains("csst.online"))
                 && !isTikTokCdn) {
@@ -1009,17 +1032,30 @@ public class LocalProxyPlugin extends Plugin {
             if (rangeHeader != null && !rangeHeader.isEmpty() && "GET".equals(currentMethod)) {
                 conn.setRequestProperty("Range", rangeHeader);
             }
+            if (customHeaders != null && !customHeaders.isEmpty()) {
+                for (Map.Entry<String, String> entry : customHeaders.entrySet()) {
+                    String key = entry.getKey();
+                    String val = entry.getValue();
+                    if (key == null || val == null || val.isEmpty()) continue;
+                    String lowerKey = key.toLowerCase(Locale.ROOT);
+                    if ("authorization".equals(lowerKey)
+                        || "origin".equals(lowerKey)
+                        || "cookie".equals(lowerKey)) {
+                        conn.setRequestProperty(key, val);
+                    }
+                }
+            }
 
             if ("POST".equals(currentMethod) && currentBody != null) {
                 byte[] payload = currentBody.getBytes(StandardCharsets.UTF_8);
                 conn.setDoOutput(true);
-                conn.setRequestProperty(
-                    "Content-Type",
-                    contentType != null && !contentType.isEmpty()
-                        ? contentType
-                        : "application/x-www-form-urlencoded; charset=UTF-8"
-                );
-                conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+                String ct = contentType != null && !contentType.isEmpty()
+                    ? contentType
+                    : "application/x-www-form-urlencoded; charset=UTF-8";
+                conn.setRequestProperty("Content-Type", ct);
+                if (!ct.toLowerCase(Locale.ROOT).contains("application/json")) {
+                    conn.setRequestProperty("X-Requested-With", "XMLHttpRequest");
+                }
                 conn.setFixedLengthStreamingMode(payload.length);
                 try (OutputStream out = conn.getOutputStream()) {
                     out.write(payload);
@@ -1033,7 +1069,7 @@ public class LocalProxyPlugin extends Plugin {
                 if (loc == null || loc.isEmpty()) {
                     throw new IOException("Redirecionamento sem destino.");
                 }
-                if (code != 307 && code != 308) {
+                if (code != 307 && code != 308 && "POST".equals(currentMethod)) {
                     currentMethod = "GET";
                     currentBody = null;
                 }

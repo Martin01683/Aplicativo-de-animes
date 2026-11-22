@@ -3,7 +3,13 @@ import {
   DEFAULT_VIDEO_SCALE,
   sanitizeVideoScaleMode,
   type VideoScaleMode,
-} from './playbackProgress';
+} from './playbackProgress.ts';
+import {
+  DEFAULT_EPISODE_SOURCES,
+  sanitizeEpisodeSources,
+  type EpisodeSourceConfig,
+} from './sources/types.ts';
+import type { CatalogSourceCredentials, LiveChartScheduleMode } from './types.ts';
 
 export type EpisodeCheckIntervalMinutes = 0 | 1 | 5 | 15 | 30 | 60;
 export type AppUpdateIntervalHours = 6 | 24 | 168;
@@ -20,9 +26,12 @@ export interface AppSettings {
   autoDownloadAppUpdates: boolean;
   defaultSection: NavSection;
   defaultAudioFilter: DefaultAudioFilter;
+  calendarScheduleMode: LiveChartScheduleMode;
   skipIntroSeconds: SkipIntroSeconds;
   autoPlayNextEpisode: boolean;
   videoScale: VideoScaleMode;
+  episodeSources: EpisodeSourceConfig[];
+  catalogCredentials: CatalogSourceCredentials;
 }
 
 export interface AppSettingsMeta {
@@ -40,9 +49,15 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   autoDownloadAppUpdates: false,
   defaultSection: 'releases',
   defaultAudioFilter: 'ALL',
+  calendarScheduleMode: 'streams',
   skipIntroSeconds: 85,
   autoPlayNextEpisode: false,
   videoScale: DEFAULT_VIDEO_SCALE,
+  episodeSources: DEFAULT_EPISODE_SOURCES.map((s) => ({
+    ...s,
+    supportsMedia: [...s.supportsMedia],
+  })),
+  catalogCredentials: {},
 };
 
 export const DEFAULT_APP_SETTINGS_META: AppSettingsMeta = {
@@ -78,11 +93,29 @@ const VALID_EPISODE_INTERVALS = new Set<number>([0, 1, 5, 15, 30, 60]);
 const VALID_UPDATE_INTERVALS = new Set<number>([6, 24, 168]);
 const VALID_SECTIONS = new Set<NavSection>(['releases', 'calendar', 'catalog', 'library']);
 const VALID_AUDIO_FILTERS = new Set<DefaultAudioFilter>(['ALL', 'DUB', 'LEG']);
+const VALID_SCHEDULE_MODES = new Set<LiveChartScheduleMode>(['streams', 'dub', 'jp']);
 const VALID_SKIP_SECONDS = new Set<number>([30, 60, 85, 90]);
+
+function sanitizeCatalogCredentials(raw: unknown): CatalogSourceCredentials {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  const rec = raw as Record<string, unknown>;
+  const out: CatalogSourceCredentials = {};
+  if (typeof rec.tvdbApiKey === 'string' && rec.tvdbApiKey.trim()) {
+    out.tvdbApiKey = rec.tvdbApiKey.trim();
+  }
+  if (typeof rec.tvdbPin === 'string' && rec.tvdbPin.trim()) {
+    out.tvdbPin = rec.tvdbPin.trim();
+  }
+  return out;
+}
 
 export function sanitizeAppSettings(raw: unknown): AppSettings {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ...DEFAULT_APP_SETTINGS };
+    return {
+      ...DEFAULT_APP_SETTINGS,
+      episodeSources: sanitizeEpisodeSources(undefined),
+      catalogCredentials: {},
+    };
   }
   const input = raw as Record<string, unknown>;
 
@@ -120,6 +153,12 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
     ? (input.defaultAudioFilter as DefaultAudioFilter)
     : DEFAULT_APP_SETTINGS.defaultAudioFilter;
 
+  const calendarScheduleMode = VALID_SCHEDULE_MODES.has(
+    input.calendarScheduleMode as LiveChartScheduleMode
+  )
+    ? (input.calendarScheduleMode as LiveChartScheduleMode)
+    : DEFAULT_APP_SETTINGS.calendarScheduleMode;
+
   const skipIntroSeconds = VALID_SKIP_SECONDS.has(Number(input.skipIntroSeconds))
     ? (Number(input.skipIntroSeconds) as SkipIntroSeconds)
     : DEFAULT_APP_SETTINGS.skipIntroSeconds;
@@ -146,12 +185,20 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
         : DEFAULT_APP_SETTINGS.autoDownloadAppUpdates,
     defaultSection,
     defaultAudioFilter,
+    calendarScheduleMode,
     skipIntroSeconds,
     autoPlayNextEpisode:
       typeof input.autoPlayNextEpisode === 'boolean'
         ? input.autoPlayNextEpisode
         : DEFAULT_APP_SETTINGS.autoPlayNextEpisode,
     videoScale: sanitizeVideoScaleMode(input.videoScale),
+    episodeSources: sanitizeEpisodeSources(input.episodeSources)
+      .filter((s) => s.builtIn)
+      .map((s) => ({
+        ...s,
+        enabled: true,
+      })),
+    catalogCredentials: sanitizeCatalogCredentials(input.catalogCredentials),
   };
 }
 

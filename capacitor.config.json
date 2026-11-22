@@ -1,6 +1,6 @@
 {
   "appId": "com.topanimes.player",
-  "appName": "TopAnimes",
+  "appName": "Anisync",
   "webDir": "dist",
   "server": {
     "androidScheme": "http",

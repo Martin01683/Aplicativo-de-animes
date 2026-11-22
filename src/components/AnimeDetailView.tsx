@@ -3,17 +3,22 @@ import {
   ArrowDownNarrowWide,
   ArrowLeft,
   ArrowUpWideNarrow,
+  Building2,
   Calendar,
   Check,
   CheckCheck,
   Clock,
   ExternalLink,
+  Film,
+  Globe,
   Heart,
   Layers,
   Play,
+  Radio,
   Search,
   SkipForward,
   Star,
+  Tv,
   X,
 } from 'lucide-react';
 import { isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
@@ -30,6 +35,7 @@ import type {
   AnimeDetails,
   AnimeEpisodeLink,
   CatalogMediaItem,
+  CatalogSourceId,
   FavoriteLatestInfo,
 } from '../lib/types';
 import { MediaPoster } from './MediaPoster';
@@ -50,6 +56,12 @@ interface AnimeDetailViewProps {
   onBack: () => void;
 }
 
+const SOURCE_BADGE_STYLE: Record<CatalogSourceId, string> = {
+  thetvdb: 'border-[#f97316]/35 bg-[#f97316]/12 text-[#fb923c] hover:bg-[#f97316]/20',
+  livechart: 'border-[#f97316]/35 bg-[#f97316]/12 text-[#fb923c] hover:bg-[#f97316]/20',
+  server: 'border-white/15 bg-white/8 text-slate-200 hover:bg-white/12',
+};
+
 export function AnimeDetailView({
   anime,
   isFavorite,
@@ -69,17 +81,20 @@ export function AnimeDetailView({
     setSortDesc(false);
   }, [anime.url]);
 
+  const isMovie = anime.kind === 'movie';
+  const isSeries = anime.kind === 'series';
+
   const latestEpisode = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster);
   const firstEpisode = anime.episodes[0];
   const lastEpisodeItem =
     anime.episodes.length > 1 ? anime.episodes[anime.episodes.length - 1] : null;
   const quickLastEpisode =
-    latestEpisode && firstEpisode && latestEpisode.episodeUrl !== firstEpisode.url
+    !isMovie && latestEpisode && firstEpisode && latestEpisode.episodeUrl !== firstEpisode.url
       ? {
           url: latestEpisode.episodeUrl,
           label: latestEpisode.episodeLabel || latestEpisode.episodeTitle,
         }
-      : lastEpisodeItem && firstEpisode && lastEpisodeItem.url !== firstEpisode.url
+      : !isMovie && lastEpisodeItem && firstEpisode && lastEpisodeItem.url !== firstEpisode.url
         ? {
             url: lastEpisodeItem.url,
             label: lastEpisodeItem.title,
@@ -144,37 +159,50 @@ export function AnimeDetailView({
     subtitleParts.push(anime.originalTitle);
   }
 
-  const extraMetaItems: Array<{ label: string; value: string; kind?: 'date' | 'clock' | 'star' | 'layers' }> = [];
+  const extraMetaItems: Array<{
+    label: string;
+    value: string;
+    kind?: 'date' | 'clock' | 'layers' | 'studio' | 'network' | 'globe';
+  }> = [];
+  if (anime.status) {
+    extraMetaItems.push({ label: 'Status', value: anime.status });
+  }
+  if (anime.studio) {
+    extraMetaItems.push({ label: 'Estúdio', value: anime.studio, kind: 'studio' });
+  }
+  if (anime.network) {
+    extraMetaItems.push({ label: 'Rede', value: anime.network, kind: 'network' });
+  }
   if (anime.firstAirDate) {
     extraMetaItems.push({ label: 'Estreia', value: anime.firstAirDate, kind: 'date' });
   }
   if (anime.lastAirDate) {
-    extraMetaItems.push({ label: 'Último ep.', value: anime.lastAirDate, kind: 'date' });
+    extraMetaItems.push({ label: 'Recente', value: anime.lastAirDate, kind: 'date' });
   }
   if (anime.averageDuration) {
     extraMetaItems.push({ label: 'Duração', value: anime.averageDuration, kind: 'clock' });
   }
-  if (anime.tmdbRating) {
-    extraMetaItems.push({
-      label: 'TMDb',
-      value: anime.tmdbVotes ? `${anime.tmdbRating} (${anime.tmdbVotes})` : anime.tmdbRating,
-      kind: 'star',
-    });
-  }
   if (anime.seasonsCount) {
     extraMetaItems.push({ label: 'Temporadas', value: anime.seasonsCount, kind: 'layers' });
   }
-  if (anime.episodesTotalCount && anime.episodesTotalCount !== String(anime.episodes.length)) {
-    extraMetaItems.push({ label: 'Total catálogo', value: `${anime.episodesTotalCount} eps` });
+  if (anime.originalLanguage) {
+    extraMetaItems.push({ label: 'Idioma', value: anime.originalLanguage, kind: 'globe' });
   }
 
-  const handleOpenMyAnimeList = () => {
-    if (!anime.myAnimeListUrl) return;
+  // Only show TheTVDB and LiveChart.me links
+  const externalLinks = useMemo(() => {
+    return (anime.externalLinks || []).filter(
+      (link) => link.source === 'thetvdb' || link.source === 'livechart'
+    );
+  }, [anime.externalLinks]);
+
+  const handleOpenExternalLink = (targetUrl: string) => {
+    if (!targetUrl) return;
     if (isNativeAndroidApp()) {
-      void openExternalOrVlcUrl(anime.myAnimeListUrl);
+      void openExternalOrVlcUrl(targetUrl);
       return;
     }
-    window.open(anime.myAnimeListUrl, '_blank', 'noopener,noreferrer');
+    window.open(targetUrl, '_blank', 'noopener,noreferrer');
   };
 
   const handleToggleFav = () => {
@@ -183,26 +211,30 @@ export function AnimeDetailView({
         id: anime.url,
         title: anime.title,
         url: anime.url,
-        kind: 'anime',
+        kind: anime.kind || 'anime',
         poster: anime.poster,
         audioType: anime.audioType,
         rating: anime.rating,
         year: anime.year,
+        catalogSource: anime.catalogSource,
+        externalIds: anime.externalIds,
       },
       latestEpisode
     );
   };
 
+  const hasDistinctBackdrop = Boolean(anime.backdrop && anime.backdrop !== anime.poster);
+
   return (
-    <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
-      <div className="mb-6 flex items-center justify-between gap-3">
+    <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+      <div className="mb-5 flex items-center justify-between gap-3">
         <button
           type="button"
           onClick={onBack}
           className="inline-flex items-center gap-2 text-sm font-medium text-slate-400 transition-colors hover:text-white"
         >
           <ArrowLeft className="h-4 w-4" />
-          <span>Voltar ao catálogo</span>
+          <span>Voltar</span>
         </button>
 
         <button
@@ -222,159 +254,188 @@ export function AnimeDetailView({
         </button>
       </div>
 
-      <div className="grid gap-8 rounded-xl border border-white/10 bg-[#151921] p-6 lg:grid-cols-[220px_1fr]">
-        <MediaPoster
-          src={anime.poster}
-          alt={anime.title}
-          aspect="portrait"
-          className="w-full max-w-[220px] rounded-lg border border-white/10"
-        />
+      {/* Hero Info Card enriched by TheTVDB */}
+      <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#151921]">
+        {hasDistinctBackdrop && (
+          <div className="pointer-events-none absolute inset-0 overflow-hidden">
+            <img
+              src={anime.backdrop}
+              alt=""
+              aria-hidden="true"
+              referrerPolicy="no-referrer"
+              className="h-full w-full object-cover opacity-15 blur-sm"
+            />
+            <div className="absolute inset-0 bg-gradient-to-r from-[#151921] via-[#151921]/92 to-[#151921]/80" />
+          </div>
+        )}
 
-        <div className="flex flex-col justify-between gap-5">
-          <div>
-            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs font-medium text-slate-400">
-              {anime.audioType && (
-                <span
-                  className={
-                    anime.audioType === 'DUB' ? 'text-emerald-400' : 'text-rose-400'
-                  }
-                >
-                  {anime.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
+        <div className="relative grid gap-6 p-5 sm:p-7 lg:grid-cols-[220px_1fr] lg:gap-8">
+          <MediaPoster
+            src={anime.poster}
+            alt={anime.title}
+            aspect="portrait"
+            className="mx-auto w-full max-w-[220px] rounded-xl border border-white/10 shadow-xl lg:mx-0"
+          />
+
+          <div className="flex flex-col justify-between gap-5">
+            <div>
+              <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5 text-xs font-medium text-slate-400">
+                <span className="inline-flex items-center gap-1 rounded-md border border-[#f97316]/30 bg-[#f97316]/12 px-2 py-0.5 text-[#fb923c]">
+                  {isMovie ? <Film className="h-3 w-3" /> : <Tv className="h-3 w-3" />}
+                  <span>{isMovie ? 'Filme' : isSeries ? 'Série' : 'Anime'}</span>
                 </span>
-              )}
-              {anime.year && (
-                <>
-                  {anime.audioType && <span>·</span>}
-                  <span className="tabular-nums">{anime.year}</span>
-                </>
-              )}
-              {anime.rating && (
-                <>
-                  {(anime.audioType || anime.year) && <span>·</span>}
+                {anime.audioType && (
+                  <span
+                    className={`rounded-md border px-2 py-0.5 font-semibold ${
+                      anime.audioType === 'DUB'
+                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                        : 'border-sky-500/35 bg-sky-500/12 text-sky-300'
+                    }`}
+                  >
+                    {anime.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
+                  </span>
+                )}
+                {anime.year && <span className="tabular-nums text-slate-300">{anime.year}</span>}
+                {anime.rating && Number.parseFloat(anime.rating) > 0 && (
                   <span className="inline-flex items-center gap-1 tabular-nums text-amber-400">
                     <Star className="h-3.5 w-3.5 fill-amber-400" />
                     {anime.rating}
                   </span>
-                </>
-              )}
-              {anime.episodes.length > 0 && (
-                <>
-                  {(anime.audioType || anime.year || anime.rating) && <span>·</span>}
-                  <span className="tabular-nums">
-                    {anime.episodes.length} episódios
+                )}
+                {!isMovie && anime.episodes.length > 0 && (
+                  <span className="tabular-nums text-slate-300">
+                    {anime.episodes.length} episódio{anime.episodes.length === 1 ? '' : 's'}
                   </span>
-                </>
-              )}
-            </div>
+                )}
+                {anime.sourceServerName && (
+                  <span className="rounded-md border border-white/10 bg-[#0d0f12]/70 px-2 py-0.5 text-[11px] text-slate-300">
+                    Servidor: {anime.sourceServerName}
+                  </span>
+                )}
+              </div>
 
-            <h1 className="mt-2 text-2xl font-bold tracking-tight text-white sm:text-3xl">
-              {anime.title}
-            </h1>
+              <h1 className="mt-3 text-2xl font-bold tracking-tight text-white sm:text-3xl">
+                {anime.title}
+              </h1>
 
-            {subtitleParts.length > 0 && (
-              <p className="mt-1 text-xs font-medium text-slate-400 sm:text-sm">
-                {subtitleParts.join(' · ')}
-              </p>
-            )}
-
-            {anime.genres.length > 0 && (
-              <p className="mt-2 text-sm text-slate-400">
-                {anime.genres.join(' · ')}
-              </p>
-            )}
-
-            <div className="mt-4 flex flex-wrap items-center gap-2.5">
-              {firstEpisode && (
-                <button
-                  type="button"
-                  onClick={() => onOpenEpisode(firstEpisode.url)}
-                  className="inline-flex items-center gap-2 rounded-lg bg-[#f97316] px-4 py-2.5 text-sm font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c]"
-                >
-                  <Play className="h-4 w-4 fill-current" />
-                  <span>Assistir {firstEpisode.title}</span>
-                </button>
+              {subtitleParts.length > 0 && (
+                <p className="mt-1 text-xs font-medium text-slate-400 sm:text-sm">
+                  {subtitleParts.join(' · ')}
+                </p>
               )}
 
-              {quickLastEpisode && (
-                <button
-                  type="button"
-                  onClick={() => onOpenEpisode(quickLastEpisode.url)}
-                  className="inline-flex items-center gap-2 rounded-lg border border-[#f97316]/45 bg-[#f97316]/12 px-4 py-2.5 text-sm font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/20"
-                >
-                  <SkipForward className="h-4 w-4" />
-                  <span>Último ({quickLastEpisode.label})</span>
-                </button>
+              {anime.genres.length > 0 && (
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  {anime.genres.map((genre) => (
+                    <span
+                      key={genre}
+                      className="rounded-md border border-white/10 bg-[#0d0f12]/65 px-2.5 py-0.5 text-xs text-slate-300"
+                    >
+                      {genre}
+                    </span>
+                  ))}
+                </div>
               )}
 
-              <button
-                type="button"
-                onClick={handleToggleFav}
-                aria-pressed={isFavorite}
-                className={`inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-semibold transition-colors ${
-                  isFavorite
-                    ? 'border-rose-500/45 bg-rose-500/15 text-rose-200 hover:bg-rose-500/20'
-                    : 'border-white/15 bg-[#0d0f12] text-slate-200 hover:border-rose-400/50 hover:text-white'
-                }`}
-              >
-                <Heart
-                  className={`h-4 w-4 ${isFavorite ? 'fill-rose-400 text-rose-400' : 'text-rose-400'}`}
-                />
-                <span>{isFavorite ? 'Nos Favoritos' : 'Adicionar aos Favoritos'}</span>
-              </button>
-
-              {anime.myAnimeListUrl && (
-                <button
-                  type="button"
-                  onClick={handleOpenMyAnimeList}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/35 bg-sky-500/10 px-3.5 py-2.5 text-xs font-semibold text-sky-300 transition-colors hover:bg-sky-500/20"
-                >
-                  <ExternalLink className="h-3.5 w-3.5" />
-                  <span>MyAnimeList</span>
-                </button>
-              )}
-
-              {anime.allSeasonsUrl && onOpenAnime && (
-                <button
-                  type="button"
-                  onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#0d0f12] px-3.5 py-2.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white"
-                >
-                  <Layers className="h-3.5 w-3.5 text-[#f97316]" />
-                  <span>Ver todas as temporadas</span>
-                </button>
-              )}
-            </div>
-
-            {extraMetaItems.length > 0 && (
-              <dl className="mt-4 flex flex-wrap gap-2 border-t border-white/10 pt-4">
-                {extraMetaItems.map((meta) => (
-                  <div
-                    key={meta.label}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-white/8 bg-[#0d0f12]/70 px-2.5 py-1.5 text-xs"
+              <div className="mt-5 flex flex-wrap items-center gap-2.5">
+                {firstEpisode && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenEpisode(firstEpisode.url)}
+                    className="inline-flex items-center gap-2 rounded-lg bg-[#f97316] px-4 py-2.5 text-sm font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c]"
                   >
-                    {meta.kind === 'date' && <Calendar className="h-3 w-3 text-slate-400" />}
-                    {meta.kind === 'clock' && <Clock className="h-3 w-3 text-slate-400" />}
-                    {meta.kind === 'star' && <Star className="h-3 w-3 fill-amber-400 text-amber-400" />}
-                    {meta.kind === 'layers' && <Layers className="h-3 w-3 text-slate-400" />}
-                    <dt className="text-slate-400">{meta.label}:</dt>
-                    <dd className="font-medium tabular-nums text-slate-200">{meta.value}</dd>
-                  </div>
-                ))}
-              </dl>
-            )}
+                    <Play className="h-4 w-4 fill-current" />
+                    <span>{isMovie ? 'Assistir Filme' : `Assistir ${firstEpisode.title}`}</span>
+                  </button>
+                )}
 
-            <p className="mt-4 max-w-3xl whitespace-pre-line border-t border-white/10 pt-4 text-sm leading-relaxed text-slate-300">
-              {anime.synopsis || 'Sinopse não disponível para este título.'}
-            </p>
+                {quickLastEpisode && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenEpisode(quickLastEpisode.url)}
+                    className="inline-flex items-center gap-2 rounded-lg border border-[#f97316]/45 bg-[#f97316]/12 px-4 py-2.5 text-sm font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/20"
+                  >
+                    <SkipForward className="h-4 w-4" />
+                    <span>Último ({quickLastEpisode.label})</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleToggleFav}
+                  aria-pressed={isFavorite}
+                  className={`inline-flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-semibold transition-colors ${
+                    isFavorite
+                      ? 'border-rose-500/45 bg-rose-500/15 text-rose-200 hover:bg-rose-500/20'
+                      : 'border-white/15 bg-[#0d0f12] text-slate-200 hover:border-rose-400/50 hover:text-white'
+                  }`}
+                >
+                  <Heart
+                    className={`h-4 w-4 ${isFavorite ? 'fill-rose-400 text-rose-400' : 'text-rose-400'}`}
+                  />
+                  <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
+                </button>
+
+                {anime.allSeasonsUrl && onOpenAnime && (
+                  <button
+                    type="button"
+                    onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#0d0f12] px-3.5 py-2.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white"
+                  >
+                    <Layers className="h-3.5 w-3.5 text-[#f97316]" />
+                    <span>Todas as temporadas</span>
+                  </button>
+                )}
+
+                {externalLinks.map((link) => (
+                  <button
+                    key={`${link.source}-${link.url}`}
+                    type="button"
+                    onClick={() => handleOpenExternalLink(link.url)}
+                    className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2.5 text-xs font-semibold transition-colors ${SOURCE_BADGE_STYLE[link.source]}`}
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" />
+                    <span>{link.label}</span>
+                  </button>
+                ))}
+              </div>
+
+              {extraMetaItems.length > 0 && (
+                <dl className="mt-5 flex flex-wrap gap-2 border-t border-white/10 pt-4">
+                  {extraMetaItems.map((meta) => (
+                    <div
+                      key={meta.label}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-white/8 bg-[#0d0f12]/70 px-2.5 py-1.5 text-xs"
+                    >
+                      {meta.kind === 'date' && <Calendar className="h-3 w-3 text-slate-400" />}
+                      {meta.kind === 'clock' && <Clock className="h-3 w-3 text-slate-400" />}
+                      {meta.kind === 'layers' && <Layers className="h-3 w-3 text-slate-400" />}
+                      {meta.kind === 'studio' && <Building2 className="h-3 w-3 text-slate-400" />}
+                      {meta.kind === 'network' && <Radio className="h-3 w-3 text-slate-400" />}
+                      {meta.kind === 'globe' && <Globe className="h-3 w-3 text-slate-400" />}
+                      <dt className="text-slate-400">{meta.label}:</dt>
+                      <dd className="font-medium tabular-nums text-slate-200">{meta.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+
+              <p className="mt-4 max-w-3xl whitespace-pre-line border-t border-white/10 pt-4 text-sm leading-relaxed text-slate-300">
+                {anime.synopsis || 'Sinopse não disponível para este título no TheTVDB.'}
+              </p>
+            </div>
           </div>
         </div>
       </div>
 
+      {/* Episodes / Movie Playback Section */}
       <section className="mt-8">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <h2 className="text-lg font-semibold text-white">Episódios</h2>
-            {anime.episodes.length > 0 && (
+            <h2 className="text-lg font-semibold text-white">
+              {isMovie ? 'Reprodução' : 'Episódios'}
+            </h2>
+            {!isMovie && anime.episodes.length > 0 && (
               <span className="font-mono text-xs tabular-nums text-slate-400">
                 {totalWatchedCount}/{anime.episodes.length} vistos
               </span>
@@ -445,7 +506,7 @@ export function AnimeDetailView({
                 <CheckCheck className="h-3.5 w-3.5" />
                 <span>
                   {allEpisodesWatched
-                    ? 'Desmarcar todas as temporadas'
+                    ? 'Desmarcar todas'
                     : 'Marcar tudo como visto'}
                 </span>
               </button>
@@ -455,7 +516,7 @@ export function AnimeDetailView({
 
         {anime.episodes.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
-            Nenhum episódio listado nesta página.
+            Nenhum episódio listado nos servidores ativos para este título ainda.
           </div>
         ) : visibleSeasonGroups.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center">
@@ -515,8 +576,12 @@ export function AnimeDetailView({
                       <CheckCheck className="h-3.5 w-3.5" />
                       <span>
                         {seasonAllWatched
-                          ? 'Temporada vista'
-                          : 'Marcar temporada como vista'}
+                          ? isMovie
+                            ? 'Visto'
+                            : 'Temporada vista'
+                          : isMovie
+                            ? 'Marcar como visto'
+                            : 'Marcar temporada como vista'}
                       </span>
                     </button>
                   </div>
@@ -535,19 +600,36 @@ export function AnimeDetailView({
                           <button
                             type="button"
                             onClick={() => onOpenEpisode(ep.url)}
-                            className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
+                            className="flex min-w-0 flex-1 items-center justify-between gap-2.5 text-left sm:gap-3"
                           >
-                            <div className="flex min-w-0 items-center gap-3 sm:gap-4">
-                              <span className="w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400 sm:w-16">
+                            <div className="flex min-w-0 flex-1 items-center gap-2.5 sm:gap-4">
+                              {ep.thumb ? (
+                                <MediaPoster
+                                  src={ep.thumb}
+                                  alt={ep.title}
+                                  aspect="landscape"
+                                  className="hidden h-12 w-20 shrink-0 rounded-md border border-white/10 sm:block"
+                                />
+                              ) : null}
+                              <span className="w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400 sm:w-20">
                                 {ep.numberLabel || 'EP'}
                               </span>
-                              <div className="min-w-0">
+                              <div className="min-w-0 flex-1">
                                 <div className="truncate text-sm font-medium text-white group-hover:text-[#f97316]">
                                   {ep.title}
                                 </div>
-                                {ep.date && (
-                                  <div className="mt-0.5 text-xs tabular-nums text-slate-500">
-                                    {ep.date}
+                                {(ep.date || ep.durationMinutes || ep.rating || resumeSec >= 2) && (
+                                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs tabular-nums text-slate-500">
+                                    {ep.date && <span>{ep.date}</span>}
+                                    {ep.durationMinutes && <span>{ep.durationMinutes} min</span>}
+                                    {ep.rating && (
+                                      <span className="text-amber-400/90">★ {ep.rating}</span>
+                                    )}
+                                    {resumeSec >= 2 && (
+                                      <span className="font-medium text-[#fb923c] sm:hidden">
+                                        Parou em {formatPlaybackTimestamp(resumeSec)}
+                                      </span>
+                                    )}
                                   </div>
                                 )}
                               </div>
@@ -555,7 +637,7 @@ export function AnimeDetailView({
 
                             <div className="flex shrink-0 items-center gap-2.5">
                               {resumeSec >= 2 && (
-                                <span className="text-xs font-medium tabular-nums text-[#fb923c]">
+                                <span className="hidden text-xs font-medium tabular-nums text-[#fb923c] sm:inline">
                                   Parou em {formatPlaybackTimestamp(resumeSec)}
                                 </span>
                               )}
@@ -584,7 +666,7 @@ export function AnimeDetailView({
                             }`}
                           >
                             <Check className="h-3.5 w-3.5" />
-                            <span>{watched ? 'Visto' : 'Marcar visto'}</span>
+                            <span>{watched ? 'Visto' : 'Visto'}</span>
                           </button>
                         </div>
                       );

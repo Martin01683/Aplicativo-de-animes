@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { WifiOff } from 'lucide-react';
+import { Trash2, WifiOff } from 'lucide-react';
 import { AnimeDetailView } from './components/AnimeDetailView';
 import { CatalogView } from './components/CatalogView';
 import { EpisodeWorkspace } from './components/EpisodeWorkspace';
@@ -25,6 +25,7 @@ import {
   type AppUpdateCheckResult,
   type RemoteAppRelease,
 } from './lib/appUpdater';
+import { inferMediaKindFromTarget, parseAnisyncUri } from './lib/catalog/idCodec';
 import {
   advanceBaselineWithWatchedEpisodes,
   buildFavoriteBaseline,
@@ -38,6 +39,8 @@ import {
 import { isSameEpisodeUrl, setNativeVlcVideoScale } from './lib/nativeVlcPlayer';
 import {
   canonicalEpisodeProgressKey,
+  countAnimeEpisodesInHistory,
+  getHistoryEntrySeriesName,
   sanitizeVideoScaleMode,
   type EpisodeProgressMap,
 } from './lib/playbackProgress';
@@ -66,6 +69,8 @@ import {
   loadFavorites,
   loadHistory,
   pushHistoryEntry,
+  removeHistoryAnime,
+  removeHistoryEpisode,
   saveAcknowledgedReleaseKey,
   saveAppSettings,
   saveAppSettingsMeta,
@@ -87,6 +92,7 @@ import type {
   FavoriteLatestInfo,
   GlossaryResponse,
   HomeCatalog,
+  LiveChartScheduleMode,
   MediaKind,
   PaginatedCatalogResponse,
   PaginatedSearchResponse,
@@ -150,6 +156,9 @@ export default function App() {
     loadAcknowledgedReleaseKey()
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsFocusSection, setSettingsFocusSection] = useState<
+    'sources' | 'catalog' | 'general'
+  >('general');
 
   const [routeStack, setRouteStack] = useState<ActiveRoute[]>([{ view: 'catalog' }]);
   const route = routeStack[routeStack.length - 1] ?? { view: 'catalog' };
@@ -170,6 +179,7 @@ export default function App() {
   >({
     animes: { ...EMPTY_BUCKET },
     movies: { ...EMPTY_BUCKET },
+    series: { ...EMPTY_BUCKET },
     dublado: { ...EMPTY_BUCKET },
     legendado: { ...EMPTY_BUCKET },
     donghua: { ...EMPTY_BUCKET },
@@ -193,6 +203,7 @@ export default function App() {
   const [weeklyCalendarDays, setWeeklyCalendarDays] = useState<CalendarDaySection[]>([]);
   const [selectedCalendarDay, setSelectedCalendarDay] = useState('hoje');
   const [loadingWeeklyCalendar, setLoadingWeeklyCalendar] = useState(false);
+  const [calendarError, setCalendarError] = useState('');
   const [weeklyCalendarInitialized, setWeeklyCalendarInitialized] = useState(false);
 
   const [searchQuery, setSearchQuery] = useState('');
@@ -206,6 +217,12 @@ export default function App() {
   const [animeDetails, setAnimeDetails] = useState<AnimeDetails | null>(null);
   const [episodeDetails, setEpisodeDetails] = useState<EpisodeDetails | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [loadingExtraServers, setLoadingExtraServers] = useState<{
+    episodeUrl: string;
+    sourceNames: string[];
+    gen: number;
+  } | null>(null);
+  const extraServersGenRef = useRef(0);
   const [detailError, setDetailError] = useState('');
 
   const [favorites, setFavorites] = useState<CatalogMediaItem[]>(() => loadFavorites());
@@ -220,6 +237,11 @@ export default function App() {
       : 'unsupported'
   );
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
+  const [pendingHistoryRemoval, setPendingHistoryRemoval] = useState<
+    | { kind: 'all'; count: number }
+    | { kind: 'anime'; entry: WatchHistoryEntry; animeName: string; count: number }
+    | null
+  >(null);
   const [progressMap, setProgressMap] = useState<EpisodeProgressMap>(() =>
     loadEpisodeProgressMap()
   );
@@ -289,6 +311,22 @@ export default function App() {
     if (patch.videoScale) {
       void setNativeVlcVideoScale(sanitizeVideoScaleMode(patch.videoScale));
     }
+    if (patch.episodeSources || patch.defaultAudioFilter) {
+      episodeDetailsCacheRef.current.clear();
+    }
+    if (patch.catalogCredentials || patch.episodeSources) {
+      animeDetailsCacheRef.current.clear();
+      setArchiveState((prev) => ({
+        animes: { ...prev.animes, initialized: false },
+        movies: { ...prev.movies, initialized: false },
+        series: { ...prev.series, initialized: false },
+        dublado: { ...prev.dublado, initialized: false },
+        legendado: { ...prev.legendado, initialized: false },
+        donghua: { ...prev.donghua, initialized: false },
+        cartoon: { ...prev.cartoon, initialized: false },
+        'live-action': { ...prev['live-action'], initialized: false },
+      }));
+    }
     setSettings((prev) => {
       const next = { ...prev, ...patch };
       saveAppSettings(next);
@@ -298,6 +336,8 @@ export default function App() {
 
   const resetSettings = useCallback(() => {
     const defaults = { ...DEFAULT_APP_SETTINGS };
+    episodeDetailsCacheRef.current.clear();
+    animeDetailsCacheRef.current.clear();
     setSettings(defaults);
     saveAppSettings(defaults);
     void setNativeVlcVideoScale(defaults.videoScale);
@@ -318,7 +358,7 @@ export default function App() {
     const body =
       newAlerts.length === 1
         ? `${first.episodeLabel} já está disponível para assistir.`
-        : `${first.animeTitle} (${first.episodeLabel}) e mais ${newAlerts.length - 1} anime(s).`;
+        : `${first.animeTitle} (${first.episodeLabel}) e mais ${newAlerts.length - 1} título(s).`;
 
     try {
       if ('serviceWorker' in navigator) {
@@ -328,7 +368,7 @@ export default function App() {
             body,
             icon: '/pwa-192x192.png',
             badge: '/pwa-192x192.png',
-            tag: `topanimes-${first.id}`,
+            tag: `anisync-${first.id}`,
           });
           return;
         }
@@ -348,7 +388,7 @@ export default function App() {
       const currentReleases = options.currentReleases || releasesRef.current;
       if (!currentFavs.length) {
         if (options.manual) {
-          showToast('Favorite um anime primeiro para verificar novos episódios.');
+          showToast('Favorite um título primeiro para verificar novos episódios.');
         }
         return;
       }
@@ -481,7 +521,7 @@ export default function App() {
       try {
         const result = await downloadAppUpdateApk(
           asset.downloadUrl,
-          asset.name || 'TopAnimes.apk',
+          asset.name || 'Anisync.apk',
           asset.digest
         );
         if (apkUpdateRequestTokenRef.current !== token) return;
@@ -571,7 +611,7 @@ export default function App() {
             showToast(`Nova atualização encontrada: ${evaluated.latestRelease.releaseName}`);
           } else if (updateToastNotifiedForRef.current !== key) {
             updateToastNotifiedForRef.current = key;
-            showToast('Nova versão do TopAnimes disponível nas Configurações.');
+            showToast('Nova versão do Anisync disponível nas Configurações.');
           }
         } else if (options.manual) {
           showToast('Você já está na versão mais recente.');
@@ -625,6 +665,9 @@ export default function App() {
         movies: prev.movies.initialized
           ? prev.movies
           : { ...prev.movies, items: home.movies },
+        series: prev.series.initialized
+          ? prev.series
+          : { ...prev.series, items: home.series || [] },
       }));
 
       if (
@@ -807,9 +850,11 @@ export default function App() {
       }));
 
       try {
-        const res = await apiFetch(
-          `/api/catalog?category=${encodeURIComponent(category)}&page=${page}`
-        );
+        const params = new URLSearchParams();
+        params.set('category', category);
+        params.set('page', String(page));
+
+        const res = await apiFetch(`/api/catalog?${params.toString()}`);
         const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
         if (!res.ok) throw new Error(data.error || 'Erro ao carregar categoria');
 
@@ -831,7 +876,7 @@ export default function App() {
           return {
             ...prev,
             [category]: {
-              items: merged.length ? merged : current.items,
+              items: append ? (merged.length ? merged : current.items) : merged,
               currentPage: data.currentPage || page,
               totalPages: data.totalPages || 1,
               loading: false,
@@ -855,6 +900,7 @@ export default function App() {
       setFilteredCatalog((prev) => ({ ...prev, loading: true }));
       try {
         const params = new URLSearchParams();
+        params.set('category', archiveCategory);
         params.set('page', String(opts.page));
         if (opts.genre) params.set('genre', opts.genre);
         else if (opts.year) params.set('year', opts.year);
@@ -881,28 +927,43 @@ export default function App() {
         showToast(err instanceof Error ? err.message : 'Falha ao filtrar títulos.');
       }
     },
-    [showToast]
+    [archiveCategory, showToast]
   );
 
-  const fetchWeeklyCalendar = useCallback(async () => {
-    setLoadingWeeklyCalendar(true);
-    try {
-      const res = await apiFetch('/api/calendar');
-      const data = (await res.json()) as WeeklyCalendarResponse & { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Erro ao carregar calendário semanal.');
-      if (Array.isArray(data.days) && data.days.length > 0) {
-        setWeeklyCalendarDays(data.days);
-        setSelectedCalendarDay((current) =>
-          data.days.some((d) => d.id === current) ? current : data.days[0].id
+  const fetchWeeklyCalendar = useCallback(
+    async (options: { mode?: LiveChartScheduleMode; refresh?: boolean } = {}) => {
+      const effectiveMode = options.mode ?? settingsRef.current.calendarScheduleMode;
+      const tzOffsetMinutes = -new Date().getTimezoneOffset();
+      setLoadingWeeklyCalendar(true);
+      setCalendarError('');
+      try {
+        const params = new URLSearchParams({
+          mode: effectiveMode,
+          tz: String(tzOffsetMinutes),
+        });
+        if (options.refresh) params.set('refresh', '1');
+        const res = await apiFetch(`/api/calendar?${params.toString()}`);
+        const data = (await res.json()) as WeeklyCalendarResponse & { error?: string };
+        if (!res.ok) throw new Error(data.error || 'Erro ao carregar calendário no LiveChart.me.');
+        if (Array.isArray(data.days) && data.days.length > 0) {
+          setWeeklyCalendarDays(data.days);
+          setSelectedCalendarDay((current) =>
+            current === 'all' || data.days.some((d) => d.id === current)
+              ? current
+              : data.days[0].id
+          );
+        }
+      } catch (err) {
+        setCalendarError(
+          err instanceof Error ? err.message : 'Não foi possível carregar o calendário do LiveChart.me.'
         );
+      } finally {
+        setLoadingWeeklyCalendar(false);
+        setWeeklyCalendarInitialized(true);
       }
-    } catch {
-      // Fallback remains home.calendar ("Hoje") rendered by CatalogView
-    } finally {
-      setLoadingWeeklyCalendar(false);
-      setWeeklyCalendarInitialized(true);
-    }
-  }, []);
+    },
+    []
+  );
 
   useEffect(() => {
     if (activeSection === 'calendar' && !weeklyCalendarInitialized && !loadingWeeklyCalendar) {
@@ -915,7 +976,11 @@ export default function App() {
       setFilteredCatalog((prev) => ({ ...prev, loading: true }));
       try {
         const type =
-          category === 'movies' ? 'movies' : category === 'animes' ? 'tvshows' : 'all';
+          category === 'movies'
+            ? 'movies'
+            : category === 'animes'
+              ? 'tvshows'
+              : 'all';
         const res = await apiFetch(
           `/api/glossary?term=${encodeURIComponent(term)}&type=${encodeURIComponent(type)}`
         );
@@ -945,7 +1010,7 @@ export default function App() {
       !archiveState[archiveCategory].initialized &&
       !archiveState[archiveCategory].loading
     ) {
-      fetchArchivePage(archiveCategory, 1, false);
+      void fetchArchivePage(archiveCategory, 1, false);
     }
   }, [
     activeSection,
@@ -982,6 +1047,14 @@ export default function App() {
     setFilteredCatalog({ ...EMPTY_BUCKET });
     setArchiveCategory(category);
   }, []);
+
+  const handleChangeCalendarScheduleMode = useCallback(
+    (mode: LiveChartScheduleMode) => {
+      updateSettings({ calendarScheduleMode: mode });
+      void fetchWeeklyCalendar({ mode });
+    },
+    [fetchWeeklyCalendar, updateSettings]
+  );
 
   const handleSelectGenre = useCallback(
     (genreSlug: string) => {
@@ -1046,7 +1119,7 @@ export default function App() {
     (category: CatalogArchiveCategory) => {
       const bucket = archiveState[category];
       if (bucket.loading || bucket.currentPage >= bucket.totalPages) return;
-      fetchArchivePage(category, bucket.currentPage + 1, true);
+      void fetchArchivePage(category, bucket.currentPage + 1, true);
     },
     [archiveState, fetchArchivePage]
   );
@@ -1119,17 +1192,17 @@ export default function App() {
     setDetailError('');
     setAnimeDetails(null);
     try {
-      const res = await apiFetch(`/api/anime?url=${encodeURIComponent(url)}`);
+      const res = await apiFetch(`/api/media?url=${encodeURIComponent(url)}`);
       const data = await res.json();
       if (navRequestGenRef.current !== reqGen) return;
-      if (!res.ok) throw new Error(data.error || 'Erro ao carregar anime');
+      if (!res.ok) throw new Error(data.error || 'Erro ao carregar detalhes do título');
       const details = data as AnimeDetails;
       animeDetailsCacheRef.current.set(cacheKey, details);
       setAnimeDetails(details);
     } catch (err) {
       if (navRequestGenRef.current !== reqGen) return;
       setDetailError(
-        err instanceof Error ? err.message : 'Falha ao carregar episódios.'
+        err instanceof Error ? err.message : 'Falha ao carregar detalhes do título.'
       );
     } finally {
       if (navRequestGenRef.current === reqGen) {
@@ -1137,6 +1210,190 @@ export default function App() {
       }
     }
   }, []);
+
+  const loadEpisodeDetailsForRoute = useCallback(
+    async (
+      url: string,
+      reqGen: number,
+      options: { bypassCache?: boolean; preserveExisting?: boolean } = {}
+    ) => {
+      const epCacheKey = normalizeTopAnimesUrl(url) || url;
+      if (!options.bypassCache) {
+        const cachedEp = episodeDetailsCacheRef.current.get(epCacheKey);
+        if (cachedEp) {
+          setEpisodeDetails(cachedEp);
+          setLoadingDetail(false);
+          setDetailError('');
+          const updatedHistory = pushHistoryEntry({
+            url: cachedEp.url,
+            title: cachedEp.title,
+            seriesTitle: cachedEp.seriesTitle,
+            seriesUrl: cachedEp.seriesUrl,
+            poster: cachedEp.backdrop || cachedEp.poster,
+            kind: cachedEp.isMovie ? 'movie' : 'episode',
+            watchedAt: new Date().toISOString(),
+          });
+          setHistory(updatedHistory);
+          return;
+        }
+      } else {
+        episodeDetailsCacheRef.current.delete(epCacheKey);
+      }
+
+      setDetailError('');
+      setLoadingDetail(true);
+      setLoadingExtraServers(null);
+      if (!options.preserveExisting) {
+        setEpisodeDetails(null);
+      }
+      try {
+        const res = await apiFetch('/api/episode', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url,
+            sources: settingsRef.current.episodeSources,
+            audioPreference: settingsRef.current.defaultAudioFilter,
+            deferCrossSources: !options.bypassCache,
+          }),
+        });
+        const data = await res.json();
+        if (navRequestGenRef.current !== reqGen) return;
+        if (!res.ok) throw new Error(data.error || 'Erro ao consultar fontes do episódio');
+        const ep = data as EpisodeDetails;
+        episodeDetailsCacheRef.current.set(epCacheKey, ep);
+        setEpisodeDetails(ep);
+        const updatedHistory = pushHistoryEntry({
+          url: ep.url,
+          title: ep.title,
+          seriesTitle: ep.seriesTitle,
+          seriesUrl: ep.seriesUrl,
+          poster: ep.backdrop || ep.poster,
+          kind: ep.isMovie ? 'movie' : 'episode',
+          watchedAt: new Date().toISOString(),
+        });
+        setHistory(updatedHistory);
+
+        // Augment with secondary integrated servers (e.g. Hinata Soul) in the background
+        // while showing an explicit loading indicator next to the server list.
+        const reportedIds = new Set((ep.sourceReports || []).map((r) => r.sourceId));
+        const pendingSourceNames = settingsRef.current.episodeSources
+          .filter((s) => s.enabled && !reportedIds.has(s.id))
+          .map((s) => s.name);
+        const hasPendingSecondarySource =
+          !options.bypassCache &&
+          !ep.url.startsWith('anisync://') &&
+          Boolean(ep.seriesTitle) &&
+          reportedIds.size === 1 &&
+          pendingSourceNames.length > 0;
+
+        if (hasPendingSecondarySource) {
+          const extraGen = ++extraServersGenRef.current;
+          const excludeSourceIds = Array.from(reportedIds);
+          setLoadingExtraServers({
+            episodeUrl: ep.url,
+            sourceNames: pendingSourceNames,
+            gen: extraGen,
+          });
+          void apiFetch('/api/sources/resolve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              excludeSourceIds,
+              query: {
+                title: ep.seriesTitle,
+                originalTitle: ep.originalTitle,
+                alternativeTitles: ep.alternativeTitles,
+                mediaType: ep.isMovie ? 'movie' : ep.mediaType || 'anime',
+                seasonNumber: ep.seasonNumber || 1,
+                episodeNumber: ep.episodeNumber || 1,
+                audioPreference: settingsRef.current.defaultAudioFilter,
+              },
+            }),
+          })
+            .then((extraRes) => (extraRes.ok ? extraRes.json() : null))
+            .then(
+              (
+                extraData: {
+                  options?: EpisodeDetails['options'];
+                  reports?: EpisodeDetails['sourceReports'];
+                } | null
+              ) => {
+                if (!extraData) return;
+                const extraOpts = Array.isArray(extraData.options) ? extraData.options : [];
+                const extraReports = Array.isArray(extraData.reports) ? extraData.reports : [];
+                if (!extraOpts.length && !extraReports.length) return;
+
+                const mergeEpisode = (base: EpisodeDetails): EpisodeDetails => {
+                  const seenKeys = new Set(
+                    base.options.map(
+                      (o) => `${o.sourceId || ''}::${o.directStreamUrl || o.embedUrl}`
+                    )
+                  );
+                  const mergedOptions = [...base.options];
+                  for (const opt of extraOpts) {
+                    const key = `${opt.sourceId || ''}::${opt.directStreamUrl || opt.embedUrl}`;
+                    if (seenKeys.has(key)) continue;
+                    seenKeys.add(key);
+                    mergedOptions.push(opt);
+                  }
+                  const seenReportIds = new Set(
+                    (base.sourceReports || []).map((r) => r.sourceId)
+                  );
+                  const mergedReports = [...(base.sourceReports || [])];
+                  for (const rep of extraReports) {
+                    if (seenReportIds.has(rep.sourceId)) continue;
+                    seenReportIds.add(rep.sourceId);
+                    mergedReports.push(rep);
+                  }
+                  return {
+                    ...base,
+                    options: mergedOptions,
+                    sourceReports: mergedReports,
+                  };
+                };
+
+                const cachedNow = episodeDetailsCacheRef.current.get(epCacheKey);
+                if (cachedNow) {
+                  episodeDetailsCacheRef.current.set(epCacheKey, mergeEpisode(cachedNow));
+                }
+                setEpisodeDetails((prev) =>
+                  prev && isSameEpisodeUrl(prev.url, ep.url) ? mergeEpisode(prev) : prev
+                );
+              }
+            )
+            .catch(() => {
+              // Secondary background augmentation is best-effort
+            })
+            .finally(() => {
+              setLoadingExtraServers((current) =>
+                current && current.gen === extraGen ? null : current
+              );
+            });
+        }
+      } catch (err) {
+        if (navRequestGenRef.current !== reqGen) return;
+        setDetailError(
+          err instanceof Error ? err.message : 'Falha ao consultar fontes de vídeo.'
+        );
+      } finally {
+        if (navRequestGenRef.current === reqGen) {
+          setLoadingDetail(false);
+        }
+      }
+    },
+    []
+  );
+
+  const handleRefreshEpisodeSources = useCallback(() => {
+    const currentRoute = routeRef.current;
+    if (currentRoute.view !== 'episode' || !currentRoute.url) return;
+    const reqGen = ++navRequestGenRef.current;
+    void loadEpisodeDetailsForRoute(currentRoute.url, reqGen, {
+      bypassCache: true,
+      preserveExisting: true,
+    });
+  }, [loadEpisodeDetailsForRoute]);
 
   const pushBrowserHistoryIfNeeded = useCallback((prevLen: number, nextLen: number) => {
     if (isNativeAndroidApp() || handlingPopstateRef.current) return;
@@ -1151,17 +1408,17 @@ export default function App() {
 
   const openMediaUrl = useCallback(
     async (url: string, explicitKind?: MediaKind) => {
-      const inferredKind: MediaKind =
-        explicitKind ||
-        (/\/filmes\//i.test(url)
-          ? 'movie'
-          : /\/episodio\//i.test(url)
-            ? 'episode'
-            : 'anime');
+      const parsed = parseAnisyncUri(url);
+      const inferredKind: MediaKind = explicitKind || inferMediaKindFromTarget(url);
+      const opensDetailPage =
+        parsed.kind === 'media' ||
+        (parsed.kind === 'legacy-url' &&
+          (inferredKind === 'anime' || inferredKind === 'series'));
 
       const reqGen = ++navRequestGenRef.current;
-      const nextFrame: ActiveRoute =
-        inferredKind === 'anime' ? { view: 'anime', url } : { view: 'episode', url };
+      const nextFrame: ActiveRoute = opensDetailPage
+        ? { view: 'anime', url }
+        : { view: 'episode', url };
 
       const prevStack = routeStackRef.current;
       const nextStack = pushRouteFrame(prevStack, nextFrame);
@@ -1169,66 +1426,15 @@ export default function App() {
       setRouteStack(nextStack);
       pushBrowserHistoryIfNeeded(prevStack.length, nextStack.length);
 
-      if (inferredKind === 'anime') {
+      if (opensDetailPage) {
         await loadAnimeDetailsForRoute(url, reqGen);
         return;
       }
 
-      const epCacheKey = normalizeTopAnimesUrl(url) || url;
-      const cachedEp = episodeDetailsCacheRef.current.get(epCacheKey);
-      const preserveExistingEpisode = routeRef.current.view === 'episode';
-
-      setDetailError('');
-      if (cachedEp) {
-        setEpisodeDetails(cachedEp);
-        setLoadingDetail(false);
-        const updatedHistory = pushHistoryEntry({
-          url: cachedEp.url,
-          title: cachedEp.title,
-          seriesTitle: cachedEp.seriesTitle,
-          seriesUrl: cachedEp.seriesUrl,
-          poster: cachedEp.backdrop || cachedEp.poster,
-          kind: cachedEp.isMovie ? 'movie' : 'episode',
-          watchedAt: new Date().toISOString(),
-        });
-        setHistory(updatedHistory);
-        return;
-      }
-
-      setLoadingDetail(true);
-      if (!preserveExistingEpisode) {
-        setEpisodeDetails(null);
-      }
-      try {
-        const res = await apiFetch(`/api/episode?url=${encodeURIComponent(url)}`);
-        const data = await res.json();
-        if (navRequestGenRef.current !== reqGen) return;
-        if (!res.ok) throw new Error(data.error || 'Erro ao carregar episódio');
-        const ep = data as EpisodeDetails;
-        episodeDetailsCacheRef.current.set(epCacheKey, ep);
-        setEpisodeDetails(ep);
-        const updatedHistory = pushHistoryEntry({
-          url: ep.url,
-          title: ep.title,
-          seriesTitle: ep.seriesTitle,
-          seriesUrl: ep.seriesUrl,
-          poster: ep.backdrop || ep.poster,
-          kind: ep.isMovie ? 'movie' : 'episode',
-          watchedAt: new Date().toISOString(),
-        });
-        setHistory(updatedHistory);
-      } catch (err) {
-        if (navRequestGenRef.current !== reqGen) return;
-        setDetailError(
-          err instanceof Error ? err.message : 'Falha ao extrair players.'
-        );
-      } finally {
-        if (navRequestGenRef.current === reqGen) {
-          setLoadingDetail(false);
-        }
-      }
+      const preserveExisting = routeRef.current.view === 'episode';
+      await loadEpisodeDetailsForRoute(url, reqGen, { preserveExisting });
     },
-    [loadAnimeDetailsForRoute, pushBrowserHistoryIfNeeded]
+    [loadAnimeDetailsForRoute, loadEpisodeDetailsForRoute, pushBrowserHistoryIfNeeded]
   );
 
   const toggleFavorite = useCallback(
@@ -1419,6 +1625,10 @@ export default function App() {
   };
 
   const navigateBackStep = useCallback((): boolean => {
+    if (pendingHistoryRemoval) {
+      setPendingHistoryRemoval(null);
+      return true;
+    }
     const step = resolveBackNavigationStep({
       settingsOpen,
       routeStack: routeStackRef.current,
@@ -1440,6 +1650,8 @@ export default function App() {
         setDetailError('');
         if (step.target.view === 'anime') {
           void loadAnimeDetailsForRoute(step.target.url, reqGen);
+        } else if (step.target.view === 'episode') {
+          void loadEpisodeDetailsForRoute(step.target.url, reqGen);
         }
         return true;
       }
@@ -1463,6 +1675,8 @@ export default function App() {
     activeSection,
     handleClearCatalogFilters,
     loadAnimeDetailsForRoute,
+    loadEpisodeDetailsForRoute,
+    pendingHistoryRemoval,
     searchResults,
     selectedGenre,
     selectedGlossary,
@@ -1495,6 +1709,57 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!pendingHistoryRemoval) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPendingHistoryRemoval(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [pendingHistoryRemoval]);
+
+  const requestClearAllHistory = useCallback(() => {
+    if (history.length === 0) return;
+    setPendingHistoryRemoval({ kind: 'all', count: history.length });
+  }, [history.length]);
+
+  const requestRemoveHistoryAnime = useCallback(
+    (entry: WatchHistoryEntry) => {
+      const count = countAnimeEpisodesInHistory(history, entry);
+      const animeName = getHistoryEntrySeriesName(entry);
+      setPendingHistoryRemoval({
+        kind: 'anime',
+        entry,
+        animeName,
+        count: Math.max(1, count),
+      });
+    },
+    [history]
+  );
+
+  const confirmPendingHistoryRemoval = useCallback(() => {
+    if (!pendingHistoryRemoval) return;
+    if (pendingHistoryRemoval.kind === 'all') {
+      clearHistory();
+      clearAllEpisodeProgress();
+      setHistory([]);
+      setProgressMap({});
+      showToast('Histórico limpo.');
+    } else {
+      const res = removeHistoryAnime(pendingHistoryRemoval.entry);
+      setHistory(res.history);
+      setProgressMap(res.progressMap);
+      showToast(
+        res.removedCount > 1
+          ? `${res.removedCount} episódios de ${pendingHistoryRemoval.animeName} removidos do histórico.`
+          : `Episódio de ${pendingHistoryRemoval.animeName} removido do histórico.`
+      );
+    }
+    setPendingHistoryRemoval(null);
+  }, [pendingHistoryRemoval, showToast]);
+
   const handleOpenRandom = useCallback(async () => {
     if (loadingRandom) return;
     setLoadingRandom(true);
@@ -1502,15 +1767,58 @@ export default function App() {
       const res = await apiFetch('/api/random');
       const data = (await res.json()) as { url?: string; kind?: MediaKind; error?: string };
       if (!res.ok || !data.url) {
-        throw new Error(data.error || 'Não foi possível sortear um anime.');
+        throw new Error(data.error || 'Não foi possível sortear um título.');
       }
       await openMediaUrl(data.url, data.kind);
     } catch (err) {
-      showToast(err instanceof Error ? err.message : 'Não foi possível sortear um anime.');
+      showToast(err instanceof Error ? err.message : 'Não foi possível sortear um título.');
     } finally {
       setLoadingRandom(false);
     }
   }, [loadingRandom, openMediaUrl, showToast]);
+
+  const settingsSnapshotOnOpenRef = useRef<{ catalog: string; sources: string } | null>(null);
+
+  const openSettingsModal = useCallback((section: 'sources' | 'catalog' | 'general' = 'general') => {
+    settingsSnapshotOnOpenRef.current = {
+      catalog: JSON.stringify({
+        creds: settingsRef.current.catalogCredentials,
+      }),
+      sources: JSON.stringify(settingsRef.current.episodeSources),
+    };
+    setSettingsFocusSection(section);
+    setSettingsOpen(true);
+  }, []);
+
+  const closeSettingsModal = useCallback(() => {
+    setSettingsOpen(false);
+    const snap = settingsSnapshotOnOpenRef.current;
+    settingsSnapshotOnOpenRef.current = null;
+    if (snap) {
+      const nextCatalogSnap = JSON.stringify({
+        creds: settingsRef.current.catalogCredentials,
+      });
+      const nextSourcesSnap = JSON.stringify(settingsRef.current.episodeSources);
+      if (nextCatalogSnap !== snap.catalog || nextSourcesSnap !== snap.sources) {
+        void fetchCatalog();
+      }
+      if (nextSourcesSnap !== snap.sources && routeRef.current.view === 'episode') {
+        handleRefreshEpisodeSources();
+      }
+    }
+    if (
+      apkDownloadProgress?.stage === 'error' ||
+      apkDownloadProgress?.stage === 'installed' ||
+      apkDownloadProgress?.stage === 'cancelled'
+    ) {
+      handleDismissApkProgress();
+    }
+  }, [
+    apkDownloadProgress?.stage,
+    fetchCatalog,
+    handleDismissApkProgress,
+    handleRefreshEpisodeSources,
+  ]);
 
   return (
     <div className="min-h-screen bg-[#0d0f12] text-[#f1f5f9]">
@@ -1527,7 +1835,7 @@ export default function App() {
         onOpenAlert={handleOpenAlert}
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
         hasAppUpdate={Boolean(appUpdateResult?.hasUpdate)}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => openSettingsModal('general')}
       />
 
       {!isOnline && (
@@ -1568,7 +1876,9 @@ export default function App() {
             filteredCatalog={filteredCatalog}
             weeklyCalendarDays={weeklyCalendarDays}
             selectedCalendarDay={selectedCalendarDay}
+            calendarScheduleMode={settings.calendarScheduleMode}
             loadingWeeklyCalendar={loadingWeeklyCalendar}
+            calendarError={calendarError}
             favorites={favorites}
             history={history}
             alerts={alerts}
@@ -1593,19 +1903,22 @@ export default function App() {
             onClearCatalogFilters={handleClearCatalogFilters}
             onLoadMoreFiltered={handleLoadMoreFiltered}
             onSelectCalendarDay={setSelectedCalendarDay}
+            onChangeCalendarScheduleMode={handleChangeCalendarScheduleMode}
+            onRefreshCalendar={() => void fetchWeeklyCalendar({ refresh: true })}
             onOpenItem={openMediaUrl}
             onToggleFavorite={toggleFavorite}
             onCheckFavoriteUpdates={() => void checkFavoriteUpdates({ manual: true })}
             onMarkAllAlertsRead={handleMarkAllAlertsRead}
             onOpenAlert={handleOpenAlert}
             onRequestPushNotifications={() => void handleRequestPushNotifications()}
-            onClearHistory={() => {
-              clearHistory();
-              clearAllEpisodeProgress();
-              setHistory([]);
-              setProgressMap({});
-              showToast('Histórico limpo.');
+            onClearHistory={requestClearAllHistory}
+            onRemoveHistoryEntry={(entry) => {
+              const res = removeHistoryEpisode(entry.url);
+              setHistory(res.history);
+              setProgressMap(res.progressMap);
+              showToast('Episódio removido do histórico.');
             }}
+            onRemoveHistoryAnime={requestRemoveHistoryAnime}
             onSelectSection={handleSelectSection}
             defaultAudioFilter={settings.defaultAudioFilter}
             watchedEpisodeKeys={watchedEpisodeKeys}
@@ -1690,6 +2003,16 @@ export default function App() {
                     : undefined
                 }
                 loadingEpisode={loadingDetail}
+                loadingExtraServers={Boolean(
+                  loadingExtraServers &&
+                    isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
+                )}
+                loadingExtraServerNames={
+                  loadingExtraServers &&
+                  isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
+                    ? loadingExtraServers.sourceNames
+                    : []
+                }
                 onToggleFavorite={toggleFavorite}
                 onToggleEpisodeWatched={(ep, watched) =>
                   handleToggleEpisodesWatched(
@@ -1708,6 +2031,7 @@ export default function App() {
                 }
                 onBack={() => navigateBackStep()}
                 onNavigateUrl={openMediaUrl}
+                onRefreshSources={handleRefreshEpisodeSources}
                 onNativeSessionSync={(result) => {
                   if (result.videoScale) {
                     updateSettings({ videoScale: sanitizeVideoScaleMode(result.videoScale) });
@@ -1779,16 +2103,8 @@ export default function App() {
 
       <SettingsModal
         open={settingsOpen}
-        onClose={() => {
-          setSettingsOpen(false);
-          if (
-            apkDownloadProgress?.stage === 'error' ||
-            apkDownloadProgress?.stage === 'installed' ||
-            apkDownloadProgress?.stage === 'cancelled'
-          ) {
-            handleDismissApkProgress();
-          }
-        }}
+        focusSection={settingsFocusSection}
+        onClose={closeSettingsModal}
         settings={settings}
         settingsMeta={settingsMeta}
         onUpdateSettings={updateSettings}
@@ -1816,19 +2132,76 @@ export default function App() {
         onApplySwUpdate={handleApplySwUpdate}
         historyCount={history.length}
         alertsCount={alerts.length}
-        onClearHistory={() => {
-          clearHistory();
-          clearAllEpisodeProgress();
-          setHistory([]);
-          setProgressMap({});
-          showToast('Histórico limpo.');
-        }}
+        onClearHistory={requestClearAllHistory}
         onClearAlerts={() => {
           clearFavoriteAlerts();
           setAlerts([]);
           showToast('Avisos limpos.');
         }}
       />
+
+      {pendingHistoryRemoval && (
+        <div
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="confirm-history-removal-title"
+          aria-describedby="confirm-history-removal-desc"
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm"
+          onClick={() => setPendingHistoryRemoval(null)}
+        >
+          <div
+            className="w-full max-w-md rounded-2xl border border-white/12 bg-[#151921] p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-rose-500/35 bg-rose-500/15 text-rose-400">
+                <Trash2 className="h-5 w-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h2
+                  id="confirm-history-removal-title"
+                  className="text-base font-bold text-white"
+                >
+                  {pendingHistoryRemoval.kind === 'all'
+                    ? 'Limpar todo o histórico?'
+                    : `Remover todos de ${pendingHistoryRemoval.animeName}?`}
+                </h2>
+                <p
+                  id="confirm-history-removal-desc"
+                  className="mt-1.5 text-xs leading-relaxed text-slate-300"
+                >
+                  {pendingHistoryRemoval.kind === 'all'
+                    ? `Isso vai remover ${pendingHistoryRemoval.count} ${
+                        pendingHistoryRemoval.count === 1 ? 'item' : 'itens'
+                      } do histórico e apagar o progresso salvo dos episódios.`
+                    : pendingHistoryRemoval.count > 1
+                      ? `Isso vai remover todos os ${pendingHistoryRemoval.count} episódios de "${pendingHistoryRemoval.animeName}" do histórico e apagar o progresso salvo deles.`
+                      : `Isso vai remover todos os registros de "${pendingHistoryRemoval.animeName}" do histórico e apagar o progresso salvo.`}
+                </p>
+              </div>
+            </div>
+
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setPendingHistoryRemoval(null)}
+                className="min-h-[40px] rounded-lg border border-white/12 bg-[#0d0f12] px-4 py-2 text-xs font-semibold text-slate-200 transition-colors hover:border-white/25 hover:text-white"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={confirmPendingHistoryRemoval}
+                className="min-h-[40px] rounded-lg bg-rose-500 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-rose-400"
+              >
+                {pendingHistoryRemoval.kind === 'all'
+                  ? 'Limpar histórico'
+                  : 'Remover todos'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {toast && (
         <div

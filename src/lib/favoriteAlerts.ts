@@ -1,14 +1,22 @@
+import {
+  buildMediaUri,
+  isAnisyncUri,
+  parseAnisyncUri,
+} from './catalog/idCodec.ts';
 import type {
   CatalogMediaItem,
   FavoriteAlertEntry,
   FavoriteBaselineMap,
   FavoriteEpisodeBaseline,
   FavoriteLatestInfo,
-} from './types';
+} from './types.ts';
 
 export function normalizeTopAnimesUrl(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
+  const trimmed = (rawUrl || '').trim();
   if (!trimmed) return '';
+  if (isAnisyncUri(trimmed)) {
+    return trimmed.replace(/\/+$/, '');
+  }
   try {
     const u = new URL(trimmed);
     const cleanPath = u.pathname.replace(/\/+$/, '');
@@ -21,6 +29,9 @@ export function normalizeTopAnimesUrl(rawUrl: string): string {
 export function canonicalEpisodeKey(rawUrl: string): string {
   const trimmed = (rawUrl || '').trim();
   if (!trimmed) return '';
+  if (isAnisyncUri(trimmed)) {
+    return trimmed.replace(/\/+$/, '').toLowerCase();
+  }
   const normalized = normalizeTopAnimesUrl(trimmed) || trimmed;
   try {
     const parsed = new URL(normalized);
@@ -36,8 +47,12 @@ export function canonicalEpisodeKey(rawUrl: string): string {
 }
 
 export function extractMediaSlug(rawUrl: string): string {
-  const trimmed = rawUrl.trim();
+  const trimmed = (rawUrl || '').trim();
   if (!trimmed) return '';
+  const anisync = parseAnisyncUri(trimmed);
+  if (anisync.kind === 'media' || anisync.kind === 'episode') {
+    return `${anisync.mediaType}/${anisync.source}/${anisync.externalId}`.toLowerCase();
+  }
   let pathname = trimmed;
   try {
     pathname = new URL(trimmed).pathname;
@@ -47,7 +62,7 @@ export function extractMediaSlug(rawUrl: string): string {
   const clean = pathname
     .toLowerCase()
     .replace(/^\/+|\/+$/g, '')
-    .replace(/^(?:animes|filmes|episodio)\//i, '');
+    .replace(/^(?:animes|anime-dublado|donghua|doramas|tokusatsus|filmes|episodio|videos)\//i, '');
 
   return clean
     .replace(/-episodio-\d+(?:-\d+)?$/i, '')
@@ -57,6 +72,10 @@ export function extractMediaSlug(rawUrl: string): string {
 
 export function extractEpisodeNumber(textOrUrl: string): number | null {
   if (!textOrUrl) return null;
+  const anisync = parseAnisyncUri(textOrUrl);
+  if (anisync.kind === 'episode') {
+    return anisync.episodeNumber;
+  }
   const slugMatch = textOrUrl.match(/-episodio-(\d+(?:\.\d+)?)(?:\/|$|\?)/i);
   if (slugMatch?.[1]) {
     const n = Number.parseFloat(slugMatch[1]);
@@ -78,11 +97,40 @@ function cleanEpisodeSeriesTitle(rawTitle: string): string {
 }
 
 export function toSeriesFavoriteItem(item: CatalogMediaItem): CatalogMediaItem {
-  if (item.kind !== 'episode' && !/\/episodio\//i.test(item.url)) {
+  const parsed = parseAnisyncUri(item.url);
+  if (parsed.kind === 'episode') {
+    const seriesUri = buildMediaUri(parsed.mediaType, parsed.source, parsed.externalId);
+    return {
+      ...item,
+      id: seriesUri,
+      url: seriesUri,
+      kind: parsed.mediaType,
+      title: cleanEpisodeSeriesTitle(item.title) || item.title,
+      episodeLabel: undefined,
+    };
+  }
+  if (parsed.kind === 'media') {
+    const norm = normalizeTopAnimesUrl(item.url);
+    return {
+      ...item,
+      id: norm,
+      url: norm,
+      kind: parsed.mediaType,
+    };
+  }
+  if (item.kind !== 'episode' && !/\/(?:episodio|videos)\//i.test(item.url)) {
     return {
       ...item,
       url: normalizeTopAnimesUrl(item.url),
       id: normalizeTopAnimesUrl(item.url),
+    };
+  }
+  if (/\/videos\/\d+/i.test(item.url)) {
+    const norm = normalizeTopAnimesUrl(item.url);
+    return {
+      ...item,
+      id: norm,
+      url: norm,
     };
   }
   const slug = extractMediaSlug(item.url);

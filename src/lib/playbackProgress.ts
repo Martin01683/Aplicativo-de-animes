@@ -1,4 +1,5 @@
-import { canonicalEpisodeKey } from './favoriteAlerts';
+import { canonicalEpisodeKey, extractMediaSlug } from './favoriteAlerts';
+import type { WatchHistoryEntry } from './types';
 
 export type VideoScaleMode = 'best-fit' | 'fit-screen' | 'fill' | '16:9' | 'original';
 
@@ -313,4 +314,100 @@ export function groupEpisodesBySeason<
   }
 
   return Array.from(groups.values()).sort((a, b) => a.seasonNumber - b.seasonNumber);
+}
+
+function normalizeHistorySeriesKey(raw: string): string {
+  return raw
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+export function getHistoryEntrySeriesName(
+  entry: Pick<WatchHistoryEntry, 'title' | 'seriesTitle'>
+): string {
+  const explicit = (entry.seriesTitle || '').trim();
+  if (explicit) return explicit;
+  const cleaned = (entry.title || '')
+    .replace(/\s*[-–—:]\s*(?:temporada\s*\d+\s*[-–—]?\s*)?(?:epis[oó]dio|ep\.?)\s*\d+(?:\.\d+)?.*$/i, '')
+    .replace(/\s+(?:epis[oó]dio|ep\.?)\s*\d+(?:\.\d+)?.*$/i, '')
+    .replace(/\s*[-–—]\s*\d+\s*x\s*\d+.*$/i, '')
+    .trim();
+  return cleaned || (entry.title || '').trim();
+}
+
+export function isSameHistoryAnime(a: WatchHistoryEntry, b: WatchHistoryEntry): boolean {
+  const keyA = canonicalEpisodeProgressKey(a.url);
+  const keyB = canonicalEpisodeProgressKey(b.url);
+  if (keyA && keyB && keyA === keyB) return true;
+  if (a.url && b.url && a.url === b.url) return true;
+
+  const seriesUrlA = a.seriesUrl ? canonicalEpisodeProgressKey(a.seriesUrl) : '';
+  const seriesUrlB = b.seriesUrl ? canonicalEpisodeProgressKey(b.seriesUrl) : '';
+  if (seriesUrlA && seriesUrlB && seriesUrlA === seriesUrlB) return true;
+
+  const nameKeyA = normalizeHistorySeriesKey(getHistoryEntrySeriesName(a));
+  const nameKeyB = normalizeHistorySeriesKey(getHistoryEntrySeriesName(b));
+  if (nameKeyA && nameKeyB && nameKeyA === nameKeyB) return true;
+
+  if (!seriesUrlA || !seriesUrlB) {
+    const slugA = extractMediaSlug(a.url);
+    const slugB = extractMediaSlug(b.url);
+    if (slugA && slugB && slugA === slugB) return true;
+  }
+
+  return false;
+}
+
+export function countAnimeEpisodesInHistory(
+  history: WatchHistoryEntry[],
+  target: WatchHistoryEntry
+): number {
+  let count = 0;
+  for (const item of history) {
+    if (isSameHistoryAnime(item, target)) count += 1;
+  }
+  return count;
+}
+
+export function removeHistoryEpisodeFromList(
+  history: WatchHistoryEntry[],
+  targetUrl: string
+): { nextHistory: WatchHistoryEntry[]; removedUrls: string[] } {
+  const targetKey = canonicalEpisodeProgressKey(targetUrl);
+  const nextHistory: WatchHistoryEntry[] = [];
+  const removedUrls: string[] = [];
+
+  for (const item of history) {
+    const itemKey = canonicalEpisodeProgressKey(item.url);
+    const matches =
+      (targetKey && itemKey && itemKey === targetKey) || item.url === targetUrl;
+    if (matches) {
+      removedUrls.push(item.url);
+    } else {
+      nextHistory.push(item);
+    }
+  }
+
+  return { nextHistory, removedUrls };
+}
+
+export function removeHistoryAnimeFromList(
+  history: WatchHistoryEntry[],
+  target: WatchHistoryEntry
+): { nextHistory: WatchHistoryEntry[]; removedUrls: string[] } {
+  const nextHistory: WatchHistoryEntry[] = [];
+  const removedUrls: string[] = [];
+
+  for (const item of history) {
+    if (isSameHistoryAnime(item, target)) {
+      removedUrls.push(item.url);
+    } else {
+      nextHistory.push(item);
+    }
+  }
+
+  return { nextHistory, removedUrls };
 }

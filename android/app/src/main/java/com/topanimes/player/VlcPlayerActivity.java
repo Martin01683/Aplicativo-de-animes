@@ -1,8 +1,10 @@
 package com.topanimes.player;
 
 import android.app.Activity;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
@@ -11,6 +13,9 @@ import android.graphics.Typeface;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.MediaMetadata;
+import android.media.session.MediaSession;
+import android.media.session.PlaybackState;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -22,6 +27,7 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -324,9 +330,32 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private int seekStreakCount = 0;
     private int seekStreakSide = 0;
 
+    private static final long MEDIA_SESSION_ACTIONS =
+        PlaybackState.ACTION_PLAY
+            | PlaybackState.ACTION_PAUSE
+            | PlaybackState.ACTION_PLAY_PAUSE
+            | PlaybackState.ACTION_STOP
+            | PlaybackState.ACTION_SEEK_TO
+            | PlaybackState.ACTION_FAST_FORWARD
+            | PlaybackState.ACTION_REWIND
+            | PlaybackState.ACTION_SKIP_TO_NEXT
+            | PlaybackState.ACTION_SKIP_TO_PREVIOUS;
+
     private AudioManager audioManager;
     private AudioManager.OnAudioFocusChangeListener audioFocusChangeListener;
     private AudioFocusRequest audioFocusRequest;
+    private MediaSession mediaSession;
+    private boolean becomingNoisyReceiverRegistered = false;
+    private boolean pendingPauseFromNoisyAudio = false;
+    private final BroadcastReceiver becomingNoisyReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null) return;
+            if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
+                uiHandler.post(() -> pausePlaybackForAudioRouteOrControl());
+            }
+        }
+    };
 
     private final Runnable hideControlsRunnable = () -> setControlsVisible(false);
     private final Runnable hideSeekBadgeRunnable = () -> {
@@ -451,7 +480,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 updateQualityLabel();
             }
         }
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         setupAudioFocus();
+        setupMediaSession();
         initLibVlc();
         setupInteractions();
         adjustResponsiveHud();
@@ -696,6 +727,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         } else {
             episodesSeriesTitle.setVisibility(View.GONE);
         }
+        updateMediaSessionMetadata();
     }
 
     private void syncPrevNextFromSeries() {
@@ -838,6 +870,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 case MediaPlayer.Event.Playing:
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        if (pendingPauseFromNoisyAudio) {
+                            pendingPauseFromNoisyAudio = false;
+                            userInitiatedPause = true;
+                            if (mediaPlayer != null && mediaPlayer.isPlaying()) {
+                                mediaPlayer.pause();
+                            }
+                            hideLoading();
+                            updatePlayPauseIcons(false);
+                            setControlsVisible(true);
+                            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
+                            return;
+                        }
                         playbackFailed = false;
                         playbackEnded = false;
                         loadingEpisode = false;
@@ -873,11 +917,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         if (pauseAfterRestoreFrame) {
                             updatePlayPauseIcons(false);
                             setControlsVisible(true);
+                            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
                             uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
                             uiHandler.postDelayed(pauseAfterRestoreFallbackRunnable, 4000L);
-                        } else if (hasActiveVout || hasPlaybackStartedForStream) {
-                            updatePlayPauseIcons(true);
-                            scheduleControlsAutoHide();
+                        } else {
+                            updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING);
+                            if (hasActiveVout || hasPlaybackStartedForStream) {
+                                updatePlayPauseIcons(true);
+                                scheduleControlsAutoHide();
+                            }
                         }
                     });
                     break;
@@ -889,6 +937,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         }
                         updatePlayPauseIcons(false);
                         setControlsVisible(true);
+                        updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
                         saveCurrentEpisodeProgress(false);
                     });
                     break;
@@ -900,6 +949,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             lastKnownDurationMs = len;
                             seekBar.setMax((int) Math.min(Integer.MAX_VALUE, len));
                             timeDurationView.setText(formatMs(len));
+                            updateMediaSessionMetadata();
                             applyPendingSeekIfReady();
                         });
                     }
@@ -1003,6 +1053,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
                             uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
                             setControlsVisible(true);
+                            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
                         }
                     });
                     break;
@@ -1064,6 +1115,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         hideLoading();
         updatePlayPauseIcons(false);
         setControlsVisible(true);
+        updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
     }
 
     private void cancelPendingPauseAfterRestore(boolean resumePlayback) {
@@ -1077,11 +1129,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (mediaPlayer != null) {
             mediaPlayer.setVolume(muted ? 0 : 100);
             if (resumePlayback) {
+                pendingPauseFromNoisyAudio = false;
                 requestAudioFocus();
                 if (!mediaPlayer.isPlaying()) {
                     mediaPlayer.play();
                 }
                 updatePlayPauseIcons(true);
+                updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING);
                 scheduleControlsAutoHide();
             }
         }
@@ -1263,12 +1317,17 @@ public class VlcPlayerActivity extends AppCompatActivity {
         userSeekedInCurrentStream = false;
         streamPreparedWallMs = SystemClock.elapsedRealtime();
         userInitiatedPause = false;
+        pendingPauseFromNoisyAudio = false;
         playbackFailed = false;
         loadingEpisode = false;
         subtitlesAttached = false;
         pendingSlaveSubtitleLabels.clear();
         slaveSubtitleLabelsById.clear();
         updateEpisodeNavButtons();
+        updateMediaSessionMetadata();
+        updateMediaSessionPlaybackState(
+            pauseAfterFirstFrame ? PlaybackState.STATE_PAUSED : PlaybackState.STATE_BUFFERING
+        );
         errorOverlay.setVisibility(View.GONE);
         showLoading(null);
 
@@ -1936,16 +1995,49 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
     }
 
-    private void togglePlayPause() {
-        if (mediaPlayer == null || loadingEpisode || playbackFailed) return;
+    private void pausePlaybackForAudioRouteOrControl() {
+        uiHandler.removeCallbacks(singleTapRunnable);
+        if (isFinishing() || isDestroyed() || mediaPlayer == null || playbackFailed) return;
+        if (pauseAfterRestoreFrame) {
+            finishPauseAfterRestoreFrame();
+            return;
+        }
+        if (mediaPlayer.isPlaying()) {
+            pendingPauseFromNoisyAudio = false;
+            userInitiatedPause = true;
+            mediaPlayer.pause();
+            updatePlayPauseIcons(false);
+            uiHandler.removeCallbacks(hideControlsRunnable);
+            setControlsVisible(true);
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
+        } else if (!loadingEpisode && !playbackEnded && !hasPlaybackStartedForStream && activePlaybackSessionGen > 0L) {
+            pendingPauseFromNoisyAudio = true;
+            userInitiatedPause = true;
+            updatePlayPauseIcons(false);
+            uiHandler.removeCallbacks(hideControlsRunnable);
+            setControlsVisible(true);
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
+        } else {
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
+        }
+    }
+
+    private void resumePlaybackFromMediaControl() {
+        uiHandler.removeCallbacks(singleTapRunnable);
+        pendingPauseFromNoisyAudio = false;
+        if (isFinishing() || isDestroyed() || mediaPlayer == null || loadingEpisode || playbackFailed) {
+            return;
+        }
         if (pauseAfterRestoreFrame) {
             cancelPendingPauseAfterRestore(true);
             return;
         }
         if (mediaPlayer.isPlaying()) {
-            userInitiatedPause = true;
-            mediaPlayer.pause();
-        } else if (playbackEnded
+            updatePlayPauseIcons(true);
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING);
+            return;
+        }
+        if (playbackEnded
             || !mediaPlayer.getVLCVout().areViewsAttached()
             || !mediaPlayer.hasMedia()
             || activePlaybackSessionGen <= 0L) {
@@ -1958,10 +2050,117 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
             }
             prepareAndPlayCurrentStream(false);
+            return;
+        }
+        userInitiatedPause = false;
+        requestAudioFocus();
+        mediaPlayer.play();
+        updatePlayPauseIcons(true);
+        updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING);
+        scheduleControlsAutoHide();
+    }
+
+    private static boolean isHandledMediaKey(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_MEDIA_PLAY:
+            case KeyEvent.KEYCODE_MEDIA_PAUSE:
+            case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+            case KeyEvent.KEYCODE_HEADSETHOOK:
+            case KeyEvent.KEYCODE_MEDIA_STOP:
+            case KeyEvent.KEYCODE_MEDIA_NEXT:
+            case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (!isHandledMediaKey(keyCode)) {
+            return super.onKeyDown(keyCode, event);
+        }
+        if (event != null && event.getRepeatCount() == 0) {
+            switch (keyCode) {
+                case KeyEvent.KEYCODE_MEDIA_PLAY:
+                    resumePlaybackFromMediaControl();
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PAUSE:
+                case KeyEvent.KEYCODE_MEDIA_STOP:
+                    pausePlaybackForAudioRouteOrControl();
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
+                case KeyEvent.KEYCODE_HEADSETHOOK:
+                    togglePlayPause();
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_NEXT:
+                    if (!loadingEpisode) {
+                        if (!nextUrl.isEmpty()) {
+                            loadEpisodeInFullscreen(nextUrl);
+                        } else if (hasNextFlag) {
+                            finishWithAction("next");
+                        }
+                    }
+                    break;
+                case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
+                    if (!loadingEpisode) {
+                        if (!prevUrl.isEmpty()) {
+                            loadEpisodeInFullscreen(prevUrl);
+                        } else if (hasPrevFlag) {
+                            finishWithAction("prev");
+                        }
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public boolean onKeyUp(int keyCode, KeyEvent event) {
+        if (isHandledMediaKey(keyCode)) {
+            return true;
+        }
+        return super.onKeyUp(keyCode, event);
+    }
+
+    private void togglePlayPause() {
+        uiHandler.removeCallbacks(singleTapRunnable);
+        if (mediaPlayer == null || loadingEpisode || playbackFailed) return;
+        if (pauseAfterRestoreFrame) {
+            cancelPendingPauseAfterRestore(true);
+            return;
+        }
+        if (mediaPlayer.isPlaying()) {
+            pendingPauseFromNoisyAudio = false;
+            userInitiatedPause = true;
+            mediaPlayer.pause();
+            updatePlayPauseIcons(false);
+            uiHandler.removeCallbacks(hideControlsRunnable);
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
+        } else if (playbackEnded
+            || !mediaPlayer.getVLCVout().areViewsAttached()
+            || !mediaPlayer.hasMedia()
+            || activePlaybackSessionGen <= 0L) {
+            pendingPauseFromNoisyAudio = false;
+            userInitiatedPause = false;
+            if (playbackEnded) {
+                playbackEnded = false;
+                pendingSeekMs = 0L;
+                lastKnownPositionMs = 0L;
+            } else {
+                pendingSeekMs = Math.max(pendingSeekMs, lastKnownPositionMs);
+            }
+            prepareAndPlayCurrentStream(false);
         } else {
+            pendingPauseFromNoisyAudio = false;
             userInitiatedPause = false;
             requestAudioFocus();
             mediaPlayer.play();
+            updatePlayPauseIcons(true);
+            updateMediaSessionPlaybackState(PlaybackState.STATE_PLAYING);
             scheduleControlsAutoHide();
         }
     }
@@ -2941,12 +3140,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         audioFocusChangeListener = focusChange -> {
             if (focusChange == AudioManager.AUDIOFOCUS_LOSS
                 || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-                uiHandler.post(() -> {
-                    if (!pauseAfterRestoreFrame && mediaPlayer != null && mediaPlayer.isPlaying()) {
-                        userInitiatedPause = true;
-                        mediaPlayer.pause();
-                    }
-                });
+                uiHandler.post(() -> pausePlaybackForAudioRouteOrControl());
             }
         };
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -2961,6 +3155,171 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 .build();
         }
         requestAudioFocus();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void setupMediaSession() {
+        if (mediaSession != null) return;
+        try {
+            mediaSession = new MediaSession(this, TAG);
+            mediaSession.setFlags(
+                MediaSession.FLAG_HANDLES_MEDIA_BUTTONS
+                    | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
+            );
+            mediaSession.setCallback(new MediaSession.Callback() {
+                @Override
+                public void onPlay() {
+                    uiHandler.post(() -> resumePlaybackFromMediaControl());
+                }
+
+                @Override
+                public void onPause() {
+                    uiHandler.post(() -> pausePlaybackForAudioRouteOrControl());
+                }
+
+                @Override
+                public void onStop() {
+                    uiHandler.post(() -> pausePlaybackForAudioRouteOrControl());
+                }
+
+                @Override
+                public void onSeekTo(long pos) {
+                    uiHandler.post(() -> {
+                        if (mediaPlayer == null || loadingEpisode || playbackFailed) return;
+                        long target = Math.max(0L, pos);
+                        long total = Math.max(lastKnownDurationMs, mediaPlayer.getLength());
+                        if (total > 0L && target > total) target = total;
+                        if (pauseAfterRestoreFrame) {
+                            cancelPendingPauseAfterRestore(false);
+                        }
+                        userSeekedInCurrentStream = true;
+                        if (!hasPlaybackStartedForStream) {
+                            firstTimeChangedMs = target;
+                        }
+                        mediaPlayer.setTime(target);
+                        lastKnownPositionMs = target;
+                        if (!userScrubbing) {
+                            seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
+                            timeCurrentView.setText(formatMs(target));
+                        }
+                        updateMediaSessionPlaybackState(
+                            mediaPlayer.isPlaying() ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED
+                        );
+                    });
+                }
+
+                @Override
+                public void onFastForward() {
+                    uiHandler.post(() -> seekByMs(5000L, "+5s"));
+                }
+
+                @Override
+                public void onRewind() {
+                    uiHandler.post(() -> seekByMs(-5000L, "-5s"));
+                }
+
+                @Override
+                public void onSkipToNext() {
+                    uiHandler.post(() -> {
+                        if (loadingEpisode) return;
+                        if (!nextUrl.isEmpty()) {
+                            loadEpisodeInFullscreen(nextUrl);
+                        } else if (hasNextFlag) {
+                            finishWithAction("next");
+                        }
+                    });
+                }
+
+                @Override
+                public void onSkipToPrevious() {
+                    uiHandler.post(() -> {
+                        if (loadingEpisode) return;
+                        if (!prevUrl.isEmpty()) {
+                            loadEpisodeInFullscreen(prevUrl);
+                        } else if (hasPrevFlag) {
+                            finishWithAction("prev");
+                        }
+                    });
+                }
+            }, uiHandler);
+            updateMediaSessionMetadata();
+            updateMediaSessionPlaybackState(PlaybackState.STATE_BUFFERING);
+            mediaSession.setActive(true);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed initializing MediaSession", e);
+        }
+    }
+
+    private void updateMediaSessionPlaybackState(int state) {
+        if (mediaSession == null) return;
+        try {
+            long pos = Math.max(0L, lastKnownPositionMs);
+            if (mediaPlayer != null && hasPlaybackStartedForStream && !pauseAfterRestoreFrame) {
+                long cur = mediaPlayer.getTime();
+                if (cur >= 0L) pos = cur;
+            }
+            float speed = (state == PlaybackState.STATE_PLAYING)
+                ? (holdSpeedActive ? 2.0f : currentSpeed)
+                : 0f;
+            PlaybackState playbackState = new PlaybackState.Builder()
+                .setActions(MEDIA_SESSION_ACTIONS)
+                .setState(state, pos, speed)
+                .build();
+            mediaSession.setPlaybackState(playbackState);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void updateMediaSessionMetadata() {
+        if (mediaSession == null) return;
+        try {
+            MediaMetadata.Builder builder = new MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, episodeTitle != null ? episodeTitle : "Episódio");
+            if (seriesTitle != null && !seriesTitle.isEmpty()) {
+                builder.putString(MediaMetadata.METADATA_KEY_ARTIST, seriesTitle);
+            }
+            if (lastKnownDurationMs > 0L) {
+                builder.putLong(MediaMetadata.METADATA_KEY_DURATION, lastKnownDurationMs);
+            }
+            mediaSession.setMetadata(builder.build());
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void releaseMediaSession() {
+        if (mediaSession != null) {
+            try {
+                mediaSession.setActive(false);
+                mediaSession.setCallback(null);
+                mediaSession.release();
+            } catch (Exception ignored) {
+            }
+            mediaSession = null;
+        }
+    }
+
+    private void registerBecomingNoisyReceiver() {
+        if (becomingNoisyReceiverRegistered) return;
+        try {
+            IntentFilter filter = new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                registerReceiver(becomingNoisyReceiver, filter, Context.RECEIVER_NOT_EXPORTED);
+            } else {
+                registerReceiver(becomingNoisyReceiver, filter);
+            }
+            becomingNoisyReceiverRegistered = true;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed registering becoming noisy receiver", e);
+        }
+    }
+
+    private void unregisterBecomingNoisyReceiver() {
+        if (!becomingNoisyReceiverRegistered) return;
+        becomingNoisyReceiverRegistered = false;
+        try {
+            unregisterReceiver(becomingNoisyReceiver);
+        } catch (Exception ignored) {
+        }
     }
 
     private void requestAudioFocus() {
@@ -3030,6 +3389,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
     protected void onStart() {
         super.onStart();
         isActivityStarted = true;
+        registerBecomingNoisyReceiver();
+        if (mediaSession != null) {
+            mediaSession.setActive(true);
+        }
         attachVideoViewsIfNeeded();
         if (shouldStartPlaybackOnStart || surfacesWereDestroyed) {
             boolean autoResume = shouldStartPlaybackOnStart
@@ -3048,6 +3411,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
         super.onResume();
         isActivityResumed = true;
         enterImmersiveMode();
+        if (mediaSession != null) {
+            mediaSession.setActive(true);
+        }
         attachVideoViewsIfNeeded();
 
         if (surfacesWereDestroyed && !loadingEpisode && !playbackFailed && !playbackEnded) {
@@ -3135,6 +3501,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (wasRestoringPausedFrame && mediaPlayer != null) {
             mediaPlayer.setVolume(muted ? 0 : 100);
         }
+        updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
         super.onPause();
     }
 
@@ -3142,6 +3509,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
     protected void onStop() {
         isActivityStarted = false;
         isActivityResumed = false;
+        unregisterBecomingNoisyReceiver();
+        updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
+        if (mediaSession != null) {
+            mediaSession.setActive(false);
+        }
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
@@ -3178,6 +3550,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
     protected void onDestroy() {
         isActivityStarted = false;
         isActivityResumed = false;
+        unregisterBecomingNoisyReceiver();
+        releaseMediaSession();
         uiHandler.removeCallbacksAndMessages(null);
         bgExecutor.shutdownNow();
         if (mediaPlayer != null) {

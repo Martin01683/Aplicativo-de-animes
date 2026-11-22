@@ -1,23 +1,32 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import {
   buildWatchedProgressMap,
   canonicalEpisodeProgressKey,
   computeProgressSnapshot,
+  countAnimeEpisodesInHistory,
   DEFAULT_VIDEO_SCALE,
   formatPlaybackTimestamp,
+  getHistoryEntrySeriesName,
   getResumePositionSec,
   getVideoScaleLabel,
   groupEpisodesBySeason,
   indexToVideoScale,
   isEpisodeCompleted,
   isEpisodeMarkedWatched,
+  isSameHistoryAnime,
+  removeHistoryAnimeFromList,
+  removeHistoryEpisodeFromList,
   sanitizeEpisodeProgressMap,
   sanitizeVideoScaleMode,
   upsertEpisodeProgressMap,
   videoScaleToIndex,
   type EpisodeProgressMap,
 } from './playbackProgress';
+import type { WatchHistoryEntry } from './types';
 
 test('canonicalEpisodeProgressKey normalizes scheme, www, and trailing slash', () => {
   assert.equal(
@@ -187,4 +196,75 @@ test('groupEpisodesBySeason groups episodes by explicit seasonNumber or numerand
   assert.equal(groups[1].episodes.length, 1);
   assert.equal(groups[2].seasonNumber, 3);
   assert.equal(groups[2].label, 'Temporada 3 (Final)');
+});
+
+test('history removal helpers remove either a single episode or all episodes of the same anime', () => {
+  const history: WatchHistoryEntry[] = [
+    {
+      url: 'https://topanimes.net/episodio/sousou-no-frieren-episodio-1/',
+      title: 'Sousou no Frieren - Episódio 1',
+      seriesTitle: 'Sousou no Frieren',
+      seriesUrl: 'https://topanimes.net/animes/sousou-no-frieren/',
+      poster: '',
+      kind: 'episode',
+      watchedAt: '2026-11-21T20:00:00Z',
+    },
+    {
+      url: 'https://www.hinatasoul.com/videos/12345',
+      title: 'Sousou no Frieren - Episódio 2',
+      seriesTitle: 'Sousou no Frieren',
+      seriesUrl: 'https://www.hinatasoul.com/animes/sousou-no-frieren',
+      poster: '',
+      kind: 'episode',
+      watchedAt: '2026-11-21T21:00:00Z',
+    },
+    {
+      url: 'https://topanimes.net/episodio/sousou-no-frieren-episodio-3/',
+      title: 'Sousou no Frieren - Episódio 3',
+      poster: '',
+      kind: 'episode',
+      watchedAt: '2026-11-21T21:30:00Z',
+    },
+    {
+      url: 'https://topanimes.net/episodio/solo-leveling-episodio-4/',
+      title: 'Solo Leveling - Episódio 4',
+      seriesTitle: 'Solo Leveling',
+      seriesUrl: 'https://topanimes.net/animes/solo-leveling/',
+      poster: '',
+      kind: 'episode',
+      watchedAt: '2026-11-21T22:00:00Z',
+    },
+  ];
+
+  assert.equal(getHistoryEntrySeriesName(history[2]), 'Sousou no Frieren');
+  assert.equal(isSameHistoryAnime(history[0], history[1]), true);
+  assert.equal(isSameHistoryAnime(history[0], history[2]), true);
+  assert.equal(isSameHistoryAnime(history[0], history[3]), false);
+  assert.equal(countAnimeEpisodesInHistory(history, history[0]), 3);
+
+  const single = removeHistoryEpisodeFromList(history, history[1].url);
+  assert.equal(single.removedUrls.length, 1);
+  assert.equal(single.nextHistory.length, 3);
+  assert.equal(single.nextHistory.some((h) => h.url === history[1].url), false);
+  assert.equal(single.nextHistory.some((h) => h.url === history[0].url), true);
+
+  const allSeries = removeHistoryAnimeFromList(history, history[0]);
+  assert.equal(allSeries.removedUrls.length, 3);
+  assert.equal(allSeries.nextHistory.length, 1);
+  assert.equal(allSeries.nextHistory[0].url, history[3].url);
+});
+
+test('App.tsx requires confirmation before bulk history clearing (clear all or all episodes of an anime)', () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const appTsx = readFileSync(resolve(here, '../App.tsx'), 'utf8');
+
+  assert.match(appTsx, /onClearHistory=\{requestClearAllHistory\}/);
+  assert.match(appTsx, /onRemoveHistoryAnime=\{requestRemoveHistoryAnime\}/);
+  assert.match(appTsx, /role="alertdialog"[\s\S]*?confirmPendingHistoryRemoval/);
+  const clearAllMatches = appTsx.match(/onClearHistory=\{requestClearAllHistory\}/g) ?? [];
+  assert.equal(
+    clearAllMatches.length,
+    2,
+    'both CatalogView and SettingsModal clear-history actions must ask confirmation'
+  );
 });

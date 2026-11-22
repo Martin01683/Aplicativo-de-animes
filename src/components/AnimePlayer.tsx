@@ -302,6 +302,8 @@ export function AnimePlayer({
     time: 0,
     side: 'center',
   });
+  const stagePointerDownRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
+  const nativeLaunchingRef = useRef(false);
 
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
@@ -959,7 +961,8 @@ export function AnimePlayer({
 
   const launchNativeVlc = useCallback(
     async (startMs?: number) => {
-      if (!sortedStreams.length || nativeLaunching) return;
+      if (!sortedStreams.length || nativeLaunchingRef.current) return;
+      nativeLaunchingRef.current = true;
       setNativeLaunching(true);
       const explicitStart = typeof startMs === 'number';
       const targetStartMs = explicitStart ? startMs : nativeResumeMs;
@@ -1032,6 +1035,7 @@ export function AnimePlayer({
       } catch {
         onToast('Não foi possível abrir o player LibVLC.');
       } finally {
+        nativeLaunchingRef.current = false;
         setNativeLaunching(false);
       }
     },
@@ -1042,7 +1046,6 @@ export function AnimePlayer({
       hasNext,
       hasPrev,
       nativeDurationMs,
-      nativeLaunching,
       nativeResumeMs,
       nextUrl,
       onChangeVideoScale,
@@ -1806,11 +1809,32 @@ export function AnimePlayer({
 
       {/* Interactive Gesture Surface (Tap, Double-Tap Seek, Hold 2x) */}
       <div
-        className="absolute inset-0 z-20"
-        onPointerDown={() => startHoldSpeed()}
-        onPointerUp={(e) => handleStageTap(e.clientX)}
-        onPointerCancel={cancelHoldSpeed}
-        onPointerLeave={cancelHoldSpeed}
+        className="absolute inset-0 z-20 touch-manipulation"
+        onPointerDown={(e) => {
+          stagePointerDownRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId };
+          startHoldSpeed();
+        }}
+        onPointerUp={(e) => {
+          const down = stagePointerDownRef.current;
+          stagePointerDownRef.current = null;
+          if (
+            down &&
+            down.pointerId === e.pointerId &&
+            Math.hypot(e.clientX - down.x, e.clientY - down.y) > 20
+          ) {
+            cancelHoldSpeed();
+            return;
+          }
+          handleStageTap(e.clientX);
+        }}
+        onPointerCancel={() => {
+          stagePointerDownRef.current = null;
+          cancelHoldSpeed();
+        }}
+        onPointerLeave={() => {
+          stagePointerDownRef.current = null;
+          cancelHoldSpeed();
+        }}
       />
 
       {/* Hidden local subtitle file picker */}
@@ -1889,9 +1913,11 @@ export function AnimePlayer({
           onClick={togglePlay}
           disabled={!activeStream}
           aria-label="Reproduzir episódio"
-          className="absolute left-1/2 top-1/2 z-30 flex h-16 w-16 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px]"
+          className={`absolute left-1/2 top-1/2 flex h-14 w-14 -translate-x-1/2 -translate-y-1/2 cursor-pointer touch-manipulation items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px] ${
+            menuOpen || episodesOpen ? 'z-20' : 'z-[35]'
+          }`}
         >
-          <Play className="ml-1 h-7 w-7 fill-current sm:h-8 sm:w-8" />
+          <Play className="ml-1 h-6 w-6 fill-current sm:h-8 sm:w-8" />
         </button>
       )}
 
@@ -1918,18 +1944,25 @@ export function AnimePlayer({
         </div>
       )}
 
-      {/* Bottom Controls HUD */}
+      {/* Bottom Controls HUD (outer gradient is pointer-events-none so it never blocks the center play button on mobile) */}
       <div
-        className={`absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/95 via-black/65 to-transparent px-3 pb-2.5 pt-10 transition-opacity duration-200 sm:px-4 sm:pb-3 ${
+        className={`pointer-events-none absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/95 via-black/65 to-transparent px-3 pb-2 pt-8 transition-opacity duration-200 sm:px-4 sm:pb-3 sm:pt-10 ${
           controlsVisible || !playing || menuOpen || episodesOpen || useNativeVlc
             ? 'opacity-100'
-            : 'pointer-events-none opacity-0'
+            : 'opacity-0'
         }`}
-        onClick={(e) => e.stopPropagation()}
       >
+        <div
+          className={
+            controlsVisible || !playing || menuOpen || episodesOpen || useNativeVlc
+              ? 'pointer-events-auto'
+              : 'pointer-events-none'
+          }
+          onClick={(e) => e.stopPropagation()}
+        >
         {/* Seek Bar */}
         <div
-          className="relative mb-2.5 flex h-5 cursor-pointer items-center"
+          className="relative mb-1.5 flex h-5 cursor-pointer items-center sm:mb-2.5"
           onMouseMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
             const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -2659,6 +2692,7 @@ export function AnimePlayer({
               </>
             )}
           </div>
+        </div>
         </div>
       </div>
 

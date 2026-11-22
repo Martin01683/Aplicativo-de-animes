@@ -30,7 +30,7 @@ on:
   workflow_call:
     inputs:
       publish:
-        description: 'Publishes the signed release TopAnimes.apk to a GitHub Release after CI and Android build succeed'
+        description: 'Publishes the signed release Anisync.apk to a GitHub Release after CI and Android build succeed'
         required: false
         type: boolean
         default: false
@@ -76,7 +76,7 @@ jobs:
         run: npm run build
 
   build-apk:
-    name: Build TopAnimes APK (release)
+    name: Build Anisync APK (release)
     needs: validate-and-test
     runs-on: ubuntu-latest
 
@@ -167,13 +167,13 @@ jobs:
           fi
 
       - name: Rename APK output
-        run: cp android/app/build/outputs/apk/release/app-release.apk TopAnimes.apk
+        run: cp android/app/build/outputs/apk/release/app-release.apk Anisync.apk
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: TopAnimes-apk
-          path: TopAnimes.apk
+          name: Anisync-apk
+          path: Anisync.apk
           retention-days: 30
 
   publish-release:
@@ -198,7 +198,7 @@ jobs:
       - name: Download APK artifact
         uses: actions/download-artifact@v8
         with:
-          name: TopAnimes-apk
+          name: Anisync-apk
 
       - name: Publish APK Release
         env:
@@ -281,19 +281,19 @@ jobs:
             echo ""
             echo "Build automático (release assinado) gerado após validação de segurança, lint, testes unitários e compilação Android (${TARGET_SHA})."
             echo ""
-            echo 'Instalação: baixe TopAnimes.apk e instale por cima da versão anterior. Se aparecer "pacote já existe" / "conflita com um pacote existente", desinstale o app UMA vez (se a versão anterior foi assinada com outra chave) e instale de novo; as próximas atualizações instalam por cima normalmente.'
+            echo 'Instalação: baixe Anisync.apk e instale por cima da versão anterior. Se aparecer "pacote já existe" / "conflita com um pacote existente", desinstale o app UMA vez (se a versão anterior foi assinada com outra chave) e instale de novo; as próximas atualizações instalam por cima normalmente.'
           } > "$NOTES_FILE"
 
-          gh release create "$TAG" TopAnimes.apk \
+          gh release create "$TAG" Anisync.apk \
             --target "$TARGET_SHA" \
-            --title "TopAnimes $TAG" \
+            --title "Anisync $TAG" \
             --notes-file "$NOTES_FILE"
 
           # Regenera CHANGELOG.md automaticamente a partir das tags e commits do repositório.
           {
             echo "# Changelog"
             echo ""
-            echo "Todas as alterações relevantes do **TopAnimes** são geradas automaticamente a partir dos commits de cada release."
+            echo "Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release."
             echo ""
             echo "## [$TAG] — $(date -u +%Y-%m-%d)"
             echo ""

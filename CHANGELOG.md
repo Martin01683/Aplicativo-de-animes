@@ -1,6 +1,6 @@
 # Changelog
 
-Todas as alterações relevantes do **TopAnimes** são geradas automaticamente a partir dos commits de cada release.
+Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
 ## [v1.0.12] — 2026-11-21
 

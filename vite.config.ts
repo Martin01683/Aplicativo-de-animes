@@ -80,10 +80,10 @@ export default defineConfig(() => {
         },
         manifest: {
           id: '/',
-          name: 'TopAnimes Mobile Player',
-          short_name: 'TopAnimes',
+          name: 'Anisync — Animes',
+          short_name: 'Anisync',
           description:
-            'Assista animes e filmes do TopAnimes no celular com player próprio e legendas ASS/SRT/VTT.',
+            'Catálogo direto dos servidores integrados com metadados do TheTVDB e calendário semanal de animes do LiveChart.me.',
           theme_color: '#0d0f12',
           background_color: '#0d0f12',
           display: 'standalone',
@@ -136,10 +136,10 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /\/api\/(home|anime)$/i,
+              urlPattern: /\/api\/(home|anime|media|catalog|calendar)$/i,
               handler: 'NetworkFirst',
               options: {
-                cacheName: 'topanimes-catalog-cache',
+                cacheName: 'anisync-catalog-cache',
                 networkTimeoutSeconds: 4,
                 expiration: { maxEntries: 30, maxAgeSeconds: 60 * 15 },
                 cacheableResponse: { statuses: [0, 200] },

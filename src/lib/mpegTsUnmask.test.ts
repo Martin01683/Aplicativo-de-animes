@@ -145,7 +145,7 @@ describe('Android KojimaCDN playback regression guards', () => {
   const resolverJava = readRepoFile(
     'android/app/src/main/java/com/topanimes/player/TopAnimesEpisodeResolver.java'
   );
-  const apiClientTs = readRepoFile('src/lib/apiClient.ts');
+  const topanimesSourceTs = readRepoFile('src/lib/sources/providers/topanimesSource.ts');
 
   it('never bypasses LocalProxyPlugin for tiktokcdn.com on Android', () => {
     const directHostsMatch = localProxyJava.match(
@@ -156,10 +156,10 @@ describe('Android KojimaCDN playback regression guards', () => {
 
     assert.doesNotMatch(resolverJava, /tiktokcdn\.com/i);
 
-    const nativePreferDirectMatch = apiClientTs.match(
-      /async function resolveNativeEmbedUrl[\s\S]*?const preferDirect\s*=\s*([^;]+);/
+    const nativePreferDirectMatch = topanimesSourceTs.match(
+      /export async function resolveTopAnimesEmbed[\s\S]*?const preferDirect\s*=\s*([^;]+);/
     );
-    assert.ok(nativePreferDirectMatch, 'resolveNativeEmbedUrl preferDirect must exist');
+    assert.ok(nativePreferDirectMatch, 'resolveTopAnimesEmbed preferDirect must exist');
     assert.doesNotMatch(nativePreferDirectMatch[1], /tiktokcdn/i);
   });
 

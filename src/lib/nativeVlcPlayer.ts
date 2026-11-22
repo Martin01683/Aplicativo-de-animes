@@ -1,5 +1,5 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
-import { normalizeTopAnimesUrl } from './favoriteAlerts';
+import { canonicalEpisodeKey as canonicalKey } from './favoriteAlerts';
 import type { VideoScaleMode } from './playbackProgress';
 import type { AnimeEpisodeLink, PlayerOption, StreamQuality, SubtitleTrack } from './types';
 
@@ -75,21 +75,9 @@ export function isDesktopShortcutsEnabled(): boolean {
   return shouldEnableDesktopShortcuts(isAndroidNativeVlcSupported(), ua);
 }
 
-function canonicalEpisodeKey(raw: string): string {
-  const normalized = normalizeTopAnimesUrl(raw) || raw.trim();
-  try {
-    const u = new URL(normalized);
-    const host = u.hostname.toLowerCase().replace(/^www\./, '');
-    const path = u.pathname.replace(/\/+$/, '').toLowerCase();
-    return `${host}${path}${u.search}`;
-  } catch {
-    return normalized.replace(/^https?:\/\/(?:www\.)?/i, '').replace(/\/+$/, '').toLowerCase();
-  }
-}
-
 export function isSameEpisodeUrl(a?: string, b?: string): boolean {
   if (!a || !b) return false;
-  return canonicalEpisodeKey(a) === canonicalEpisodeKey(b);
+  return canonicalKey(a) === canonicalKey(b);
 }
 
 /**
