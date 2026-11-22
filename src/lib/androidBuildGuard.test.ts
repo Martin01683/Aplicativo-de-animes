@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -444,5 +444,18 @@ describe('Pre-push build checks and Android Gradle gate', () => {
       androidChanged: true,
     });
     assert.equal(respectsExplicitOverride.action, 'skip');
+  });
+  it('blocks committing unused AI Studio chat attachments in public/assets/aistudio', () => {
+    const gitignore = readRepoFile('.gitignore');
+    assert.match(gitignore, /^public\/assets\/aistudio\/\*$/m);
+
+    const aistudioDir = resolve(ROOT, 'public/assets/aistudio');
+    const files = readdirSync(aistudioDir);
+    const disallowed = files.filter((f) => !/^captura-topanimes\.net-[\w-]+\.html$/.test(f));
+    assert.deepEqual(
+      disallowed,
+      [],
+      `Unexpected non-fixture files in public/assets/aistudio/: ${disallowed.join(', ')}`,
+    );
   });
 });
