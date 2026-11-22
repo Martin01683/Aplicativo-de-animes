@@ -11,6 +11,7 @@ import {
   hasAndroidChanges,
   parseLocalPropertiesSdkDir,
 } from '../../scripts/check-android-build.mjs';
+import { resolveBufferedEndSec } from './playerBuffer';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -463,5 +464,78 @@ describe('Pre-push build checks and Android Gradle gate', () => {
       '',
       `public/assets/aistudio/ must never have tracked files in git: ${tracked}`,
     );
+  });
+});
+
+describe('Video buffered progress bar (Android LibVLC + Web)', () => {
+  it('defines secondaryProgress layer in Android seekbar_player_progress.xml', () => {
+    const seekbarXml = readRepoFile(
+      'android/app/src/main/res/drawable/seekbar_player_progress.xml',
+    );
+    const bgIdx = seekbarXml.indexOf('@android:id/background');
+    const secIdx = seekbarXml.indexOf('@android:id/secondaryProgress');
+    const progIdx = seekbarXml.indexOf('@android:id/progress');
+    assert.ok(bgIdx >= 0, 'background layer must exist');
+    assert.ok(secIdx > bgIdx, 'secondaryProgress layer must come after background');
+    assert.ok(progIdx > secIdx, 'progress layer must render above secondaryProgress');
+  });
+
+  it('wires LocalProxyPlugin buffer telemetry and VlcPlayerActivity secondaryProgress updates', () => {
+    const proxyJava = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/LocalProxyPlugin.java',
+    );
+    const activityJava = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java',
+    );
+    assert.match(proxyJava, /public interface BufferProgressListener/);
+    assert.match(
+      proxyJava,
+      /public static String buildSharedProxyUrl\(String targetUrl, String referer, long sessionId\)/,
+    );
+    assert.match(proxyJava, /EXTINF_DURATION_PATTERN/);
+    assert.match(proxyJava, /seg_start_ms/);
+    assert.match(proxyJava, /seg_end_ms/);
+    assert.match(proxyJava, /parseByteRangeWindow/);
+
+    assert.match(activityJava, /--prefetch-buffer-size=32768/);
+    assert.match(activityJava, /seekBar\.setSecondaryProgress\(/);
+    assert.match(activityJava, /LocalProxyPlugin\.setBufferProgressListener\(/);
+    assert.match(activityJava, /LocalProxyPlugin\.clearBufferProgressListener\(/);
+    assert.match(activityJava, /applyByteRangeBufferSample/);
+    assert.match(activityJava, /applyHlsTimeBufferSample/);
+  });
+
+  it('resolves the active buffered end timestamp for web video TimeRanges', () => {
+    const makeRanges = (ranges: Array<[number, number]>) => ({
+      length: ranges.length,
+      start: (i: number) => ranges[i][0],
+      end: (i: number) => ranges[i][1],
+    });
+
+    assert.equal(resolveBufferedEndSec(makeRanges([]), 0, 1420), 0);
+    assert.equal(resolveBufferedEndSec(makeRanges([[0, 125.5]]), 0, 1420), 125.5);
+    assert.equal(
+      resolveBufferedEndSec(
+        makeRanges([
+          [0, 60],
+          [300, 420],
+        ]),
+        310,
+        1420,
+      ),
+      420,
+    );
+    assert.equal(
+      resolveBufferedEndSec(
+        makeRanges([
+          [0, 60],
+          [300, 420],
+        ]),
+        15,
+        1420,
+      ),
+      60,
+    );
+    assert.equal(resolveBufferedEndSec(makeRanges([[0, 2000]]), 500, 1420), 1420);
   });
 });

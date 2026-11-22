@@ -334,8 +334,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private int currentScaleIdx = 0;
     private boolean muted = false;
     private boolean controlsVisible = true;
+    private static final long DIRECT_BUFFER_FALLBACK_WINDOW_MS = 15000L;
     private boolean userScrubbing = false;
     private boolean playbackFailed = false;
+    private long bufferSessionCounter = 0L;
+    private volatile long activeBufferSessionId = 0L;
+    private long bufferedPositionMs = 0L;
+    private long pendingBufferedRangeStart = -1L;
+    private long pendingBufferedRangeEnd = -1L;
+    private long pendingBufferedTotalBytes = -1L;
+    private boolean hasProxyBufferTelemetry = false;
     private boolean playbackEnded = false;
     private boolean loadingEpisode = false;
     private boolean subtitlesAttached = false;
@@ -927,6 +935,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         options.add("--no-drop-late-frames");
         options.add("--no-skip-frames");
         options.add("--network-caching=1500");
+        options.add("--prefetch-buffer-size=32768");
         options.add("--http-reconnect");
         libVlc = new LibVLC(this, options);
         libVlc.setUserAgent("TopAnimes", DEFAULT_UA);
@@ -962,6 +971,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     float pct = event.getBuffering();
                     uiHandler.post(() -> {
                         if (isFinishing() || isDestroyed() || eventSession != activePlaybackSessionGen) return;
+                        if (!hasProxyBufferTelemetry && lastKnownDurationMs > 0L) {
+                            long currentPos = Math.max(0L, lastKnownPositionMs);
+                            float clampedPct = Math.max(0f, Math.min(100f, pct));
+                            long cachedAheadMs = Math.round((clampedPct / 100f) * DIRECT_BUFFER_FALLBACK_WINDOW_MS);
+                            long fallbackBuffered = Math.min(lastKnownDurationMs, currentPos + cachedAheadMs);
+                            if (fallbackBuffered > bufferedPositionMs) {
+                                bufferedPositionMs = fallbackBuffered;
+                                updateSeekBarBufferedProgress();
+                            }
+                        }
                         if (pct >= 100f && !loadingEpisode && (hasActiveVout || hasPlaybackStartedForStream)) {
                             hideLoading();
                         } else if (mediaPlayer != null && (!mediaPlayer.isPlaying() || !hasPlaybackStartedForStream)) {
@@ -1074,6 +1093,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             lastKnownDurationMs = len;
                             seekBar.setMax((int) Math.min(Integer.MAX_VALUE, len));
                             timeDurationView.setText(formatMs(len));
+                            flushPendingByteRangeBufferSample();
+                            updateSeekBarBufferedProgress();
                             updateMediaSessionMetadata();
                             applyPendingSeekIfReady();
                         });
@@ -1129,7 +1150,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             lastKnownDurationMs = totalLen;
                             seekBar.setMax((int) Math.min(Integer.MAX_VALUE, totalLen));
                             timeDurationView.setText(formatMs(totalLen));
+                            flushPendingByteRangeBufferSample();
                         }
+                        if (!hasProxyBufferTelemetry && hasPlaybackStartedForStream && lastKnownDurationMs > 0L) {
+                            long minDirectBuffered = Math.min(lastKnownDurationMs, timeMs + 3000L);
+                            if (minDirectBuffered > bufferedPositionMs) {
+                                bufferedPositionMs = minDirectBuffered;
+                            }
+                        }
+                        updateSeekBarBufferedProgress();
                         if (pauseAfterRestoreFrame) {
                             restoreFrameTimeReached = true;
                             maybeSchedulePauseAfterRestoreFrame();
@@ -1408,6 +1437,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
         if (streams.isEmpty()) {
             activePlaybackSessionGen = -1L;
+            activeBufferSessionId = 0L;
+            LocalProxyPlugin.clearBufferProgressListener(0L);
+            hasProxyBufferTelemetry = false;
+            resetBufferProgress(0L);
             pauseAfterRestoreFrame = false;
             playbackFailed = true;
             loadingEpisode = false;
@@ -1445,9 +1478,33 @@ public class VlcPlayerActivity extends AppCompatActivity {
         StreamItem item = streams.get(currentStreamIdx);
         updateQualityLabel();
 
+        final long nextBufferSession = ++bufferSessionCounter;
+        activeBufferSessionId = nextBufferSession;
+        hasProxyBufferTelemetry = false;
+        resetBufferProgress(pendingSeekMs);
+
         String targetUrl = item.url;
         if (useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
-            targetUrl = LocalProxyPlugin.buildSharedProxyUrl(item.url, referer);
+            targetUrl = LocalProxyPlugin.buildSharedProxyUrl(item.url, referer, nextBufferSession);
+            LocalProxyPlugin.setBufferProgressListener(nextBufferSession, new LocalProxyPlugin.BufferProgressListener() {
+                @Override
+                public void onByteRangeBuffered(long sid, long rangeStart, long rangeEnd, long totalBytes) {
+                    uiHandler.post(() -> {
+                        if (isFinishing() || isDestroyed() || sid != activeBufferSessionId) return;
+                        applyByteRangeBufferSample(rangeStart, rangeEnd, totalBytes);
+                    });
+                }
+
+                @Override
+                public void onHlsTimeBuffered(long sid, long segStartMs, long segEndMs) {
+                    uiHandler.post(() -> {
+                        if (isFinishing() || isDestroyed() || sid != activeBufferSessionId) return;
+                        applyHlsTimeBufferSample(segStartMs, segEndMs);
+                    });
+                }
+            });
+        } else {
+            LocalProxyPlugin.clearBufferProgressListener(0L);
         }
 
         hasPlaybackStartedForStream = false;
@@ -1953,8 +2010,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     if (!hasPlaybackStartedForStream) {
                         firstTimeChangedMs = target;
                     }
+                    long prevPos = lastKnownPositionMs;
                     mediaPlayer.setTime(target);
                     lastKnownPositionMs = target;
+                    onSeekCommitted(prevPos, target);
                 }
                 scheduleControlsAutoHide();
             }
@@ -2349,10 +2408,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (!hasPlaybackStartedForStream) {
             firstTimeChangedMs = target;
         }
+        long prevPos = lastKnownPositionMs;
         mediaPlayer.setTime(target);
         lastKnownPositionMs = target;
         timeCurrentView.setText(formatMs(target));
         seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
+        onSeekCommitted(prevPos, target);
 
         if (gestureBadge != null) gestureBadge.setVisibility(View.GONE);
         if (seekBadge != null) {
@@ -2608,8 +2669,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
         pendingSeekMs = getSavedResumePositionMs(normalizedTarget);
         lastKnownPositionMs = pendingSeekMs;
         lastKnownDurationMs = 0L;
+        hasProxyBufferTelemetry = false;
         seekBar.setProgress(0);
         seekBar.setMax(100);
+        resetBufferProgress(pendingSeekMs);
         timeCurrentView.setText(formatMs(pendingSeekMs));
         timeDurationView.setText("0:00");
 
@@ -3371,12 +3434,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         if (!hasPlaybackStartedForStream) {
                             firstTimeChangedMs = target;
                         }
+                        long prevPos = lastKnownPositionMs;
                         mediaPlayer.setTime(target);
                         lastKnownPositionMs = target;
                         if (!userScrubbing) {
                             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
                             timeCurrentView.setText(formatMs(target));
                         }
+                        onSeekCommitted(prevPos, target);
                         updateMediaSessionPlaybackState(
                             mediaPlayer.isPlaying() ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED
                         );
@@ -3729,6 +3794,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        LocalProxyPlugin.clearBufferProgressListener(activeBufferSessionId);
+        activeBufferSessionId = 0L;
         isActivityStarted = false;
         isActivityResumed = false;
         unregisterBecomingNoisyReceiver();
@@ -3779,11 +3846,120 @@ public class VlcPlayerActivity extends AppCompatActivity {
         pendingSeekMs = 0L;
         activeSeekTargetMs = target;
         activeSeekIssuedElapsedMs = SystemClock.elapsedRealtime();
+        long prevPos = lastKnownPositionMs;
         lastKnownPositionMs = target;
         mediaPlayer.setTime(target);
         if (!userScrubbing) {
             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
             timeCurrentView.setText(formatMs(target));
+        }
+        onSeekCommitted(prevPos, target);
+    }
+
+    private void updateSeekBarBufferedProgress() {
+        if (seekBar == null) return;
+        long total = lastKnownDurationMs;
+        if (total <= 0L && mediaPlayer != null) {
+            long len = mediaPlayer.getLength();
+            if (len > 0L) {
+                total = len;
+                lastKnownDurationMs = len;
+                seekBar.setMax((int) Math.min(Integer.MAX_VALUE, len));
+                if (timeDurationView != null) {
+                    timeDurationView.setText(formatMs(len));
+                }
+            }
+        }
+        if (total <= 0L) {
+            seekBar.setSecondaryProgress(0);
+            return;
+        }
+        long currentPos = Math.max(0L, lastKnownPositionMs);
+        long effectiveBuffered = Math.max(currentPos, Math.min(bufferedPositionMs, total));
+        seekBar.setSecondaryProgress((int) Math.min(Integer.MAX_VALUE, effectiveBuffered));
+    }
+
+    private void resetBufferProgress(long anchorMs) {
+        bufferedPositionMs = Math.max(0L, anchorMs);
+        pendingBufferedRangeStart = -1L;
+        pendingBufferedRangeEnd = -1L;
+        pendingBufferedTotalBytes = -1L;
+        updateSeekBarBufferedProgress();
+    }
+
+    private void onSeekCommitted(long previousPosMs, long targetMs) {
+        long clampedTarget = Math.max(0L, targetMs);
+        if (clampedTarget < previousPosMs || clampedTarget > bufferedPositionMs) {
+            bufferedPositionMs = clampedTarget;
+        }
+        pendingBufferedRangeStart = -1L;
+        pendingBufferedRangeEnd = -1L;
+        pendingBufferedTotalBytes = -1L;
+        updateSeekBarBufferedProgress();
+    }
+
+    private void flushPendingByteRangeBufferSample() {
+        if (pendingBufferedTotalBytes > 0L && pendingBufferedRangeEnd > pendingBufferedRangeStart) {
+            long start = pendingBufferedRangeStart;
+            long end = pendingBufferedRangeEnd;
+            long total = pendingBufferedTotalBytes;
+            pendingBufferedRangeStart = -1L;
+            pendingBufferedRangeEnd = -1L;
+            pendingBufferedTotalBytes = -1L;
+            applyByteRangeBufferSample(start, end, total);
+        }
+    }
+
+    private void applyByteRangeBufferSample(long rangeStart, long rangeEnd, long totalBytes) {
+        if (totalBytes <= 0L || rangeEnd <= rangeStart) return;
+        long total = lastKnownDurationMs;
+        if (total <= 0L && mediaPlayer != null) {
+            long len = mediaPlayer.getLength();
+            if (len > 0L) {
+                total = len;
+                lastKnownDurationMs = len;
+                seekBar.setMax((int) Math.min(Integer.MAX_VALUE, len));
+                if (timeDurationView != null) {
+                    timeDurationView.setText(formatMs(len));
+                }
+            }
+        }
+        double startFrac = rangeStart / (double) totalBytes;
+        double endFrac = Math.min(1.0, rangeEnd / (double) totalBytes);
+        if (total <= 0L) {
+            if (startFrac <= 0.15) {
+                pendingBufferedRangeStart = rangeStart;
+                pendingBufferedRangeEnd = rangeEnd;
+                pendingBufferedTotalBytes = totalBytes;
+            }
+            return;
+        }
+        long currentPos = Math.max(0L, lastKnownPositionMs);
+        double playFrac = Math.min(1.0, currentPos / (double) total);
+        double bufferedFrac = Math.min(1.0, Math.max(0L, bufferedPositionMs) / (double) total);
+        if (startFrac > Math.max(playFrac, bufferedFrac) + 0.15) {
+            return;
+        }
+        hasProxyBufferTelemetry = true;
+        long candidateMs = Math.round(endFrac * total);
+        if (candidateMs > bufferedPositionMs) {
+            bufferedPositionMs = Math.min(total, candidateMs);
+            updateSeekBarBufferedProgress();
+        }
+    }
+
+    private void applyHlsTimeBufferSample(long segStartMs, long segEndMs) {
+        if (segEndMs <= 0L) return;
+        long currentPos = Math.max(0L, lastKnownPositionMs);
+        long frontier = Math.max(currentPos, bufferedPositionMs);
+        if (segStartMs > frontier + 600000L) {
+            return;
+        }
+        hasProxyBufferTelemetry = true;
+        long clampedEnd = lastKnownDurationMs > 0L ? Math.min(lastKnownDurationMs, segEndMs) : segEndMs;
+        if (clampedEnd > bufferedPositionMs) {
+            bufferedPositionMs = clampedEnd;
+            updateSeekBarBufferedProgress();
         }
     }
 

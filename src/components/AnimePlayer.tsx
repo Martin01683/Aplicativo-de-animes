@@ -40,6 +40,7 @@ import type {
   StreamQuality,
   SubtitleTrack,
 } from '../lib/types';
+import { resolveBufferedEndSec } from '../lib/playerBuffer';
 import {
   decodeSubtitleBuffer,
   hexToRgb,
@@ -1830,7 +1831,7 @@ export function AnimePlayer({
               if (dur > 0) latestPlaybackRef.current.duration = dur;
 
               if (v.buffered.length > 0) {
-                setBufferedEnd(v.buffered.end(v.buffered.length - 1));
+                setBufferedEnd(resolveBufferedEndSec(v.buffered, v.currentTime, dur));
               }
 
               if (episodeUrl && Date.now() - lastSavedProgressWallRef.current >= 3000) {
@@ -1841,11 +1842,20 @@ export function AnimePlayer({
                 });
               }
             }}
+            onProgress={() => {
+              const v = videoRef.current;
+              if (!v || v.buffered.length === 0) return;
+              const dur = Number.isFinite(v.duration) ? v.duration : duration;
+              setBufferedEnd(resolveBufferedEndSec(v.buffered, v.currentTime, dur));
+            }}
             onDurationChange={() => {
               const v = videoRef.current;
               if (v && Number.isFinite(v.duration) && v.duration > 0) {
                 setDuration(v.duration);
                 latestPlaybackRef.current.duration = v.duration;
+                if (v.buffered.length > 0) {
+                  setBufferedEnd(resolveBufferedEndSec(v.buffered, v.currentTime, v.duration));
+                }
                 applyPendingSeek(v);
               }
             }}
@@ -2037,7 +2047,7 @@ export function AnimePlayer({
           )}
           <div className="relative h-1.5 w-full overflow-hidden rounded-full bg-white/20">
             <div
-              className="absolute inset-y-0 left-0 bg-white/35"
+              className="absolute inset-y-0 left-0 bg-white/55 transition-[width] duration-150"
               style={{ width: `${bufferedPct}%` }}
             />
             <div
