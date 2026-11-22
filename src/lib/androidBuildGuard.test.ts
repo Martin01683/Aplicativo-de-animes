@@ -539,3 +539,31 @@ describe('Video buffered progress bar (Android LibVLC + Web)', () => {
     assert.equal(resolveBufferedEndSec(makeRanges([[0, 2000]]), 500, 1420), 1420);
   });
 });
+
+describe('Android double-tap seek-only HUD guard', () => {
+  it('declares vlc_bottom_controls_row inside vlc_bottom_bar and wires seek-only HUD in VlcPlayerActivity', () => {
+    const layoutXml = readRepoFile('android/app/src/main/res/layout/activity_vlc_player.xml');
+    const activityJava = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java',
+    );
+
+    assert.match(layoutXml, /android:id="@\+id\/vlc_top_bar"/);
+    assert.match(layoutXml, /android:id="@\+id\/vlc_bottom_bar"/);
+    assert.match(layoutXml, /android:id="@\+id\/vlc_seekbar"/);
+    assert.match(layoutXml, /android:id="@\+id\/vlc_bottom_controls_row"/);
+    assert.match(layoutXml, /android:id="@\+id\/vlc_seek_badge"/);
+
+    assert.match(activityJava, /topBar\s*=\s*findViewById\(R\.id\.vlc_top_bar\)/);
+    assert.match(activityJava, /bottomBar\s*=\s*findViewById\(R\.id\.vlc_bottom_bar\)/);
+    assert.match(
+      activityJava,
+      /bottomControlsRow\s*=\s*findViewById\(R\.id\.vlc_bottom_controls_row\)/,
+    );
+    assert.match(activityJava, /private\s+void\s+showSeekOnlyHud\(\)/);
+    assert.match(activityJava, /private\s+void\s+applyHudVisibility\(\)/);
+    assert.match(activityJava, /hideSeekOnlyHudRunnable/);
+    assert.match(activityJava, /seekByMs\(side < 0 \? -5000L : 5000L, badgeLabel, false, true\)/);
+    assert.match(activityJava, /uiHandler\.postDelayed\(singleTapRunnable, DOUBLE_TAP_WINDOW_MS\)/);
+  });
+});
+

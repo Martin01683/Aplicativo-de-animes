@@ -46,6 +46,7 @@
         android:layout_height="wrap_content"
         android:layout_gravity="center"
         android:background="@drawable/bg_player_pill_dark"
+        android:elevation="10dp"
         android:paddingLeft="16dp"
         android:paddingTop="8dp"
         android:paddingRight="16dp"
@@ -255,6 +256,7 @@
 
             <!-- Main Control Row -->
             <LinearLayout
+                android:id="@+id/vlc_bottom_controls_row"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="2dp"

@@ -201,6 +201,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private VLCVideoLayout videoLayout;
 
     private RelativeLayout controlsOverlay;
+    private View topBar;
+    private View bottomBar;
+    private View bottomControlsRow;
     private LinearLayout loadingContainer;
     private TextView loadingLabel;
     private LinearLayout errorOverlay;
@@ -334,6 +337,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private int currentScaleIdx = 0;
     private boolean muted = false;
     private boolean controlsVisible = true;
+    private boolean seekOnlyHudActive = false;
+    private static final long DOUBLE_TAP_WINDOW_MS = 320L;
+    private static final long SEEK_STREAK_TIMEOUT_MS = 850L;
     private static final long DIRECT_BUFFER_FALLBACK_WINDOW_MS = 15000L;
     private boolean userScrubbing = false;
     private boolean playbackFailed = false;
@@ -415,6 +421,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
     };
 
     private final Runnable hideControlsRunnable = () -> setControlsVisible(false);
+    private final Runnable hideSeekOnlyHudRunnable = () -> {
+        seekOnlyHudActive = false;
+        seekStreakCount = 0;
+        seekStreakSide = 0;
+        if (seekBadge != null) seekBadge.setVisibility(View.GONE);
+        if (!controlsVisible) {
+            applyHudVisibility();
+        }
+    };
     private final Runnable hideSeekBadgeRunnable = () -> {
         if (seekBadge != null) seekBadge.setVisibility(View.GONE);
     };
@@ -442,6 +457,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
             gestureMode = GESTURE_HOLD_2X;
             holdSpeedActive = true;
             uiHandler.removeCallbacks(singleTapRunnable);
+            if (seekOnlyHudActive) {
+                setControlsVisible(false);
+            }
             mediaPlayer.setRate(2.0f);
             if (holdSpeedBadge != null) holdSpeedBadge.setVisibility(View.VISIBLE);
         }
@@ -543,6 +561,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private void bindViews() {
         videoLayout = findViewById(R.id.vlc_video_layout);
         controlsOverlay = findViewById(R.id.vlc_controls_overlay);
+        topBar = findViewById(R.id.vlc_top_bar);
+        bottomBar = findViewById(R.id.vlc_bottom_bar);
+        bottomControlsRow = findViewById(R.id.vlc_bottom_controls_row);
         loadingContainer = findViewById(R.id.vlc_loading_container);
         loadingLabel = findViewById(R.id.vlc_loading_label);
         errorOverlay = findViewById(R.id.vlc_error_overlay);
@@ -1383,7 +1404,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private void hideLoading() {
         loadingContainer.setVisibility(View.GONE);
         loadingLabel.setVisibility(View.GONE);
-        if (!playbackFailed && controlsVisible) {
+        if (!playbackFailed && controlsVisible && !seekOnlyHudActive) {
             btnPlayCenter.setVisibility(View.VISIBLE);
         }
     }
@@ -1996,6 +2017,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
             public void onStartTrackingTouch(SeekBar bar) {
                 userScrubbing = true;
                 uiHandler.removeCallbacks(hideControlsRunnable);
+                if (seekOnlyHudActive) {
+                    setControlsVisible(true);
+                    uiHandler.removeCallbacks(hideControlsRunnable);
+                }
             }
 
             @Override
@@ -2161,6 +2186,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void showGestureBadge(String text, boolean autoHide) {
+        if (seekOnlyHudActive) {
+            setControlsVisible(false);
+        }
         if (seekBadge != null) seekBadge.setVisibility(View.GONE);
         if (gestureBadge == null) return;
         gestureBadge.setText(text);
@@ -2176,9 +2204,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
         int side = rel < 0.38f ? -1 : (rel > 0.62f ? 1 : 0);
         long now = System.currentTimeMillis();
 
-        if (side != 0 && side == lastTapSide && (now - lastTapTimeMs) < 350L) {
+        boolean isContinuingSeekStreak =
+            side != 0 && seekOnlyHudActive && seekStreakCount > 0 && side == seekStreakSide;
+        boolean isDoubleTapOnSide =
+            side != 0 && side == lastTapSide && (now - lastTapTimeMs) <= DOUBLE_TAP_WINDOW_MS;
+
+        if (isContinuingSeekStreak || isDoubleTapOnSide) {
             uiHandler.removeCallbacks(singleTapRunnable);
             lastTapTimeMs = now;
+            lastTapSide = side;
             if (seekStreakSide == side) {
                 seekStreakCount++;
             } else {
@@ -2187,9 +2221,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             }
             int totalSec = seekStreakCount * 5;
             String badgeLabel = (side < 0 ? "-" : "+") + totalSec + "s";
-            uiHandler.removeCallbacks(resetSeekStreakRunnable);
-            uiHandler.postDelayed(resetSeekStreakRunnable, 850L);
-            seekByMs(side < 0 ? -5000L : 5000L, badgeLabel, false);
+            seekByMs(side < 0 ? -5000L : 5000L, badgeLabel, false, true);
             return;
         }
 
@@ -2199,7 +2231,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (side == 0) {
             setControlsVisible(!controlsVisible);
         } else {
-            uiHandler.postDelayed(singleTapRunnable, 250L);
+            uiHandler.postDelayed(singleTapRunnable, DOUBLE_TAP_WINDOW_MS);
         }
     }
 
@@ -2390,10 +2422,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void seekByMs(long deltaMs, String badgeText) {
-        seekByMs(deltaMs, badgeText, true);
+        seekByMs(deltaMs, badgeText, true, false);
     }
 
     private void seekByMs(long deltaMs, String badgeText, boolean refreshAutoHide) {
+        seekByMs(deltaMs, badgeText, refreshAutoHide, false);
+    }
+
+    private void seekByMs(long deltaMs, String badgeText, boolean refreshAutoHide, boolean seekOnlyHud) {
         if (mediaPlayer == null) return;
         if (pauseAfterRestoreFrame) {
             cancelPendingPauseAfterRestore(false);
@@ -2419,22 +2455,76 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (seekBadge != null) {
             seekBadge.setText(badgeText);
             seekBadge.setVisibility(View.VISIBLE);
-            uiHandler.removeCallbacks(hideSeekBadgeRunnable);
-            uiHandler.postDelayed(hideSeekBadgeRunnable, 700L);
         }
-        if (refreshAutoHide || controlsVisible) {
-            scheduleControlsAutoHide();
+        if (seekOnlyHud) {
+            uiHandler.removeCallbacks(hideSeekBadgeRunnable);
+            uiHandler.removeCallbacks(resetSeekStreakRunnable);
+            showSeekOnlyHud();
+        } else {
+            if (seekBadge != null) {
+                uiHandler.removeCallbacks(hideSeekBadgeRunnable);
+                uiHandler.postDelayed(hideSeekBadgeRunnable, 700L);
+            }
+            if (refreshAutoHide || controlsVisible) {
+                scheduleControlsAutoHide();
+            }
+        }
+    }
+
+    private void showSeekOnlyHud() {
+        uiHandler.removeCallbacks(hideControlsRunnable);
+        uiHandler.removeCallbacks(hideSeekOnlyHudRunnable);
+        controlsVisible = false;
+        seekOnlyHudActive = true;
+        applyHudVisibility();
+        uiHandler.postDelayed(hideSeekOnlyHudRunnable, SEEK_STREAK_TIMEOUT_MS);
+    }
+
+    private void applyHudVisibility() {
+        if (controlsVisible) {
+            controlsOverlay.setVisibility(View.VISIBLE);
+            if (topBar != null) topBar.setVisibility(View.VISIBLE);
+            if (bottomBar != null) {
+                bottomBar.setVisibility(View.VISIBLE);
+                bottomBar.setClickable(true);
+            }
+            if (bottomControlsRow != null) bottomControlsRow.setVisibility(View.VISIBLE);
+            if (loadingContainer.getVisibility() != View.VISIBLE && !playbackFailed) {
+                btnPlayCenter.setVisibility(View.VISIBLE);
+            } else {
+                btnPlayCenter.setVisibility(View.GONE);
+            }
+        } else if (seekOnlyHudActive) {
+            controlsOverlay.setVisibility(View.VISIBLE);
+            if (topBar != null) topBar.setVisibility(View.GONE);
+            if (bottomBar != null) {
+                bottomBar.setVisibility(View.VISIBLE);
+                bottomBar.setClickable(false);
+            }
+            if (bottomControlsRow != null) bottomControlsRow.setVisibility(View.GONE);
+            btnPlayCenter.setVisibility(View.GONE);
+        } else {
+            controlsOverlay.setVisibility(View.GONE);
+            btnPlayCenter.setVisibility(View.GONE);
+            if (topBar != null) topBar.setVisibility(View.VISIBLE);
+            if (bottomBar != null) {
+                bottomBar.setVisibility(View.VISIBLE);
+                bottomBar.setClickable(true);
+            }
+            if (bottomControlsRow != null) bottomControlsRow.setVisibility(View.VISIBLE);
         }
     }
 
     private void setControlsVisible(boolean visible) {
         controlsVisible = visible;
-        controlsOverlay.setVisibility(visible ? View.VISIBLE : View.GONE);
-        if (visible && loadingContainer.getVisibility() != View.VISIBLE && !playbackFailed) {
-            btnPlayCenter.setVisibility(View.VISIBLE);
-        } else if (!visible) {
-            btnPlayCenter.setVisibility(View.GONE);
+        seekOnlyHudActive = false;
+        uiHandler.removeCallbacks(hideSeekOnlyHudRunnable);
+        if (visible) {
+            seekStreakCount = 0;
+            seekStreakSide = 0;
+            uiHandler.removeCallbacks(resetSeekStreakRunnable);
         }
+        applyHudVisibility();
         if (visible) {
             scheduleControlsAutoHide();
         } else {
@@ -3702,9 +3792,17 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(holdSpeedRunnable);
         uiHandler.removeCallbacks(singleTapRunnable);
+        uiHandler.removeCallbacks(hideSeekOnlyHudRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
 
+        if (seekOnlyHudActive) {
+            seekOnlyHudActive = false;
+            seekStreakCount = 0;
+            seekStreakSide = 0;
+            if (seekBadge != null) seekBadge.setVisibility(View.GONE);
+            applyHudVisibility();
+        }
         if (holdSpeedActive) {
             holdSpeedActive = false;
             if (holdSpeedBadge != null) holdSpeedBadge.setVisibility(View.GONE);

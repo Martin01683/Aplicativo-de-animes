@@ -71,6 +71,15 @@ import {
 } from '../lib/storage';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
 import { isGenuineEpisodeEnd, shouldAutoAdvanceEpisode } from '../lib/serverFailover';
+import {
+  classifyTapSide,
+  clearSeekOnlyState,
+  createInitialDoubleTapSeekState,
+  DOUBLE_TAP_WINDOW_MS,
+  evaluateStageTap,
+  resolvePlayerHudMode,
+  SEEK_STREAK_TIMEOUT_MS,
+} from '../lib/playerDoubleTapSeek';
 import { MediaPoster } from './MediaPoster';
 
 interface AnimePlayerProps {
@@ -319,10 +328,9 @@ export function AnimePlayer({
   const onPlaybackProgressRef = useRef(onPlaybackProgress);
   onPlaybackProgressRef.current = onPlaybackProgress;
 
-  const lastTapRef = useRef<{ time: number; side: 'left' | 'right' | 'center' }>({
-    time: 0,
-    side: 'center',
-  });
+  const doubleTapStateRef = useRef(createInitialDoubleTapSeekState());
+  const singleTapTimerRef = useRef<number | null>(null);
+  const seekOnlyTimerRef = useRef<number | null>(null);
   const stagePointerDownRef = useRef<{ x: number; y: number; pointerId: number } | null>(null);
   const nativeLaunchingRef = useRef(false);
 
@@ -338,6 +346,7 @@ export function AnimePlayer({
   const [holdSpeedActive, setHoldSpeedActive] = useState(false);
   const [loop, setLoop] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [seekOnlyHudActive, setSeekOnlyHudActive] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [dragOver, setDragOver] = useState(false);
@@ -959,7 +968,29 @@ export function AnimePlayer({
     return () => document.removeEventListener('fullscreenchange', onFsChange);
   }, []);
 
+  const exitSeekOnlyHud = useCallback((clearBadge = false) => {
+    if (seekOnlyTimerRef.current !== null) {
+      window.clearTimeout(seekOnlyTimerRef.current);
+      seekOnlyTimerRef.current = null;
+    }
+    doubleTapStateRef.current = clearSeekOnlyState(doubleTapStateRef.current);
+    setSeekOnlyHudActive(false);
+    if (clearBadge) {
+      setSeekBadge(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (singleTapTimerRef.current !== null) window.clearTimeout(singleTapTimerRef.current);
+      if (seekOnlyTimerRef.current !== null) window.clearTimeout(seekOnlyTimerRef.current);
+      if (hideTimerRef.current !== null) window.clearTimeout(hideTimerRef.current);
+      if (holdTimerRef.current !== null) window.clearTimeout(holdTimerRef.current);
+    };
+  }, []);
+
   const showControlsTemporarily = useCallback(() => {
+    exitSeekOnlyHud(false);
     setControlsVisible(true);
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
     if (videoRef.current && !videoRef.current.paused && !menuOpen && !episodesOpen) {
@@ -967,7 +998,7 @@ export function AnimePlayer({
         setControlsVisible(false);
       }, 2800);
     }
-  }, [episodesOpen, menuOpen]);
+  }, [episodesOpen, exitSeekOnlyHud, menuOpen]);
 
   const selectVideoScale = useCallback(
     (nextScale: VideoScaleMode) => {
@@ -1146,7 +1177,7 @@ export function AnimePlayer({
   }, [launchNativeVlc, onToast, showControlsTemporarily, useNativeVlc]);
 
   const seekBy = useCallback(
-    (deltaSeconds: number, label?: string) => {
+    (deltaSeconds: number, label?: string, options?: { seekOnlyHud?: boolean }) => {
       if (useNativeVlc) {
         const nextMs = Math.max(0, nativeResumeMs + deltaSeconds * 1000);
         void launchNativeVlc(nextMs);
@@ -1182,7 +1213,25 @@ export function AnimePlayer({
       }
       const text = label || `${deltaSeconds > 0 ? '+' : ''}${Math.round(deltaSeconds)}s`;
       setSeekBadge({ label: text, key: Date.now() });
-      showControlsTemporarily();
+      if (options?.seekOnlyHud) {
+        if (hideTimerRef.current !== null) {
+          window.clearTimeout(hideTimerRef.current);
+          hideTimerRef.current = null;
+        }
+        if (seekOnlyTimerRef.current !== null) {
+          window.clearTimeout(seekOnlyTimerRef.current);
+        }
+        setControlsVisible(false);
+        setSeekOnlyHudActive(true);
+        seekOnlyTimerRef.current = window.setTimeout(() => {
+          seekOnlyTimerRef.current = null;
+          doubleTapStateRef.current = clearSeekOnlyState(doubleTapStateRef.current);
+          setSeekOnlyHudActive(false);
+          setSeekBadge(null);
+        }, SEEK_STREAK_TIMEOUT_MS);
+      } else {
+        showControlsTemporarily();
+      }
     },
     [
       duration,
@@ -1376,7 +1425,7 @@ export function AnimePlayer({
     }
   }, []);
 
-  const handleStageTap = (clientX: number) => {
+  const handleStageTap = (clientX: number, pointerType: string) => {
     if (useNativeVlc) {
       if (menuOpen) {
         setMenuOpen(false);
@@ -1405,26 +1454,53 @@ export function AnimePlayer({
     if (!stage) return;
     const rect = stage.getBoundingClientRect();
     const relX = (clientX - rect.left) / Math.max(1, rect.width);
-    const side: 'left' | 'right' | 'center' =
-      relX < 0.3 ? 'left' : relX > 0.7 ? 'right' : 'center';
+    const side = classifyTapSide(relX, 0.38);
+    const evalResult = evaluateStageTap(doubleTapStateRef.current, side, Date.now());
+    doubleTapStateRef.current = evalResult.nextState;
 
-    const now = Date.now();
-    if (
-      side !== 'center' &&
-      lastTapRef.current.side === side &&
-      now - lastTapRef.current.time < 320
-    ) {
-      seekBy(side === 'left' ? -5 : 5);
-      lastTapRef.current = { time: 0, side: 'center' };
+    if (evalResult.action === 'double-tap-seek') {
+      if (singleTapTimerRef.current !== null) {
+        window.clearTimeout(singleTapTimerRef.current);
+        singleTapTimerRef.current = null;
+      }
+      seekBy(evalResult.deltaSeconds, evalResult.badgeLabel ?? undefined, { seekOnlyHud: true });
       return;
     }
 
-    lastTapRef.current = { time: now, side };
-    if (side === 'center') {
-      togglePlay();
-    } else {
-      showControlsTemporarily();
+    if (singleTapTimerRef.current !== null) {
+      window.clearTimeout(singleTapTimerRef.current);
+      singleTapTimerRef.current = null;
     }
+
+    if (evalResult.action === 'toggle-controls-now') {
+      exitSeekOnlyHud(true);
+      if (pointerType === 'mouse') {
+        togglePlay();
+      } else if (controlsVisible) {
+        if (hideTimerRef.current !== null) {
+          window.clearTimeout(hideTimerRef.current);
+          hideTimerRef.current = null;
+        }
+        setControlsVisible(false);
+      } else {
+        showControlsTemporarily();
+      }
+      return;
+    }
+
+    singleTapTimerRef.current = window.setTimeout(() => {
+      singleTapTimerRef.current = null;
+      if (holdActiveRef.current) return;
+      if (controlsVisible) {
+        if (hideTimerRef.current !== null) {
+          window.clearTimeout(hideTimerRef.current);
+          hideTimerRef.current = null;
+        }
+        setControlsVisible(false);
+      } else {
+        showControlsTemporarily();
+      }
+    }, DOUBLE_TAP_WINDOW_MS);
   };
 
   const triggerPrevEpisode = useCallback(() => {
@@ -1565,12 +1641,12 @@ export function AnimePlayer({
     togglePlay,
   ]);
 
-  // Clear transient seek ripple badge
+  // Clear transient seek ripple badge (when not managed by seek-only double-tap timer)
   useEffect(() => {
-    if (!seekBadge) return;
+    if (!seekBadge || seekOnlyHudActive) return;
     const t = window.setTimeout(() => setSeekBadge(null), 650);
     return () => window.clearTimeout(t);
-  }, [seekBadge]);
+  }, [seekBadge, seekOnlyHudActive]);
 
   const activeQualityLabel = useMemo(() => {
     if (activeHlsLevel >= 0) {
@@ -1603,11 +1679,25 @@ export function AnimePlayer({
 
   const effectiveErrorMsg = externalErrorMessage || errorMsg;
   const showEpisodeNav = Boolean(onPrevEpisode || onNextEpisode || seriesEpisodes.length > 0);
+  const hudMode = resolvePlayerHudMode({
+    controlsVisible,
+    seekOnlyHudActive,
+    playing,
+    menuOpen,
+    episodesOpen,
+    useNativeVlc,
+  });
 
   return (
     <div
       ref={stageRef}
-      onMouseMove={showControlsTemporarily}
+      data-testid="anime-player-stage"
+      data-hud-mode={hudMode}
+      onPointerMove={(e) => {
+        if (e.pointerType === 'mouse' && !seekOnlyHudActive) {
+          showControlsTemporarily();
+        }
+      }}
       onDragOver={(e) => {
         if (!desktopShortcutsEnabled) return;
         e.preventDefault();
@@ -1876,6 +1966,7 @@ export function AnimePlayer({
 
       {/* Interactive Gesture Surface (Tap, Double-Tap Seek, Hold 2x) */}
       <div
+        data-testid="player-gesture-surface"
         className="absolute inset-0 z-20 touch-manipulation"
         onPointerDown={(e) => {
           stagePointerDownRef.current = { x: e.clientX, y: e.clientY, pointerId: e.pointerId };
@@ -1892,7 +1983,7 @@ export function AnimePlayer({
             cancelHoldSpeed();
             return;
           }
-          handleStageTap(e.clientX);
+          handleStageTap(e.clientX, e.pointerType);
         }}
         onPointerCancel={() => {
           stagePointerDownRef.current = null;
@@ -1913,13 +2004,12 @@ export function AnimePlayer({
         onChange={handleFileChange}
       />
 
-      {/* Top Bar Overlay (shown in Fullscreen when HUD is visible) */}
+      {/* Top Bar Overlay (shown in Fullscreen when full HUD is visible) */}
       {isFullscreen && (
         <div
+          data-testid="player-top-bar"
           className={`pointer-events-none absolute inset-x-0 top-0 z-30 flex items-center justify-between gap-3 bg-gradient-to-b from-black/85 via-black/40 to-transparent px-4 pb-8 pt-3 transition-opacity duration-200 sm:px-5 ${
-            controlsVisible || !playing || menuOpen || episodesOpen || loadingEpisode
-              ? 'opacity-100'
-              : 'opacity-0'
+            hudMode === 'full' || loadingEpisode ? 'opacity-100' : 'opacity-0'
           }`}
         >
           <div className="min-w-0">
@@ -1945,7 +2035,8 @@ export function AnimePlayer({
       {seekBadge && (
         <div
           key={seekBadge.key}
-          className="pointer-events-none absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/75 px-4 py-2 font-mono text-sm font-semibold tabular-nums text-white backdrop-blur-sm"
+          data-testid="player-seek-badge"
+          className="pointer-events-none absolute left-1/2 top-1/2 z-40 -translate-x-1/2 -translate-y-1/2 rounded-full bg-black/75 px-4 py-2 font-mono text-sm font-semibold tabular-nums text-white backdrop-blur-sm"
         >
           {seekBadge.label}
         </div>
@@ -1973,20 +2064,25 @@ export function AnimePlayer({
         </div>
       )}
 
-      {/* Center Play Button when Paused (same appearance on Web and Android) */}
-      {!playing && !effectiveErrorMsg && !waiting && !loadingEpisode && !nativeLaunching && (
-        <button
-          type="button"
-          onClick={togglePlay}
-          disabled={!activeStream}
-          aria-label="Reproduzir episódio"
-          className={`absolute left-1/2 top-1/2 flex h-14 w-14 -translate-x-1/2 -translate-y-1/2 cursor-pointer touch-manipulation items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px] ${
-            menuOpen || episodesOpen ? 'z-20' : 'z-[35]'
-          }`}
-        >
-          <Play className="ml-1 h-6 w-6 fill-current sm:h-8 sm:w-8" />
-        </button>
-      )}
+      {/* Center Play Button when Paused (hidden during seek-only double-tap feedback) */}
+      {!playing &&
+        !effectiveErrorMsg &&
+        !waiting &&
+        !loadingEpisode &&
+        !nativeLaunching &&
+        hudMode !== 'seek-only' && (
+          <button
+            type="button"
+            onClick={togglePlay}
+            disabled={!activeStream}
+            aria-label="Reproduzir episódio"
+            className={`absolute left-1/2 top-1/2 flex h-14 w-14 -translate-x-1/2 -translate-y-1/2 cursor-pointer touch-manipulation items-center justify-center rounded-full bg-[#f97316] text-[#0d0f12] shadow-2xl transition-transform hover:scale-105 active:scale-95 disabled:opacity-60 sm:h-[72px] sm:w-[72px] ${
+              menuOpen || episodesOpen ? 'z-20' : 'z-[35]'
+            }`}
+          >
+            <Play className="ml-1 h-6 w-6 fill-current sm:h-8 sm:w-8" />
+          </button>
+        )}
 
       {/* Playback Error State */}
       {effectiveErrorMsg && !loadingEpisode && (
@@ -2014,22 +2110,19 @@ export function AnimePlayer({
       {/* Bottom Controls HUD (outer gradient is pointer-events-none so it never blocks the center play button on mobile) */}
       <div
         className={`pointer-events-none absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/95 via-black/65 to-transparent px-3 pb-2 pt-8 transition-opacity duration-200 sm:px-4 sm:pb-3 sm:pt-10 ${
-          controlsVisible || !playing || menuOpen || episodesOpen || useNativeVlc
-            ? 'opacity-100'
-            : 'opacity-0'
+          hudMode !== 'hidden' ? 'opacity-100' : 'opacity-0'
         }`}
       >
         <div
-          className={
-            controlsVisible || !playing || menuOpen || episodesOpen || useNativeVlc
-              ? 'pointer-events-auto'
-              : 'pointer-events-none'
-          }
+          className={hudMode === 'full' ? 'pointer-events-auto' : 'pointer-events-none'}
           onClick={(e) => e.stopPropagation()}
         >
         {/* Seek Bar */}
         <div
-          className="relative mb-1.5 flex h-5 cursor-pointer items-center sm:mb-2.5"
+          data-testid="player-seekbar-wrapper"
+          className={`relative flex h-5 cursor-pointer items-center ${
+            hudMode === 'seek-only' ? 'pointer-events-auto mb-0.5' : 'mb-1.5 sm:mb-2.5'
+          }`}
           onMouseMove={(e) => {
             const rect = e.currentTarget.getBoundingClientRect();
             const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -2037,7 +2130,7 @@ export function AnimePlayer({
           }}
           onMouseLeave={() => setHoverSeek(null)}
         >
-          {hoverSeek && displayDurationSec > 0 && (
+          {hoverSeek && displayDurationSec > 0 && hudMode === 'full' && (
             <div
               className="pointer-events-none absolute -top-7 -translate-x-1/2 rounded bg-black/90 px-2 py-0.5 font-mono text-[11px] tabular-nums text-white"
               style={{ left: `${hoverSeek.pct}%` }}
@@ -2068,6 +2161,9 @@ export function AnimePlayer({
                 void launchNativeVlc(target * 1000);
                 return;
               }
+              if (seekOnlyHudActive) {
+                showControlsTemporarily();
+              }
               pendingSeekSecRef.current = 0;
               applyingPendingSeekRef.current = false;
               userSeekedInStreamRef.current = true;
@@ -2096,7 +2192,14 @@ export function AnimePlayer({
         </div>
 
         {/* Control Buttons Row */}
-        <div className="flex items-center justify-between gap-1 sm:gap-2">
+        <div
+          data-testid="player-controls-row"
+          className={
+            hudMode === 'seek-only'
+              ? 'hidden'
+              : 'flex items-center justify-between gap-1 sm:gap-2'
+          }
+        >
           {/* Left Side: Play, Audio, Time, -5s, +5s, +85s */}
           <div className="flex min-w-0 items-center gap-0.5 sm:gap-1.5">
             <button
