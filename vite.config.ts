@@ -116,6 +116,7 @@ export default defineConfig(() => {
         workbox: {
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
+          globIgnores: ['**/assets/aistudio/**', 'assets/aistudio/**'],
           navigateFallbackDenylist: [/^\/api\//, /^\/downloads\//, /\.apk$/i],
           runtimeCaching: [
             {
@@ -148,6 +149,23 @@ export default defineConfig(() => {
           ],
         },
       }),
+      // Never bundle AI Studio chat attachments (public/assets/aistudio) into dist/ or the APK.
+      {
+        name: 'exclude-aistudio-attachments',
+        apply: 'build',
+        writeBundle(): void {
+          const distAistudio = path.resolve(rootDir, 'dist/assets/aistudio');
+          if (fs.existsSync(distAistudio)) {
+            fs.rmSync(distAistudio, { recursive: true, force: true });
+          }
+        },
+        closeBundle(): void {
+          const distAistudio = path.resolve(rootDir, 'dist/assets/aistudio');
+          if (fs.existsSync(distAistudio)) {
+            fs.rmSync(distAistudio, { recursive: true, force: true });
+          }
+        },
+      },
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.

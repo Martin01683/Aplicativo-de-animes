@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { readdirSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -445,17 +446,22 @@ describe('Pre-push build checks and Android Gradle gate', () => {
     });
     assert.equal(respectsExplicitOverride.action, 'skip');
   });
-  it('blocks committing unused AI Studio chat attachments in public/assets/aistudio', () => {
+  it('blocks AI Studio chat attachments from git and from Vite/APK builds', () => {
     const gitignore = readRepoFile('.gitignore');
-    assert.match(gitignore, /^public\/assets\/aistudio\/\*$/m);
+    assert.match(gitignore, /^public\/assets\/aistudio\/$/m);
 
-    const aistudioDir = resolve(ROOT, 'public/assets/aistudio');
-    const files = readdirSync(aistudioDir);
-    const disallowed = files.filter((f) => !/^captura-topanimes\.net-[\w-]+\.html$/.test(f));
-    assert.deepEqual(
-      disallowed,
-      [],
-      `Unexpected non-fixture files in public/assets/aistudio/: ${disallowed.join(', ')}`,
+    const viteConfig = readRepoFile('vite.config.ts');
+    assert.match(viteConfig, /exclude-aistudio-attachments/);
+    assert.match(viteConfig, /globIgnores:[\s\S]*aistudio/);
+
+    const tracked = execFileSync('git', ['ls-files', 'public/assets/aistudio'], {
+      cwd: ROOT,
+      encoding: 'utf8',
+    }).trim();
+    assert.equal(
+      tracked,
+      '',
+      `public/assets/aistudio/ must never have tracked files in git: ${tracked}`,
     );
   });
 });

@@ -194,7 +194,7 @@ function decodeCatalogPrefsHeader(req: Request): CatalogPreferences | undefined 
 
 const nodeSnapshotReader: SnapshotAssetReader = async (assetFileName: string) => {
   const safeName = path.basename(assetFileName);
-  const fullPath = path.join(__dirname, 'public/assets/aistudio', safeName);
+  const fullPath = path.join(__dirname, 'tests/fixtures/topanimes', safeName);
   if (!fs.existsSync(fullPath)) return null;
   return fs.readFileSync(fullPath, 'utf8');
 };

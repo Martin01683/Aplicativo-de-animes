@@ -257,16 +257,7 @@ function encodeCatalogConfigHeader(prefs?: CatalogPreferences): string | null {
   return encodeBase64Json(prefs);
 }
 
-const defaultBrowserSnapshotReader: SnapshotFetcher = async (assetFileName: string) => {
-  if (typeof window === 'undefined' || typeof window.fetch !== 'function') return null;
-  try {
-    const res = await window.fetch(`/assets/aistudio/${encodeURIComponent(assetFileName)}`);
-    if (!res.ok) return null;
-    return await res.text();
-  } catch {
-    return null;
-  }
-};
+const defaultBrowserSnapshotReader: SnapshotFetcher = async () => null;
 
 export async function routeNativeApiRequest(
   pathWithQuery: string,

@@ -25,27 +25,27 @@ import { isSafeExternalHttpUrl, isTopAnimesUrl, unwrapAvisoUrl } from './urlSafe
 const ROOT = process.cwd();
 const HOME_CAPTURE = path.join(
   ROOT,
-  'public/assets/aistudio/captura-topanimes.net-20261120-185536_c8f54b4e.html'
+  'tests/fixtures/topanimes/captura-topanimes.net-20261120-185536_c8f54b4e.html'
 );
 const EPISODE_CAPTURE = path.join(
   ROOT,
-  'public/assets/aistudio/captura-topanimes.net-20261120-185622_7446cc49.html'
+  'tests/fixtures/topanimes/captura-topanimes.net-20261120-185622_7446cc49.html'
 );
 const EPISODES_ARCHIVE_CAPTURE = path.join(
   ROOT,
-  'public/assets/aistudio/captura-topanimes.net-20261120-193317_58010c0a.html'
+  'tests/fixtures/topanimes/captura-topanimes.net-20261120-193317_58010c0a.html'
 );
 const SEARCH_CAPTURE = path.join(
   ROOT,
-  'public/assets/aistudio/captura-topanimes.net-20261120-193320_0ff36db0.html'
+  'tests/fixtures/topanimes/captura-topanimes.net-20261120-193320_0ff36db0.html'
 );
 const ANIMES_ARCHIVE_CAPTURE = path.join(
   ROOT,
-  'public/assets/aistudio/captura-topanimes.net-20261120-194623_978b4a6c.html'
+  'tests/fixtures/topanimes/captura-topanimes.net-20261120-194623_978b4a6c.html'
 );
 const MOVIES_ARCHIVE_CAPTURE = path.join(
   ROOT,
-  'public/assets/aistudio/captura-topanimes.net-20261120-194902_e963a754.html'
+  'tests/fixtures/topanimes/captura-topanimes.net-20261120-194902_e963a754.html'
 );
 
 describe('urlSafety', () => {

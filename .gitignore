@@ -16,6 +16,5 @@ downloads/*.apk
 *.jks
 keystore.properties
 
-# AI Studio chat attachments (keep only HTML test fixtures)
-public/assets/aistudio/*
-!public/assets/aistudio/captura-topanimes.net-*.html
+# AI Studio chat attachments — NEVER commit or bundle
+public/assets/aistudio/
