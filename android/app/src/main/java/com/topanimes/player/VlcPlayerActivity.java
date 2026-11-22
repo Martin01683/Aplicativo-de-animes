@@ -4028,11 +4028,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
         for (TopAnimesEpisodeResolver.ServerOption opt : serverOptions) {
             try {
                 JSONObject o = new JSONObject();
-                o.put("nume", opt.nume);
-                o.put("label", opt.label);
-                o.put("postId", opt.postId);
-                o.put("postType", opt.postType);
-                o.put("ajaxUrl", opt.ajaxUrl);
+                o.put("nume", opt.nume != null ? opt.nume : "");
+                o.put("label", opt.label != null ? opt.label : "");
+                o.put("embedUrl", opt.embedUrl != null ? opt.embedUrl : "");
+                o.put("providerKind", opt.providerKind != null ? opt.providerKind : "other");
                 arr.put(o);
             } catch (Exception ignored) {
             }
