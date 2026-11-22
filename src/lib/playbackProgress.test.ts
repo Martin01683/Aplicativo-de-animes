@@ -268,3 +268,123 @@ test('App.tsx requires confirmation before bulk history clearing (clear all or a
     'both CatalogView and SettingsModal clear-history actions must ask confirmation'
   );
 });
+
+test('formatHistoryEpisodeTitle prefixes bare episode titles with seriesTitle without duplicating existing prefixes', async () => {
+  const { formatHistoryEpisodeTitle } = await import('./playbackProgress.ts');
+  assert.equal(
+    formatHistoryEpisodeTitle('Episódio 5', 'Sousou no Frieren'),
+    'Sousou no Frieren — Episódio 5'
+  );
+  assert.equal(
+    formatHistoryEpisodeTitle('Sousou no Frieren - Episódio 5', 'Sousou no Frieren'),
+    'Sousou no Frieren - Episódio 5'
+  );
+  assert.equal(formatHistoryEpisodeTitle('Episódio 1'), 'Episódio 1');
+});
+
+test('storage syncs loadHistory, pushHistoryEntry, saveEpisodeProgress with meta, and route session across restarts', async () => {
+  const store = new Map<string, string>();
+  const prevStorage = (globalThis as { localStorage?: Storage }).localStorage;
+  (globalThis as { localStorage?: Storage }).localStorage = {
+    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
+    setItem: (k: string, v: string) => {
+      store.set(k, String(v));
+    },
+    removeItem: (k: string) => {
+      store.delete(k);
+    },
+    clear: () => {
+      store.clear();
+    },
+    key: (i: number) => Array.from(store.keys())[i] ?? null,
+    get length() {
+      return store.size;
+    },
+  };
+
+  try {
+    const {
+      loadActiveRouteSession,
+      loadEpisodeProgressMap,
+      loadHistory,
+      pushHistoryEntry,
+      saveActiveRouteSession,
+      saveEpisodeProgress,
+    } = await import('./storage.ts');
+
+    const ep1Url = 'https://topanimes.net/episodio/frieren-episodio-1/';
+    const ep2Url = 'https://www.hinatasoul.com/videos/987654';
+
+    // Saving progress with meta inserts a new history entry even if pushHistoryEntry wasn't called first
+    saveEpisodeProgress({
+      url: ep1Url,
+      positionSec: 185,
+      durationSec: 1420,
+      meta: {
+        title: 'Episódio 1',
+        seriesTitle: 'Sousou no Frieren',
+        seriesUrl: 'https://topanimes.net/animes/frieren/',
+        poster: 'https://img.example/frieren.jpg',
+        kind: 'episode',
+      },
+    });
+
+    let hist = loadHistory();
+    assert.equal(hist.length, 1);
+    assert.equal(hist[0].title, 'Sousou no Frieren — Episódio 1');
+    assert.equal(hist[0].positionSec, 185);
+    assert.equal(hist[0].completed, false);
+
+    // Completing an episode via fullscreen switch records it in history and progressMap
+    saveEpisodeProgress({
+      url: ep2Url,
+      positionSec: 1400,
+      durationSec: 1420,
+      ended: true,
+      meta: {
+        title: 'Episódio 2',
+        seriesTitle: 'Sousou no Frieren',
+        seriesUrl: 'https://topanimes.net/animes/frieren/',
+        poster: 'https://img.example/frieren.jpg',
+        kind: 'episode',
+        promoteInHistory: true,
+      },
+    });
+    pushHistoryEntry({
+      url: ep2Url,
+      title: 'Episódio 2',
+      seriesTitle: 'Sousou no Frieren',
+      seriesUrl: 'https://topanimes.net/animes/frieren/',
+      poster: 'https://img.example/frieren.jpg',
+      kind: 'episode',
+      watchedAt: '2026-11-22T10:00:00.000Z',
+    });
+
+    hist = loadHistory();
+    assert.equal(hist.length, 2);
+    assert.equal(hist[0].url, ep2Url);
+    assert.equal(hist[0].title, 'Sousou no Frieren — Episódio 2');
+    assert.equal(hist[0].completed, true);
+    assert.equal(hist[0].positionSec, 0);
+
+    const pMap = loadEpisodeProgressMap();
+    assert.equal(pMap['hinatasoul.com/videos/987654']?.completed, true);
+
+    // Active route session persists and restores the episode workspace across screen-off WebView reloads
+    saveActiveRouteSession({
+      routeStack: [
+        { view: 'catalog' },
+        { view: 'anime', url: 'https://topanimes.net/animes/frieren/' },
+        { view: 'episode', url: ep2Url },
+      ],
+      activeSection: 'catalog',
+    });
+    const restoredSession = loadActiveRouteSession();
+    assert.equal(restoredSession.activeSection, 'catalog');
+    assert.equal(restoredSession.routeStack.length, 3);
+    assert.deepEqual(restoredSession.routeStack[2], { view: 'episode', url: ep2Url });
+  } finally {
+    (globalThis as { localStorage?: Storage }).localStorage = prevStorage;
+  }
+});
+

@@ -36,7 +36,12 @@ import {
   normalizeTopAnimesUrl,
   toSeriesFavoriteItem,
 } from './lib/favoriteAlerts';
-import { isSameEpisodeUrl, setNativeVlcVideoScale } from './lib/nativeVlcPlayer';
+import {
+  consumeNativeVlcPendingSession,
+  isSameEpisodeUrl,
+  setNativeVlcVideoScale,
+  type NativeVlcPlayResult,
+} from './lib/nativeVlcPlayer';
 import {
   canonicalEpisodeProgressKey,
   countAnimeEpisodesInHistory,
@@ -61,6 +66,7 @@ import {
   clearFavoriteAlerts,
   clearHistory,
   loadAcknowledgedReleaseKey,
+  loadActiveRouteSession,
   loadAppSettings,
   loadAppSettingsMeta,
   loadEpisodeProgressMap,
@@ -72,6 +78,7 @@ import {
   removeHistoryAnime,
   removeHistoryEpisode,
   saveAcknowledgedReleaseKey,
+  saveActiveRouteSession,
   saveAppSettings,
   saveAppSettingsMeta,
   saveEpisodeProgress,
@@ -160,9 +167,18 @@ export default function App() {
     'sources' | 'catalog' | 'general'
   >('general');
 
-  const [routeStack, setRouteStack] = useState<ActiveRoute[]>([{ view: 'catalog' }]);
+  const initialRouteSession = useMemo(() => loadActiveRouteSession(), []);
+  const [routeStack, setRouteStack] = useState<ActiveRoute[]>(() =>
+    initialRouteSession.routeStack.length > 0
+      ? initialRouteSession.routeStack
+      : [{ view: 'catalog' }]
+  );
   const route = routeStack[routeStack.length - 1] ?? { view: 'catalog' };
-  const [activeSection, setActiveSection] = useState<NavSection>(() => loadAppSettings().defaultSection);
+  const [activeSection, setActiveSection] = useState<NavSection>(() =>
+    initialRouteSession.routeStack.length > 1
+      ? initialRouteSession.activeSection
+      : loadAppSettings().defaultSection
+  );
 
   const [catalog, setCatalog] = useState<HomeCatalog | null>(null);
   const [loadingCatalog, setLoadingCatalog] = useState(true);
@@ -265,6 +281,9 @@ export default function App() {
   const baselinesRef = useRef(baselines);
   const alertsRef = useRef(alerts);
   const releasesRef = useRef(releases);
+  const historyRef = useRef(history);
+  const animeDetailsRef = useRef(animeDetails);
+  const episodeDetailsRef = useRef(episodeDetails);
   const settingsRef = useRef(settings);
   const settingsMetaRef = useRef(settingsMeta);
   const buildInfoRef = useRef(buildInfo);
@@ -278,6 +297,7 @@ export default function App() {
   const navRequestGenRef = useRef(0);
   const handlingPopstateRef = useRef(false);
   const initialCheckDoneRef = useRef(false);
+  const initialRouteHydratedRef = useRef(false);
   const startupAppUpdateCheckedRef = useRef(false);
   const checkingAppUpdateRef = useRef(false);
   const autoDownloadTriggeredForRef = useRef<string | null>(null);
@@ -287,6 +307,9 @@ export default function App() {
   baselinesRef.current = baselines;
   alertsRef.current = alerts;
   releasesRef.current = releases;
+  historyRef.current = history;
+  animeDetailsRef.current = animeDetails;
+  episodeDetailsRef.current = episodeDetails;
   settingsRef.current = settings;
   settingsMetaRef.current = settingsMeta;
   buildInfoRef.current = buildInfo;
@@ -294,6 +317,10 @@ export default function App() {
   acknowledgedReleaseKeyRef.current = acknowledgedReleaseKey;
   routeRef.current = route;
   routeStackRef.current = routeStack;
+
+  useEffect(() => {
+    saveActiveRouteSession({ routeStack, activeSection });
+  }, [routeStack, activeSection]);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -1211,6 +1238,66 @@ export default function App() {
     }
   }, []);
 
+  const resolveKnownEpisodeMeta = useCallback((targetUrl: string) => {
+    const key = canonicalEpisodeProgressKey(targetUrl);
+    if (!key) return null;
+
+    const currentAnime = animeDetailsRef.current;
+    if (currentAnime) {
+      const matchedEp = currentAnime.episodes.find(
+        (ep) => canonicalEpisodeProgressKey(ep.url) === key || ep.url === targetUrl
+      );
+      if (matchedEp) {
+        return {
+          title: matchedEp.title || `${currentAnime.title} — ${matchedEp.numberLabel || 'Episódio'}`,
+          seriesTitle: currentAnime.title,
+          seriesUrl: currentAnime.url,
+          poster: currentAnime.poster,
+          isMovie: currentAnime.kind === 'movie',
+        };
+      }
+    }
+
+    const currentEp = episodeDetailsRef.current;
+    if (currentEp && (canonicalEpisodeProgressKey(currentEp.url) === key || currentEp.url === targetUrl)) {
+      return {
+        title: currentEp.title,
+        seriesTitle: currentEp.seriesTitle,
+        seriesUrl: currentEp.seriesUrl,
+        poster: currentEp.backdrop || currentEp.poster,
+        isMovie: currentEp.isMovie,
+      };
+    }
+
+    const histMatch = historyRef.current.find(
+      (item) => canonicalEpisodeProgressKey(item.url) === key || item.url === targetUrl
+    );
+    if (histMatch) {
+      return {
+        title: histMatch.title,
+        seriesTitle: histMatch.seriesTitle,
+        seriesUrl: histMatch.seriesUrl,
+        poster: histMatch.poster,
+        isMovie: histMatch.kind === 'movie',
+      };
+    }
+
+    const relMatch = releasesRef.current.find(
+      (item) => canonicalEpisodeProgressKey(item.url) === key || item.url === targetUrl
+    );
+    if (relMatch) {
+      return {
+        title: relMatch.title,
+        seriesTitle: undefined,
+        seriesUrl: undefined,
+        poster: relMatch.poster,
+        isMovie: relMatch.kind === 'movie',
+      };
+    }
+
+    return null;
+  }, []);
+
   const loadEpisodeDetailsForRoute = useCallback(
     async (
       url: string,
@@ -1218,6 +1305,7 @@ export default function App() {
       options: { bypassCache?: boolean; preserveExisting?: boolean } = {}
     ) => {
       const epCacheKey = normalizeTopAnimesUrl(url) || url;
+      const knownMeta = resolveKnownEpisodeMeta(url);
       if (!options.bypassCache) {
         const cachedEp = episodeDetailsCacheRef.current.get(epCacheKey);
         if (cachedEp) {
@@ -1227,9 +1315,9 @@ export default function App() {
           const updatedHistory = pushHistoryEntry({
             url: cachedEp.url,
             title: cachedEp.title,
-            seriesTitle: cachedEp.seriesTitle,
-            seriesUrl: cachedEp.seriesUrl,
-            poster: cachedEp.backdrop || cachedEp.poster,
+            seriesTitle: cachedEp.seriesTitle || knownMeta?.seriesTitle,
+            seriesUrl: cachedEp.seriesUrl || knownMeta?.seriesUrl,
+            poster: cachedEp.backdrop || cachedEp.poster || knownMeta?.poster || '',
             kind: cachedEp.isMovie ? 'movie' : 'episode',
             watchedAt: new Date().toISOString(),
           });
@@ -1238,6 +1326,19 @@ export default function App() {
         }
       } else {
         episodeDetailsCacheRef.current.delete(epCacheKey);
+      }
+
+      if (knownMeta?.title) {
+        const optimisticHistory = pushHistoryEntry({
+          url,
+          title: knownMeta.title,
+          seriesTitle: knownMeta.seriesTitle,
+          seriesUrl: knownMeta.seriesUrl,
+          poster: knownMeta.poster || '',
+          kind: knownMeta.isMovie ? 'movie' : 'episode',
+          watchedAt: new Date().toISOString(),
+        });
+        setHistory(optimisticHistory);
       }
 
       setDetailError('');
@@ -1260,7 +1361,14 @@ export default function App() {
         const data = await res.json();
         if (navRequestGenRef.current !== reqGen) return;
         if (!res.ok) throw new Error(data.error || 'Erro ao consultar fontes do episódio');
-        const ep = data as EpisodeDetails;
+        const rawEp = data as EpisodeDetails;
+        const ep: EpisodeDetails = {
+          ...rawEp,
+          seriesTitle: rawEp.seriesTitle || knownMeta?.seriesTitle || rawEp.title,
+          seriesUrl: rawEp.seriesUrl || knownMeta?.seriesUrl || '',
+          poster: rawEp.poster || knownMeta?.poster || '',
+          backdrop: rawEp.backdrop || rawEp.poster || knownMeta?.poster || '',
+        };
         episodeDetailsCacheRef.current.set(epCacheKey, ep);
         setEpisodeDetails(ep);
         const updatedHistory = pushHistoryEntry({
@@ -1382,8 +1490,209 @@ export default function App() {
         }
       }
     },
-    []
+    [resolveKnownEpisodeMeta]
   );
+
+  const syncNativeSessionResult = useCallback(
+    (
+      result: NativeVlcPlayResult,
+      fallbackMeta?: {
+        url?: string;
+        title?: string;
+        seriesTitle?: string;
+        seriesUrl?: string;
+        poster?: string;
+        isMovie?: boolean;
+      }
+    ) => {
+      if (result.videoScale) {
+        updateSettings({ videoScale: sanitizeVideoScaleMode(result.videoScale) });
+      }
+
+      const visitedList = Array.isArray(result.visitedEpisodes) ? result.visitedEpisodes : [];
+      if (visitedList.length > 0) {
+        const sortedVisited = [...visitedList].sort(
+          (a, b) => (a.watchedAtMs || 0) - (b.watchedAtMs || 0)
+        );
+        let nextHist = historyRef.current;
+        for (const visited of sortedVisited) {
+          if (!visited?.url) continue;
+          const known = resolveKnownEpisodeMeta(visited.url);
+          const epTitle = visited.title || known?.title || fallbackMeta?.title || 'Episódio';
+          const epSeriesTitle =
+            visited.seriesTitle || known?.seriesTitle || fallbackMeta?.seriesTitle;
+          const epSeriesUrl = visited.seriesUrl || known?.seriesUrl || fallbackMeta?.seriesUrl;
+          const epPoster = visited.poster || known?.poster || fallbackMeta?.poster || '';
+          const epIsMovie = Boolean(visited.isMovie ?? known?.isMovie ?? fallbackMeta?.isMovie);
+          const watchedAt =
+            typeof visited.watchedAtMs === 'number' && visited.watchedAtMs > 0
+              ? new Date(visited.watchedAtMs).toISOString()
+              : new Date().toISOString();
+          const posSec = Math.max(0, (visited.positionMs || 0) / 1000);
+          const durSec = Math.max(0, (visited.durationMs || 0) / 1000);
+          const completedFlag = Boolean(visited.completed);
+
+          if (
+            typeof visited.positionMs === 'number' ||
+            typeof visited.completed === 'boolean'
+          ) {
+            saveEpisodeProgress({
+              url: visited.url,
+              positionSec: posSec,
+              durationSec: durSec,
+              ended: completedFlag,
+              meta: {
+                title: epTitle,
+                seriesTitle: epSeriesTitle,
+                seriesUrl: epSeriesUrl,
+                poster: epPoster,
+                kind: epIsMovie ? 'movie' : 'episode',
+                watchedAt,
+                promoteInHistory: true,
+              },
+            });
+          }
+
+          nextHist = pushHistoryEntry({
+            url: visited.url,
+            title: epTitle,
+            seriesTitle: epSeriesTitle,
+            seriesUrl: epSeriesUrl,
+            poster: epPoster,
+            kind: epIsMovie ? 'movie' : 'episode',
+            watchedAt,
+            positionSec: completedFlag ? 0 : posSec > 0 ? posSec : undefined,
+            durationSec: durSec > 0 ? durSec : undefined,
+            completed: completedFlag ? true : undefined,
+          });
+        }
+        historyRef.current = nextHist;
+        setHistory(nextHist);
+      }
+
+      const activeResUrl = result.episodeUrl || fallbackMeta?.url;
+      if (activeResUrl && typeof result.positionMs === 'number') {
+        const matchingVisited = visitedList.find((v) => isSameEpisodeUrl(v.url, activeResUrl));
+        const known = resolveKnownEpisodeMeta(activeResUrl);
+        const epTitle =
+          matchingVisited?.title || known?.title || fallbackMeta?.title || 'Episódio';
+        const epSeriesTitle =
+          matchingVisited?.seriesTitle || known?.seriesTitle || fallbackMeta?.seriesTitle;
+        const epSeriesUrl =
+          matchingVisited?.seriesUrl || known?.seriesUrl || fallbackMeta?.seriesUrl;
+        const epPoster =
+          matchingVisited?.poster || known?.poster || fallbackMeta?.poster || '';
+        const epIsMovie = Boolean(
+          matchingVisited?.isMovie ?? known?.isMovie ?? fallbackMeta?.isMovie
+        );
+        const completedFlag = Boolean(result.completed || matchingVisited?.completed);
+        const posSec = Math.max(0, result.positionMs / 1000);
+        const durSec = Math.max(0, (result.durationMs || 0) / 1000);
+
+        saveEpisodeProgress({
+          url: activeResUrl,
+          positionSec: posSec,
+          durationSec: durSec,
+          ended: completedFlag,
+          meta: {
+            title: epTitle,
+            seriesTitle: epSeriesTitle,
+            seriesUrl: epSeriesUrl,
+            poster: epPoster,
+            kind: epIsMovie ? 'movie' : 'episode',
+            watchedAt: new Date().toISOString(),
+            promoteInHistory: true,
+          },
+        });
+
+        if (visitedList.length === 0) {
+          const nextHist = pushHistoryEntry({
+            url: activeResUrl,
+            title: epTitle,
+            seriesTitle: epSeriesTitle,
+            seriesUrl: epSeriesUrl,
+            poster: epPoster,
+            kind: epIsMovie ? 'movie' : 'episode',
+            watchedAt: new Date().toISOString(),
+            positionSec: completedFlag ? 0 : posSec > 0 ? posSec : undefined,
+            durationSec: durSec > 0 ? durSec : undefined,
+            completed: completedFlag ? true : undefined,
+          });
+          historyRef.current = nextHist;
+          setHistory(nextHist);
+        }
+      }
+
+      refreshProgressState();
+    },
+    [refreshProgressState, resolveKnownEpisodeMeta, updateSettings]
+  );
+
+  // Hydrate restored active route (episode or anime details) on startup
+  useEffect(() => {
+    if (initialRouteHydratedRef.current) return;
+    initialRouteHydratedRef.current = true;
+    const currentRoute = routeRef.current;
+    if (currentRoute.view === 'episode' && currentRoute.url) {
+      const reqGen = ++navRequestGenRef.current;
+      void loadEpisodeDetailsForRoute(currentRoute.url, reqGen);
+    } else if (currentRoute.view === 'anime' && currentRoute.url) {
+      const reqGen = ++navRequestGenRef.current;
+      void loadAnimeDetailsForRoute(currentRoute.url, reqGen);
+    }
+  }, [loadAnimeDetailsForRoute, loadEpisodeDetailsForRoute]);
+
+  // Consume any persisted native VLC session on startup or foreground return
+  useEffect(() => {
+    const syncPending = async () => {
+      const pending = await consumeNativeVlcPendingSession();
+      if (!pending) return;
+      const currentEp = episodeDetailsRef.current;
+      syncNativeSessionResult(
+        pending,
+        currentEp
+          ? {
+              url: currentEp.url,
+              title: currentEp.title,
+              seriesTitle: currentEp.seriesTitle,
+              seriesUrl: currentEp.seriesUrl,
+              poster: currentEp.backdrop || currentEp.poster,
+              isMovie: currentEp.isMovie,
+            }
+          : undefined
+      );
+      if (
+        pending.episodeUrl &&
+        routeRef.current.view === 'episode' &&
+        !isSameEpisodeUrl(pending.episodeUrl, routeRef.current.url)
+      ) {
+        const reqGen = ++navRequestGenRef.current;
+        const nextStack = pushRouteFrame(routeStackRef.current, {
+          view: 'episode',
+          url: pending.episodeUrl,
+        });
+        routeStackRef.current = nextStack;
+        setRouteStack(nextStack);
+        void loadEpisodeDetailsForRoute(pending.episodeUrl, reqGen, { preserveExisting: true });
+      }
+    };
+
+    void syncPending();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        void syncPending();
+      }
+    };
+    const onFocus = () => {
+      void syncPending();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
+    };
+  }, [loadEpisodeDetailsForRoute, syncNativeSessionResult]);
 
   const handleRefreshEpisodeSources = useCallback(() => {
     const currentRoute = routeRef.current;
@@ -2033,45 +2342,14 @@ export default function App() {
                 onNavigateUrl={openMediaUrl}
                 onRefreshSources={handleRefreshEpisodeSources}
                 onNativeSessionSync={(result) => {
-                  if (result.videoScale) {
-                    updateSettings({ videoScale: sanitizeVideoScaleMode(result.videoScale) });
-                  }
-                  if (Array.isArray(result.visitedEpisodes) && result.visitedEpisodes.length > 0) {
-                    let nextHist = history;
-                    for (const visited of result.visitedEpisodes) {
-                      if (!visited?.url) continue;
-                      nextHist = pushHistoryEntry({
-                        url: visited.url,
-                        title: visited.title || episodeDetails.title,
-                        seriesTitle: episodeDetails.seriesTitle,
-                        seriesUrl: episodeDetails.seriesUrl,
-                        poster: episodeDetails.backdrop || episodeDetails.poster,
-                        kind: episodeDetails.isMovie ? 'movie' : 'episode',
-                        watchedAt: new Date().toISOString(),
-                      });
-                      if (
-                        typeof visited.positionMs === 'number' ||
-                        typeof visited.completed === 'boolean'
-                      ) {
-                        saveEpisodeProgress({
-                          url: visited.url,
-                          positionSec: (visited.positionMs || 0) / 1000,
-                          durationSec: (visited.durationMs || 0) / 1000,
-                          ended: Boolean(visited.completed),
-                        });
-                      }
-                    }
-                    setHistory(nextHist);
-                  }
-                  const activeResUrl = result.episodeUrl || episodeDetails.url;
-                  if (activeResUrl && typeof result.positionMs === 'number') {
-                    saveEpisodeProgress({
-                      url: activeResUrl,
-                      positionSec: result.positionMs / 1000,
-                      durationSec: (result.durationMs || 0) / 1000,
-                    });
-                  }
-                  refreshProgressState();
+                  syncNativeSessionResult(result, {
+                    url: episodeDetails.url,
+                    title: episodeDetails.title,
+                    seriesTitle: episodeDetails.seriesTitle,
+                    seriesUrl: episodeDetails.seriesUrl,
+                    poster: episodeDetails.backdrop || episodeDetails.poster,
+                    isMovie: episodeDetails.isMovie,
+                  });
                   if (
                     result.episodeUrl &&
                     !isSameEpisodeUrl(result.episodeUrl, episodeDetails.url)

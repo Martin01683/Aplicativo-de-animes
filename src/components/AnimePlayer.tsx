@@ -77,6 +77,7 @@ interface AnimePlayerProps {
   episodeUrl?: string;
   seriesUrl?: string;
   seriesTitle?: string;
+  isMovie?: boolean;
   seriesEpisodes?: AnimeEpisodeLink[];
   watchedUrls?: Set<string>;
   playerOptions?: PlayerOption[];
@@ -196,6 +197,7 @@ export function AnimePlayer({
   episodeUrl,
   seriesUrl,
   seriesTitle,
+  isMovie = false,
   seriesEpisodes = [],
   watchedUrls,
   playerOptions = [],
@@ -287,12 +289,30 @@ export function AnimePlayer({
     currentTime: number;
     duration: number;
     hasStarted: boolean;
+    ended: boolean;
   }>({
     url: episodeUrl || '',
     currentTime: 0,
     duration: 0,
     hasStarted: false,
+    ended: false,
   });
+  const latestMetaRef = useRef({
+    title,
+    seriesTitle,
+    seriesUrl,
+    poster,
+    isMovie,
+    episodeUrl,
+  });
+  latestMetaRef.current = {
+    title,
+    seriesTitle,
+    seriesUrl,
+    poster,
+    isMovie,
+    episodeUrl,
+  };
   const lastSavedProgressWallRef = useRef(0);
   const prevEpisodeUrlRef = useRef<string | undefined>(episodeUrl);
   const onPlaybackProgressRef = useRef(onPlaybackProgress);
@@ -369,49 +389,62 @@ export function AnimePlayer({
       if (!targetUrl) return;
       const positionSec = opts?.positionSec ?? latestPlaybackRef.current.currentTime;
       const durationSec = opts?.durationSec ?? latestPlaybackRef.current.duration;
+      const ended = opts?.ended ?? latestPlaybackRef.current.ended;
       if (
         !opts?.forceReset &&
-        !opts?.ended &&
+        !ended &&
         !latestPlaybackRef.current.hasStarted &&
         positionSec < 2
       ) {
         return;
       }
-      if (!opts?.forceReset && !opts?.ended && pendingSeekSecRef.current > 1 && positionSec < 2) {
+      if (!opts?.forceReset && !ended && pendingSeekSecRef.current > 1 && positionSec < 2) {
         return;
       }
+      const metaSnap = latestMetaRef.current;
+      const isCurrentEp = isSameEpisodeUrl(targetUrl, metaSnap.episodeUrl);
       const res = saveEpisodeProgress({
         url: targetUrl,
         positionSec,
         durationSec,
-        ended: opts?.ended,
+        ended,
         forceReset: opts?.forceReset,
+        meta: isCurrentEp
+          ? {
+              title: metaSnap.title,
+              seriesTitle: metaSnap.seriesTitle,
+              seriesUrl: metaSnap.seriesUrl,
+              poster: metaSnap.poster,
+              kind: metaSnap.isMovie ? 'movie' : 'episode',
+            }
+          : undefined,
       });
       lastSavedProgressWallRef.current = Date.now();
-      if (res.history || opts?.ended || opts?.forceReset || positionSec >= 2) {
+      if (res.history || ended || opts?.forceReset || positionSec >= 2) {
         onPlaybackProgressRef.current?.();
       }
     },
     []
   );
 
-  // Flush progress on page hide / unmount
+  // Flush progress on page hide / unmount (Web HTML5 player only; native VLC manages its own session)
   useEffect(() => {
+    if (useNativeVlc) return;
     const flush = () => {
       const v = videoRef.current;
-      if (v && !useNativeVlc) {
+      if (v) {
         const dur =
           Number.isFinite(v.duration) && v.duration > 0
             ? v.duration
             : latestPlaybackRef.current.duration;
-        if (Number.isFinite(v.currentTime) && v.currentTime > 0) {
+        if (!latestPlaybackRef.current.ended && Number.isFinite(v.currentTime) && v.currentTime > 0) {
           latestPlaybackRef.current.currentTime = v.currentTime;
         }
         if (dur > 0) {
           latestPlaybackRef.current.duration = dur;
         }
       }
-      persistEpisodeProgressNow();
+      persistEpisodeProgressNow({ ended: latestPlaybackRef.current.ended });
     };
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') flush();
@@ -430,8 +463,8 @@ export function AnimePlayer({
   // Reset per-episode guards and load saved resume point when switching episodes
   useEffect(() => {
     const prevUrl = prevEpisodeUrlRef.current;
-    if (prevUrl && !isSameEpisodeUrl(prevUrl, episodeUrl)) {
-      persistEpisodeProgressNow({ url: prevUrl });
+    if (!useNativeVlc && prevUrl && !isSameEpisodeUrl(prevUrl, episodeUrl)) {
+      persistEpisodeProgressNow({ url: prevUrl, ended: latestPlaybackRef.current.ended });
     }
     prevEpisodeUrlRef.current = episodeUrl;
 
@@ -459,10 +492,11 @@ export function AnimePlayer({
       currentTime: savedResumeSec > 1 ? savedResumeSec : 0,
       duration: savedEntry?.durationSec || 0,
       hasStarted: false,
+      ended: Boolean(savedEntry?.completed),
     };
     setCurrentTime(savedResumeSec > 1 ? savedResumeSec : 0);
     setDuration(savedEntry?.durationSec || 0);
-  }, [episodeUrl, persistEpisodeProgressNow]);
+  }, [episodeUrl, persistEpisodeProgressNow, useNativeVlc]);
 
   // Reset per-server retry counter on server switch
   useEffect(() => {
@@ -597,6 +631,14 @@ export function AnimePlayer({
   const advanceFallbackOrFail = useCallback(() => {
     clearLoadWatchdog();
     if (loadingEpisode || !activeStream) return;
+    const resumeTime = Math.max(
+      pendingSeekSecRef.current,
+      videoRef.current?.currentTime || 0,
+      latestPlaybackRef.current.currentTime || 0
+    );
+    if (resumeTime > 1) {
+      pendingSeekSecRef.current = resumeTime;
+    }
     if (playbackMode === 'direct-cors') {
       setPlaybackMode('proxy');
       return;
@@ -619,7 +661,6 @@ export function AnimePlayer({
     }
     setPlaying(false);
     setWaiting(false);
-    const resumeTime = videoRef.current?.currentTime || 0;
     if (hasUntriedFallbackServers && onServerPlaybackFailed && selectedServerNume) {
       onServerPlaybackFailed(selectedServerNume, resumeTime);
       return;
@@ -980,6 +1021,8 @@ export function AnimePlayer({
           episodeUrl,
           seriesUrl,
           seriesTitle,
+          poster,
+          isMovie,
           streams: sortedStreams,
           subtitles,
           episodes: seriesEpisodes,
@@ -1013,10 +1056,21 @@ export function AnimePlayer({
         }
         const activeResultUrl = res?.episodeUrl || episodeUrl;
         if (activeResultUrl && typeof res?.positionMs === 'number') {
+          const posSec = Math.max(0, res.positionMs / 1000);
+          const durSec = Math.max(0, (res.durationMs || 0) / 1000);
+          const completedFlag = Boolean(res.completed);
+          latestPlaybackRef.current = {
+            url: activeResultUrl,
+            currentTime: completedFlag ? 0 : posSec,
+            duration: durSec || latestPlaybackRef.current.duration,
+            hasStarted: posSec >= 2 || completedFlag,
+            ended: completedFlag,
+          };
           persistEpisodeProgressNow({
             url: activeResultUrl,
-            positionSec: res.positionMs / 1000,
-            durationSec: (res.durationMs || 0) / 1000,
+            positionSec: posSec,
+            durationSec: durSec,
+            ended: completedFlag,
           });
           if (isSameEpisodeUrl(activeResultUrl, episodeUrl)) {
             setNativeResumeMs(
@@ -1045,6 +1099,7 @@ export function AnimePlayer({
       episodeUrl,
       hasNext,
       hasPrev,
+      isMovie,
       nativeDurationMs,
       nativeResumeMs,
       nextUrl,
@@ -1055,6 +1110,7 @@ export function AnimePlayer({
       onToast,
       persistEpisodeProgressNow,
       playerOptions,
+      poster,
       preferDirect,
       prevUrl,
       referer,
@@ -1653,6 +1709,7 @@ export function AnimePlayer({
               if (reachedGenuineEnd) {
                 latestPlaybackRef.current.currentTime = effectiveDuration;
                 latestPlaybackRef.current.duration = effectiveDuration;
+                latestPlaybackRef.current.ended = true;
                 persistEpisodeProgressNow({
                   url: episodeUrl,
                   positionSec: effectiveDuration,

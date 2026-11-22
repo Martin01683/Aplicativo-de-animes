@@ -525,6 +525,7 @@ export function EpisodeWorkspace({
               episodeUrl={episode.url}
               seriesUrl={episode.seriesUrl}
               seriesTitle={episode.seriesTitle}
+              isMovie={episode.isMovie}
               seriesEpisodes={seriesEpisodes}
               watchedUrls={watchedUrls}
               playerOptions={playableOptions}

@@ -14,6 +14,7 @@ import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
 
 import org.json.JSONArray;
+import org.json.JSONObject;
 
 @CapacitorPlugin(name = "NativeVlcPlayer")
 public class NativeVlcPlayerPlugin extends Plugin {
@@ -35,6 +36,8 @@ public class NativeVlcPlayerPlugin extends Plugin {
         String episodeUrl = call.getString("episodeUrl", "");
         String seriesUrl = call.getString("seriesUrl", "");
         String seriesTitle = call.getString("seriesTitle", "");
+        String poster = call.getString("poster", "");
+        boolean isMovie = Boolean.TRUE.equals(call.getBoolean("isMovie", false));
         String selectedServerNume = call.getString("selectedServerNume", "");
         String referer = call.getString("referer", "https://topanimes.net/");
         boolean preferDirect = Boolean.TRUE.equals(call.getBoolean("preferDirect", false));
@@ -55,6 +58,8 @@ public class NativeVlcPlayerPlugin extends Plugin {
         intent.putExtra(VlcPlayerActivity.EXTRA_EPISODE_URL, episodeUrl);
         intent.putExtra(VlcPlayerActivity.EXTRA_SERIES_URL, seriesUrl);
         intent.putExtra(VlcPlayerActivity.EXTRA_SERIES_TITLE, seriesTitle);
+        intent.putExtra(VlcPlayerActivity.EXTRA_POSTER, poster);
+        intent.putExtra(VlcPlayerActivity.EXTRA_IS_MOVIE, isMovie);
         intent.putExtra(VlcPlayerActivity.EXTRA_STREAMS_JSON, streams.toString());
         intent.putExtra(
             VlcPlayerActivity.EXTRA_SUBTITLES_JSON,
@@ -97,17 +102,35 @@ public class NativeVlcPlayerPlugin extends Plugin {
         call.resolve();
     }
 
+    @PluginMethod
+    public void consumePendingSession(PluginCall call) {
+        String pendingRaw = VlcPlayerActivity.consumePendingSessionJson(getContext());
+        JSObject ret = new JSObject();
+        if (pendingRaw != null && !pendingRaw.isEmpty()) {
+            JSObject sessionObj = parsePendingSessionToJSObject(pendingRaw);
+            if (sessionObj != null) {
+                ret.put("session", sessionObj);
+                call.resolve(ret);
+                return;
+            }
+        }
+        ret.put("session", JSObject.NULL);
+        call.resolve(ret);
+    }
+
     @ActivityCallback
     private void onPlayerResult(PluginCall call, ActivityResult result) {
         if (call == null) return;
         JSObject ret = new JSObject();
         Intent data = result.getData();
         if (result.getResultCode() == Activity.RESULT_OK && data != null) {
+            VlcPlayerActivity.clearPendingSessionJson(getContext());
             String action = data.getStringExtra(VlcPlayerActivity.RESULT_ACTION);
             ret.put("action", action != null ? action : "closed");
             ret.put("episodeUrl", data.getStringExtra(VlcPlayerActivity.RESULT_EPISODE_URL));
             ret.put("positionMs", data.getLongExtra(VlcPlayerActivity.RESULT_POSITION_MS, 0L));
             ret.put("durationMs", data.getLongExtra(VlcPlayerActivity.RESULT_DURATION_MS, 0L));
+            ret.put("completed", data.getBooleanExtra(VlcPlayerActivity.RESULT_COMPLETED, false));
             ret.put("streamIndex", data.getIntExtra(VlcPlayerActivity.RESULT_STREAM_INDEX, 0));
             String videoScale = data.getStringExtra(VlcPlayerActivity.RESULT_VIDEO_SCALE);
             if (videoScale != null && !videoScale.isEmpty()) {
@@ -122,11 +145,46 @@ public class NativeVlcPlayerPlugin extends Plugin {
                 }
             }
         } else {
+            String pendingRaw = VlcPlayerActivity.consumePendingSessionJson(getContext());
+            JSObject recovered = parsePendingSessionToJSObject(pendingRaw);
+            if (recovered != null) {
+                call.resolve(recovered);
+                return;
+            }
             ret.put("action", "closed");
             ret.put("positionMs", 0L);
             ret.put("durationMs", 0L);
+            ret.put("completed", false);
             ret.put("streamIndex", 0);
         }
         call.resolve(ret);
+    }
+
+    private static JSObject parsePendingSessionToJSObject(String pendingRaw) {
+        if (pendingRaw == null || pendingRaw.isEmpty()) return null;
+        try {
+            JSONObject obj = new JSONObject(pendingRaw);
+            JSObject ret = new JSObject();
+            ret.put("action", obj.optString("action", "closed"));
+            String epUrl = obj.optString("episodeUrl", "");
+            if (!epUrl.isEmpty()) {
+                ret.put("episodeUrl", epUrl);
+            }
+            ret.put("positionMs", Math.max(0L, obj.optLong("positionMs", 0L)));
+            ret.put("durationMs", Math.max(0L, obj.optLong("durationMs", 0L)));
+            ret.put("completed", obj.optBoolean("completed", false));
+            ret.put("streamIndex", Math.max(0, obj.optInt("streamIndex", 0)));
+            String videoScale = obj.optString("videoScale", "");
+            if (!videoScale.isEmpty()) {
+                ret.put("videoScale", videoScale);
+            }
+            JSONArray visited = obj.optJSONArray("visitedEpisodes");
+            if (visited != null) {
+                ret.put("visitedEpisodes", visited);
+            }
+            return ret;
+        } catch (Exception e) {
+            return null;
+        }
     }
 }

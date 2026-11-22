@@ -325,6 +325,18 @@ function normalizeHistorySeriesKey(raw: string): string {
     .trim();
 }
 
+export function formatHistoryEpisodeTitle(title: string, seriesTitle?: string): string {
+  const cleanTitle = (title || '').trim() || 'Episódio';
+  const cleanSeries = (seriesTitle || '').trim();
+  if (!cleanSeries) return cleanTitle;
+  const normSeries = normalizeHistorySeriesKey(cleanSeries);
+  const normTitle = normalizeHistorySeriesKey(cleanTitle);
+  if (normSeries && normTitle.startsWith(normSeries)) {
+    return cleanTitle;
+  }
+  return `${cleanSeries} — ${cleanTitle}`;
+}
+
 export function getHistoryEntrySeriesName(
   entry: Pick<WatchHistoryEntry, 'title' | 'seriesTitle'>
 ): string {

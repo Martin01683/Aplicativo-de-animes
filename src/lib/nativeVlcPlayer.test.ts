@@ -410,6 +410,51 @@ describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () 
       )
     );
   });
+
+  it('keeps VlcPlayerActivity alive across screen-off/launcher reopen and persists pending watch session', () => {
+    const manifestXml = readFileSync(
+      resolve(ROOT, 'android/app/src/main/AndroidManifest.xml'),
+      'utf8'
+    );
+    const activityJava = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java'),
+      'utf8'
+    );
+    const pluginJava = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/NativeVlcPlayerPlugin.java'),
+      'utf8'
+    );
+    const resolverJava = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/TopAnimesEpisodeResolver.java'),
+      'utf8'
+    );
+
+    // MainActivity must use singleTop (never singleTask) so tapping the launcher icon after
+    // screen-off does not perform CLEAR_TOP and destroy VlcPlayerActivity
+    assert.match(manifestXml, /android:name="\.MainActivity"[\s\S]*?android:launchMode="singleTop"/);
+    assert.doesNotMatch(manifestXml, /android:launchMode="singleTask"/);
+
+    // Active seek guard prevents pre-seek 0:00 TimeChanged events from resetting lastKnownPositionMs
+    assert.match(activityJava, /activeSeekTargetMs\s*=\s*target/);
+    assert.match(activityJava, /long\s+targetBeforeApply\s*=\s*pendingSeekMs/);
+    assert.match(activityJava, /waitingForSeekCompletion/);
+
+    // Full state and pending session are persisted in onPause/onStop/onSaveInstanceState
+    assert.match(activityJava, /PREF_PENDING_SESSION_JSON/);
+    assert.match(activityJava, /persistPendingSessionPref\(/);
+    assert.match(activityJava, /consumePendingSessionJson\(/);
+    assert.match(activityJava, /restoreFromSavedInstanceState\(savedInstanceState\)/);
+    assert.match(pluginJava, /public void consumePendingSession\(PluginCall call\)/);
+    assert.match(pluginJava, /VlcPlayerActivity\.consumePendingSessionJson\(getContext\(\)\)/);
+
+    // Fullscreen episode switching supports both TopAnimes and Hinata Soul URLs
+    assert.match(resolverJava, /public static String normalizeSupportedEpisodeUrl\(String rawUrl\)/);
+    assert.match(
+      activityJava,
+      /TopAnimesEpisodeResolver\.normalizeSupportedEpisodeUrl\(rawTargetUrl\)/
+    );
+  });
 });
+
 
 

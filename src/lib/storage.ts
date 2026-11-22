@@ -2,6 +2,7 @@ import {
   buildWatchedProgressMap,
   canonicalEpisodeProgressKey,
   computeProgressSnapshot,
+  formatHistoryEpisodeTitle,
   getResumePositionSec,
   removeHistoryAnimeFromList,
   removeHistoryEpisodeFromList,
@@ -40,6 +41,7 @@ const SETTINGS_META_KEY = 'anisync:settings_meta:v1';
 const LEGACY_SETTINGS_META_KEY = 'topvlc:settings_meta:v1';
 const ACK_RELEASE_KEY = 'anisync:ack_release:v1';
 const LEGACY_ACK_RELEASE_KEY = 'topvlc:ack_release:v1';
+const ROUTE_SESSION_KEY = 'anisync:route_session:v1';
 
 function readWithLegacyFallback(primaryKey: string, legacyKey: string): string | null {
   const primary = localStorage.getItem(primaryKey);
@@ -71,7 +73,29 @@ export function loadHistory(): WatchHistoryEntry[] {
     const raw = readWithLegacyFallback(HISTORY_KEY, LEGACY_HISTORY_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    const progressMap = loadEpisodeProgressMap();
+    return parsed
+      .filter((item): item is WatchHistoryEntry => Boolean(item && typeof item.url === 'string' && item.url.trim()))
+      .map((item) => {
+        const key = canonicalEpisodeProgressKey(item.url);
+        const savedProgress = key ? progressMap[key] : undefined;
+        const completed = Boolean(savedProgress ? savedProgress.completed : item.completed);
+        const positionSec = completed
+          ? 0
+          : (savedProgress?.positionSec ?? item.positionSec);
+        const durationSec =
+          savedProgress && savedProgress.durationSec > 0
+            ? savedProgress.durationSec
+            : item.durationSec;
+        return {
+          ...item,
+          title: formatHistoryEpisodeTitle(item.title, item.seriesTitle),
+          positionSec,
+          durationSec,
+          completed,
+        };
+      });
   } catch {
     return [];
   }
@@ -81,18 +105,35 @@ export function pushHistoryEntry(entry: WatchHistoryEntry): WatchHistoryEntry[] 
   const entryKey = canonicalEpisodeProgressKey(entry.url);
   const previousAll = loadHistory();
   const prevMatch = previousAll.find(
-    (item) => canonicalEpisodeProgressKey(item.url) === entryKey
+    (item) => canonicalEpisodeProgressKey(item.url) === entryKey || item.url === entry.url
   );
   const progressMap = loadEpisodeProgressMap();
   const savedProgress = entryKey ? progressMap[entryKey] : undefined;
 
+  const seriesTitle = (entry.seriesTitle || prevMatch?.seriesTitle || '').trim() || undefined;
+  const seriesUrl = (entry.seriesUrl || prevMatch?.seriesUrl || '').trim() || undefined;
+  const poster = (entry.poster || prevMatch?.poster || '').trim();
+  const completed = Boolean(
+    entry.completed ?? savedProgress?.completed ?? prevMatch?.completed
+  );
+  const positionSec = completed
+    ? 0
+    : (entry.positionSec ?? savedProgress?.positionSec ?? prevMatch?.positionSec);
+  const durationSec =
+    entry.durationSec && entry.durationSec > 0
+      ? entry.durationSec
+      : (savedProgress?.durationSec ?? prevMatch?.durationSec);
+
   const mergedEntry: WatchHistoryEntry = {
+    ...prevMatch,
     ...entry,
-    positionSec:
-      entry.positionSec ?? savedProgress?.positionSec ?? prevMatch?.positionSec,
-    durationSec:
-      entry.durationSec ?? savedProgress?.durationSec ?? prevMatch?.durationSec,
-    completed: entry.completed ?? savedProgress?.completed ?? prevMatch?.completed,
+    title: formatHistoryEpisodeTitle(entry.title || prevMatch?.title || 'Episódio', seriesTitle),
+    poster,
+    seriesTitle,
+    seriesUrl,
+    positionSec,
+    durationSec,
+    completed,
   };
 
   const existing = previousAll.filter(
@@ -210,12 +251,23 @@ export function getEpisodeResumeSeconds(url: string): number {
   return getResumePositionSec(getEpisodeProgress(url));
 }
 
+export interface EpisodeHistoryMeta {
+  title?: string;
+  seriesTitle?: string;
+  seriesUrl?: string;
+  poster?: string;
+  kind?: 'episode' | 'movie';
+  watchedAt?: string;
+  promoteInHistory?: boolean;
+}
+
 export function saveEpisodeProgress(params: {
   url: string;
   positionSec: number;
   durationSec: number;
   ended?: boolean;
   forceReset?: boolean;
+  meta?: EpisodeHistoryMeta;
 }): { map: EpisodeProgressMap; history: WatchHistoryEntry[] | null } {
   const snapshot = computeProgressSnapshot(params);
   const currentMap = loadEpisodeProgressMap();
@@ -229,20 +281,58 @@ export function saveEpisodeProgress(params: {
   const key = canonicalEpisodeProgressKey(params.url);
   const currentHistory = loadHistory();
   let updatedHistory: WatchHistoryEntry[] | null = null;
-  if (
-    key &&
-    currentHistory.some((item) => canonicalEpisodeProgressKey(item.url) === key)
-  ) {
-    updatedHistory = currentHistory.map((item) =>
-      canonicalEpisodeProgressKey(item.url) === key
-        ? {
-            ...item,
-            positionSec: snapshot.positionSec,
-            durationSec: snapshot.durationSec,
-            completed: snapshot.completed,
-          }
-        : item
-    );
+  const existingIdx = key
+    ? currentHistory.findIndex((item) => canonicalEpisodeProgressKey(item.url) === key)
+    : -1;
+
+  if (existingIdx >= 0) {
+    const item = currentHistory[existingIdx];
+    const seriesTitle = (params.meta?.seriesTitle || item.seriesTitle || '').trim() || undefined;
+    const seriesUrl = (params.meta?.seriesUrl || item.seriesUrl || '').trim() || undefined;
+    const poster = (params.meta?.poster || item.poster || '').trim();
+    const rawTitle = (params.meta?.title || item.title || 'Episódio').trim();
+    const updatedItem: WatchHistoryEntry = {
+      ...item,
+      title: formatHistoryEpisodeTitle(rawTitle, seriesTitle),
+      poster,
+      seriesTitle,
+      seriesUrl,
+      kind: params.meta?.kind || item.kind,
+      watchedAt: params.meta?.watchedAt || item.watchedAt,
+      positionSec: snapshot.positionSec,
+      durationSec: snapshot.durationSec > 0 ? snapshot.durationSec : item.durationSec,
+      completed: snapshot.completed,
+    };
+
+    if (params.meta?.promoteInHistory) {
+      const rest = currentHistory.filter((_, idx) => idx !== existingIdx);
+      updatedHistory = [updatedItem, ...rest].slice(0, 30);
+    } else {
+      updatedHistory = currentHistory.map((entry, idx) =>
+        idx === existingIdx ? updatedItem : entry
+      );
+    }
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
+    } catch {
+      // ignore
+    }
+  } else if (key && params.meta?.title) {
+    const seriesTitle = (params.meta.seriesTitle || '').trim() || undefined;
+    const seriesUrl = (params.meta.seriesUrl || '').trim() || undefined;
+    const newItem: WatchHistoryEntry = {
+      title: formatHistoryEpisodeTitle(params.meta.title, seriesTitle),
+      url: params.url,
+      poster: (params.meta.poster || '').trim(),
+      kind: params.meta.kind || 'episode',
+      watchedAt: params.meta.watchedAt || new Date().toISOString(),
+      seriesUrl,
+      seriesTitle,
+      positionSec: snapshot.positionSec,
+      durationSec: snapshot.durationSec,
+      completed: snapshot.completed,
+    };
+    updatedHistory = [newItem, ...currentHistory].slice(0, 30);
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
     } catch {
@@ -416,3 +506,90 @@ export function saveAcknowledgedReleaseKey(key: string | null): void {
     // ignore
   }
 }
+
+export type PersistedRouteNode =
+  | { view: 'catalog' }
+  | { view: 'anime'; url: string }
+  | { view: 'episode'; url: string };
+
+export type PersistedCatalogSection = 'releases' | 'calendar' | 'catalog' | 'library';
+
+export interface PersistedRouteSession {
+  routeStack: PersistedRouteNode[];
+  activeSection: PersistedCatalogSection;
+}
+
+const VALID_SECTIONS = new Set<PersistedCatalogSection>([
+  'releases',
+  'calendar',
+  'catalog',
+  'library',
+]);
+
+export function loadActiveRouteSession(): PersistedRouteSession {
+  const fallback: PersistedRouteSession = {
+    routeStack: [{ view: 'catalog' }],
+    activeSection: 'releases',
+  };
+  try {
+    const raw = localStorage.getItem(ROUTE_SESSION_KEY);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<PersistedRouteSession>;
+    const activeSection: PersistedCatalogSection =
+      typeof parsed?.activeSection === 'string' &&
+      VALID_SECTIONS.has(parsed.activeSection as PersistedCatalogSection)
+        ? (parsed.activeSection as PersistedCatalogSection)
+        : 'releases';
+
+    if (!Array.isArray(parsed?.routeStack) || parsed.routeStack.length === 0) {
+      return { routeStack: [{ view: 'catalog' }], activeSection };
+    }
+
+    const sanitizedStack: PersistedRouteNode[] = [];
+    for (const node of parsed.routeStack) {
+      if (!node || typeof node !== 'object') continue;
+      const view = (node as { view?: unknown }).view;
+      if (view === 'catalog') {
+        sanitizedStack.push({ view: 'catalog' });
+      } else if (view === 'anime' || view === 'episode') {
+        const url = typeof (node as { url?: unknown }).url === 'string'
+          ? (node as { url: string }).url.trim()
+          : '';
+        if (url) {
+          sanitizedStack.push(view === 'anime' ? { view: 'anime', url } : { view: 'episode', url });
+        }
+      }
+    }
+
+    if (sanitizedStack.length === 0) {
+      sanitizedStack.push({ view: 'catalog' });
+    } else if (sanitizedStack[0].view !== 'catalog') {
+      sanitizedStack.unshift({ view: 'catalog' });
+    }
+
+    return {
+      routeStack: sanitizedStack.slice(-10),
+      activeSection,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+export function saveActiveRouteSession(session: PersistedRouteSession): void {
+  try {
+    const sanitizedStack: PersistedRouteNode[] = session.routeStack.map((node) =>
+      node.view === 'episode' ? { view: 'episode', url: node.url } : node
+    );
+    localStorage.setItem(
+      ROUTE_SESSION_KEY,
+      JSON.stringify({
+        routeStack: sanitizedStack.slice(-10),
+        activeSection: session.activeSection,
+      })
+    );
+  } catch {
+    // ignore
+  }
+}
+

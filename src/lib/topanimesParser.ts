@@ -1122,8 +1122,13 @@ export function parseEpisodePageHtml(html: string, pageUrl: string): EpisodeDeta
   const epMatch = title.match(/(?:EP|Epis[oó]dio)\s*(\d+)/i);
   const episodeLabel = epMatch ? `Episódio ${epMatch[1]}` : isMovie ? 'Filme Completo' : undefined;
 
-  const poster = upgradeImageUrl($('.poster img').first().attr('src'));
-  const backdrop = upgradeImageUrl($('meta[property="og:image"]').attr('content')) || poster;
+  const posterImg = $('.poster img').first();
+  const rawPoster =
+    posterImg.attr('data-src') ||
+    posterImg.attr('data-lazy-src') ||
+    posterImg.attr('src');
+  const backdrop = upgradeImageUrl($('meta[property="og:image"]').attr('content'));
+  const poster = upgradeImageUrl(rawPoster) || backdrop;
   const synopsis = cleanText($('#info .wp-content p, .wp-content p').first().text());
 
   const genres: string[] = [];

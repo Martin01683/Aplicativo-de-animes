@@ -1618,6 +1618,16 @@ public final class TopAnimesEpisodeResolver {
         }
     }
 
+    public static String normalizeSupportedEpisodeUrl(String rawUrl) {
+        if (rawUrl == null) return "";
+        String trimmed = rawUrl.trim();
+        if (trimmed.isEmpty() || "#".equals(trimmed) || trimmed.startsWith("javascript:")) return "";
+        if (isHinataSoulUrl(trimmed)) {
+            return normalizeHinataSoulUrl(trimmed);
+        }
+        return normalizeTopAnimesUrl(trimmed);
+    }
+
     public static String normalizeTopAnimesUrl(String rawUrl) {
         if (rawUrl == null) return "";
         String trimmed = rawUrl.trim();

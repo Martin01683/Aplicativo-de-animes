@@ -352,7 +352,7 @@ export function CatalogView({
         const dur = entry.durationSec ?? 0;
         const completed =
           Boolean(entry.completed) || (dur > 0 && isEpisodeCompleted(pos, dur, false));
-        return !completed && pos >= 10;
+        return !completed && pos >= 2;
       })
       .slice(0, 4);
   }, [history]);

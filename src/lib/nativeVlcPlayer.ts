@@ -8,6 +8,8 @@ export interface NativeVlcPlayOptions {
   episodeUrl?: string;
   seriesUrl?: string;
   seriesTitle?: string;
+  poster?: string;
+  isMovie?: boolean;
   streams: StreamQuality[];
   subtitles: SubtitleTrack[];
   episodes?: AnimeEpisodeLink[];
@@ -31,9 +33,14 @@ export interface NativeVlcPlayOptions {
 export interface NativeVlcVisitedEpisode {
   url: string;
   title: string;
+  seriesTitle?: string;
+  seriesUrl?: string;
+  poster?: string;
+  isMovie?: boolean;
   positionMs?: number;
   durationMs?: number;
   completed?: boolean;
+  watchedAtMs?: number;
 }
 
 export interface NativeVlcPlayResult {
@@ -41,6 +48,7 @@ export interface NativeVlcPlayResult {
   episodeUrl?: string;
   positionMs: number;
   durationMs: number;
+  completed?: boolean;
   streamIndex: number;
   videoScale?: VideoScaleMode;
   visitedEpisodes?: NativeVlcVisitedEpisode[];
@@ -49,6 +57,7 @@ export interface NativeVlcPlayResult {
 export interface NativeVlcPlayerPlugin {
   play(options: NativeVlcPlayOptions): Promise<NativeVlcPlayResult>;
   setVideoScale(options: { videoScale: VideoScaleMode }): Promise<void>;
+  consumePendingSession(): Promise<{ session: NativeVlcPlayResult | null }>;
 }
 
 const NativeVlcPlayer = registerPlugin<NativeVlcPlayerPlugin>('NativeVlcPlayer');
@@ -132,6 +141,16 @@ export async function setNativeVlcVideoScale(videoScale: VideoScaleMode): Promis
     await NativeVlcPlayer.setVideoScale({ videoScale });
   } catch {
     // ignore if native plugin method is unavailable
+  }
+}
+
+export async function consumeNativeVlcPendingSession(): Promise<NativeVlcPlayResult | null> {
+  if (!isAndroidNativeVlcSupported()) return null;
+  try {
+    const res = await NativeVlcPlayer.consumePendingSession();
+    return res?.session || null;
+  } catch {
+    return null;
   }
 }
 
