@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.13] — 2026-11-22
+
+### Novidades
+- Rebrand to Anisync, add Hinata Soul source, history management, and faster episode loading (`a3527bf`)
+
 ## [v1.0.12] — 2026-11-21
 
 ### Correções
