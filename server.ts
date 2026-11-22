@@ -572,6 +572,54 @@ async function createAppServer(): Promise<void> {
       },
       appType: 'custom',
     });
+
+    if (disableHmr) {
+      app.get('/@vite/client', (_req: Request, res: Response) => {
+        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.send(`const sheetsMap = new Map();
+export function updateStyle(id, content) {
+  let style = sheetsMap.get(id);
+  if (!style) {
+    style = document.createElement('style');
+    style.setAttribute('type', 'text/css');
+    style.setAttribute('data-vite-dev-id', id);
+    style.textContent = content;
+    document.head.appendChild(style);
+    sheetsMap.set(id, style);
+  } else {
+    style.textContent = content;
+  }
+}
+export function removeStyle(id) {
+  const style = sheetsMap.get(id);
+  if (style) {
+    document.head.removeChild(style);
+    sheetsMap.delete(id);
+  }
+}
+export function createHotContext() {
+  return {
+    data: {},
+    accept() {},
+    acceptDeps() {},
+    acceptExports() {},
+    dispose() {},
+    prune() {},
+    invalidate() {},
+    on() {},
+    off() {},
+    send() {},
+  };
+}
+export function injectQuery(url) {
+  return url;
+}
+export class ErrorOverlay extends HTMLElement {}
+`);
+      });
+    }
+
     app.use(vite.middlewares);
 
     app.use(async (req: Request, res: Response, next) => {
