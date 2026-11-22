@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.15] — 2026-11-22
+
+### Melhorias e Manutenção
+- Move test fixtures out of public/ and exclude public/assets/aistudio from Vite builds (`e68c1f4`)
+
 ## [v1.0.14] — 2026-11-22
 
 ### Correções
