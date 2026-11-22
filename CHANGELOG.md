@@ -2,6 +2,14 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.17] — 2026-11-22
+
+### Novidades
+- Hide full UI during double-tap side seek leaving only progress bar and seek delta (`d71a724`)
+
+### Correções
+- Serve zero-WebSocket Vite client shim when DISABLE_HMR is enabled (`2f5b3c8`)
+
 ## [v1.0.16] — 2026-11-22
 
 ### Novidades
