@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.16] — 2026-11-22
+
+### Novidades
+- Add real buffered progress bar to native Android LibVLC and web players (`ac8be16`)
+
 ## [v1.0.15] — 2026-11-22
 
 ### Melhorias e Manutenção
