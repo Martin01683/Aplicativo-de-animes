@@ -2,6 +2,15 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.24] — 2026-11-23
+
+### Novidades
+- Add Sonarr-style collapsible seasons with Expandir tudo / Recolher tudo (`020c042`)
+- Unify all anime seasons on a single page with season tabs and cross-season playback (`2c8da55`)
+
+### Correções
+- Label undated episodes as 'A ser anunciada' and ignore TV network names / TBA placeholders (`2d7896a`)
+
 ## [v1.0.23] — 2026-11-23
 
 ### Novidades
