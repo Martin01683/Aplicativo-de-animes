@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.19] — 2026-11-23
+
+### Novidades
+- Clarify that release dates and countdowns reflect official launch forecasts (`e0ce697`)
+
 ## [v1.0.18] — 2026-11-23
 
 ### Novidades
