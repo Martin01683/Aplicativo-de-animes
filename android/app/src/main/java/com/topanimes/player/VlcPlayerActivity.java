@@ -59,6 +59,7 @@ import org.videolan.libvlc.Media;
 import org.videolan.libvlc.MediaPlayer;
 import org.videolan.libvlc.interfaces.IMedia;
 import org.videolan.libvlc.interfaces.IVLCVout;
+import org.videolan.libvlc.util.HWDecoderUtil;
 import org.videolan.libvlc.util.VLCVideoLayout;
 
 import java.io.ByteArrayOutputStream;
@@ -112,8 +113,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private static final String PREFS_NAME = "topanimes_player_prefs";
     private static final String PREF_VIDEO_SCALE_IDX = "video_scale_idx";
+    private static final String PREF_AUDIO_OUTPUT_MODE = "audio_output_mode";
     private static final String PREF_EPISODE_PROGRESS_JSON = "episode_progress_json";
     private static final String PREF_PENDING_SESSION_JSON = "pending_session_json";
+    private static final String AUDIO_OUTPUT_AUTO = "auto";
+    private static final String AUDIO_OUTPUT_AUDIOTRACK = "audiotrack";
+    private static final String AUDIO_OUTPUT_OPENSLES = "opensles";
+    private static final String[] AUDIO_OUTPUT_IDS = new String[] {
+        AUDIO_OUTPUT_AUTO,
+        AUDIO_OUTPUT_AUDIOTRACK,
+        AUDIO_OUTPUT_OPENSLES
+    };
+    private static final String[] AUDIO_OUTPUT_LABELS = new String[] {
+        "Automático (Padrão)",
+        "AudioTrack",
+        "OpenSL ES"
+    };
     private static final String STATE_POSITION_MS = "state_position_ms";
     private static final String STATE_DURATION_MS = "state_duration_ms";
     private static final String STATE_STREAM_INDEX = "state_stream_index";
@@ -309,8 +324,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private boolean useProxyForAttempt = false;
     private int currentStreamIdx = 0;
     private long pendingSeekMs = 0L;
-    private long activeSeekTargetMs = 0L;
+    private long activeSeekTargetMs = -1L;
     private long activeSeekIssuedElapsedMs = 0L;
+    private long pendingInteractiveSeekMs = -1L;
+    private long pendingInteractiveSeekPrevPosMs = 0L;
     private long lastKnownPositionMs = 0L;
     private long lastKnownDurationMs = 0L;
     private long lastProgressSavedWallMs = 0L;
@@ -319,6 +336,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private static final int MAX_RETRIES_PER_SERVER = 1;
     private static final long LOAD_WATCHDOG_TIMEOUT_MS = 12000L;
+    private static final long INTERACTIVE_SEEK_COALESCE_MS = 140L;
 
     private volatile long activePlaybackSessionGen = 0L;
     private long sessionCounter = 0L;
@@ -335,6 +353,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private float currentSpeed = 1.0f;
     private int currentScaleIdx = 0;
+    private String audioOutputMode = AUDIO_OUTPUT_AUTO;
     private boolean muted = false;
     private boolean controlsVisible = true;
     private boolean seekOnlyHudActive = false;
@@ -407,6 +426,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private AudioManager audioManager;
     private AudioManager.OnAudioFocusChangeListener audioFocusChangeListener;
     private AudioFocusRequest audioFocusRequest;
+    private boolean hasAudioFocus = false;
+    private boolean audioDucked = false;
     private MediaSession mediaSession;
     private boolean becomingNoisyReceiverRegistered = false;
     private boolean pendingPauseFromNoisyAudio = false;
@@ -439,6 +460,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private final Runnable resetSeekStreakRunnable = () -> {
         seekStreakCount = 0;
         seekStreakSide = 0;
+    };
+    private final Runnable commitInteractiveSeekRunnable = () -> {
+        if (pendingInteractiveSeekMs < 0L || mediaPlayer == null || isFinishing() || isDestroyed()) {
+            pendingInteractiveSeekMs = -1L;
+            return;
+        }
+        long target = pendingInteractiveSeekMs;
+        long prevPos = pendingInteractiveSeekPrevPosMs;
+        pendingInteractiveSeekMs = -1L;
+        commitPlayerSeek(prevPos, target);
     };
     private final Runnable singleTapRunnable = () -> {
         if (gestureMode == GESTURE_NONE && !holdSpeedActive) {
@@ -546,6 +577,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (savedInstanceState != null) {
             restoreFromSavedInstanceState(savedInstanceState);
         }
+        audioOutputMode = loadAudioOutputPreference(this);
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         setupAudioFocus();
         setupMediaSession();
@@ -951,10 +983,88 @@ public class VlcPlayerActivity extends AppCompatActivity {
         });
     }
 
+    private String resolveAudioOutputModule() {
+        if (AUDIO_OUTPUT_OPENSLES.equals(audioOutputMode)) {
+            return "opensles";
+        }
+        if (AUDIO_OUTPUT_AUDIOTRACK.equals(audioOutputMode)) {
+            return "android_audiotrack";
+        }
+        HWDecoderUtil.AudioOutput hwOut = HWDecoderUtil.getAudioOutputFromDevice();
+        if (hwOut == HWDecoderUtil.AudioOutput.OPENSLES) {
+            return "opensles";
+        }
+        return "android_audiotrack";
+    }
+
+    private int computeTargetPlayerVolume() {
+        if (muted || pauseAfterRestoreFrame) return 0;
+        return audioDucked ? 25 : 100;
+    }
+
+    private void applyTargetVolumeIfNeeded() {
+        if (mediaPlayer == null) return;
+        int targetVol = computeTargetPlayerVolume();
+        if (mediaPlayer.getVolume() != targetVol) {
+            mediaPlayer.setVolume(targetVol);
+        }
+    }
+
+    private void syncPlayerPlaybackParametersIfNeeded() {
+        if (mediaPlayer == null) return;
+        float targetRate = holdSpeedActive ? 2.0f : currentSpeed;
+        if (Math.abs(mediaPlayer.getRate() - targetRate) > 0.001f) {
+            mediaPlayer.setRate(targetRate);
+        }
+        applyTargetVolumeIfNeeded();
+        if (userDisabledSubtitles && mediaPlayer.getSpuTrack() != -1) {
+            mediaPlayer.setSpuTrack(-1);
+        }
+        if (preferredAudioTrackId >= 0 && mediaPlayer.getAudioTrack() != preferredAudioTrackId) {
+            MediaPlayer.TrackDescription[] audioTracks = mediaPlayer.getAudioTracks();
+            if (audioTracks != null) {
+                for (MediaPlayer.TrackDescription t : audioTracks) {
+                    if (t.id == preferredAudioTrackId) {
+                        mediaPlayer.setAudioTrack(preferredAudioTrackId);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private void clearPendingInteractiveSeek() {
+        uiHandler.removeCallbacks(commitInteractiveSeekRunnable);
+        pendingInteractiveSeekMs = -1L;
+    }
+
+    private void flushPendingInteractiveSeekIfAny() {
+        if (pendingInteractiveSeekMs < 0L) return;
+        uiHandler.removeCallbacks(commitInteractiveSeekRunnable);
+        long target = pendingInteractiveSeekMs;
+        long prevPos = pendingInteractiveSeekPrevPosMs;
+        pendingInteractiveSeekMs = -1L;
+        if (mediaPlayer != null && !isFinishing() && !isDestroyed()) {
+            commitPlayerSeek(prevPos, target);
+        }
+    }
+
+    private void commitPlayerSeek(long prevPos, long target) {
+        if (mediaPlayer == null) return;
+        activeSeekTargetMs = target;
+        activeSeekIssuedElapsedMs = SystemClock.elapsedRealtime();
+        lastKnownPositionMs = target;
+        mediaPlayer.setTime(target, true);
+        onSeekCommitted(prevPos, target);
+    }
+
     private void initLibVlc() {
+        String resolvedAout = resolveAudioOutputModule();
         ArrayList<String> options = new ArrayList<>();
-        options.add("--no-drop-late-frames");
-        options.add("--no-skip-frames");
+        // Allow LibVLC to drop/skip late video frames on seek & pause/resume so A/V sync
+        // recovers smoothly instead of stalling/flushing the audio pipeline for several seconds.
+        options.add("--aout=" + resolvedAout);
+        options.add("--audio-time-stretch");
         options.add("--network-caching=1500");
         options.add("--prefetch-buffer-size=32768");
         options.add("--http-reconnect");
@@ -962,6 +1072,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         libVlc.setUserAgent("TopAnimes", DEFAULT_UA);
 
         mediaPlayer = new MediaPlayer(libVlc);
+        mediaPlayer.setAudioOutput(resolvedAout);
         mediaPlayer.getVLCVout().addCallback(voutCallback);
 
         mediaPlayer.setEventListener(event -> {
@@ -1057,24 +1168,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             hideLoading();
                         }
                         applyPendingSeekIfReady();
-                        if (mediaPlayer != null) {
-                            mediaPlayer.setRate(holdSpeedActive ? 2.0f : currentSpeed);
-                            mediaPlayer.setVolume((muted || pauseAfterRestoreFrame) ? 0 : 100);
-                            if (userDisabledSubtitles) {
-                                mediaPlayer.setSpuTrack(-1);
-                            }
-                            if (preferredAudioTrackId >= 0) {
-                                MediaPlayer.TrackDescription[] audioTracks = mediaPlayer.getAudioTracks();
-                                if (audioTracks != null) {
-                                    for (MediaPlayer.TrackDescription t : audioTracks) {
-                                        if (t.id == preferredAudioTrackId) {
-                                            mediaPlayer.setAudioTrack(preferredAudioTrackId);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        syncPlayerPlaybackParametersIfNeeded();
                         if (!subtitlesAttached) {
                             subtitlesAttached = true;
                             downloadAndAttachSubtitles(eventSession);
@@ -1132,10 +1226,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
                                 return;
                             }
                         }
-                        if (activeSeekTargetMs > 3000L) {
+                        if (pendingInteractiveSeekMs >= 0L) {
+                            return;
+                        }
+                        if (activeSeekTargetMs >= 0L) {
                             long seekElapsed = SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs;
-                            if (timeMs >= Math.max(0L, activeSeekTargetMs - 3000L) || seekElapsed > 2500L) {
-                                activeSeekTargetMs = 0L;
+                            if (Math.abs(timeMs - activeSeekTargetMs) <= 8000L || seekElapsed > 2500L) {
+                                activeSeekTargetMs = -1L;
                             } else {
                                 return;
                             }
@@ -1294,7 +1391,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             if (mediaPlayer.isPlaying()) {
                 mediaPlayer.pause();
             }
-            mediaPlayer.setVolume(muted ? 0 : 100);
+            applyTargetVolumeIfNeeded();
         }
         hideLoading();
         updatePlayPauseIcons(false);
@@ -1311,7 +1408,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         restoreFrameTargetMs = 0L;
         pausedMidRestore = false;
         if (mediaPlayer != null) {
-            mediaPlayer.setVolume(muted ? 0 : 100);
+            applyTargetVolumeIfNeeded();
             if (resumePlayback) {
                 pendingPauseFromNoisyAudio = false;
                 requestAudioFocus();
@@ -1327,8 +1424,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private long captureCurrentPositionMs() {
         long pos = lastKnownPositionMs;
-        boolean waitingForSeekCompletion = activeSeekTargetMs > 3000L
-            && (SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs) <= 2500L;
+        boolean waitingForSeekCompletion =
+            pendingInteractiveSeekMs >= 0L
+                || (activeSeekTargetMs >= 0L
+                    && (SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs) <= 2500L);
         if (mediaPlayer != null
             && hasPlaybackStartedForStream
             && pendingSeekMs <= 0L
@@ -1448,6 +1547,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+        clearPendingInteractiveSeek();
+        activeSeekTargetMs = -1L;
         pauseAfterRestoreFrame = pauseAfterFirstFrame;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -1672,6 +1773,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         activePlaybackSessionGen = -1L;
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+        clearPendingInteractiveSeek();
+        activeSeekTargetMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -2016,6 +2119,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             @Override
             public void onStartTrackingTouch(SeekBar bar) {
                 userScrubbing = true;
+                clearPendingInteractiveSeek();
                 uiHandler.removeCallbacks(hideControlsRunnable);
                 if (seekOnlyHudActive) {
                     setControlsVisible(true);
@@ -2036,9 +2140,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         firstTimeChangedMs = target;
                     }
                     long prevPos = lastKnownPositionMs;
-                    mediaPlayer.setTime(target);
-                    lastKnownPositionMs = target;
-                    onSeekCommitted(prevPos, target);
+                    clearPendingInteractiveSeek();
+                    commitPlayerSeek(prevPos, target);
                 }
                 scheduleControlsAutoHide();
             }
@@ -2117,10 +2220,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     }
                     if (targetVol == 0) {
                         muted = true;
-                        if (mediaPlayer != null) mediaPlayer.setVolume(0);
+                        applyTargetVolumeIfNeeded();
                     } else if (muted) {
                         muted = false;
-                        if (mediaPlayer != null) mediaPlayer.setVolume(pauseAfterRestoreFrame ? 0 : 100);
+                        applyTargetVolumeIfNeeded();
                     }
                     if (btnMute != null) {
                         btnMute.setImageResource(
@@ -2243,6 +2346,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return;
         }
         if (mediaPlayer.isPlaying()) {
+            flushPendingInteractiveSeekIfAny();
             pendingPauseFromNoisyAudio = false;
             userInitiatedPause = true;
             mediaPlayer.pause();
@@ -2374,6 +2478,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return;
         }
         if (mediaPlayer.isPlaying()) {
+            flushPendingInteractiveSeekIfAny();
             pendingPauseFromNoisyAudio = false;
             userInitiatedPause = true;
             mediaPlayer.pause();
@@ -2414,9 +2519,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, Math.max(1, max / 5), 0);
             }
         }
-        if (mediaPlayer != null) {
-            mediaPlayer.setVolume((muted || pauseAfterRestoreFrame) ? 0 : 100);
-        }
+        applyTargetVolumeIfNeeded();
         btnMute.setImageResource(muted ? R.drawable.ic_player_volume_off : R.drawable.ic_player_volume_on);
         scheduleControlsAutoHide();
     }
@@ -2435,8 +2538,19 @@ public class VlcPlayerActivity extends AppCompatActivity {
             cancelPendingPauseAfterRestore(false);
         }
         long total = Math.max(lastKnownDurationMs, mediaPlayer.getLength());
-        long rawCurrent = mediaPlayer.getTime();
-        long current = rawCurrent >= 0L ? rawCurrent : Math.max(0L, lastKnownPositionMs);
+        boolean hasRecentSeekAnchor =
+            pendingInteractiveSeekMs >= 0L
+                || (activeSeekTargetMs >= 0L
+                    && (SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs) <= 2500L);
+        long current;
+        if (pendingInteractiveSeekMs >= 0L) {
+            current = pendingInteractiveSeekMs;
+        } else if (hasRecentSeekAnchor) {
+            current = Math.max(0L, lastKnownPositionMs);
+        } else {
+            long rawCurrent = mediaPlayer.getTime();
+            current = rawCurrent >= 0L ? rawCurrent : Math.max(0L, lastKnownPositionMs);
+        }
         long target = current + deltaMs;
         if (target < 0L) target = 0L;
         if (total > 0L && target > total) target = total;
@@ -2444,12 +2558,25 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (!hasPlaybackStartedForStream) {
             firstTimeChangedMs = target;
         }
-        long prevPos = lastKnownPositionMs;
-        mediaPlayer.setTime(target);
-        lastKnownPositionMs = target;
-        timeCurrentView.setText(formatMs(target));
-        seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
-        onSeekCommitted(prevPos, target);
+        if (seekOnlyHud) {
+            if (pendingInteractiveSeekMs < 0L) {
+                pendingInteractiveSeekPrevPosMs = lastKnownPositionMs;
+            }
+            pendingInteractiveSeekMs = target;
+            lastKnownPositionMs = target;
+            timeCurrentView.setText(formatMs(target));
+            seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
+            uiHandler.removeCallbacks(commitInteractiveSeekRunnable);
+            uiHandler.postDelayed(commitInteractiveSeekRunnable, INTERACTIVE_SEEK_COALESCE_MS);
+        } else {
+            long prevPos = pendingInteractiveSeekMs >= 0L
+                ? pendingInteractiveSeekPrevPosMs
+                : lastKnownPositionMs;
+            clearPendingInteractiveSeek();
+            timeCurrentView.setText(formatMs(target));
+            seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
+            commitPlayerSeek(prevPos, target);
+        }
 
         if (gestureBadge != null) gestureBadge.setVisibility(View.GONE);
         if (seekBadge != null) {
@@ -2733,6 +2860,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+        clearPendingInteractiveSeek();
+        activeSeekTargetMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -3076,7 +3205,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         String name = audioLabels.get(t.id);
                         addSettingsRow(name, active ? "✓" : "", active, v -> {
                             preferredAudioTrackId = t.id;
-                            if (mediaPlayer != null) mediaPlayer.setAudioTrack(t.id);
+                            if (mediaPlayer != null && mediaPlayer.getAudioTrack() != t.id) {
+                                mediaPlayer.setAudioTrack(t.id);
+                            }
                             closeSettingsMenu();
                         });
                     }
@@ -3086,7 +3217,64 @@ public class VlcPlayerActivity extends AppCompatActivity {
             } else {
                 addSettingsRow("Nenhuma faixa de áudio", "", false, v -> {});
             }
+
+            View div = new View(this);
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(1)
+            );
+            dlp.topMargin = dp(6);
+            dlp.bottomMargin = dp(6);
+            div.setLayoutParams(dlp);
+            div.setBackgroundColor(Color.parseColor("#1AFFFFFF"));
+            settingsItems.addView(div);
+
+            TextView sectionHeader = new TextView(this);
+            sectionHeader.setText("SAÍDA DE ÁUDIO");
+            sectionHeader.setTextColor(Color.parseColor("#94A3B8"));
+            sectionHeader.setTextSize(TypedValue.COMPLEX_UNIT_SP, 10);
+            sectionHeader.setTypeface(null, Typeface.BOLD);
+            LinearLayout.LayoutParams shlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            shlp.leftMargin = dp(4);
+            shlp.bottomMargin = dp(6);
+            sectionHeader.setLayoutParams(shlp);
+            settingsItems.addView(sectionHeader);
+
+            for (int i = 0; i < AUDIO_OUTPUT_IDS.length; i++) {
+                final String modeId = AUDIO_OUTPUT_IDS[i];
+                final String modeLabel = AUDIO_OUTPUT_LABELS[i];
+                boolean active = modeId.equals(audioOutputMode);
+                addSettingsRow(modeLabel, active ? "✓" : "", active, v -> {
+                    closeSettingsMenu();
+                    applyAudioOutputMode(modeId, modeLabel);
+                });
+            }
         }
+    }
+
+    private void applyAudioOutputMode(String modeId, String modeLabel) {
+        String normalized = normalizeAudioOutputMode(modeId);
+        if (normalized.equals(audioOutputMode)) return;
+        audioOutputMode = normalized;
+        saveAudioOutputPreference(this, normalized);
+        String resolvedAout = resolveAudioOutputModule();
+        if (mediaPlayer != null) {
+            mediaPlayer.setAudioOutput(resolvedAout);
+            if (!loadingEpisode && !playbackFailed && !streams.isEmpty() && isActivityStarted) {
+                boolean keepPaused = !mediaPlayer.isPlaying() && hasPlaybackStartedForStream && !playbackEnded;
+                long resumePos = captureCurrentPositionMs();
+                pendingSeekMs = Math.max(pendingSeekMs, resumePos);
+                try {
+                    mediaPlayer.stop();
+                } catch (Exception ignored) {
+                }
+                prepareAndPlayCurrentStream(keepPaused);
+            }
+        }
+        Toast.makeText(this, "Saída de áudio: " + modeLabel, Toast.LENGTH_SHORT).show();
     }
 
     private String getActiveSubtitleSummary() {
@@ -3298,6 +3486,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+        clearPendingInteractiveSeek();
+        activeSeekTargetMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -3468,7 +3658,18 @@ public class VlcPlayerActivity extends AppCompatActivity {
         audioFocusChangeListener = focusChange -> {
             if (focusChange == AudioManager.AUDIOFOCUS_LOSS
                 || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                hasAudioFocus = false;
+                audioDucked = false;
                 uiHandler.post(() -> pausePlaybackForAudioRouteOrControl());
+            } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK) {
+                audioDucked = true;
+                uiHandler.post(this::applyTargetVolumeIfNeeded);
+            } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                hasAudioFocus = true;
+                if (audioDucked) {
+                    audioDucked = false;
+                    uiHandler.post(this::applyTargetVolumeIfNeeded);
+                }
             }
         };
         audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
@@ -3517,14 +3718,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         if (!hasPlaybackStartedForStream) {
                             firstTimeChangedMs = target;
                         }
-                        long prevPos = lastKnownPositionMs;
-                        mediaPlayer.setTime(target);
-                        lastKnownPositionMs = target;
+                        long prevPos = pendingInteractiveSeekMs >= 0L
+                            ? pendingInteractiveSeekPrevPosMs
+                            : lastKnownPositionMs;
+                        clearPendingInteractiveSeek();
+                        commitPlayerSeek(prevPos, target);
                         if (!userScrubbing) {
                             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
                             timeCurrentView.setText(formatMs(target));
                         }
-                        onSeekCommitted(prevPos, target);
                         updateMediaSessionPlaybackState(
                             mediaPlayer.isPlaying() ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED
                         );
@@ -3577,7 +3779,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
         if (mediaSession == null) return;
         try {
             long pos = Math.max(0L, lastKnownPositionMs);
-            if (mediaPlayer != null && hasPlaybackStartedForStream && !pauseAfterRestoreFrame) {
+            if (mediaPlayer != null
+                && hasPlaybackStartedForStream
+                && !pauseAfterRestoreFrame
+                && pendingInteractiveSeekMs < 0L) {
                 long cur = mediaPlayer.getTime();
                 if (cur >= 0L) pos = cur;
             }
@@ -3646,8 +3851,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void requestAudioFocus() {
-        if (audioManager == null || audioFocusRequest == null) return;
-        audioManager.requestAudioFocus(audioFocusRequest);
+        if (audioManager == null || audioFocusRequest == null || hasAudioFocus) return;
+        int res = audioManager.requestAudioFocus(audioFocusRequest);
+        hasAudioFocus = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
+        if (hasAudioFocus && audioDucked) {
+            audioDucked = false;
+            applyTargetVolumeIfNeeded();
+        }
     }
 
     private void finishWithAction(String action) {
@@ -3778,6 +3988,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(hideSeekOnlyHudRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+        flushPendingInteractiveSeekIfAny();
 
         if (seekOnlyHudActive) {
             seekOnlyHudActive = false;
@@ -3823,7 +4034,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             mediaPlayer.pause();
         }
         if (wasRestoringPausedFrame && mediaPlayer != null) {
-            mediaPlayer.setVolume(muted ? 0 : 100);
+            applyTargetVolumeIfNeeded();
         }
         updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
         super.onPause();
@@ -3841,6 +4052,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(loadWatchdogRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+        clearPendingInteractiveSeek();
+        activeSeekTargetMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -3909,6 +4122,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
             } catch (Exception ignored) {
             }
         }
+        hasAudioFocus = false;
+        audioDucked = false;
         clearCachedSubtitles();
         super.onDestroy();
     }
@@ -3921,16 +4136,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
             target = Math.max(0L, total - 1500L);
         }
         pendingSeekMs = 0L;
-        activeSeekTargetMs = target;
-        activeSeekIssuedElapsedMs = SystemClock.elapsedRealtime();
         long prevPos = lastKnownPositionMs;
-        lastKnownPositionMs = target;
-        mediaPlayer.setTime(target);
+        commitPlayerSeek(prevPos, target);
         if (!userScrubbing) {
             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
             timeCurrentView.setText(formatMs(target));
         }
-        onSeekCommitted(prevPos, target);
     }
 
     private void updateSeekBarBufferedProgress() {
@@ -4455,6 +4666,31 @@ public class VlcPlayerActivity extends AppCompatActivity {
         ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             .edit()
             .putInt(PREF_VIDEO_SCALE_IDX, idx)
+            .apply();
+    }
+
+    public static String normalizeAudioOutputMode(String rawMode) {
+        if (rawMode != null) {
+            String clean = rawMode.trim().toLowerCase(Locale.ROOT);
+            for (String id : AUDIO_OUTPUT_IDS) {
+                if (id.equals(clean)) return id;
+            }
+        }
+        return AUDIO_OUTPUT_AUTO;
+    }
+
+    public static String loadAudioOutputPreference(Context ctx) {
+        if (ctx == null) return AUDIO_OUTPUT_AUTO;
+        String stored = ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getString(PREF_AUDIO_OUTPUT_MODE, AUDIO_OUTPUT_AUTO);
+        return normalizeAudioOutputMode(stored);
+    }
+
+    public static void saveAudioOutputPreference(Context ctx, String mode) {
+        if (ctx == null) return;
+        ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putString(PREF_AUDIO_OUTPUT_MODE, normalizeAudioOutputMode(mode))
             .apply();
     }
 

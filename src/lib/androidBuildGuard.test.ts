@@ -568,3 +568,74 @@ describe('Android double-tap seek-only HUD guard', () => {
   });
 });
 
+describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
+  it('avoids frame-drop suppression and guards Event.Playing, audio focus, fast seeks, and aout selection in VlcPlayerActivity', () => {
+    const activityJava = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java',
+    );
+
+    assert.doesNotMatch(
+      activityJava,
+      /--no-drop-late-frames/,
+      'LibVLC must not disable drop-late-frames (causes multi-second audio desync on seek and resume)',
+    );
+    assert.doesNotMatch(
+      activityJava,
+      /--no-skip-frames/,
+      'LibVLC must not disable skip-frames (causes multi-second audio desync on seek and resume)',
+    );
+    assert.match(activityJava, /--audio-time-stretch/);
+    assert.match(activityJava, /--aout=/);
+    assert.match(activityJava, /HWDecoderUtil\.getAudioOutputFromDevice\(\)/);
+    assert.match(activityJava, /mediaPlayer\.setAudioOutput\(resolvedAout\)/);
+    assert.match(activityJava, /"opensles"/);
+    assert.match(activityJava, /"android_audiotrack"/);
+    assert.match(activityJava, /private boolean hasAudioFocus = false/);
+    assert.match(activityJava, /AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK/);
+    assert.match(activityJava, /commitInteractiveSeekRunnable/);
+    assert.match(activityJava, /mediaPlayer\.setTime\(target, true\)/);
+    assert.match(activityJava, /syncPlayerPlaybackParametersIfNeeded\(\)/);
+    assert.match(activityJava, /mediaPlayer\.getRate\(\)/);
+    assert.match(activityJava, /mediaPlayer\.getVolume\(\)/);
+    assert.match(activityJava, /mediaPlayer\.getAudioTrack\(\)/);
+  });
+
+  it('places episode synopsis and "Ver todos os episódios" button above "Marcar como visto" and "Favoritar" in EpisodeWorkspace', () => {
+    const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
+
+    const synopsisIdx = workspaceTsx.indexOf('data-episode-synopsis="true"');
+    const allEpisodesBtnIdx = workspaceTsx.indexOf("'Ver todos os episódios'");
+    const watchedBtnIdx = workspaceTsx.indexOf("'Marcar como visto'");
+    const favoriteBtnIdx = workspaceTsx.indexOf("'Favoritar'");
+
+    assert.ok(synopsisIdx > 0, 'EpisodeWorkspace must render data-episode-synopsis');
+    assert.ok(allEpisodesBtnIdx > 0, 'EpisodeWorkspace must render "Ver todos os episódios"');
+    assert.ok(watchedBtnIdx > 0, 'EpisodeWorkspace must render "Marcar como visto"');
+    assert.ok(favoriteBtnIdx > 0, 'EpisodeWorkspace must render "Favoritar"');
+    assert.ok(
+      synopsisIdx < watchedBtnIdx && synopsisIdx < favoriteBtnIdx,
+      'Episode synopsis must appear above "Marcar como visto" and "Favoritar"',
+    );
+    assert.ok(
+      allEpisodesBtnIdx < watchedBtnIdx && allEpisodesBtnIdx < favoriteBtnIdx,
+      '"Ver todos os episódios" button must appear above "Marcar como visto" and "Favoritar"',
+    );
+    assert.match(workspaceTsx, /tvdbSynopsis\?\.episodeImage/);
+    assert.match(workspaceTsx, /matchedSeriesEpisode\?\.thumb/);
+  });
+
+  it('loads localized TheTVDB anime synopsis and shows TheTVDB episode thumbnails across mobile and desktop in AnimeDetailView', () => {
+    const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
+
+    assert.match(detailTsx, /\/api\/anime-synopsis\?/);
+    assert.match(detailTsx, /data-anime-synopsis="true"/);
+    assert.match(detailTsx, /TheTVDB · Traduzido via Google Tradutor/);
+    assert.match(detailTsx, /effectivePoster = tvdbAnimeSynopsis\?\.poster \|\| anime\.poster/);
+    assert.doesNotMatch(
+      detailTsx,
+      /hidden h-12 w-20 shrink-0 rounded-md border border-white\/10 sm:block/,
+      'Episode thumbnails in AnimeDetailView should remain visible on mobile screens too',
+    );
+  });
+});
+
