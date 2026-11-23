@@ -8,6 +8,7 @@ import {
   CloudOff,
   Heart,
   Keyboard,
+  Layers,
   Loader2,
   RefreshCw,
   Server,
@@ -43,6 +44,7 @@ import { formatServerLabel } from '../lib/topanimesParser';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
+  AnimeSynopsisResult,
   CatalogMediaItem,
   EpisodeDetails,
   EpisodeSynopsisResult,
@@ -53,7 +55,6 @@ import type {
 } from '../lib/types';
 import { isSafeExternalHttpUrl } from '../lib/urlSafety';
 import { AnimePlayer } from './AnimePlayer';
-import { MediaPoster } from './MediaPoster';
 
 interface EpisodeWorkspaceProps {
   episode: EpisodeDetails;
@@ -61,6 +62,8 @@ interface EpisodeWorkspaceProps {
   watchedUrls?: Set<string>;
   progressMap?: EpisodeProgressMap;
   initialSeriesEpisodes?: AnimeEpisodeLink[];
+  initialSeriesArtwork?: { poster?: string; backdrop?: string };
+  initialSeriesExternalIds?: ExternalMediaIds;
   loadingEpisode?: boolean;
   loadingExtraServers?: boolean;
   loadingExtraServerNames?: string[];
@@ -103,6 +106,8 @@ export function EpisodeWorkspace({
   watchedUrls,
   progressMap,
   initialSeriesEpisodes,
+  initialSeriesArtwork,
+  initialSeriesExternalIds,
   loadingEpisode = false,
   loadingExtraServers = false,
   loadingExtraServerNames = [],
@@ -146,11 +151,17 @@ export function EpisodeWorkspace({
 
   const seriesCacheRef = useRef<Map<string, AnimeEpisodeLink[]>>(new Map());
   const seriesExternalIdsCacheRef = useRef<Map<string, ExternalMediaIds>>(new Map());
+  const seriesArtworkCacheRef = useRef<Map<string, { poster?: string; backdrop?: string }>>(
+    new Map()
+  );
   const [seriesEpisodes, setSeriesEpisodes] = useState<AnimeEpisodeLink[]>(
     initialSeriesEpisodes || []
   );
   const [seriesExternalIds, setSeriesExternalIds] = useState<ExternalMediaIds | undefined>(
-    episode.externalIds
+    episode.externalIds || initialSeriesExternalIds
+  );
+  const [seriesArtwork, setSeriesArtwork] = useState<{ poster?: string; backdrop?: string }>(
+    initialSeriesArtwork || {}
   );
   const [seriesMediaReadyForUrl, setSeriesMediaReadyForUrl] = useState<string>(
     initialSeriesEpisodes && initialSeriesEpisodes.length > 0 ? episode.seriesUrl || '' : ''
@@ -216,22 +227,32 @@ export function EpisodeWorkspace({
     }
   }, [episode.url, failoverExhaustedMsg, playableOptions]);
 
-  // Fetch and cache the series episode list so in-fullscreen episode selection & TheTVDB IDs are populated
+  // Fetch and cache the series episode list so in-fullscreen episode selection, TheTVDB IDs & artwork are populated
   useEffect(() => {
     if (episode.isMovie || !episode.seriesUrl) {
       setSeriesEpisodes([]);
-      setSeriesExternalIds(episode.externalIds);
+      setSeriesExternalIds(episode.externalIds || initialSeriesExternalIds);
+      setSeriesArtwork(initialSeriesArtwork || {});
       setSeriesMediaReadyForUrl(episode.seriesUrl || '__none__');
       return;
     }
 
     const seriesUrl = episode.seriesUrl;
     const seriesKey = normalizeTopAnimesUrl(seriesUrl) || seriesUrl;
+    if (initialSeriesExternalIds) {
+      seriesExternalIdsCacheRef.current.set(seriesKey, initialSeriesExternalIds);
+    }
+    if (initialSeriesArtwork?.poster || initialSeriesArtwork?.backdrop) {
+      seriesArtworkCacheRef.current.set(seriesKey, initialSeriesArtwork);
+    }
     if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
       seriesCacheRef.current.set(seriesKey, initialSeriesEpisodes);
       setSeriesEpisodes(initialSeriesEpisodes);
       const cachedIds = seriesExternalIdsCacheRef.current.get(seriesKey);
-      setSeriesExternalIds(episode.externalIds || cachedIds);
+      setSeriesExternalIds(episode.externalIds || initialSeriesExternalIds || cachedIds);
+      setSeriesArtwork(
+        initialSeriesArtwork || seriesArtworkCacheRef.current.get(seriesKey) || {}
+      );
       setSeriesMediaReadyForUrl(seriesUrl);
       return;
     }
@@ -239,7 +260,12 @@ export function EpisodeWorkspace({
     const cached = seriesCacheRef.current.get(seriesKey);
     if (cached && cached.length > 0) {
       setSeriesEpisodes(cached);
-      setSeriesExternalIds(episode.externalIds || seriesExternalIdsCacheRef.current.get(seriesKey));
+      setSeriesExternalIds(
+        episode.externalIds || initialSeriesExternalIds || seriesExternalIdsCacheRef.current.get(seriesKey)
+      );
+      setSeriesArtwork(
+        initialSeriesArtwork || seriesArtworkCacheRef.current.get(seriesKey) || {}
+      );
       setSeriesMediaReadyForUrl(seriesUrl);
       return;
     }
@@ -257,6 +283,14 @@ export function EpisodeWorkspace({
           seriesExternalIdsCacheRef.current.set(seriesKey, data.externalIds);
           setSeriesExternalIds((prev) => ({ ...data.externalIds, ...prev }));
         }
+        if (data?.poster || data?.backdrop) {
+          const art = {
+            poster: data.poster || undefined,
+            backdrop: data.backdrop || undefined,
+          };
+          seriesArtworkCacheRef.current.set(seriesKey, art);
+          setSeriesArtwork(art);
+        }
         setSeriesMediaReadyForUrl(seriesUrl);
       })
       .catch(() => {
@@ -268,7 +302,14 @@ export function EpisodeWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [episode.externalIds, episode.isMovie, episode.seriesUrl, initialSeriesEpisodes]);
+  }, [
+    episode.externalIds,
+    episode.isMovie,
+    episode.seriesUrl,
+    initialSeriesArtwork,
+    initialSeriesEpisodes,
+    initialSeriesExternalIds,
+  ]);
 
   const matchedSeriesEpisode = useMemo(() => {
     if (!seriesEpisodes.length) return undefined;
@@ -288,13 +329,8 @@ export function EpisodeWorkspace({
     );
   }, [episode.episodeLabel, episode.episodeNumber, episode.seasonNumber, episode.title, episode.url, seriesEpisodes]);
 
-  // Fetch TheTVDB episode synopsis (PT-BR -> Google Translate -> EN fallback) asynchronously
+  // Fetch TheTVDB episode/movie synopsis & artwork (PT-BR -> Google Translate -> EN fallback) asynchronously
   useEffect(() => {
-    if (episode.isMovie) {
-      setLocalizedSynopsisState({ episodeUrl: episode.url, loading: false, result: null });
-      return;
-    }
-
     const epCacheKey = normalizeTopAnimesUrl(episode.url) || episode.url;
     if (synopsisCacheRef.current.has(epCacheKey)) {
       setLocalizedSynopsisState({
@@ -307,6 +343,66 @@ export function EpisodeWorkspace({
 
     const tvdbId = episode.externalIds?.tvdbId || seriesExternalIds?.tvdbId;
     const tvdbSlug = episode.externalIds?.tvdbSlug || seriesExternalIds?.tvdbSlug;
+
+    if (episode.isMovie) {
+      const movieTitle = episode.seriesTitle || episode.title;
+      if (!tvdbId && !tvdbSlug && !movieTitle) {
+        setLocalizedSynopsisState({ episodeUrl: episode.url, loading: false, result: null });
+        return;
+      }
+      const params = new URLSearchParams();
+      params.set('mediaType', 'movie');
+      if (movieTitle) params.set('title', movieTitle);
+      if (episode.originalTitle) params.set('originalTitle', episode.originalTitle);
+      if (episode.year) params.set('year', episode.year);
+      if (tvdbId && tvdbId > 0) params.set('tvdbId', String(tvdbId));
+      if (tvdbSlug) params.set('tvdbSlug', tvdbSlug);
+
+      let cancelled = false;
+      setLocalizedSynopsisState({ episodeUrl: episode.url, loading: true, result: null });
+
+      apiFetch(`/api/anime-synopsis?${params.toString()}`)
+        .then((res) => (res.ok ? res.json() : null))
+        .then((payload: { result?: AnimeSynopsisResult | null } | null) => {
+          if (cancelled) return;
+          const movieRes = payload?.result ?? null;
+          const mapped: EpisodeSynopsisResult | null = movieRes
+            ? {
+                synopsis: movieRes.synopsis,
+                language: movieRes.language,
+                source: movieRes.source,
+                episodeImage: movieRes.backdrop || movieRes.poster,
+                tvdbSeriesId: movieRes.tvdbId,
+              }
+            : null;
+          synopsisCacheRef.current.set(epCacheKey, mapped);
+          if (movieRes?.poster || movieRes?.backdrop) {
+            setSeriesArtwork((prev) => ({
+              poster: movieRes.poster || prev.poster,
+              backdrop: movieRes.backdrop || prev.backdrop,
+            }));
+          }
+          setLocalizedSynopsisState({
+            episodeUrl: episode.url,
+            loading: false,
+            result: mapped,
+          });
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setLocalizedSynopsisState({
+              episodeUrl: episode.url,
+              loading: false,
+              result: null,
+            });
+          }
+        });
+
+      return () => {
+        cancelled = true;
+      };
+    }
+
     const tvdbEpisodeId = matchedSeriesEpisode?.tvdbEpisodeId;
     const seasonNum = matchedSeriesEpisode?.seasonNumber || episode.seasonNumber || 1;
     const epNum =
@@ -666,8 +762,34 @@ export function EpisodeWorkspace({
   const parentMediaKind: 'anime' | 'series' | 'movie' =
     episode.mediaType || (episode.isMovie ? 'movie' : 'anime');
 
+  const scopedSynopsis =
+    localizedSynopsisState.episodeUrl === episode.url
+      ? localizedSynopsisState
+      : { loading: false, result: null };
+  const tvdbSynopsis = scopedSynopsis.result;
+  const displaySynopsis = tvdbSynopsis?.synopsis || episode.synopsis;
+  const synopsisSourceCaption =
+    tvdbSynopsis?.source === 'thetvdb-pt-br'
+      ? 'TheTVDB · PT-BR'
+      : tvdbSynopsis?.source === 'thetvdb-google-translate'
+        ? 'TheTVDB · Traduzido via Google Tradutor'
+        : tvdbSynopsis?.source === 'thetvdb-en'
+          ? 'TheTVDB · Original (EN)'
+          : null;
+
+  const effectiveEpisodePoster =
+    tvdbSynopsis?.episodeImage ||
+    matchedSeriesEpisode?.thumb ||
+    episode.backdrop ||
+    seriesArtwork.backdrop ||
+    episode.poster ||
+    seriesArtwork.poster ||
+    '';
+  const effectiveSeriesPoster =
+    seriesArtwork.poster || episode.poster || effectiveEpisodePoster;
+
   return (
-    <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
+    <div className="mx-auto max-w-5xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
       {/* Top Breadcrumb & Prev/Next Episode Controls */}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 sm:mb-6">
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400 sm:text-sm">
@@ -772,365 +894,327 @@ export function EpisodeWorkspace({
       </div>
 
       {/* Main Cinema Player + Metadata Layout */}
-      <div className="grid gap-6 lg:grid-cols-[1fr_320px] lg:gap-8">
-        <div className="min-w-0 space-y-5">
-          {showPlayer ? (
-            <AnimePlayer
-              title={episode.title}
-              episodeUrl={episode.url}
-              seriesUrl={episode.seriesUrl}
-              seriesTitle={episode.seriesTitle}
-              isMovie={episode.isMovie}
-              seriesEpisodes={seriesEpisodes}
-              watchedUrls={watchedUrls}
-              playerOptions={playableOptions}
-              selectedServerNume={selectedOption?.nume}
-              streams={hasResolvedStreams ? resolved.streams : []}
-              referer={resolved?.referer || 'https://topanimes.net/'}
-              preferDirect={resolved?.preferDirect}
-              poster={episode.backdrop || episode.poster}
-              subtitles={hasResolvedStreams ? resolved.subtitles : []}
-              hasPrev={Boolean(effectivePrevUrl)}
-              hasNext={Boolean(effectiveNextUrl)}
-              prevUrl={effectivePrevUrl}
-              nextUrl={effectiveNextUrl}
-              upcomingNextEpisode={activeUpcomingNext}
-              loadingEpisode={isTransitioning}
-              hasUntriedFallbackServers={hasUntriedFallbackServers}
-              resumeAfterFailover={resumeAfterFailover}
-              errorMessage={
-                failoverExhaustedMsg ||
-                (!isTransitioning && !hasResolvedStreams
-                  ? resolved?.errorMessage ||
-                    'Selecione outro servidor abaixo ou tente novamente em instantes.'
-                  : '')
+      <div className="min-w-0 space-y-5">
+        {showPlayer ? (
+          <AnimePlayer
+            title={episode.title}
+            episodeUrl={episode.url}
+            seriesUrl={episode.seriesUrl}
+            seriesTitle={episode.seriesTitle}
+            isMovie={episode.isMovie}
+            seriesEpisodes={seriesEpisodes}
+            watchedUrls={watchedUrls}
+            playerOptions={playableOptions}
+            selectedServerNume={selectedOption?.nume}
+            streams={hasResolvedStreams ? resolved.streams : []}
+            referer={resolved?.referer || 'https://topanimes.net/'}
+            preferDirect={resolved?.preferDirect}
+            poster={effectiveEpisodePoster}
+            subtitles={hasResolvedStreams ? resolved.subtitles : []}
+            hasPrev={Boolean(effectivePrevUrl)}
+            hasNext={Boolean(effectiveNextUrl)}
+            prevUrl={effectivePrevUrl}
+            nextUrl={effectiveNextUrl}
+            upcomingNextEpisode={activeUpcomingNext}
+            loadingEpisode={isTransitioning}
+            hasUntriedFallbackServers={hasUntriedFallbackServers}
+            resumeAfterFailover={resumeAfterFailover}
+            errorMessage={
+              failoverExhaustedMsg ||
+              (!isTransitioning && !hasResolvedStreams
+                ? resolved?.errorMessage ||
+                  'Selecione outro servidor abaixo ou tente novamente em instantes.'
+                : '')
+            }
+            skipIntroSeconds={skipIntroSeconds}
+            autoPlayNextEpisode={autoPlayNextEpisode}
+            videoScale={videoScale}
+            onPrevEpisode={() =>
+              effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')
+            }
+            onNextEpisode={() =>
+              effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')
+            }
+            onSelectEpisode={(epUrl) => {
+              if (!isSameEpisodeUrl(epUrl, episode.url)) {
+                onNavigateUrl(epUrl, 'episode');
               }
-              skipIntroSeconds={skipIntroSeconds}
-              autoPlayNextEpisode={autoPlayNextEpisode}
-              videoScale={videoScale}
-              onPrevEpisode={() =>
-                effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')
-              }
-              onNextEpisode={() =>
-                effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')
-              }
-              onSelectEpisode={(epUrl) => {
-                if (!isSameEpisodeUrl(epUrl, episode.url)) {
-                  onNavigateUrl(epUrl, 'episode');
-                }
-              }}
-              onSelectServer={(nume) => {
-                const match = playableOptions.find((o) => o.nume === nume);
-                if (match) handleManualServerSelect(match);
-              }}
-              onChangeVideoScale={onChangeVideoScale}
-              onPlaybackProgress={onPlaybackProgress}
-              onServerPlaybackFailed={handleServerPlaybackFailed}
-              onRetryEpisodePlayback={handleRetryAllServers}
-              onNativeSessionSync={onNativeSessionSync}
-              onToast={onToast}
-            />
-          ) : isTransitioning ? (
-            <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
-              <div className="h-10 w-10 animate-spin rounded-full border-3 border-white/15 border-t-[#f97316]" />
-              <p className="mt-3 text-sm font-medium text-slate-300">
-                Consultando provedores e extraindo vídeo...
-              </p>
-            </div>
-          ) : (
-            <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
-              <Server className="h-9 w-9 text-[#f97316]/80" />
-              <p className="max-w-md text-sm leading-relaxed text-slate-300">
-                {failoverExhaustedMsg ||
-                  resolved?.errorMessage ||
-                  'Nenhum servidor encontrado automaticamente para este título.'}
-              </p>
-            </div>
-          )}
+            }}
+            onSelectServer={(nume) => {
+              const match = playableOptions.find((o) => o.nume === nume);
+              if (match) handleManualServerSelect(match);
+            }}
+            onChangeVideoScale={onChangeVideoScale}
+            onPlaybackProgress={onPlaybackProgress}
+            onServerPlaybackFailed={handleServerPlaybackFailed}
+            onRetryEpisodePlayback={handleRetryAllServers}
+            onNativeSessionSync={onNativeSessionSync}
+            onToast={onToast}
+          />
+        ) : isTransitioning ? (
+          <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
+            <div className="h-10 w-10 animate-spin rounded-full border-3 border-white/15 border-t-[#f97316]" />
+            <p className="mt-3 text-sm font-medium text-slate-300">
+              Consultando provedores e extraindo vídeo...
+            </p>
+          </div>
+        ) : (
+          <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
+            <Server className="h-9 w-9 text-[#f97316]/80" />
+            <p className="max-w-md text-sm leading-relaxed text-slate-300">
+              {failoverExhaustedMsg ||
+                resolved?.errorMessage ||
+                'Nenhum servidor encontrado automaticamente para este título.'}
+            </p>
+          </div>
+        )}
 
-          {/* Title, Favorite & Aggregated Server Switcher Card */}
-          <section className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-white/8 pb-4">
-              <div className="min-w-0">
-                <h1 className="text-lg font-bold text-white sm:text-2xl">
-                  {episode.title}
-                </h1>
-                {episode.genres.length > 0 && (
-                  <p className="mt-1 text-xs text-slate-400">
-                    {episode.genres.join(' · ')}
+        {/* Title, Episode Synopsis, All Episodes Button, Favorite & Aggregated Server Switcher Card */}
+        <section className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
+          <div className="space-y-3.5 border-b border-white/8 pb-4">
+            <div className="min-w-0">
+              <h1 className="text-lg font-bold text-white sm:text-2xl">
+                {episode.title}
+              </h1>
+              {episode.genres.length > 0 && (
+                <p className="mt-1 text-xs text-slate-400">
+                  {episode.genres.join(' · ')}
+                </p>
+              )}
+            </div>
+
+            {/* Episode Synopsis (TheTVDB PT-BR -> Google Translate -> EN fallback) */}
+            {scopedSynopsis.loading && !tvdbSynopsis ? (
+              <div
+                data-episode-synopsis-loading="true"
+                className="space-y-2"
+                aria-label="Carregando sinopse do episódio"
+              >
+                <div className="h-3 w-2/3 animate-pulse rounded bg-white/10" />
+                <div className="h-3 w-full animate-pulse rounded bg-white/8" />
+                <div className="h-3 w-5/6 animate-pulse rounded bg-white/8" />
+              </div>
+            ) : displaySynopsis ? (
+              <div
+                data-episode-synopsis="true"
+                data-synopsis-source={tvdbSynopsis?.source || 'fallback'}
+                className="space-y-1.5"
+              >
+                {tvdbSynopsis?.episodeTitle && (
+                  <p className="text-xs font-semibold text-slate-200 sm:text-sm">
+                    {tvdbSynopsis.episodeTitle}
+                  </p>
+                )}
+                <p className="whitespace-pre-line text-xs leading-relaxed text-slate-300 sm:text-sm">
+                  {displaySynopsis}
+                </p>
+                {synopsisSourceCaption && (
+                  <p className="text-[11px] font-medium text-slate-500">
+                    {synopsisSourceCaption}
                   </p>
                 )}
               </div>
+            ) : null}
 
-              <div className="flex flex-wrap items-center gap-2">
-                {onToggleEpisodeWatched && (() => {
-                  const watched = isEpisodeMarkedWatched(episode.url, progressMap, watchedUrls);
-                  return (
-                    <button
-                      type="button"
-                      onClick={() => onToggleEpisodeWatched(episode, !watched)}
-                      aria-pressed={watched}
-                      className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
-                        watched
-                          ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                          : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
-                      }`}
-                    >
-                      <Check className="h-3.5 w-3.5" />
-                      <span>{watched ? 'Visto' : 'Marcar como visto'}</span>
-                    </button>
-                  );
-                })()}
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    const epNum =
-                      episode.episodeNumber ??
-                      extractEpisodeNumber(episode.episodeLabel || '') ??
-                      extractEpisodeNumber(episode.title) ??
-                      extractEpisodeNumber(episode.url);
-                    onToggleFavorite(
-                      {
-                        id: episode.seriesUrl || episode.url,
-                        title: episode.seriesTitle,
-                        url: episode.seriesUrl || episode.url,
-                        kind: parentMediaKind,
-                        poster: episode.poster || episode.backdrop,
-                        audioType: null,
-                        catalogSource: episode.catalogSource,
-                        externalIds: episode.externalIds,
-                      },
-                      episode.isMovie
-                        ? null
-                        : {
-                            episodeUrl: normalizeTopAnimesUrl(episode.url),
-                            episodeTitle: episode.title,
-                            episodeLabel:
-                              episode.episodeLabel ||
-                              (epNum !== null ? `EP ${epNum}` : 'Episódio atual'),
-                            episodeNumber: epNum,
-                            poster: episode.backdrop || episode.poster,
-                          }
-                    );
-                  }}
-                  aria-pressed={isFavorite}
-                  className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
-                    isFavorite
-                      ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                      : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:text-white'
-                  }`}
-                >
-                  <Heart
-                    className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : ''}`}
-                  />
-                  <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
-                </button>
-              </div>
-            </div>
-
-            {/* Aggregated Sources & Server Selector */}
-            <div className="pt-4">
-              <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-slate-400">
-                <span className="inline-flex items-center gap-2">
-                  <Server className="h-3.5 w-3.5 text-[#f97316]" />
-                  <span>Servidores dos Provedores ({playableOptions.length})</span>
-                </span>
-                {onRefreshSources && (
-                  <button
-                    type="button"
-                    disabled={loadingEpisode}
-                    onClick={onRefreshSources}
-                    className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#0d0f12] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
-                  >
-                    <RefreshCw className={`h-3 w-3 text-[#f97316] ${loadingEpisode ? 'animate-spin' : ''}`} />
-                    <span>Rebuscar</span>
-                  </button>
-                )}
-              </div>
-
-              {/* Per-Source Resolution Reports */}
-              {((episode.sourceReports && episode.sourceReports.length > 0) ||
-                loadingExtraServers) && (
-                <div className="mb-3 flex flex-wrap gap-1.5">
-                  {(episode.sourceReports || [])
-                    .filter((r) => r.status !== 'skipped')
-                    .map((rep) => (
-                      <span
-                        key={rep.sourceId}
-                        title={rep.errorMessage || rep.matchedTitle || rep.sourceName}
-                        className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${
-                          rep.status === 'found'
-                            ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
-                            : rep.status === 'error'
-                              ? 'border-red-500/35 bg-red-500/10 text-red-300'
-                              : 'border-white/10 bg-[#0d0f12] text-slate-400'
-                        }`}
-                      >
-                        <span>{rep.sourceName}</span>
-                        <span className="font-mono text-[10px] opacity-80">
-                          {rep.status === 'found'
-                            ? `${rep.optionsCount} srv`
-                            : rep.status === 'error'
-                              ? 'erro'
-                              : '0'}
-                        </span>
-                      </span>
-                    ))}
-                  {loadingExtraServers && (
-                    <span
-                      role="status"
-                      aria-live="polite"
-                      className="inline-flex items-center gap-1.5 rounded-full border border-[#f97316]/35 bg-[#f97316]/10 px-2.5 py-0.5 text-[11px] font-medium text-[#fb923c]"
-                    >
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                      <span>
-                        {loadingExtraServerNames.length > 0
-                          ? `${loadingExtraServerNames.join(', ')} carregando...`
-                          : 'Carregando mais servidores...'}
-                      </span>
-                    </span>
-                  )}
-                </div>
-              )}
-
-              {playableOptions.length === 0 && !loadingExtraServers ? (
-                <p className="text-sm text-amber-300/90">
-                  Nenhum servidor de vídeo encontrado nos provedores integrados para este título. Toque em Rebuscar para tentar novamente.
-                </p>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {playableOptions.map((opt) => {
-                    const active = selectedOption?.nume === opt.nume;
-                    return (
-                      <button
-                        key={opt.nume}
-                        type="button"
-                        onClick={() => handleManualServerSelect(opt)}
-                        className={`min-h-[40px] rounded-lg border px-3.5 py-2 text-xs font-medium transition-colors sm:text-sm ${
-                          active
-                            ? 'border-[#f97316] bg-[#f97316]/15 text-white'
-                            : 'border-white/10 bg-[#0d0f12] text-slate-300 hover:border-white/25 hover:text-white'
-                        }`}
-                      >
-                        {opt.label}
-                      </button>
-                    );
-                  })}
-                  {loadingExtraServers && (
-                    <span
-                      aria-hidden="true"
-                      className="inline-flex min-h-[40px] items-center gap-2 rounded-lg border border-dashed border-[#f97316]/35 bg-[#0d0f12]/70 px-3.5 py-2 text-xs font-medium text-slate-300 sm:text-sm"
-                    >
-                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
-                      <span>
-                        {loadingExtraServerNames.length > 0
-                          ? `Buscando ${loadingExtraServerNames.join(', ')}...`
-                          : 'Buscando mais servidores...'}
-                      </span>
-                    </span>
-                  )}
-                </div>
-              )}
-            </div>
-
-            <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-white/8 bg-[#0d0f12] px-3.5 py-2.5 text-[11px] leading-relaxed text-slate-400">
-              <Keyboard className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#f97316]" />
-              {desktopShortcutsEnabled ? (
-                <span>
-                  <strong className="text-slate-200">Gestos &amp; Atalhos:</strong> toque duplo nas laterais para ±5s, segure na tela ou Espaço para 2×, botão <strong className="text-slate-200">+{skipIntroSeconds}s</strong> pula abertura, e arraste arquivos <span className="font-mono">.ass/.srt/.vtt</span> para carregar legendas locais.
-                </span>
-              ) : (
-                <span>
-                  <strong className="text-slate-200">Gestos:</strong> deslize esq./dir. para brilho e volume · toque duplo ±5s · segure 2×.
-                </span>
-              )}
-            </div>
-          </section>
-        </div>
-
-        {/* Episode Metadata Sidebar */}
-        <aside className="space-y-4">
-          <div className="overflow-hidden rounded-xl border border-white/10 bg-[#151921]">
-            <MediaPoster
-              src={episode.backdrop || episode.poster}
-              alt={episode.title}
-              aspect="landscape"
-              className="w-full border-b border-white/8"
-            />
-            <div className="p-5">
-              <div className="text-xs font-medium text-[#f97316]">
-                {episode.isMovie ? 'Filme' : episode.mediaType === 'series' ? 'Série' : 'Episódio'}
-              </div>
-              <h2 className="mt-1 text-base font-semibold text-white">
-                {episode.seriesTitle}
-              </h2>
-              {(() => {
-                const scopedSynopsis =
-                  localizedSynopsisState.episodeUrl === episode.url
-                    ? localizedSynopsisState
-                    : { loading: false, result: null };
-                const tvdbSynopsis = scopedSynopsis.result;
-                const displaySynopsis = tvdbSynopsis?.synopsis || episode.synopsis;
-                const sourceCaption =
-                  tvdbSynopsis?.source === 'thetvdb-pt-br'
-                    ? 'TheTVDB · PT-BR'
-                    : tvdbSynopsis?.source === 'thetvdb-google-translate'
-                      ? 'TheTVDB · Traduzido via Google Tradutor'
-                      : tvdbSynopsis?.source === 'thetvdb-en'
-                        ? 'TheTVDB · Original (EN)'
-                        : null;
-
-                if (scopedSynopsis.loading && !tvdbSynopsis) {
-                  return (
-                    <div
-                      data-episode-synopsis-loading="true"
-                      className="mt-3 space-y-2"
-                      aria-label="Carregando sinopse do episódio"
-                    >
-                      <div className="h-3 w-2/3 animate-pulse rounded bg-white/10" />
-                      <div className="h-3 w-full animate-pulse rounded bg-white/8" />
-                      <div className="h-3 w-5/6 animate-pulse rounded bg-white/8" />
-                    </div>
-                  );
-                }
-
-                if (!displaySynopsis) return null;
-
-                return (
-                  <div
-                    data-episode-synopsis="true"
-                    data-synopsis-source={tvdbSynopsis?.source || 'fallback'}
-                    className="mt-3 space-y-2"
-                  >
-                    {tvdbSynopsis?.episodeTitle && (
-                      <p className="text-xs font-medium text-slate-200">
-                        {tvdbSynopsis.episodeTitle}
-                      </p>
-                    )}
-                    <p className="whitespace-pre-line text-xs leading-relaxed text-slate-300">
-                      {displaySynopsis}
-                    </p>
-                    {sourceCaption && (
-                      <p className="text-[10px] font-medium text-slate-500">
-                        {sourceCaption}
-                      </p>
-                    )}
-                  </div>
-                );
-              })()}
-              {episode.seriesUrl && (
+            {/* Ver todos os episódios button — positioned directly above Marcar como visto & Favoritar */}
+            {episode.seriesUrl && (
+              <div>
                 <button
                   type="button"
                   onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind)}
-                  className="mt-4 w-full rounded-lg border border-white/12 bg-[#0d0f12] px-3 py-2.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+                  className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-white/12 bg-[#0d0f12] px-3.5 py-2.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white sm:w-auto"
                 >
-                  {episode.isMovie ? 'Ver detalhes do filme' : 'Ver todos os episódios'}
+                  <Layers className="h-3.5 w-3.5 text-[#f97316]" />
+                  <span>{episode.isMovie ? 'Ver detalhes do filme' : 'Ver todos os episódios'}</span>
+                </button>
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center gap-2">
+              {onToggleEpisodeWatched && (() => {
+                const watched = isEpisodeMarkedWatched(episode.url, progressMap, watchedUrls);
+                return (
+                  <button
+                    type="button"
+                    onClick={() => onToggleEpisodeWatched(episode, !watched)}
+                    aria-pressed={watched}
+                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                      watched
+                        ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                        : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
+                    }`}
+                  >
+                    <Check className="h-3.5 w-3.5" />
+                    <span>{watched ? 'Visto' : 'Marcar como visto'}</span>
+                  </button>
+                );
+              })()}
+
+              <button
+                type="button"
+                onClick={() => {
+                  const epNum =
+                    episode.episodeNumber ??
+                    extractEpisodeNumber(episode.episodeLabel || '') ??
+                    extractEpisodeNumber(episode.title) ??
+                    extractEpisodeNumber(episode.url);
+                  onToggleFavorite(
+                    {
+                      id: episode.seriesUrl || episode.url,
+                      title: episode.seriesTitle,
+                      url: episode.seriesUrl || episode.url,
+                      kind: parentMediaKind,
+                      poster: effectiveSeriesPoster,
+                      audioType: null,
+                      catalogSource: episode.catalogSource,
+                      externalIds: episode.externalIds,
+                    },
+                    episode.isMovie
+                      ? null
+                      : {
+                          episodeUrl: normalizeTopAnimesUrl(episode.url),
+                          episodeTitle: episode.title,
+                          episodeLabel:
+                            episode.episodeLabel ||
+                            (epNum !== null ? `EP ${epNum}` : 'Episódio atual'),
+                          episodeNumber: epNum,
+                          poster: effectiveEpisodePoster,
+                        }
+                  );
+                }}
+                aria-pressed={isFavorite}
+                className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                  isFavorite
+                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
+                    : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:text-white'
+                }`}
+              >
+                <Heart
+                  className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : ''}`}
+                />
+                <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Aggregated Sources & Server Selector */}
+          <div className="pt-4">
+            <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-slate-400">
+              <span className="inline-flex items-center gap-2">
+                <Server className="h-3.5 w-3.5 text-[#f97316]" />
+                <span>Servidores dos Provedores ({playableOptions.length})</span>
+              </span>
+              {onRefreshSources && (
+                <button
+                  type="button"
+                  disabled={loadingEpisode}
+                  onClick={onRefreshSources}
+                  className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#0d0f12] px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-3 w-3 text-[#f97316] ${loadingEpisode ? 'animate-spin' : ''}`} />
+                  <span>Rebuscar</span>
                 </button>
               )}
             </div>
+
+            {/* Per-Source Resolution Reports */}
+            {((episode.sourceReports && episode.sourceReports.length > 0) ||
+              loadingExtraServers) && (
+              <div className="mb-3 flex flex-wrap gap-1.5">
+                {(episode.sourceReports || [])
+                  .filter((r) => r.status !== 'skipped')
+                  .map((rep) => (
+                    <span
+                      key={rep.sourceId}
+                      title={rep.errorMessage || rep.matchedTitle || rep.sourceName}
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${
+                        rep.status === 'found'
+                          ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
+                          : rep.status === 'error'
+                            ? 'border-red-500/35 bg-red-500/10 text-red-300'
+                            : 'border-white/10 bg-[#0d0f12] text-slate-400'
+                      }`}
+                    >
+                      <span>{rep.sourceName}</span>
+                      <span className="font-mono text-[10px] opacity-80">
+                        {rep.status === 'found'
+                          ? `${rep.optionsCount} srv`
+                          : rep.status === 'error'
+                            ? 'erro'
+                            : '0'}
+                      </span>
+                    </span>
+                  ))}
+                {loadingExtraServers && (
+                  <span
+                    role="status"
+                    aria-live="polite"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-[#f97316]/35 bg-[#f97316]/10 px-2.5 py-0.5 text-[11px] font-medium text-[#fb923c]"
+                  >
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    <span>
+                      {loadingExtraServerNames.length > 0
+                        ? `${loadingExtraServerNames.join(', ')} carregando...`
+                        : 'Carregando mais servidores...'}
+                    </span>
+                  </span>
+                )}
+              </div>
+            )}
+
+            {playableOptions.length === 0 && !loadingExtraServers ? (
+              <p className="text-sm text-amber-300/90">
+                Nenhum servidor de vídeo encontrado nos provedores integrados para este título. Toque em Rebuscar para tentar novamente.
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {playableOptions.map((opt) => {
+                  const active = selectedOption?.nume === opt.nume;
+                  return (
+                    <button
+                      key={opt.nume}
+                      type="button"
+                      onClick={() => handleManualServerSelect(opt)}
+                      className={`min-h-[40px] rounded-lg border px-3.5 py-2 text-xs font-medium transition-colors sm:text-sm ${
+                        active
+                          ? 'border-[#f97316] bg-[#f97316]/15 text-white'
+                          : 'border-white/10 bg-[#0d0f12] text-slate-300 hover:border-white/25 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+                {loadingExtraServers && (
+                  <span
+                    aria-hidden="true"
+                    className="inline-flex min-h-[40px] items-center gap-2 rounded-lg border border-dashed border-[#f97316]/35 bg-[#0d0f12]/70 px-3.5 py-2 text-xs font-medium text-slate-300 sm:text-sm"
+                  >
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                    <span>
+                      {loadingExtraServerNames.length > 0
+                        ? `Buscando ${loadingExtraServerNames.join(', ')}...`
+                        : 'Buscando mais servidores...'}
+                    </span>
+                  </span>
+                )}
+              </div>
+            )}
           </div>
-        </aside>
+
+          <div className="mt-4 flex items-start gap-2.5 rounded-lg border border-white/8 bg-[#0d0f12] px-3.5 py-2.5 text-[11px] leading-relaxed text-slate-400">
+            <Keyboard className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#f97316]" />
+            {desktopShortcutsEnabled ? (
+              <span>
+                <strong className="text-slate-200">Gestos &amp; Atalhos:</strong> toque duplo nas laterais para ±5s, segure na tela ou Espaço para 2×, botão <strong className="text-slate-200">+{skipIntroSeconds}s</strong> pula abertura, e arraste arquivos <span className="font-mono">.ass/.srt/.vtt</span> para carregar legendas locais.
+              </span>
+            ) : (
+              <span>
+                <strong className="text-slate-200">Gestos:</strong> deslize esq./dir. para brilho e volume · toque duplo ±5s · segure 2×.
+              </span>
+            )}
+          </div>
+        </section>
       </div>
     </div>
   );

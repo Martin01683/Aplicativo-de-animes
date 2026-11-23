@@ -251,6 +251,8 @@ export async function getAggregatedMediaDetails(
         poster: tvdbMatch.poster,
         backdrop: tvdbMatch.backdrop,
         synopsis: tvdbMatch.synopsis,
+        synopsisSource: tvdbMatch.synopsisSource,
+        synopsisLanguage: tvdbMatch.synopsisLanguage,
         year: tvdbMatch.year,
         firstAirDate: tvdbMatch.firstAirDate,
         status: tvdbMatch.status,

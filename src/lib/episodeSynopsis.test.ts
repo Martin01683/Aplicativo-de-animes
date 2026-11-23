@@ -4,10 +4,13 @@ import type { HttpFetcher } from './httpTypes.ts';
 import {
   parseTvdbAllSeasonsHtml,
   parseTvdbEpisodePageHtml,
+  parseTvdbMediaPageTranslations,
 } from './catalog/providers/thetvdbProvider.ts';
 import {
+  clearAnimeSynopsisCache,
   clearEpisodeSynopsisCache,
   parseGoogleTranslateResponse,
+  resolveLocalizedAnimeSynopsis,
   resolveLocalizedEpisodeSynopsis,
   splitTextForTranslation,
 } from './episodeSynopsis.ts';
@@ -280,4 +283,177 @@ test('resolveLocalizedEpisodeSynopsis resolves episode from tvdbSlug + season/ep
   assert.equal(result?.episodeTitle, 'Segundo Desafio');
   assert.equal(result?.synopsis, 'O protagonista enfrenta o segundo desafio no templo antigo.');
   assert.equal(result?.tvdbEpisodeId, 888002);
+});
+
+test('parseTvdbEpisodePageHtml extracts TheTVDB episode image and normalizes relative /banners paths while ignoring placeholders', () => {
+  const html = `
+    <html>
+      <head>
+        <meta property="og:image" content="https://www.thetvdb.com/images/missing/episode.jpg" />
+      </head>
+      <body>
+        <img src="/images/v2/logo.png" />
+        <img data-src="/banners/v4/episode/9350138/screencap/6516d0c091a5d.jpg" />
+        <div class="change_translation_text" data-language="pt" data-title="O Fim da Jornada">
+          <p>Sinopse oficial em PT-BR.</p>
+        </div>
+      </body>
+    </html>
+  `;
+  const parsed = parseTvdbEpisodePageHtml(html);
+  assert.equal(
+    parsed.episodeImage,
+    'https://artworks.thetvdb.com/banners/v4/episode/9350138/screencap/6516d0c091a5d.jpg'
+  );
+  assert.equal(parsed.ptBrOverview, 'Sinopse oficial em PT-BR.');
+});
+
+test('parseTvdbMediaPageTranslations extracts PT-BR/EN synopses and official TheTVDB poster/backdrop', () => {
+  const html = `
+    <html>
+      <head>
+        <meta property="og:image" content="https://artworks.thetvdb.com/banners/v4/series/424536/posters/poster.jpg" />
+      </head>
+      <body>
+        <img class="img-responsive" src="/banners/v4/series/424536/posters/poster.jpg" />
+        <div style="background-image:url('https://artworks.thetvdb.com/banners/v4/series/424536/backgrounds/bg.jpg')"></div>
+        <div class="change_translation_text" data-language="por">
+          <p>Português europeu ignorado.</p>
+        </div>
+        <div class="change_translation_text" data-language="eng">
+          <p>An elf mage sets out on a new journey.</p>
+        </div>
+      </body>
+    </html>
+  `;
+  const parsed = parseTvdbMediaPageTranslations(html);
+  assert.equal(parsed.ptBrOverview, undefined);
+  assert.equal(parsed.engOverview, 'An elf mage sets out on a new journey.');
+  assert.equal(
+    parsed.poster,
+    'https://artworks.thetvdb.com/banners/v4/series/424536/posters/poster.jpg'
+  );
+  assert.equal(
+    parsed.backdrop,
+    'https://artworks.thetvdb.com/banners/v4/series/424536/backgrounds/bg.jpg'
+  );
+});
+
+test('resolveLocalizedAnimeSynopsis prefers native PT-BR, translates EN via Google Translate, and falls back to EN', async () => {
+  clearAnimeSynopsisCache();
+  let translateCalls = 0;
+
+  const mockFetch: HttpFetcher = async (url) => {
+    if (url.includes('/series/native-pt-anime')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: `
+          <img class="img-responsive" src="https://artworks.thetvdb.com/banners/v4/series/1001/posters/p1.jpg" />
+          <div class="change_translation_text" data-language="pt">
+            <p>Sinopse nativa do anime em português do Brasil.</p>
+          </div>
+          <div class="change_translation_text" data-language="eng">
+            <p>English anime synopsis.</p>
+          </div>
+        `,
+      };
+    }
+    if (url.includes('/series/english-only-anime')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: `
+          <img class="img-responsive" src="https://artworks.thetvdb.com/banners/v4/series/1002/posters/p2.jpg" />
+          <div style="background:url('https://artworks.thetvdb.com/banners/v4/series/1002/backgrounds/b2.jpg')"></div>
+          <div class="change_translation_text" data-language="eng">
+            <p>A young swordsman travels across a fractured kingdom.</p>
+          </div>
+        `,
+      };
+    }
+    if (url.includes('/movies/english-movie')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: `
+          <img class="img-responsive" src="https://artworks.thetvdb.com/banners/v4/movie/2001/posters/pm.jpg" />
+          <div class="change_translation_text" data-language="eng">
+            <p>A standalone anime movie adventure.</p>
+          </div>
+        `,
+      };
+    }
+    if (url.includes('translate.googleapis.com')) {
+      translateCalls++;
+      if (url.includes('standalone')) {
+        return { ok: false, status: 503, finalUrl: url, body: '' };
+      }
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: JSON.stringify([
+          [
+            [
+              'Um jovem espadachim viaja por um reino fragmentado.',
+              'A young swordsman travels across a fractured kingdom.',
+            ],
+          ],
+          null,
+          'en',
+        ]),
+      };
+    }
+    return { ok: false, status: 404, finalUrl: url, body: '' };
+  };
+
+  const nativePt = await resolveLocalizedAnimeSynopsis(mockFetch, {
+    tvdbId: 1001,
+    tvdbSlug: 'native-pt-anime',
+    useCache: false,
+  });
+  assert.equal(translateCalls, 0);
+  assert.equal(nativePt?.source, 'thetvdb-pt-br');
+  assert.equal(nativePt?.language, 'pt-BR');
+  assert.equal(nativePt?.synopsis, 'Sinopse nativa do anime em português do Brasil.');
+  assert.equal(
+    nativePt?.poster,
+    'https://artworks.thetvdb.com/banners/v4/series/1001/posters/p1.jpg'
+  );
+
+  const translated = await resolveLocalizedAnimeSynopsis(mockFetch, {
+    tvdbId: 1002,
+    tvdbSlug: 'english-only-anime',
+    useCache: false,
+  });
+  assert.equal(translateCalls, 1);
+  assert.equal(translated?.source, 'thetvdb-google-translate');
+  assert.equal(translated?.language, 'pt-BR');
+  assert.equal(translated?.synopsis, 'Um jovem espadachim viaja por um reino fragmentado.');
+  assert.equal(
+    translated?.poster,
+    'https://artworks.thetvdb.com/banners/v4/series/1002/posters/p2.jpg'
+  );
+  assert.equal(
+    translated?.backdrop,
+    'https://artworks.thetvdb.com/banners/v4/series/1002/backgrounds/b2.jpg'
+  );
+
+  const movieFallback = await resolveLocalizedAnimeSynopsis(mockFetch, {
+    tvdbId: 2001,
+    tvdbSlug: 'english-movie',
+    mediaType: 'movie',
+    useCache: false,
+  });
+  assert.equal(movieFallback?.source, 'thetvdb-en');
+  assert.equal(movieFallback?.language, 'en');
+  assert.equal(movieFallback?.synopsis, 'A standalone anime movie adventure.');
+  assert.equal(
+    movieFallback?.poster,
+    'https://artworks.thetvdb.com/banners/v4/movie/2001/posters/pm.jpg'
+  );
 });

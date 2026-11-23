@@ -14,7 +14,8 @@ export function MediaPoster({
   aspect = 'portrait',
   className = '',
 }: MediaPosterProps) {
-  const [failed, setFailed] = useState(false);
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const failed = Boolean(src && failedSrc === src);
 
   const ratioClass = aspect === 'landscape' ? 'aspect-video' : 'aspect-[2/3]';
 
@@ -28,7 +29,7 @@ export function MediaPoster({
           alt={alt}
           loading="lazy"
           referrerPolicy="no-referrer"
-          onError={() => setFailed(true)}
+          onError={() => setFailedSrc(src)}
           className="h-full w-full object-cover transition-transform duration-300 group-hover:scale-[1.03]"
         />
       ) : (

@@ -356,5 +356,58 @@ test('formatUpcomingEpisodeNotice builds clear official forecast messages for pl
   assert.match(tbaMsg, /data oficial não confirmada/);
 });
 
+test('mergeServerAndCatalogEpisodes prefers TheTVDB episode thumbnails over server thumbnails and falls back cleanly', () => {
+  const merged = mergeServerAndCatalogEpisodes({
+    serverTitle: 'Frieren',
+    serverUrl: 'https://topanimes.net/animes/frieren/',
+    serverEpisodes: [
+      {
+        numberLabel: '1 - 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        title: 'Episódio 1',
+        url: 'https://topanimes.net/episodio/frieren-ep-1/',
+        thumb: 'https://topanimes.net/wp-content/uploads/server-ep1.jpg',
+      },
+      {
+        numberLabel: '1 - 2',
+        episodeNumber: 2,
+        seasonNumber: 1,
+        title: 'Episódio 2',
+        url: 'https://topanimes.net/episodio/frieren-ep-2/',
+        thumb: 'https://topanimes.net/wp-content/uploads/server-ep2.jpg',
+      },
+    ],
+    catalogEpisodes: [
+      {
+        numberLabel: 'EP 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 1 — O Fim da Jornada',
+        url: 'anisync://episode/anime/thetvdb/424536/s1/e1',
+        thumb: 'https://artworks.thetvdb.com/banners/v4/episode/1/screencap/tvdb-ep1.jpg',
+      },
+      {
+        numberLabel: 'EP 2',
+        episodeNumber: 2,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 2 — Não Precisava Ser Magia',
+        url: 'anisync://episode/anime/thetvdb/424536/s1/e2',
+      },
+    ],
+    serverMatched: true,
+    tvdbId: 424536,
+  });
+
+  assert.equal(merged.length, 2);
+  assert.equal(
+    merged[0].thumb,
+    'https://artworks.thetvdb.com/banners/v4/episode/1/screencap/tvdb-ep1.jpg'
+  );
+  assert.equal(merged[1].thumb, 'https://topanimes.net/wp-content/uploads/server-ep2.jpg');
+});
+
 
 

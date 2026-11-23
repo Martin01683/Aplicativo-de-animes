@@ -27,7 +27,10 @@ import {
   normalizeTopAnimesUrl,
   pickLatestAnimeEpisode,
 } from './favoriteAlerts.ts';
-import { resolveLocalizedEpisodeSynopsis } from './episodeSynopsis.ts';
+import {
+  resolveLocalizedAnimeSynopsis,
+  resolveLocalizedEpisodeSynopsis,
+} from './episodeSynopsis.ts';
 import {
   extractHinataSoulSeasonNumber,
   parseHinataSoulEpisodePageHtml,
@@ -710,6 +713,45 @@ export async function dispatchAnisyncApiRequest(
           Number.isFinite(tvdbEpisodeIdRaw) && tvdbEpisodeIdRaw > 0
             ? tvdbEpisodeIdRaw
             : undefined,
+        fallbackEnglishOverview,
+        credentials: catalogPrefs?.credentials,
+        useCache,
+      });
+
+      return { status: 200, body: { result } };
+    } catch {
+      return { status: 200, body: { result: null } };
+    }
+  }
+
+  if (pathname === '/api/anime-synopsis') {
+    const title = (url.searchParams.get('title') || '').trim();
+    const originalTitle = (url.searchParams.get('originalTitle') || '').trim() || undefined;
+    const year = (url.searchParams.get('year') || '').trim() || undefined;
+    const mediaTypeParam = (url.searchParams.get('mediaType') || '').trim();
+    const mediaType =
+      mediaTypeParam === 'series'
+        ? 'series'
+        : mediaTypeParam === 'movie'
+          ? 'movie'
+          : 'anime';
+    const tvdbIdRaw = Number.parseInt(url.searchParams.get('tvdbId') || '', 10);
+    const tvdbSlug = (url.searchParams.get('tvdbSlug') || '').trim() || undefined;
+    const fallbackEnglishOverview =
+      (url.searchParams.get('englishOverview') || '').trim().slice(0, 2000) || undefined;
+
+    if (!title && !originalTitle && !tvdbIdRaw && !tvdbSlug) {
+      return { status: 400, body: { error: 'Parâmetros insuficientes para buscar sinopse do anime.' } };
+    }
+
+    try {
+      const result = await resolveLocalizedAnimeSynopsis(fetchHttp, {
+        title: title || undefined,
+        originalTitle,
+        year,
+        mediaType,
+        tvdbId: Number.isFinite(tvdbIdRaw) && tvdbIdRaw > 0 ? tvdbIdRaw : undefined,
+        tvdbSlug,
         fallbackEnglishOverview,
         credentials: catalogPrefs?.credentials,
         useCache,

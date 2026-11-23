@@ -1,10 +1,12 @@
 import * as cheerio from 'cheerio';
 import { mergeServerAndCatalogEpisodes } from '../../episodeAvailability.ts';
+import { translateEnglishToPtBr } from '../../googleTranslate.ts';
 import type { HttpFetcher } from '../../httpTypes.ts';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
   CatalogSourceCredentials,
+  EpisodeSynopsisSource,
   ExternalMediaIds,
   MediaKind,
   SearchResultItem,
@@ -89,9 +91,15 @@ function translateStatus(raw: string | undefined): string | undefined {
 }
 
 function isValidArtworkUrl(raw: string | undefined): string {
-  const cleaned = cleanText(raw);
+  let cleaned = cleanText(raw);
   if (!cleaned) return '';
-  if (/\/images\/missing\//i.test(cleaned)) return '';
+  if (cleaned.startsWith('//')) {
+    cleaned = `https:${cleaned}`;
+  } else if (/^\/banners\//i.test(cleaned)) {
+    cleaned = `https://artworks.thetvdb.com${cleaned}`;
+  }
+  if (/\/images\/(?:missing|v2\/(?:logo|placeholder))/i.test(cleaned)) return '';
+  if (/^https?:\/\/(?:www\.)?thetvdb\.com\/images\//i.test(cleaned)) return '';
   return isSafeExternalHttpUrl(cleaned) ? cleaned : '';
 }
 
@@ -165,6 +173,8 @@ export interface TvdbRichMatch {
   englishTitle?: string;
   alternativeTitles: string[];
   synopsis: string;
+  synopsisSource?: EpisodeSynopsisSource;
+  synopsisLanguage?: 'pt-BR' | 'en';
   poster: string;
   backdrop: string;
   year?: string;
@@ -190,6 +200,32 @@ function pickPreferredTranslation(
     if (eng) return eng;
   }
   return cleanText(fallback);
+}
+
+function pickLocalizedTvdbOverview(
+  map: Record<string, string> | undefined,
+  fallback?: string
+): {
+  synopsis: string;
+  synopsisSource?: EpisodeSynopsisSource;
+  synopsisLanguage?: 'pt-BR' | 'en';
+} {
+  if (map && typeof map === 'object') {
+    const ptBr = cleanText(map.pt || map['pt-br'] || map.pt_br);
+    if (ptBr) {
+      return { synopsis: ptBr, synopsisSource: 'thetvdb-pt-br', synopsisLanguage: 'pt-BR' };
+    }
+    const eng = cleanText(map.eng || map.en);
+    if (eng) {
+      return { synopsis: eng, synopsisSource: 'thetvdb-en', synopsisLanguage: 'en' };
+    }
+  }
+  const fb = cleanText(fallback);
+  if (fb) {
+    return { synopsis: fb, synopsisSource: 'thetvdb-en', synopsisLanguage: 'en' };
+  }
+  const por = map && typeof map === 'object' ? cleanText(map.por) : '';
+  return { synopsis: por };
 }
 
 export function parseTvdbWebSearchHit(hit: TvdbWebSearchHit): TvdbRichMatch | null {
@@ -224,7 +260,7 @@ export function parseTvdbWebSearchHit(hit: TvdbWebSearchHit): TvdbRichMatch | nu
     isValidArtworkUrl(hit.image) ||
     isValidArtworkUrl(hit.thumbnail);
   const backdrop = isValidArtworkUrl(hit.banner) || poster;
-  const synopsis = pickPreferredTranslation(hit.overviews, hit.overview);
+  const localizedOverview = pickLocalizedTvdbOverview(hit.overviews, hit.overview);
 
   const yearRaw =
     hit.year !== undefined && hit.year !== null && String(hit.year).trim()
@@ -257,7 +293,9 @@ export function parseTvdbWebSearchHit(hit: TvdbWebSearchHit): TvdbRichMatch | nu
     originalTitle,
     englishTitle,
     alternativeTitles: Array.from(altSet).slice(0, 10),
-    synopsis,
+    synopsis: localizedOverview.synopsis,
+    synopsisSource: localizedOverview.synopsisSource,
+    synopsisLanguage: localizedOverview.synopsisLanguage,
     poster,
     backdrop,
     year,
@@ -671,17 +709,37 @@ export function parseTvdbPublicHtml(
     translations.set(lang, extractCleanTranslationText($, el));
   });
 
-  const ptBlock = translations.get('pt') || translations.get('por');
-  const engBlock = translations.get('eng');
+  const ptBrBlock =
+    translations.get('pt') || translations.get('pt-br') || translations.get('pt_br');
+  const porBlock = translations.get('por');
+  const ptBlock = ptBrBlock || porBlock;
+  const engBlock = translations.get('eng') || translations.get('en');
   const jpnBlock = translations.get('jpn');
 
   const title = ptBlock?.title || engBlock?.title || rawH1 || ogTitle;
   if (!title) return null;
 
-  const synopsis =
-    ptBlock?.synopsis ||
-    engBlock?.synopsis ||
-    cleanText($('meta[property="og:description"], meta[name="description"]').attr('content'));
+  const metaDescription = cleanText(
+    $('meta[property="og:description"], meta[name="description"]').attr('content')
+  );
+  let synopsis = '';
+  let synopsisSource: EpisodeSynopsisSource | undefined;
+  let synopsisLanguage: 'pt-BR' | 'en' | undefined;
+  if (ptBrBlock?.synopsis) {
+    synopsis = ptBrBlock.synopsis;
+    synopsisSource = 'thetvdb-pt-br';
+    synopsisLanguage = 'pt-BR';
+  } else if (engBlock?.synopsis) {
+    synopsis = engBlock.synopsis;
+    synopsisSource = 'thetvdb-en';
+    synopsisLanguage = 'en';
+  } else if (porBlock?.synopsis) {
+    synopsis = porBlock.synopsis;
+  } else if (metaDescription) {
+    synopsis = metaDescription;
+    synopsisSource = 'thetvdb-en';
+    synopsisLanguage = 'en';
+  }
 
   const originalTitle = rawH1 && rawH1 !== title ? rawH1 : jpnBlock?.title || undefined;
   const alternativeTitle =
@@ -696,7 +754,7 @@ export function parseTvdbPublicHtml(
   };
   addAlt(alternativeTitle);
   addAlt(originalTitle);
-  for (const b of [ptBlock, engBlock, jpnBlock]) {
+  for (const b of [ptBrBlock, porBlock, engBlock, jpnBlock]) {
     for (const a of b?.aliases || []) addAlt(a);
   }
 
@@ -804,21 +862,28 @@ export function parseTvdbPublicHtml(
 
   // Poster & Backdrop artwork
   let poster = '';
-  $('img.img-responsive').each((_, img) => {
+  $('img').each((_, img) => {
     if (poster) return;
-    const src = $(img).attr('src') || $(img).attr('data-src') || '';
-    if (/artworks\.thetvdb\.com\/banners\/.*\/posters\//i.test(src)) {
-      poster = isValidArtworkUrl(src);
+    const $img = $(img);
+    const src = $img.attr('data-src') || $img.attr('data-original') || $img.attr('src') || '';
+    const valid = isValidArtworkUrl(src);
+    if (valid && /\/banners\/.*\/posters\//i.test(valid)) {
+      poster = valid;
     }
   });
   if (!poster) {
     poster =
       isValidArtworkUrl($('meta[property="og:image"]').attr('content')) ||
-      isValidArtworkUrl($('img.img-responsive').first().attr('src'));
+      isValidArtworkUrl(
+        $('img.img-responsive').first().attr('data-src') ||
+          $('img.img-responsive').first().attr('src')
+      );
   }
 
   let backdrop = '';
-  const bgMatch = html.match(/https:\/\/artworks\.thetvdb\.com\/banners\/[^"'\s)]+(?:backgrounds|fanart|banners)\/[^"'\s)]+/i);
+  const bgMatch = html.match(
+    /(?:https?:)?\/\/artworks\.thetvdb\.com\/banners\/[^"'\s)]+(?:backgrounds|fanart|banners)\/[^"'\s)]+/i
+  );
   if (bgMatch?.[0]) backdrop = isValidArtworkUrl(bgMatch[0]);
   if (!backdrop) backdrop = poster;
 
@@ -862,6 +927,8 @@ export function parseTvdbPublicHtml(
     poster,
     backdrop,
     synopsis,
+    synopsisSource,
+    synopsisLanguage,
     year,
     firstAirDate,
     lastAirDate,
@@ -912,8 +979,15 @@ export function parseTvdbAllSeasonsHtml(
     const tvdbEpisodeId = epIdMatch ? Number.parseInt(epIdMatch[1], 10) : undefined;
     const date = cleanText($li.find('ul.list-inline li').first().text()) || undefined;
     const overview = cleanText($li.find('.list-group-item-text p').first().text()) || undefined;
-    const imgEl = $li.find('img').first();
-    const thumb = isValidArtworkUrl(imgEl.attr('data-src') || imgEl.attr('src')) || undefined;
+    let thumb: string | undefined;
+    $li.find('img').each((__, img) => {
+      if (thumb) return;
+      const $img = $(img);
+      const candidate = isValidArtworkUrl(
+        $img.attr('data-src') || $img.attr('data-original') || $img.attr('src')
+      );
+      if (candidate) thumb = candidate;
+    });
 
     const title = rawTitle ? `Episódio ${episodeNumber} — ${rawTitle}` : `Episódio ${episodeNumber}`;
     episodes.push({
@@ -999,6 +1073,7 @@ export async function fetchTheTvdbDetails(
             companies?: Array<{ name?: string; companyType?: { companyTypeName?: string } }>;
             remoteIds?: Array<{ id?: string; sourceName?: string }>;
             aliases?: Array<{ name?: string }>;
+            artworks?: Array<{ image?: string; type?: number; score?: number }>;
           };
         };
         const d = payload.data;
@@ -1033,6 +1108,12 @@ export async function fetchTheTvdbDetails(
             imdbId: imdbRemote && /^tt\d+$/i.test(imdbRemote) ? imdbRemote : undefined,
           };
 
+          const poster = isValidArtworkUrl(d.image);
+          const bestBgArtwork = (d.artworks || [])
+            .filter((a) => (a.type === 3 || a.type === 15) && isValidArtworkUrl(a.image))
+            .sort((a, b) => (b.score || 0) - (a.score || 0))[0];
+          const backdrop = isValidArtworkUrl(bestBgArtwork?.image) || poster;
+
           const episodes: AnimeEpisodeLink[] = [];
           if (resolvedType === 'movie') {
             episodes.push({
@@ -1043,6 +1124,7 @@ export async function fetchTheTvdbDetails(
               title: 'Filme Completo',
               url: buildEpisodeUri('movie', 'thetvdb', tvdbId, 1, 1),
               date: d.firstAired || undefined,
+              thumb: backdrop || poster || undefined,
             });
           } else if (epsRes && epsRes.ok) {
             const ePayload = JSON.parse(epsRes.body) as {
@@ -1084,6 +1166,27 @@ export async function fetchTheTvdbDetails(
           const runtimeVal = d.averageRuntime || d.runtime;
           const uri = buildMediaUri(resolvedType, 'thetvdb', tvdbId);
 
+          let finalSynopsis = ptOverview || '';
+          let finalSynopsisSource: EpisodeSynopsisSource | undefined = ptOverview
+            ? 'thetvdb-pt-br'
+            : undefined;
+          let finalSynopsisLanguage: 'pt-BR' | 'en' | undefined = ptOverview ? 'pt-BR' : undefined;
+          if (!finalSynopsis && d.overview) {
+            const engOverview = cleanText(d.overview);
+            if (engOverview) {
+              const translated = await translateEnglishToPtBr(fetchHttp, engOverview);
+              if (translated) {
+                finalSynopsis = translated;
+                finalSynopsisSource = 'thetvdb-google-translate';
+                finalSynopsisLanguage = 'pt-BR';
+              } else {
+                finalSynopsis = engOverview;
+                finalSynopsisSource = 'thetvdb-en';
+                finalSynopsisLanguage = 'en';
+              }
+            }
+          }
+
           return {
             title,
             originalTitle: d.name !== title ? d.name : undefined,
@@ -1097,9 +1200,11 @@ export async function fetchTheTvdbDetails(
             externalIds,
             enrichmentSources: ['thetvdb'],
             externalLinks: buildExternalDatabaseLinks(externalIds, { mediaType: resolvedType }),
-            poster: isValidArtworkUrl(d.image),
-            backdrop: isValidArtworkUrl(d.image),
-            synopsis: ptOverview || d.overview || '',
+            poster,
+            backdrop,
+            synopsis: finalSynopsis,
+            synopsisSource: finalSynopsisSource,
+            synopsisLanguage: finalSynopsisLanguage,
             year: d.year || d.firstAired?.slice(0, 4) || undefined,
             firstAirDate: d.firstAired || undefined,
             lastAirDate: d.lastAired || undefined,
@@ -1137,31 +1242,43 @@ export async function fetchTheTvdbDetails(
     const details = parseTvdbPublicHtml(res.body, tvdbId, mediaType, res.finalUrl || pageUrl);
     if (!details) return null;
 
+    // Translate English synopsis via Google Translate in parallel with episode guide fetch when PT-BR is missing
+    const translatePromise =
+      details.synopsisSource === 'thetvdb-en' && details.synopsis
+        ? translateEnglishToPtBr(fetchHttp, details.synopsis).catch(() => null)
+        : Promise.resolve(null);
+
     // Load full official episodes guide for series/anime when requested
-    if (details.kind !== 'movie' && includeEpisodes && details.externalIds?.tvdbSlug) {
-      try {
-        const epsRes = await fetchHttp(
-          `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(details.externalIds.tvdbSlug)}/allseasons/official`,
-          {
-            referer: res.finalUrl || pageUrl,
-            timeoutMs: 10000,
-          }
-        );
-        if (epsRes.ok) {
-          const parsedEps = parseTvdbAllSeasonsHtml(
-            epsRes.body,
-            details.externalIds.tvdbId || tvdbId,
-            (details.kind as CanonicalMediaType) || 'anime'
-          );
-          if (parsedEps.length > 0) {
-            details.episodes = parsedEps;
-            const seasons = new Set(parsedEps.map((e) => e.seasonNumber || 1));
-            details.seasonsCount = String(seasons.size);
-            details.episodesTotalCount = String(parsedEps.length);
-          }
-        }
-      } catch {
-        // Keep base metadata even if episode list request fails
+    const episodesPromise =
+      details.kind !== 'movie' && includeEpisodes && details.externalIds?.tvdbSlug
+        ? fetchHttp(
+            `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(details.externalIds.tvdbSlug)}/allseasons/official`,
+            {
+              referer: res.finalUrl || pageUrl,
+              timeoutMs: 10000,
+            }
+          ).catch(() => null)
+        : Promise.resolve(null);
+
+    const [translatedSynopsis, epsRes] = await Promise.all([translatePromise, episodesPromise]);
+
+    if (translatedSynopsis) {
+      details.synopsis = translatedSynopsis;
+      details.synopsisSource = 'thetvdb-google-translate';
+      details.synopsisLanguage = 'pt-BR';
+    }
+
+    if (epsRes?.ok) {
+      const parsedEps = parseTvdbAllSeasonsHtml(
+        epsRes.body,
+        details.externalIds?.tvdbId || tvdbId,
+        (details.kind as CanonicalMediaType) || 'anime'
+      );
+      if (parsedEps.length > 0) {
+        details.episodes = parsedEps;
+        const seasons = new Set(parsedEps.map((e) => e.seasonNumber || 1));
+        details.seasonsCount = String(seasons.size);
+        details.episodesTotalCount = String(parsedEps.length);
       }
     }
 
@@ -1285,11 +1402,39 @@ export async function enrichServerDetailsWithTheTvdb(
   ).slice(0, 10);
 
   const tvdbGenres = tvdb?.genres?.length ? tvdb.genres : bestMatch.genres;
-  const tvdbSynopsis = tvdb?.synopsis || bestMatch.synopsis;
+  let tvdbSynopsis = tvdb?.synopsis || '';
+  let tvdbSynopsisSource = tvdb?.synopsis ? tvdb.synopsisSource : undefined;
+  let tvdbSynopsisLanguage = tvdb?.synopsis ? tvdb.synopsisLanguage : undefined;
+
+  if (!tvdbSynopsis && bestMatch.synopsis) {
+    tvdbSynopsis = bestMatch.synopsis;
+    tvdbSynopsisSource = bestMatch.synopsisSource;
+    tvdbSynopsisLanguage = bestMatch.synopsisLanguage;
+    if (tvdbSynopsisSource === 'thetvdb-en') {
+      const translated = await translateEnglishToPtBr(fetchHttp, tvdbSynopsis).catch(() => null);
+      if (translated) {
+        tvdbSynopsis = translated;
+        tvdbSynopsisSource = 'thetvdb-google-translate';
+        tvdbSynopsisLanguage = 'pt-BR';
+      }
+    }
+  }
+
+  const resolvedPoster = tvdb?.poster || bestMatch.poster || serverDetails.poster;
+  const resolvedBackdrop =
+    tvdb?.backdrop ||
+    bestMatch.backdrop ||
+    tvdb?.poster ||
+    bestMatch.poster ||
+    serverDetails.backdrop ||
+    serverDetails.poster;
 
   const mergedEpisodes =
     resolvedKind === 'movie'
-      ? serverDetails.episodes
+      ? serverDetails.episodes.map((ep) => ({
+          ...ep,
+          thumb: tvdb?.backdrop || bestMatch.backdrop || tvdb?.poster || bestMatch.poster || ep.thumb,
+        }))
       : mergeServerAndCatalogEpisodes({
           serverTitle: serverDetails.title,
           serverUrl: serverDetails.url,
@@ -1314,9 +1459,11 @@ export async function enrichServerDetailsWithTheTvdb(
         ? tvdb.title
         : tvdb?.alternativeTitle || serverDetails.alternativeTitle,
     alternativeTitles: altTitles,
-    poster: serverDetails.poster || tvdb?.poster || bestMatch.poster,
-    backdrop: tvdb?.backdrop || bestMatch.backdrop || serverDetails.backdrop || serverDetails.poster,
+    poster: resolvedPoster,
+    backdrop: resolvedBackdrop,
     synopsis: tvdbSynopsis || serverDetails.synopsis,
+    synopsisSource: tvdbSynopsis ? tvdbSynopsisSource : serverDetails.synopsisSource,
+    synopsisLanguage: tvdbSynopsis ? tvdbSynopsisLanguage : serverDetails.synopsisLanguage,
     year: tvdb?.year || bestMatch.year || serverDetails.year,
     firstAirDate: tvdb?.firstAirDate || bestMatch.firstAirDate || serverDetails.firstAirDate,
     lastAirDate: tvdb?.lastAirDate || serverDetails.lastAirDate,
@@ -1337,13 +1484,14 @@ export interface TvdbEpisodeTranslations {
   ptBrTitle?: string;
   engOverview?: string;
   engTitle?: string;
+  episodeImage?: string;
   tvdbEpisodeId?: number;
   tvdbSeriesId?: number;
 }
 
 /**
  * Parses a public TheTVDB.com episode HTML page (`/series/{slug}/episodes/{id}`)
- * and extracts strictly PT-BR (`pt`) and English (`eng`) overviews and episode titles.
+ * and extracts strictly PT-BR (`pt`) and English (`eng`) overviews, episode titles, and artwork.
  */
 export function parseTvdbEpisodePageHtml(html: string): TvdbEpisodeTranslations {
   const $ = cheerio.load(html);
@@ -1361,11 +1509,26 @@ export function parseTvdbEpisodePageHtml(html: string): TvdbEpisodeTranslations 
     translations.get('pt') || translations.get('pt-br') || translations.get('pt_br');
   const engBlock = translations.get('eng') || translations.get('en');
 
+  let episodeImage = '';
+  $('img').each((_, img) => {
+    if (episodeImage) return;
+    const rawSrc = $(img).attr('data-src') || $(img).attr('data-original') || $(img).attr('src') || '';
+    const valid = isValidArtworkUrl(rawSrc);
+    if (valid && /\/banners\/.*(?:episode|episodes|screencap)/i.test(valid)) {
+      episodeImage = valid;
+    }
+  });
+  if (!episodeImage) {
+    const ogImg = isValidArtworkUrl($('meta[property="og:image"]').attr('content'));
+    if (ogImg) episodeImage = ogImg;
+  }
+
   return {
     ptBrOverview: ptBrBlock?.synopsis || undefined,
     ptBrTitle: ptBrBlock?.title || undefined,
     engOverview: engBlock?.synopsis || undefined,
     engTitle: engBlock?.title || undefined,
+    ...(episodeImage ? { episodeImage } : {}),
   };
 }
 
@@ -1391,7 +1554,7 @@ function matchTvdbEpisodeFromList(
 }
 
 /**
- * Fetches localized PT-BR and EN episode overview translations from TheTVDB.com
+ * Fetches localized PT-BR and EN episode overview translations & artwork from TheTVDB.com
  * for a given episode (by tvdbEpisodeId, tvdbId/tvdbSlug, or series title + season/episode).
  */
 export async function fetchTheTvdbEpisodeTranslations(
@@ -1416,6 +1579,7 @@ export async function fetchTheTvdbEpisodeTranslations(
   let tvdbSeriesId = options.tvdbId && options.tvdbId > 0 ? options.tvdbId : undefined;
   let tvdbSlug = cleanText(options.tvdbSlug) || undefined;
   let fallbackEngOverview = cleanText(options.fallbackEnglishOverview) || undefined;
+  let fallbackEpisodeImage: string | undefined;
 
   // 1. Resolve tvdbEpisodeId via series episode guide if we don't already have it
   if (!tvdbEpisodeId) {
@@ -1486,12 +1650,19 @@ export async function fetchTheTvdbEpisodeTranslations(
       if (!fallbackEngOverview && matched.overview) {
         fallbackEngOverview = cleanText(matched.overview) || undefined;
       }
+      if (matched.thumb) {
+        fallbackEpisodeImage = matched.thumb;
+      }
     }
   }
 
   if (!tvdbEpisodeId) {
     return fallbackEngOverview
-      ? { engOverview: fallbackEngOverview, tvdbSeriesId }
+      ? {
+          engOverview: fallbackEngOverview,
+          ...(fallbackEpisodeImage ? { episodeImage: fallbackEpisodeImage } : {}),
+          tvdbSeriesId,
+        }
       : null;
   }
 
@@ -1499,7 +1670,7 @@ export async function fetchTheTvdbEpisodeTranslations(
   const token = await getTvdbBearerToken(fetchHttp, options.credentials);
   if (token) {
     try {
-      const [ptRes, engRes] = await Promise.all([
+      const [ptRes, engRes, baseRes] = await Promise.all([
         fetchHttp(`${TVDB_V4_API_BASE}/episodes/${tvdbEpisodeId}/translations/pt`, {
           accept: 'application/json',
           headers: { Authorization: `Bearer ${token}` },
@@ -1510,12 +1681,20 @@ export async function fetchTheTvdbEpisodeTranslations(
           headers: { Authorization: `Bearer ${token}` },
           timeoutMs: 6500,
         }).catch(() => null),
+        !fallbackEpisodeImage
+          ? fetchHttp(`${TVDB_V4_API_BASE}/episodes/${tvdbEpisodeId}`, {
+              accept: 'application/json',
+              headers: { Authorization: `Bearer ${token}` },
+              timeoutMs: 6500,
+            }).catch(() => null)
+          : Promise.resolve(null),
       ]);
 
       let ptBrOverview: string | undefined;
       let ptBrTitle: string | undefined;
       let engOverview: string | undefined;
       let engTitle: string | undefined;
+      let apiImage = fallbackEpisodeImage;
 
       if (ptRes?.ok) {
         const parsed = JSON.parse(ptRes.body) as { data?: { name?: string; overview?: string } };
@@ -1527,6 +1706,11 @@ export async function fetchTheTvdbEpisodeTranslations(
         engOverview = cleanText(parsed.data?.overview) || undefined;
         engTitle = cleanText(parsed.data?.name) || undefined;
       }
+      if (!apiImage && baseRes?.ok) {
+        const parsed = JSON.parse(baseRes.body) as { data?: { image?: string } };
+        const validImg = isValidArtworkUrl(parsed.data?.image);
+        if (validImg) apiImage = validImg;
+      }
 
       if (ptBrOverview || engOverview) {
         return {
@@ -1534,6 +1718,7 @@ export async function fetchTheTvdbEpisodeTranslations(
           ptBrTitle,
           engOverview: engOverview || fallbackEngOverview,
           engTitle,
+          ...(apiImage ? { episodeImage: apiImage } : {}),
           tvdbEpisodeId,
           tvdbSeriesId,
         };
@@ -1555,11 +1740,13 @@ export async function fetchTheTvdbEpisodeTranslations(
     });
     if (res.ok) {
       const parsed = parseTvdbEpisodePageHtml(res.body);
+      const episodeImage = parsed.episodeImage || fallbackEpisodeImage;
       return {
         ptBrOverview: parsed.ptBrOverview,
         ptBrTitle: parsed.ptBrTitle,
         engOverview: parsed.engOverview || fallbackEngOverview,
         engTitle: parsed.engTitle,
+        ...(episodeImage ? { episodeImage } : {}),
         tvdbEpisodeId,
         tvdbSeriesId,
       };
@@ -1571,8 +1758,240 @@ export async function fetchTheTvdbEpisodeTranslations(
   if (fallbackEngOverview) {
     return {
       engOverview: fallbackEngOverview,
+      ...(fallbackEpisodeImage ? { episodeImage: fallbackEpisodeImage } : {}),
       tvdbEpisodeId,
       tvdbSeriesId,
+    };
+  }
+
+  return null;
+}
+
+export interface TvdbMediaTranslations {
+  ptBrOverview?: string;
+  engOverview?: string;
+  poster?: string;
+  backdrop?: string;
+  tvdbId?: number;
+  tvdbSlug?: string;
+}
+
+/**
+ * Parses a public TheTVDB.com series or movie HTML page and extracts strictly
+ * PT-BR (`pt`) and English (`eng`) synopses plus official poster & backdrop artwork.
+ */
+export function parseTvdbMediaPageTranslations(html: string): TvdbMediaTranslations {
+  const $ = cheerio.load(html);
+  const translations = new Map<string, { title: string; synopsis: string }>();
+
+  $('.change_translation_text[data-language]').each((_, el) => {
+    const lang = cleanText($(el).attr('data-language')).toLowerCase();
+    if (!lang) return;
+    const extracted = extractCleanTranslationText($, el);
+    translations.set(lang, { title: extracted.title, synopsis: extracted.synopsis });
+  });
+
+  // Strictly PT-BR on TheTVDB (`pt` = Portuguese - Brazil; `por` is European Portuguese)
+  const ptBrBlock =
+    translations.get('pt') || translations.get('pt-br') || translations.get('pt_br');
+  const engBlock = translations.get('eng') || translations.get('en');
+
+  let poster = '';
+  $('img').each((_, img) => {
+    if (poster) return;
+    const $img = $(img);
+    const src = $img.attr('data-src') || $img.attr('data-original') || $img.attr('src') || '';
+    const valid = isValidArtworkUrl(src);
+    if (valid && /\/banners\/.*\/posters\//i.test(valid)) {
+      poster = valid;
+    }
+  });
+  if (!poster) {
+    poster =
+      isValidArtworkUrl($('meta[property="og:image"]').attr('content')) ||
+      isValidArtworkUrl(
+        $('img.img-responsive').first().attr('data-src') ||
+          $('img.img-responsive').first().attr('src')
+      );
+  }
+
+  let backdrop = '';
+  const bgMatch = html.match(
+    /(?:https?:)?\/\/artworks\.thetvdb\.com\/banners\/[^"'\s)]+(?:backgrounds|fanart|banners)\/[^"'\s)]+/i
+  );
+  if (bgMatch?.[0]) backdrop = isValidArtworkUrl(bgMatch[0]);
+  if (!backdrop) backdrop = poster;
+
+  return {
+    ptBrOverview: ptBrBlock?.synopsis || undefined,
+    engOverview: engBlock?.synopsis || undefined,
+    ...(poster ? { poster } : {}),
+    ...(backdrop ? { backdrop } : {}),
+  };
+}
+
+/**
+ * Fetches localized PT-BR and EN series/movie synopses & artwork from TheTVDB.com
+ * (by tvdbId/tvdbSlug or title/originalTitle/year), mirroring episode synopsis resolution.
+ */
+export async function fetchTheTvdbMediaTranslations(
+  fetchHttp: HttpFetcher,
+  options: {
+    title?: string;
+    originalTitle?: string;
+    alternativeTitles?: string[];
+    year?: string;
+    mediaType?: CanonicalMediaType;
+    tvdbId?: number;
+    tvdbSlug?: string;
+    fallbackEnglishOverview?: string;
+    credentials?: CatalogSourceCredentials;
+  }
+): Promise<TvdbMediaTranslations | null> {
+  let tvdbId = options.tvdbId && options.tvdbId > 0 ? options.tvdbId : undefined;
+  let tvdbSlug = cleanText(options.tvdbSlug) || undefined;
+  let mediaType: CanonicalMediaType = options.mediaType || 'anime';
+  let fallbackEngOverview = cleanText(options.fallbackEnglishOverview) || undefined;
+  let fallbackPtBrOverview: string | undefined;
+  let fallbackPoster: string | undefined;
+  let fallbackBackdrop: string | undefined;
+
+  // 1. Resolve tvdbId / tvdbSlug via keyless search if missing
+  if (!tvdbId && !tvdbSlug) {
+    const searchTerms = [
+      options.title,
+      options.originalTitle,
+      ...(options.alternativeTitles || []),
+    ].filter((x): x is string => Boolean(x && x.trim().length >= 2));
+
+    if (searchTerms.length > 0) {
+      const bestMatch = await findBestTheTvdbMatch(fetchHttp, searchTerms, {
+        mediaType,
+        year: options.year,
+      }).catch(() => null);
+      if (bestMatch) {
+        tvdbId = bestMatch.tvdbId;
+        tvdbSlug = bestMatch.slug || undefined;
+        mediaType = bestMatch.mediaType;
+        if (bestMatch.poster) fallbackPoster = bestMatch.poster;
+        if (bestMatch.backdrop) fallbackBackdrop = bestMatch.backdrop;
+        if (bestMatch.synopsis) {
+          if (bestMatch.synopsisSource === 'thetvdb-pt-br') {
+            fallbackPtBrOverview = bestMatch.synopsis;
+          } else if (!fallbackEngOverview) {
+            fallbackEngOverview = bestMatch.synopsis;
+          }
+        }
+      }
+    }
+  }
+
+  if (!tvdbId && !tvdbSlug) {
+    return fallbackPtBrOverview || fallbackEngOverview
+      ? {
+          ptBrOverview: fallbackPtBrOverview,
+          engOverview: fallbackEngOverview,
+          ...(fallbackPoster ? { poster: fallbackPoster } : {}),
+          ...(fallbackBackdrop ? { backdrop: fallbackBackdrop } : {}),
+        }
+      : null;
+  }
+
+  const isMovie = mediaType === 'movie';
+  const apiSegment = isMovie ? 'movies' : 'series';
+
+  // 2. Try official TheTVDB v4 API translations when API key is configured
+  const token = await getTvdbBearerToken(fetchHttp, options.credentials);
+  if (token && tvdbId) {
+    try {
+      const [ptRes, engRes, baseRes] = await Promise.all([
+        fetchHttp(`${TVDB_V4_API_BASE}/${apiSegment}/${tvdbId}/translations/pt`, {
+          accept: 'application/json',
+          headers: { Authorization: `Bearer ${token}` },
+          timeoutMs: 6500,
+        }).catch(() => null),
+        fetchHttp(`${TVDB_V4_API_BASE}/${apiSegment}/${tvdbId}/translations/eng`, {
+          accept: 'application/json',
+          headers: { Authorization: `Bearer ${token}` },
+          timeoutMs: 6500,
+        }).catch(() => null),
+        !fallbackPoster
+          ? fetchHttp(`${TVDB_V4_API_BASE}/${apiSegment}/${tvdbId}`, {
+              accept: 'application/json',
+              headers: { Authorization: `Bearer ${token}` },
+              timeoutMs: 6500,
+            }).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+
+      let ptBrOverview: string | undefined;
+      let engOverview: string | undefined;
+      let apiPoster = fallbackPoster;
+
+      if (ptRes?.ok) {
+        const parsed = JSON.parse(ptRes.body) as { data?: { overview?: string } };
+        ptBrOverview = cleanText(parsed.data?.overview) || undefined;
+      }
+      if (engRes?.ok) {
+        const parsed = JSON.parse(engRes.body) as { data?: { overview?: string } };
+        engOverview = cleanText(parsed.data?.overview) || undefined;
+      }
+      if (!apiPoster && baseRes?.ok) {
+        const parsed = JSON.parse(baseRes.body) as { data?: { image?: string } };
+        const validImg = isValidArtworkUrl(parsed.data?.image);
+        if (validImg) apiPoster = validImg;
+      }
+
+      if (ptBrOverview || engOverview) {
+        return {
+          ptBrOverview,
+          engOverview: engOverview || fallbackEngOverview,
+          ...(apiPoster ? { poster: apiPoster } : {}),
+          ...(fallbackBackdrop || apiPoster ? { backdrop: fallbackBackdrop || apiPoster } : {}),
+          tvdbId,
+          tvdbSlug,
+        };
+      }
+    } catch {
+      // Fall through to public TheTVDB.com HTML page
+    }
+  }
+
+  // 3. Public TheTVDB.com series/movie page (zero API key required)
+  const pageUrl = tvdbSlug
+    ? `${TVDB_WEB_ORIGIN}/${isMovie ? 'movies' : 'series'}/${encodeURIComponent(tvdbSlug)}`
+    : `${TVDB_WEB_ORIGIN}/dereferrer/${isMovie ? 'movie' : 'series'}/${tvdbId}`;
+
+  try {
+    const res = await fetchHttp(pageUrl, {
+      referer: `${TVDB_WEB_ORIGIN}/`,
+      timeoutMs: 9000,
+    });
+    if (res.ok) {
+      const parsed = parseTvdbMediaPageTranslations(res.body);
+      const poster = parsed.poster || fallbackPoster;
+      const backdrop = parsed.backdrop || fallbackBackdrop || poster;
+      return {
+        ptBrOverview: parsed.ptBrOverview || fallbackPtBrOverview,
+        engOverview: parsed.engOverview || fallbackEngOverview,
+        ...(poster ? { poster } : {}),
+        ...(backdrop ? { backdrop } : {}),
+        tvdbId,
+        tvdbSlug,
+      };
+    }
+  } catch {
+    // Fall back to search overview if available
+  }
+
+  if (fallbackPtBrOverview || fallbackEngOverview) {
+    return {
+      ptBrOverview: fallbackPtBrOverview,
+      engOverview: fallbackEngOverview,
+      ...(fallbackPoster ? { poster: fallbackPoster } : {}),
+      ...(fallbackBackdrop ? { backdrop: fallbackBackdrop } : {}),
+      tvdbId,
+      tvdbSlug,
     };
   }
 

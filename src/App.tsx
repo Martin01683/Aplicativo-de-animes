@@ -2747,6 +2747,23 @@ export default function App() {
                       ? animeDetails.episodes
                       : undefined
                   }
+                  initialSeriesArtwork={
+                    animeDetails &&
+                    episodeDetails.seriesUrl &&
+                    isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
+                      ? {
+                          poster: animeDetails.poster || undefined,
+                          backdrop: animeDetails.backdrop || undefined,
+                        }
+                      : undefined
+                  }
+                  initialSeriesExternalIds={
+                    animeDetails &&
+                    episodeDetails.seriesUrl &&
+                    isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
+                      ? animeDetails.externalIds
+                      : undefined
+                  }
                   loadingEpisode={loadingDetail}
                   loadingExtraServers={Boolean(
                     loadingExtraServers &&

@@ -343,12 +343,20 @@ test('TheTVDB provider searches publicly without API key, parses PT-BR series/mo
   assert.equal(enriched.network, 'Nippon TV');
   assert.equal(enriched.status, 'Em exibição');
   assert.equal(enriched.externalIds?.tvdbId, 424536);
-  // Preserves playable server episodes untouched!
+  // Prioritizes TheTVDB official anime artwork & PT-BR synopsis metadata over streaming server poster
+  assert.equal(
+    enriched.poster,
+    'https://artworks.thetvdb.com/banners/v4/series/424536/posters/68d6d5b36aa2f.jpg'
+  );
+  assert.equal(enriched.synopsisSource, 'thetvdb-pt-br');
+  assert.equal(enriched.synopsisLanguage, 'pt-BR');
+  // Preserves playable server episodes untouched while upgrading to TheTVDB episode thumbnail!
   assert.equal(enriched.episodes.length, 1);
   assert.equal(
     enriched.episodes[0].url,
     'https://topanimes.net/episodio/sousou-no-frieren-dublado-episodio-1/'
   );
+  assert.equal(enriched.episodes[0].thumb, 'https://artworks.thetvdb.com/banners/ep1.jpg');
 
   // Direct anisync://anime/thetvdb/424536 lookup returns full TheTVDB metadata + episodes
   const directTvdb = await getAggregatedMediaDetails(mockFetcher, 'anisync://anime/thetvdb/424536');
@@ -356,4 +364,134 @@ test('TheTVDB provider searches publicly without API key, parses PT-BR series/mo
   assert.equal(directTvdb.title, 'Frieren e a Jornada para o Além');
   assert.equal(directTvdb.episodes.length, 1);
   assert.equal(directTvdb.episodes[0].url, 'anisync://episode/anime/thetvdb/424536/s1/e1');
+});
+
+test('enrichServerDetailsWithTheTvdb translates English-only TheTVDB synopsis via Google Translate and prioritizes TheTVDB images', async () => {
+  const tvdbEnglishHtml = `
+    <html><body>
+      <h1>Starlight Blade</h1>
+      <img class="img-responsive" src="/banners/v4/series/909090/posters/starlight.jpg" />
+      <div style="background-image:url('https://artworks.thetvdb.com/banners/v4/series/909090/backgrounds/starlight-bg.jpg')"></div>
+      <div class="change_translation_text" data-language="eng" data-title="Starlight Blade">
+        <p>Two siblings defend their floating city from ancient sky machines.</p>
+      </div>
+      <ul id="series_basic_info">
+        <li><strong>TheTVDB.com Series ID</strong><span>909090</span></li>
+        <li><strong>Genres</strong><span><a>Anime</a><a>Action</a></span></li>
+        <li><strong>Original Country</strong><span>Japan</span></li>
+        <li><strong>Original Language</strong><span>Japanese</span></li>
+      </ul>
+    </body></html>`;
+
+  const allSeasonsHtml = `
+    <ul>
+      <li class="list-group-item">
+        <img src="/images/v2/placeholder.png" />
+        <h4><span class="episode-label">S01E01</span><a href="/series/starlight-blade/episodes/5001">Skyfall</a></h4>
+        <div class="list-group-item-text">
+          <img data-src="/banners/v4/episode/5001/screencap/ep1.jpg" />
+          <p>First episode summary.</p>
+        </div>
+      </li>
+    </ul>`;
+
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url.includes('api4.thetvdb.com/web/search/queries')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: JSON.stringify({
+          results: [
+            {
+              hits: [
+                {
+                  id: 909090,
+                  type: 'series',
+                  name: 'Starlight Blade',
+                  slug: 'starlight-blade',
+                  country: 'jpn',
+                  primary_language: 'jpn',
+                  year: '2026',
+                  poster: '/banners/v4/series/909090/posters/starlight.jpg',
+                  translations: { eng: 'Starlight Blade' },
+                  overviews: { eng: 'Two siblings defend their floating city from ancient sky machines.' },
+                  genres: ['Anime', 'Action'],
+                },
+              ],
+            },
+          ],
+        }),
+      };
+    }
+    if (url.includes('/allseasons/official')) {
+      return { status: 200, ok: true, finalUrl: url, body: allSeasonsHtml };
+    }
+    if (url.includes('/series/starlight-blade')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: 'https://www.thetvdb.com/series/starlight-blade',
+        body: tvdbEnglishHtml,
+      };
+    }
+    if (url.includes('translate.googleapis.com')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: JSON.stringify([
+          [
+            [
+              'Dois irmãos defendem sua cidade flutuante de antigas máquinas celestes.',
+              'Two siblings defend their floating city from ancient sky machines.',
+            ],
+          ],
+          null,
+          'en',
+        ]),
+      };
+    }
+    return { status: 404, ok: false, finalUrl: url, body: '' };
+  };
+
+  const enriched = await enrichServerDetailsWithTheTvdb(mockFetcher, {
+    title: 'Starlight Blade',
+    url: 'https://topanimes.net/animes/starlight-blade/',
+    kind: 'anime',
+    poster: 'https://topanimes.net/wp-content/uploads/server-poster.jpg',
+    backdrop: 'https://topanimes.net/wp-content/uploads/server-bg.jpg',
+    synopsis: 'Sinopse antiga do servidor.',
+    genres: [],
+    audioType: 'LEG',
+    episodes: [
+      {
+        numberLabel: '1 - 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        title: 'Episódio 1',
+        url: 'https://topanimes.net/episodio/starlight-blade-ep-1/',
+        thumb: 'https://topanimes.net/wp-content/uploads/server-ep1.jpg',
+      },
+    ],
+  });
+
+  assert.equal(
+    enriched.synopsis,
+    'Dois irmãos defendem sua cidade flutuante de antigas máquinas celestes.'
+  );
+  assert.equal(enriched.synopsisSource, 'thetvdb-google-translate');
+  assert.equal(enriched.synopsisLanguage, 'pt-BR');
+  assert.equal(
+    enriched.poster,
+    'https://artworks.thetvdb.com/banners/v4/series/909090/posters/starlight.jpg'
+  );
+  assert.equal(
+    enriched.backdrop,
+    'https://artworks.thetvdb.com/banners/v4/series/909090/backgrounds/starlight-bg.jpg'
+  );
+  assert.equal(
+    enriched.episodes[0].thumb,
+    'https://artworks.thetvdb.com/banners/v4/episode/5001/screencap/ep1.jpg'
+  );
 });

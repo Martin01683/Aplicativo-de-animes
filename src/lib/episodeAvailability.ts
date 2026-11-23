@@ -589,7 +589,7 @@ export function mergeServerAndCatalogEpisodes(params: {
         seasonLabel: catEp.seasonLabel || matchedServer.seasonLabel || `Temporada ${sNum}`,
         numberLabel: matchedServer.numberLabel || catEp.numberLabel,
         date: matchedServer.date || catEp.date,
-        thumb: matchedServer.thumb || catEp.thumb,
+        thumb: catEp.thumb || matchedServer.thumb,
         overview: matchedServer.overview || catEp.overview,
         durationMinutes: matchedServer.durationMinutes || catEp.durationMinutes,
         airingAt: matchedServer.airingAt ?? catEp.airingAt,

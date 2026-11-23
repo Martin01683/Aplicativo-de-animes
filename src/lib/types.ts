@@ -208,6 +208,8 @@ export interface AnimeDetails {
   poster: string;
   backdrop: string;
   synopsis: string;
+  synopsisSource?: EpisodeSynopsisSource;
+  synopsisLanguage?: 'pt-BR' | 'en';
   year?: string;
   rating?: string;
   tmdbRating?: string;
@@ -333,8 +335,19 @@ export interface EpisodeSynopsisResult {
   language: 'pt-BR' | 'en';
   source: EpisodeSynopsisSource;
   episodeTitle?: string;
+  episodeImage?: string;
   tvdbEpisodeId?: number;
   tvdbSeriesId?: number;
+}
+
+export interface AnimeSynopsisResult {
+  synopsis: string;
+  language: 'pt-BR' | 'en';
+  source: EpisodeSynopsisSource;
+  poster?: string;
+  backdrop?: string;
+  tvdbId?: number;
+  tvdbSlug?: string;
 }
 
 export interface VlcPlaylistEntry {

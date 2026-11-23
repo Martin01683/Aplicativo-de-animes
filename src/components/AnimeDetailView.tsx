@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownNarrowWide,
   ArrowLeft,
@@ -25,13 +25,13 @@ import {
   Tv,
   X,
 } from 'lucide-react';
-import { isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
+import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
 import {
   formatEpisodeCountdown,
   formatEpisodeReleaseDate,
   isEpisodeAvailableOnServer,
 } from '../lib/episodeAvailability';
-import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
+import { normalizeTopAnimesUrl, pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
   formatPlaybackTimestamp,
@@ -43,6 +43,7 @@ import {
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
+  AnimeSynopsisResult,
   CatalogMediaItem,
   CatalogSourceId,
   FavoriteLatestInfo,
@@ -89,11 +90,120 @@ export function AnimeDetailView({
   const [episodeFilter, setEpisodeFilter] = useState('');
   const [sortDesc, setSortDesc] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const synopsisCacheRef = useRef<Map<string, AnimeSynopsisResult | null>>(new Map());
+  const [localizedSynopsisState, setLocalizedSynopsisState] = useState<{
+    animeUrl: string;
+    loading: boolean;
+    result: AnimeSynopsisResult | null;
+  }>({ animeUrl: '', loading: false, result: null });
 
   useEffect(() => {
     setEpisodeFilter('');
     setSortDesc(false);
   }, [anime.url]);
+
+  // Fetch TheTVDB anime synopsis (PT-BR -> Google Translate -> EN fallback) & artwork when needed
+  useEffect(() => {
+    const alreadyLocalizedFromTvdb =
+      Boolean(anime.synopsis && anime.synopsis.trim()) &&
+      (anime.synopsisSource === 'thetvdb-pt-br' ||
+        anime.synopsisSource === 'thetvdb-google-translate');
+
+    if (alreadyLocalizedFromTvdb) {
+      setLocalizedSynopsisState({
+        animeUrl: anime.url,
+        loading: false,
+        result: {
+          synopsis: anime.synopsis,
+          language: anime.synopsisLanguage || 'pt-BR',
+          source: anime.synopsisSource!,
+          poster: anime.poster || undefined,
+          backdrop: anime.backdrop || undefined,
+          tvdbId: anime.externalIds?.tvdbId,
+          tvdbSlug: anime.externalIds?.tvdbSlug,
+        },
+      });
+      return;
+    }
+
+    const cacheKey = normalizeTopAnimesUrl(anime.url) || anime.url;
+    if (synopsisCacheRef.current.has(cacheKey)) {
+      setLocalizedSynopsisState({
+        animeUrl: anime.url,
+        loading: false,
+        result: synopsisCacheRef.current.get(cacheKey) ?? null,
+      });
+      return;
+    }
+
+    const tvdbId = anime.externalIds?.tvdbId;
+    const tvdbSlug = anime.externalIds?.tvdbSlug;
+    if (!anime.title && !anime.originalTitle && !tvdbId && !tvdbSlug) {
+      setLocalizedSynopsisState({ animeUrl: anime.url, loading: false, result: null });
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (anime.title) params.set('title', anime.title);
+    if (anime.originalTitle) params.set('originalTitle', anime.originalTitle);
+    if (anime.year) params.set('year', anime.year);
+    if (anime.kind) params.set('mediaType', anime.kind);
+    if (tvdbId && tvdbId > 0) params.set('tvdbId', String(tvdbId));
+    if (tvdbSlug) params.set('tvdbSlug', tvdbSlug);
+    if (anime.synopsisSource === 'thetvdb-en' && anime.synopsis) {
+      params.set('englishOverview', anime.synopsis.slice(0, 1800));
+    }
+
+    let cancelled = false;
+    setLocalizedSynopsisState({ animeUrl: anime.url, loading: true, result: null });
+
+    apiFetch(`/api/anime-synopsis?${params.toString()}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { result?: AnimeSynopsisResult | null } | null) => {
+        if (cancelled) return;
+        const resolvedResult = payload?.result ?? null;
+        synopsisCacheRef.current.set(cacheKey, resolvedResult);
+        setLocalizedSynopsisState({
+          animeUrl: anime.url,
+          loading: false,
+          result: resolvedResult,
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLocalizedSynopsisState({
+            animeUrl: anime.url,
+            loading: false,
+            result: null,
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    anime.backdrop,
+    anime.externalIds?.tvdbId,
+    anime.externalIds?.tvdbSlug,
+    anime.kind,
+    anime.originalTitle,
+    anime.poster,
+    anime.synopsis,
+    anime.synopsisLanguage,
+    anime.synopsisSource,
+    anime.title,
+    anime.url,
+    anime.year,
+  ]);
+
+  const scopedSynopsis =
+    localizedSynopsisState.animeUrl === anime.url
+      ? localizedSynopsisState
+      : { loading: false, result: null };
+  const tvdbAnimeSynopsis = scopedSynopsis.result;
+  const effectivePoster = tvdbAnimeSynopsis?.poster || anime.poster;
+  const effectiveBackdrop = tvdbAnimeSynopsis?.backdrop || anime.backdrop || effectivePoster;
 
   const hasScheduledEpisodes = useMemo(
     () => anime.episodes.some((ep) => !isEpisodeAvailableOnServer(ep)),
@@ -115,7 +225,7 @@ export function AnimeDetailView({
   );
   const unavailableCount = anime.episodes.length - playableEpisodes.length;
 
-  const latestEpisode = pickLatestAnimeEpisode(playableEpisodes, anime.title, anime.poster);
+  const latestEpisode = pickLatestAnimeEpisode(playableEpisodes, anime.title, effectivePoster);
   const firstEpisode = playableEpisodes[0];
   const lastEpisodeItem =
     playableEpisodes.length > 1 ? playableEpisodes[playableEpisodes.length - 1] : null;
@@ -243,7 +353,7 @@ export function AnimeDetailView({
         title: anime.title,
         url: anime.url,
         kind: anime.kind || 'anime',
-        poster: anime.poster,
+        poster: effectivePoster,
         audioType: anime.audioType,
         rating: anime.rating,
         year: anime.year,
@@ -254,7 +364,7 @@ export function AnimeDetailView({
     );
   };
 
-  const hasDistinctBackdrop = Boolean(anime.backdrop && anime.backdrop !== anime.poster);
+  const hasDistinctBackdrop = Boolean(effectiveBackdrop && effectiveBackdrop !== effectivePoster);
 
   return (
     <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
@@ -312,7 +422,7 @@ export function AnimeDetailView({
         {hasDistinctBackdrop && (
           <div className="pointer-events-none absolute inset-0 overflow-hidden">
             <img
-              src={anime.backdrop}
+              src={effectiveBackdrop}
               alt=""
               aria-hidden="true"
               referrerPolicy="no-referrer"
@@ -324,7 +434,7 @@ export function AnimeDetailView({
 
         <div className="relative grid gap-6 p-5 sm:p-7 lg:grid-cols-[220px_1fr] lg:gap-8">
           <MediaPoster
-            src={anime.poster}
+            src={effectivePoster}
             alt={anime.title}
             aspect="portrait"
             className="mx-auto w-full max-w-[220px] rounded-xl border border-white/10 shadow-xl lg:mx-0"
@@ -494,9 +604,54 @@ export function AnimeDetailView({
                 </dl>
               )}
 
-              <p className="mt-4 max-w-3xl whitespace-pre-line border-t border-white/10 pt-4 text-sm leading-relaxed text-slate-300">
-                {anime.synopsis || 'Sinopse não disponível para este título no TheTVDB.'}
-              </p>
+              {(() => {
+                const displaySynopsis = tvdbAnimeSynopsis?.synopsis || anime.synopsis;
+                const activeSource = tvdbAnimeSynopsis?.source || anime.synopsisSource;
+                const sourceCaption =
+                  activeSource === 'thetvdb-pt-br'
+                    ? 'TheTVDB · PT-BR'
+                    : activeSource === 'thetvdb-google-translate'
+                      ? 'TheTVDB · Traduzido via Google Tradutor'
+                      : activeSource === 'thetvdb-en'
+                        ? 'TheTVDB · Original (EN)'
+                        : null;
+
+                if (scopedSynopsis.loading && !displaySynopsis) {
+                  return (
+                    <div
+                      data-anime-synopsis-loading="true"
+                      className="mt-4 max-w-3xl space-y-2 border-t border-white/10 pt-4"
+                      aria-label="Carregando sinopse do anime"
+                    >
+                      <div className="h-3.5 w-3/4 animate-pulse rounded bg-white/10" />
+                      <div className="h-3.5 w-full animate-pulse rounded bg-white/8" />
+                      <div className="h-3.5 w-5/6 animate-pulse rounded bg-white/8" />
+                    </div>
+                  );
+                }
+
+                return (
+                  <div
+                    data-anime-synopsis="true"
+                    data-synopsis-source={activeSource || 'fallback'}
+                    className="mt-4 max-w-3xl space-y-2 border-t border-white/10 pt-4"
+                  >
+                    <p className="whitespace-pre-line text-sm leading-relaxed text-slate-300">
+                      {displaySynopsis || 'Sinopse não disponível para este título no TheTVDB.'}
+                    </p>
+                    {scopedSynopsis.loading && (
+                      <p className="text-[11px] font-medium text-slate-500">
+                        Buscando sinopse no TheTVDB...
+                      </p>
+                    )}
+                    {!scopedSynopsis.loading && sourceCaption && (
+                      <p className="text-[11px] font-medium text-slate-500">
+                        {sourceCaption}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
         </div>
@@ -720,13 +875,20 @@ export function AnimeDetailView({
                                   src={ep.thumb}
                                   alt={ep.title}
                                   aspect="landscape"
-                                  className="hidden h-12 w-20 shrink-0 rounded-md border border-white/10 opacity-60 sm:block"
+                                  className="h-11 w-[72px] shrink-0 rounded-md border border-white/10 opacity-60 sm:h-12 sm:w-20"
                                 />
                               ) : null}
-                              <span className="w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-500 sm:w-20">
+                              <span
+                                className={`${ep.thumb ? 'hidden sm:inline-block' : ''} w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-500 sm:w-20`}
+                              >
                                 {ep.numberLabel || 'EP'}
                               </span>
                               <div className="min-w-0 flex-1">
+                                {ep.thumb && (
+                                  <div className="font-mono text-[10px] font-medium tabular-nums text-slate-500 sm:hidden">
+                                    {ep.numberLabel || 'EP'}
+                                  </div>
+                                )}
                                 <div className="truncate text-sm font-medium text-slate-300">
                                   {ep.title}
                                 </div>
@@ -799,13 +961,20 @@ export function AnimeDetailView({
                                   src={ep.thumb}
                                   alt={ep.title}
                                   aspect="landscape"
-                                  className="hidden h-12 w-20 shrink-0 rounded-md border border-white/10 sm:block"
+                                  className="h-11 w-[72px] shrink-0 rounded-md border border-white/10 sm:h-12 sm:w-20"
                                 />
                               ) : null}
-                              <span className="w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400 sm:w-20">
+                              <span
+                                className={`${ep.thumb ? 'hidden sm:inline-block' : ''} w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400 sm:w-20`}
+                              >
                                 {ep.numberLabel || 'EP'}
                               </span>
                               <div className="min-w-0 flex-1">
+                                {ep.thumb && (
+                                  <div className="font-mono text-[10px] font-medium tabular-nums text-slate-400 sm:hidden">
+                                    {ep.numberLabel || 'EP'}
+                                  </div>
+                                )}
                                 <div className="truncate text-sm font-medium text-white group-hover:text-[#f97316]">
                                   {ep.title}
                                 </div>
