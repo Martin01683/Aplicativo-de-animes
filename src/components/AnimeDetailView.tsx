@@ -89,6 +89,10 @@ export function AnimeDetailView({
 }: AnimeDetailViewProps) {
   const [episodeFilter, setEpisodeFilter] = useState('');
   const [sortDesc, setSortDesc] = useState(false);
+  const [selectedSeasonState, setSelectedSeasonState] = useState<{
+    animeUrl: string;
+    season: number | 'all';
+  }>({ animeUrl: '', season: 'all' });
   const [nowMs, setNowMs] = useState(() => Date.now());
   const synopsisCacheRef = useRef<Map<string, AnimeSynopsisResult | null>>(new Map());
   const [localizedSynopsisState, setLocalizedSynopsisState] = useState<{
@@ -244,12 +248,24 @@ export function AnimeDetailView({
 
   const baseSeasonGroups = useMemo(() => groupEpisodesBySeason(anime.episodes), [anime.episodes]);
 
+  const activeSeasonTab: number | 'all' = useMemo(() => {
+    if (selectedSeasonState.animeUrl !== anime.url) return 'all';
+    if (selectedSeasonState.season === 'all') return 'all';
+    const exists = baseSeasonGroups.some((g) => g.seasonNumber === selectedSeasonState.season);
+    return exists ? selectedSeasonState.season : 'all';
+  }, [anime.url, baseSeasonGroups, selectedSeasonState.animeUrl, selectedSeasonState.season]);
+
   const visibleSeasonGroups = useMemo(() => {
     const query = episodeFilter.trim().toLowerCase();
     const isPureDigits = /^\d+$/.test(query);
     const numericTarget = isPureDigits ? Number.parseInt(query, 10) : null;
 
-    const groups = baseSeasonGroups
+    const sourceGroups =
+      !query && activeSeasonTab !== 'all'
+        ? baseSeasonGroups.filter((g) => g.seasonNumber === activeSeasonTab)
+        : baseSeasonGroups;
+
+    const groups = sourceGroups
       .map((group) => {
         const filtered = !query
           ? group.episodes
@@ -281,7 +297,7 @@ export function AnimeDetailView({
       .filter((g) => g.episodes.length > 0);
 
     return sortDesc ? [...groups].reverse() : groups;
-  }, [baseSeasonGroups, episodeFilter, sortDesc]);
+  }, [activeSeasonTab, baseSeasonGroups, episodeFilter, sortDesc]);
 
   const isWatchedEpisode = (ep: AnimeEpisodeLink) =>
     isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls);
@@ -750,6 +766,70 @@ export function AnimeDetailView({
             )}
           </div>
         </div>
+
+        {!isMovie && baseSeasonGroups.length > 1 && (
+          <div
+            data-season-tabs="true"
+            role="tablist"
+            aria-label="Temporadas do anime"
+            className="mb-4 flex items-center gap-2 overflow-x-auto pb-1"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeSeasonTab === 'all'}
+              onClick={() =>
+                setSelectedSeasonState({ animeUrl: anime.url, season: 'all' })
+              }
+              className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+                activeSeasonTab === 'all'
+                  ? 'border-[#f97316] bg-[#f97316]/15 text-[#fb923c]'
+                  : 'border-white/12 bg-[#151921] text-slate-300 hover:border-white/25 hover:text-white'
+              }`}
+            >
+              <span>Todas ({baseSeasonGroups.length})</span>
+              <span className="font-mono text-[11px] font-normal tabular-nums text-slate-400">
+                {anime.episodes.length} eps
+              </span>
+            </button>
+
+            {baseSeasonGroups.map((group) => {
+              const isSelected = activeSeasonTab === group.seasonNumber;
+              const groupPlayable = group.episodes.filter(isEpisodeAvailableOnServer);
+              const groupWatched = groupPlayable.filter(isWatchedEpisode).length;
+              const groupAllWatched =
+                groupPlayable.length > 0 && groupWatched === groupPlayable.length;
+
+              return (
+                <button
+                  key={group.seasonNumber}
+                  type="button"
+                  role="tab"
+                  aria-selected={isSelected}
+                  onClick={() =>
+                    setSelectedSeasonState({
+                      animeUrl: anime.url,
+                      season: group.seasonNumber,
+                    })
+                  }
+                  className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+                    isSelected
+                      ? 'border-[#f97316] bg-[#f97316]/15 text-[#fb923c]'
+                      : groupAllWatched
+                        ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300 hover:border-emerald-400/55'
+                        : 'border-white/12 bg-[#151921] text-slate-300 hover:border-white/25 hover:text-white'
+                  }`}
+                >
+                  {groupAllWatched && <Check className="h-3.5 w-3.5 shrink-0 text-emerald-400" />}
+                  <span>{group.label}</span>
+                  <span className="font-mono text-[11px] font-normal tabular-nums text-slate-400">
+                    {group.episodes.length}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         {!isMovie && unavailableCount > 0 && (
           <div

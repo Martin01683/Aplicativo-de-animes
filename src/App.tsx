@@ -2732,38 +2732,36 @@ export default function App() {
                   </div>
                 }
               >
-                <EpisodeWorkspace
-                  episode={episodeDetails}
-                  isFavorite={isItemFavorited(
-                    episodeDetails.seriesUrl || episodeDetails.url,
-                    favorites
-                  )}
-                  watchedUrls={watchedUrls}
-                  progressMap={progressMap}
-                  initialSeriesEpisodes={
+                {(() => {
+                  const matchesLoadedAnime = Boolean(
                     animeDetails &&
-                    episodeDetails.seriesUrl &&
-                    isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
-                      ? animeDetails.episodes
-                      : undefined
-                  }
-                  initialSeriesArtwork={
-                    animeDetails &&
-                    episodeDetails.seriesUrl &&
-                    isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
-                      ? {
-                          poster: animeDetails.poster || undefined,
-                          backdrop: animeDetails.backdrop || undefined,
-                        }
-                      : undefined
-                  }
-                  initialSeriesExternalIds={
-                    animeDetails &&
-                    episodeDetails.seriesUrl &&
-                    isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
-                      ? animeDetails.externalIds
-                      : undefined
-                  }
+                      ((episodeDetails.seriesUrl &&
+                        isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)) ||
+                        animeDetails.episodes.some((ep) =>
+                          isSameEpisodeUrl(ep.url, episodeDetails.url)
+                        ))
+                  );
+                  return (
+                    <EpisodeWorkspace
+                      episode={episodeDetails}
+                      isFavorite={isItemFavorited(
+                        episodeDetails.seriesUrl || episodeDetails.url,
+                        favorites
+                      )}
+                      watchedUrls={watchedUrls}
+                      progressMap={progressMap}
+                      initialSeriesEpisodes={matchesLoadedAnime ? animeDetails?.episodes : undefined}
+                      initialSeriesArtwork={
+                        matchesLoadedAnime && animeDetails
+                          ? {
+                              poster: animeDetails.poster || undefined,
+                              backdrop: animeDetails.backdrop || undefined,
+                            }
+                          : undefined
+                      }
+                      initialSeriesExternalIds={
+                        matchesLoadedAnime ? animeDetails?.externalIds : undefined
+                      }
                   loadingEpisode={loadingDetail}
                   loadingExtraServers={Boolean(
                     loadingExtraServers &&
@@ -2821,6 +2819,8 @@ export default function App() {
                   videoScale={settings.videoScale}
                   onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
                 />
+                  );
+                })()}
               </Suspense>
             ) : null}
           </>

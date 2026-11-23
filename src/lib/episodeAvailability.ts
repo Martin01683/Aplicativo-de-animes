@@ -347,6 +347,7 @@ export function mergeServerAndCatalogEpisodes(params: {
   serverMatched: boolean;
   tvdbId?: number;
   mediaType?: CanonicalMediaType;
+  unifyAllSeasons?: boolean;
 }): AnimeEpisodeLink[] {
   const {
     serverTitle,
@@ -357,6 +358,7 @@ export function mergeServerAndCatalogEpisodes(params: {
     serverMatched,
     tvdbId,
     mediaType = 'anime',
+    unifyAllSeasons = false,
   } = params;
 
   const explicitSeason = extractExplicitSeasonNumber(serverTitle);
@@ -392,7 +394,9 @@ export function mergeServerAndCatalogEpisodes(params: {
       (ep) => ep.seasonNumber === targetSingleSeason
     );
     if (matchingSeasonCatalog.length > 0) {
-      scopedCatalog = matchingSeasonCatalog;
+      if (!unifyAllSeasons) {
+        scopedCatalog = matchingSeasonCatalog;
+      }
       mappedServerSeason = targetSingleSeason;
     }
   }
@@ -582,12 +586,16 @@ export function mergeServerAndCatalogEpisodes(params: {
         Boolean(catEp.title) &&
         !isGenericEpisodeTitle(catEp.title) &&
         isGenericEpisodeTitle(matchedServer.title);
+      const hasMisleadingSeason1Label =
+        sNum > 1 && /^\s*1\s*[-·]\s*\d+\s*$/.test(matchedServer.numberLabel || '');
       merged.push({
         ...matchedServer,
         title: preferCatalogTitle ? catEp.title : matchedServer.title,
         seasonNumber: sNum,
         seasonLabel: catEp.seasonLabel || matchedServer.seasonLabel || `Temporada ${sNum}`,
-        numberLabel: matchedServer.numberLabel || catEp.numberLabel,
+        numberLabel: hasMisleadingSeason1Label
+          ? catEp.numberLabel || `T${sNum} · EP ${eNum ?? ''}`.trim()
+          : matchedServer.numberLabel || catEp.numberLabel,
         date: matchedServer.date || catEp.date,
         thumb: catEp.thumb || matchedServer.thumb,
         overview: matchedServer.overview || catEp.overview,

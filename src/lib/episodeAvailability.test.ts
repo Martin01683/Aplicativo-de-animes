@@ -409,5 +409,88 @@ test('mergeServerAndCatalogEpisodes prefers TheTVDB episode thumbnails over serv
   assert.equal(merged[1].thumb, 'https://topanimes.net/wp-content/uploads/server-ep2.jpg');
 });
 
+test('mergeServerAndCatalogEpisodes keeps all seasons when unifyAllSeasons is true and pickLatestAnimeEpisode prioritizes the latest season', () => {
+  const merged = mergeServerAndCatalogEpisodes({
+    serverTitle: 'Frieren 2ª Temporada',
+    serverUrl: 'https://topanimes.net/animes/frieren-2/',
+    serverEpisodes: [
+      {
+        numberLabel: '1 - 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        title: 'Episódio 1',
+        url: 'https://topanimes.net/episodio/frieren-ep-1/',
+      },
+      {
+        numberLabel: '1 - 28',
+        episodeNumber: 28,
+        seasonNumber: 1,
+        title: 'Episódio 28',
+        url: 'https://topanimes.net/episodio/frieren-ep-28/',
+      },
+      {
+        numberLabel: '1 - 1',
+        episodeNumber: 1,
+        seasonNumber: 2,
+        title: 'Episódio 1',
+        url: 'https://topanimes.net/episodio/frieren-2-ep-1/',
+      },
+      {
+        numberLabel: '1 - 3',
+        episodeNumber: 3,
+        seasonNumber: 2,
+        title: 'Episódio 3',
+        url: 'https://topanimes.net/episodio/frieren-2-ep-3/',
+      },
+    ],
+    catalogEpisodes: [
+      {
+        numberLabel: 'EP 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 1 — O Fim da Jornada',
+        url: 'anisync://episode/anime/thetvdb/424536/s1/e1',
+      },
+      {
+        numberLabel: 'EP 28',
+        episodeNumber: 28,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 28 — Seria Constrangedor',
+        url: 'anisync://episode/anime/thetvdb/424536/s1/e28',
+      },
+      {
+        numberLabel: 'T2 · EP 1',
+        episodeNumber: 1,
+        seasonNumber: 2,
+        seasonLabel: 'Temporada 2',
+        title: 'Episódio 1 — Novo Rumo',
+        url: 'anisync://episode/anime/thetvdb/424536/s2/e1',
+      },
+      {
+        numberLabel: 'T2 · EP 3',
+        episodeNumber: 3,
+        seasonNumber: 2,
+        seasonLabel: 'Temporada 2',
+        title: 'Episódio 3 — Fronteira Norte',
+        url: 'anisync://episode/anime/thetvdb/424536/s2/e3',
+      },
+    ],
+    serverMatched: true,
+    tvdbId: 424536,
+    unifyAllSeasons: true,
+  });
+
+  assert.equal(merged.length, 4);
+  assert.equal(merged[2].seasonNumber, 2);
+  assert.equal(merged[2].numberLabel, 'T2 · EP 1');
+
+  const latest = pickLatestAnimeEpisode(merged, 'Frieren', 'https://example.com/poster.jpg');
+  assert.ok(latest);
+  assert.equal(latest.episodeUrl, 'https://topanimes.net/episodio/frieren-2-ep-3/');
+  assert.equal(latest.episodeLabel, 'T2 · EP 3');
+});
+
 
 

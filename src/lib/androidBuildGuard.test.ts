@@ -636,6 +636,10 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
       /hidden h-12 w-20 shrink-0 rounded-md border border-white\/10 sm:block/,
       'Episode thumbnails in AnimeDetailView should remain visible on mobile screens too',
     );
+    assert.match(detailTsx, /data-season-tabs="true"/);
+
+    const appTsx = readRepoFile('src/App.tsx');
+    assert.match(appTsx, /animeDetails\.episodes\.some\(\(ep\) =>/);
   });
 });
 

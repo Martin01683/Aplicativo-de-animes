@@ -229,6 +229,7 @@ export function pickLatestAnimeEpisode(
   episodes: Array<{
     numberLabel: string;
     episodeNumber: number | null;
+    seasonNumber?: number;
     title: string;
     url: string;
     thumb?: string;
@@ -251,6 +252,7 @@ export function pickRecentAnimeEpisodes(
   episodes: Array<{
     numberLabel: string;
     episodeNumber: number | null;
+    seasonNumber?: number;
     title: string;
     url: string;
     thumb?: string;
@@ -263,23 +265,38 @@ export function pickRecentAnimeEpisodes(
 ): FavoriteLatestInfo[] {
   const playableEpisodes = episodes.filter((ep) => ep.availableOnServer !== false);
   if (!playableEpisodes.length) return [];
-  const mapped: Array<{ info: FavoriteLatestInfo; orderIndex: number }> = playableEpisodes.map((ep, idx) => {
-    const num = ep.episodeNumber ?? extractEpisodeNumber(ep.url) ?? extractEpisodeNumber(ep.title);
-    return {
-      orderIndex: idx,
-      info: {
-        episodeUrl: normalizeTopAnimesUrl(ep.url),
-        episodeTitle: `${seriesTitle} — ${ep.title}`,
-        episodeLabel: num !== null ? `EP ${num}` : ep.numberLabel || ep.title,
-        episodeNumber: num,
-        poster: ep.thumb || fallbackPoster,
-        audioType: meta?.audioType ?? null,
-        sourceServerName: meta?.sourceServerName,
-      },
-    };
-  });
+  const mapped: Array<{ info: FavoriteLatestInfo; seasonNumber: number; orderIndex: number }> =
+    playableEpisodes.map((ep, idx) => {
+      const num = ep.episodeNumber ?? extractEpisodeNumber(ep.url) ?? extractEpisodeNumber(ep.title);
+      const seasonNum =
+        ep.seasonNumber && Number.isFinite(ep.seasonNumber) && ep.seasonNumber > 0
+          ? ep.seasonNumber
+          : 1;
+      const formattedLabel =
+        num !== null
+          ? seasonNum > 1
+            ? `T${seasonNum} · EP ${num}`
+            : `EP ${num}`
+          : ep.numberLabel || ep.title;
+      return {
+        seasonNumber: seasonNum,
+        orderIndex: idx,
+        info: {
+          episodeUrl: normalizeTopAnimesUrl(ep.url),
+          episodeTitle: `${seriesTitle} — ${ep.title}`,
+          episodeLabel: formattedLabel,
+          episodeNumber: num,
+          poster: ep.thumb || fallbackPoster,
+          audioType: meta?.audioType ?? null,
+          sourceServerName: meta?.sourceServerName,
+        },
+      };
+    });
 
   mapped.sort((a, b) => {
+    if (a.seasonNumber !== b.seasonNumber) {
+      return b.seasonNumber - a.seasonNumber;
+    }
     if (a.info.episodeNumber !== null && b.info.episodeNumber !== null) {
       return b.info.episodeNumber - a.info.episodeNumber;
     }

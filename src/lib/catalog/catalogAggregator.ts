@@ -275,6 +275,7 @@ export async function getAggregatedMediaDetails(
               serverMatched: false,
               tvdbId: tvdbMatch.tvdbId,
               mediaType: (base.kind as CanonicalMediaType) || 'anime',
+              unifyAllSeasons: true,
             });
 
       const mergedIds = {

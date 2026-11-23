@@ -21,6 +21,7 @@ import {
   type CanonicalMediaType,
 } from '../idCodec.ts';
 import { findLiveChartScheduleHint } from './livechartProvider.ts';
+import { unifyServerSeasonsWithCatalog } from '../seasonUnifier.ts';
 
 const TVDB_V4_API_BASE = 'https://api4.thetvdb.com/v4';
 const TVDB_WEB_SEARCH_URL = 'https://api4.thetvdb.com/web/search/queries';
@@ -1323,19 +1324,42 @@ export async function enrichServerDetailsWithTheTvdb(
   ]);
 
   if (!bestMatch) {
+    const unifiedWithoutTvdb = !isMovie
+      ? await unifyServerSeasonsWithCatalog(fetchHttp, serverDetails, [], queryTerms).catch(
+          () => null
+        )
+      : null;
+    const activeEpisodes = unifiedWithoutTvdb?.serverEpisodes || serverDetails.episodes;
+    const activeTitle = unifiedWithoutTvdb?.unifiedTitle || serverDetails.title;
+    const activeSeasonsCount =
+      unifiedWithoutTvdb && unifiedWithoutTvdb.unifiedSeasonCount > 1
+        ? String(unifiedWithoutTvdb.unifiedSeasonCount)
+        : serverDetails.seasonsCount;
+
     if (!isMovie && liveChartHint) {
       const mergedWithSchedule = mergeServerAndCatalogEpisodes({
         serverTitle: serverDetails.title,
         serverUrl: serverDetails.url,
-        serverEpisodes: serverDetails.episodes,
+        serverEpisodes: activeEpisodes,
         catalogEpisodes: [],
         liveChartHint,
-        serverMatched: serverDetails.episodes.length > 0,
+        serverMatched: activeEpisodes.length > 0,
         mediaType: (serverDetails.kind as CanonicalMediaType) || 'anime',
+        unifyAllSeasons: true,
       });
       return {
         ...serverDetails,
+        title: activeTitle,
+        seasonsCount: activeSeasonsCount,
         episodes: mergedWithSchedule,
+      };
+    }
+    if (unifiedWithoutTvdb && unifiedWithoutTvdb.addedSeasonPages > 0) {
+      return {
+        ...serverDetails,
+        title: activeTitle,
+        seasonsCount: activeSeasonsCount,
+        episodes: activeEpisodes,
       };
     }
     return serverDetails;
@@ -1350,21 +1374,43 @@ export async function enrichServerDetailsWithTheTvdb(
   }).catch(() => null);
 
   const tvdb = fullTvdb || null;
-  const resolvedLiveChartHint =
-    liveChartHint ||
-    (!isMovie
-      ? await findLiveChartScheduleHint(fetchHttp, {
-          livechartId: extra?.livechartId ?? serverDetails.externalIds?.livechartId,
-          titles: [
-            ...queryTerms,
-            tvdb?.title || '',
-            tvdb?.originalTitle || '',
-            tvdb?.alternativeTitle || '',
-            bestMatch.title,
-            bestMatch.englishTitle || '',
-          ].filter(Boolean),
-        }).catch(() => null)
-      : null);
+  const resolvedKind: CanonicalMediaType =
+    serverDetails.kind === 'movie' || bestMatch.mediaType === 'movie'
+      ? 'movie'
+      : serverDetails.kind === 'series'
+        ? 'series'
+        : bestMatch.mediaType;
+
+  const extraReferenceTitles = [
+    ...queryTerms,
+    tvdb?.title || '',
+    tvdb?.originalTitle || '',
+    tvdb?.alternativeTitle || '',
+    ...(tvdb?.alternativeTitles || []),
+    bestMatch.title,
+    bestMatch.originalTitle || '',
+    bestMatch.englishTitle || '',
+    ...bestMatch.alternativeTitles,
+  ].filter(Boolean);
+
+  const [resolvedLiveChartHint, unifiedSeasons] = await Promise.all([
+    liveChartHint
+      ? Promise.resolve(liveChartHint)
+      : !isMovie
+        ? findLiveChartScheduleHint(fetchHttp, {
+            livechartId: extra?.livechartId ?? serverDetails.externalIds?.livechartId,
+            titles: extraReferenceTitles,
+          }).catch(() => null)
+        : Promise.resolve(null),
+    resolvedKind !== 'movie'
+      ? unifyServerSeasonsWithCatalog(
+          fetchHttp,
+          serverDetails,
+          tvdb?.episodes || [],
+          extraReferenceTitles
+        ).catch(() => null)
+      : Promise.resolve(null),
+  ]);
 
   const mergedIds: ExternalMediaIds = {
     ...serverDetails.externalIds,
@@ -1374,16 +1420,13 @@ export async function enrichServerDetailsWithTheTvdb(
       ? { livechartId: resolvedLiveChartHint.livechartId }
       : {}),
   };
-  const resolvedKind: CanonicalMediaType =
-    serverDetails.kind === 'movie' || bestMatch.mediaType === 'movie'
-      ? 'movie'
-      : serverDetails.kind === 'series'
-        ? 'series'
-        : bestMatch.mediaType;
+
+  const resolvedTitle = unifiedSeasons?.unifiedTitle || serverDetails.title;
 
   const altTitles = Array.from(
     new Set(
       [
+        serverDetails.title,
         serverDetails.alternativeTitle,
         serverDetails.originalTitle,
         ...(serverDetails.alternativeTitles || []),
@@ -1397,7 +1440,7 @@ export async function enrichServerDetailsWithTheTvdb(
         ...bestMatch.alternativeTitles,
       ]
         .map((t) => cleanText(t))
-        .filter((t) => t && t.toLowerCase() !== serverDetails.title.toLowerCase())
+        .filter((t) => t && t.toLowerCase() !== resolvedTitle.toLowerCase())
     )
   ).slice(0, 10);
 
@@ -1429,6 +1472,8 @@ export async function enrichServerDetailsWithTheTvdb(
     serverDetails.backdrop ||
     serverDetails.poster;
 
+  const unifiedServerEps = unifiedSeasons?.serverEpisodes || serverDetails.episodes;
+
   const mergedEpisodes =
     resolvedKind === 'movie'
       ? serverDetails.episodes.map((ep) => ({
@@ -1438,16 +1483,23 @@ export async function enrichServerDetailsWithTheTvdb(
       : mergeServerAndCatalogEpisodes({
           serverTitle: serverDetails.title,
           serverUrl: serverDetails.url,
-          serverEpisodes: serverDetails.episodes,
+          serverEpisodes: unifiedServerEps,
           catalogEpisodes: tvdb?.episodes || [],
           liveChartHint: resolvedLiveChartHint,
-          serverMatched: serverDetails.episodes.length > 0,
+          serverMatched: unifiedServerEps.length > 0,
           tvdbId: bestMatch.tvdbId,
           mediaType: resolvedKind,
+          unifyAllSeasons: true,
         });
+
+  const mergedSeasonCount =
+    resolvedKind !== 'movie' && mergedEpisodes.length > 0
+      ? new Set(mergedEpisodes.map((ep) => ep.seasonNumber || 1)).size
+      : 0;
 
   return {
     ...serverDetails,
+    title: resolvedTitle,
     kind: resolvedKind,
     catalogSource: 'thetvdb',
     externalIds: mergedIds,
@@ -1455,7 +1507,7 @@ export async function enrichServerDetailsWithTheTvdb(
     externalLinks: buildExternalDatabaseLinks(mergedIds, { mediaType: resolvedKind }),
     originalTitle: tvdb?.originalTitle || bestMatch.originalTitle || serverDetails.originalTitle,
     alternativeTitle:
-      tvdb?.title && tvdb.title.toLowerCase() !== serverDetails.title.toLowerCase()
+      tvdb?.title && tvdb.title.toLowerCase() !== resolvedTitle.toLowerCase()
         ? tvdb.title
         : tvdb?.alternativeTitle || serverDetails.alternativeTitle,
     alternativeTitles: altTitles,
@@ -1468,7 +1520,10 @@ export async function enrichServerDetailsWithTheTvdb(
     firstAirDate: tvdb?.firstAirDate || bestMatch.firstAirDate || serverDetails.firstAirDate,
     lastAirDate: tvdb?.lastAirDate || serverDetails.lastAirDate,
     averageDuration: tvdb?.averageDuration || serverDetails.averageDuration,
-    seasonsCount: tvdb?.seasonsCount || serverDetails.seasonsCount,
+    seasonsCount:
+      mergedSeasonCount > 0
+        ? String(mergedSeasonCount)
+        : tvdb?.seasonsCount || serverDetails.seasonsCount,
     status: tvdb?.status || bestMatch.status || serverDetails.status,
     studio: tvdb?.studio || bestMatch.studio || serverDetails.studio,
     network: tvdb?.network || bestMatch.network || serverDetails.network,
