@@ -2,6 +2,14 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.22] — 2026-11-23
+
+### Correções
+- Upgrade Capacitor 8, Android SDK 36, latest dependencies, and fix build warnings (`43f897b`)
+
+### Melhorias e Manutenção
+- Update libvlc-all from 3.6.5 to 3.7.8 (`7610162`)
+
 ## [v1.0.20] — 2026-11-23
 
 ### Melhorias e Manutenção
