@@ -2,6 +2,16 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.20] — 2026-11-23
+
+### Melhorias e Manutenção
+- Rename server to provider and update episode logic (`3c689b1`)
+
+## [v1.0.19] — 2026-11-23
+
+### Novidades
+- Clarify that release dates and countdowns reflect official launch forecasts (`e0ce697`)
+
 ## [v1.0.18] — 2026-11-23
 
 ### Novidades
