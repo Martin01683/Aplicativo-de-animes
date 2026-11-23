@@ -2,6 +2,15 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.18] — 2026-11-23
+
+### Novidades
+- Show complete episode guide with release dates, live countdowns, and improved server matching (`576785e`)
+- Overhaul notification center, native Android delivery, quiet hours, and per-anime mute (`acb26c1`)
+
+### Correções
+- Remove update dot from settings gear, scroll update actions to download panel, and boost calendar countdown contrast (`becca84`)
+
 ## [v1.0.17] — 2026-11-22
 
 ### Novidades
