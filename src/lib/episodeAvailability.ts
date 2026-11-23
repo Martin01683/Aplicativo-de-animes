@@ -193,8 +193,7 @@ export function formatEpisodeReleaseDate(
       : parseEpisodeDateToTimestampSec(dateStr);
 
   if (!ts) {
-    const fallback = (dateStr || '').trim();
-    return fallback || null;
+    return null;
   }
 
   try {
@@ -234,7 +233,7 @@ export function formatEpisodeCountdown(
       : parseEpisodeDateToTimestampSec(dateStr);
 
   if (!ts) {
-    return { label: 'Em breve', state: 'tba' };
+    return { label: 'A ser anunciada', state: 'tba' };
   }
 
   const diffSec = Math.floor(ts - nowMs / 1000);

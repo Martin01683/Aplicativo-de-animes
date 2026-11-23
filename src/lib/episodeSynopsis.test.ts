@@ -58,21 +58,29 @@ test('parseTvdbEpisodePageHtml extracts strictly PT-BR (pt) and EN (eng), ignori
   assert.equal(parsedNoPtBr.engOverview, 'English overview text here.');
 });
 
-test('parseTvdbAllSeasonsHtml captures tvdbEpisodeId from episode links', () => {
+test('parseTvdbAllSeasonsHtml captures tvdbEpisodeId from episode links and ignores network names or TBA titles', () => {
   const html = `
     <ul>
       <li class="list-group-item">
         <span class="episode-label">S01E01</span>
         <h4><a href="/series/sousou-no-frieren/episodes/9350138">The Journey's End</a></h4>
-        <ul class="list-inline"><li>September 29, 2023</li></ul>
+        <ul class="list-inline"><li>September 29, 2023</li><li>Nippon TV</li></ul>
         <div class="list-group-item-text"><p>English summary from guide.</p></div>
+      </li>
+      <li class="list-group-item">
+        <span class="episode-label">S03E13</span>
+        <h4><a href="/series/sousou-no-frieren/episodes/9350999">TBA</a></h4>
+        <ul class="list-inline"><li>Nippon TV</li></ul>
       </li>
     </ul>
   `;
   const eps = parseTvdbAllSeasonsHtml(html, 424536, 'anime');
-  assert.equal(eps.length, 1);
+  assert.equal(eps.length, 2);
   assert.equal(eps[0].tvdbEpisodeId, 9350138);
+  assert.equal(eps[0].date, 'September 29, 2023');
   assert.equal(eps[0].overview, 'English summary from guide.');
+  assert.equal(eps[1].title, 'Episódio 13');
+  assert.equal(eps[1].date, undefined);
 });
 
 test('parseGoogleTranslateResponse joins translated segments and rejects malformed input', () => {

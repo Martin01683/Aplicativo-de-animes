@@ -1,5 +1,8 @@
 import * as cheerio from 'cheerio';
-import { mergeServerAndCatalogEpisodes } from '../../episodeAvailability.ts';
+import {
+  mergeServerAndCatalogEpisodes,
+  parseEpisodeDateToTimestampSec,
+} from '../../episodeAvailability.ts';
 import { translateEnglishToPtBr } from '../../googleTranslate.ts';
 import type { HttpFetcher } from '../../httpTypes.ts';
 import type {
@@ -975,10 +978,18 @@ export function parseTvdbAllSeasonsHtml(
 
     const titleAnchor = $li.find('h4 a').first();
     const rawTitle = cleanText(titleAnchor.text());
+    const cleanEpTitle = rawTitle && !/^(?:tba|tbd)$/i.test(rawTitle) ? rawTitle : '';
     const epHref = titleAnchor.attr('href') || '';
     const epIdMatch = epHref.match(/\/episodes\/(\d+)/i);
     const tvdbEpisodeId = epIdMatch ? Number.parseInt(epIdMatch[1], 10) : undefined;
-    const date = cleanText($li.find('ul.list-inline li').first().text()) || undefined;
+    let date: string | undefined;
+    $li.find('ul.list-inline li').each((__, metaLi) => {
+      if (date) return;
+      const candidate = cleanText($(metaLi).text());
+      if (candidate && parseEpisodeDateToTimestampSec(candidate) !== undefined) {
+        date = candidate;
+      }
+    });
     const overview = cleanText($li.find('.list-group-item-text p').first().text()) || undefined;
     let thumb: string | undefined;
     $li.find('img').each((__, img) => {
@@ -990,7 +1001,9 @@ export function parseTvdbAllSeasonsHtml(
       if (candidate) thumb = candidate;
     });
 
-    const title = rawTitle ? `Episódio ${episodeNumber} — ${rawTitle}` : `Episódio ${episodeNumber}`;
+    const title = cleanEpTitle
+      ? `Episódio ${episodeNumber} — ${cleanEpTitle}`
+      : `Episódio ${episodeNumber}`;
     episodes.push({
       numberLabel: seasonNumber > 1 ? `T${seasonNumber} · EP ${episodeNumber}` : `EP ${episodeNumber}`,
       episodeNumber,
@@ -1145,12 +1158,16 @@ export async function fetchTheTvdbDetails(
             for (const ep of ePayload.data?.episodes || []) {
               if (!ep.number || ep.number <= 0 || ep.seasonNumber === 0) continue;
               const sNum = ep.seasonNumber && ep.seasonNumber > 0 ? ep.seasonNumber : 1;
+              const cleanApiEpName =
+                ep.name && !/^(?:tba|tbd)$/i.test(ep.name.trim()) ? ep.name.trim() : '';
               episodes.push({
                 numberLabel: sNum > 1 ? `T${sNum} · EP ${ep.number}` : `EP ${ep.number}`,
                 episodeNumber: ep.number,
                 seasonNumber: sNum,
                 seasonLabel: `Temporada ${sNum}`,
-                title: ep.name ? `Episódio ${ep.number} — ${ep.name}` : `Episódio ${ep.number}`,
+                title: cleanApiEpName
+                  ? `Episódio ${ep.number} — ${cleanApiEpName}`
+                  : `Episódio ${ep.number}`,
                 url: buildEpisodeUri(resolvedType, 'thetvdb', tvdbId, sNum, ep.number),
                 date: ep.aired || undefined,
                 thumb: isValidArtworkUrl(ep.image) || undefined,

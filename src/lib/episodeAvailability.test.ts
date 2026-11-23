@@ -35,6 +35,8 @@ test('formatEpisodeReleaseDate formats date-only and exact-time timestamps clean
   assert.ok(withTime && /^\d{2}\/\d{2}\/2026 · \d{2}:\d{2}$/.test(withTime));
 
   assert.equal(formatEpisodeReleaseDate(undefined, undefined, false), null);
+  assert.equal(formatEpisodeReleaseDate('Nippon TV', undefined, false), null);
+  assert.equal(formatEpisodeReleaseDate('TBA', undefined, false), null);
 });
 
 test('formatEpisodeCountdown matches Calendar countdown semantics across future, now, pending, and TBA', () => {
@@ -62,7 +64,11 @@ test('formatEpisodeCountdown matches Calendar countdown semantics across future,
     state: 'pending',
   });
   assert.deepEqual(formatEpisodeCountdown(undefined, nowMs), {
-    label: 'Em breve',
+    label: 'A ser anunciada',
+    state: 'tba',
+  });
+  assert.deepEqual(formatEpisodeCountdown(undefined, nowMs, 'Nippon TV'), {
+    label: 'A ser anunciada',
     state: 'tba',
   });
 });
