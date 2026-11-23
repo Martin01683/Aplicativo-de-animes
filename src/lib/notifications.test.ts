@@ -203,3 +203,23 @@ test('Android native notification bridge declares POST_NOTIFICATIONS, channels, 
   assert.match(mainActivity, /consumePendingNotificationTarget/);
   assert.match(mainActivity, /__anisyncOpenNotificationTarget/);
 });
+
+test('Header settings gear hides update badge and update buttons jump directly to updates settings section', () => {
+  const headerSource = readFileSync(resolve(ROOT, 'src/components/Header.tsx'), 'utf-8');
+  const appSource = readFileSync(resolve(ROOT, 'src/App.tsx'), 'utf-8');
+  const settingsModalSource = readFileSync(
+    resolve(ROOT, 'src/components/SettingsModal.tsx'),
+    'utf-8'
+  );
+
+  const settingsButtonChunk = headerSource.slice(headerSource.indexOf('<Settings className='));
+  assert.doesNotMatch(settingsButtonChunk, /hasAppUpdate/);
+  assert.match(appSource, /onOpenUpdateSettings=\{\(\) => openSettingsModal\('updates'\)\}/);
+  assert.match(
+    appSource,
+    /if \(targetKind === 'settings'\) \{\s*openSettingsModal\('updates'\);/
+  );
+  assert.match(settingsModalSource, /focusSection === 'updates'/);
+  assert.match(settingsModalSource, /id="settings-updates-panel"\s+ref=\{updatesPanelRef\}/);
+});
+

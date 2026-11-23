@@ -205,20 +205,10 @@ export function Header({
               setOpenPopover(false);
               onOpenSettings();
             }}
-            aria-label={
-              hasAppUpdate
-                ? 'Abrir configurações do Anisync (nova atualização disponível)'
-                : 'Abrir configurações do Anisync'
-            }
+            aria-label="Abrir configurações do Anisync"
             className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-[#151921] text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
           >
             <Settings className="h-4.5 w-4.5" />
-            {hasAppUpdate && (
-              <span
-                aria-hidden="true"
-                className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#0d0f12] bg-[#f97316]"
-              />
-            )}
           </button>
         </div>
       </div>

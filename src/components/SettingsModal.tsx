@@ -57,7 +57,7 @@ const HOUR_OPTIONS = Array.from({ length: 24 }, (_, idx) => idx);
 
 interface SettingsModalProps {
   open: boolean;
-  focusSection?: 'sources' | 'catalog' | 'notifications' | 'general';
+  focusSection?: 'sources' | 'catalog' | 'notifications' | 'updates' | 'general';
   onClose: () => void;
   settings: AppSettings;
   settingsMeta: AppSettingsMeta;
@@ -162,6 +162,7 @@ export function SettingsModal({
 }: SettingsModalProps) {
   const sourcesSectionRef = useRef<HTMLElement>(null);
   const notificationsSectionRef = useRef<HTMLElement>(null);
+  const updatesPanelRef = useRef<HTMLDivElement>(null);
   const [showCredsPanel, setShowCredsPanel] = useState(false);
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
@@ -179,11 +180,19 @@ export function SettingsModal({
 
   useEffect(() => {
     if (!open) return;
-    if (focusSection === 'sources') {
-      sourcesSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    } else if (focusSection === 'notifications') {
-      notificationsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
+    const target =
+      focusSection === 'sources'
+        ? sourcesSectionRef.current
+        : focusSection === 'notifications'
+          ? notificationsSectionRef.current
+          : focusSection === 'updates'
+            ? updatesPanelRef.current
+            : null;
+    if (!target) return;
+    const rafId = window.requestAnimationFrame(() => {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+    return () => window.cancelAnimationFrame(rafId);
   }, [open, focusSection]);
 
   if (!open) return null;
@@ -845,7 +854,11 @@ export function SettingsModal({
             </div>
 
             {/* Manual Check + Update Status Panel */}
-            <div className="space-y-3 rounded-xl border border-white/10 bg-[#0d0f12]/70 p-4">
+            <div
+              id="settings-updates-panel"
+              ref={updatesPanelRef}
+              className="scroll-mt-4 space-y-3 rounded-xl border border-white/10 bg-[#0d0f12]/70 p-4"
+            >
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="text-xs text-slate-400">
                   Última verificação:{' '}

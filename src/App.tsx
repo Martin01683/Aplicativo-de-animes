@@ -190,7 +190,7 @@ export default function App() {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsFocusSection, setSettingsFocusSection] = useState<
-    'sources' | 'catalog' | 'notifications' | 'general'
+    'sources' | 'catalog' | 'notifications' | 'updates' | 'general'
   >('general');
 
   const initialRouteSession = useMemo(() => loadActiveRouteSession(), []);
@@ -2437,7 +2437,7 @@ export default function App() {
   const settingsSnapshotOnOpenRef = useRef<{ catalog: string; sources: string } | null>(null);
 
   const openSettingsModal = useCallback(
-    (section: 'sources' | 'catalog' | 'notifications' | 'general' = 'general') => {
+    (section: 'sources' | 'catalog' | 'notifications' | 'updates' | 'general' = 'general') => {
       settingsSnapshotOnOpenRef.current = {
         catalog: JSON.stringify({
           creds: settingsRef.current.catalogCredentials,
@@ -2452,7 +2452,7 @@ export default function App() {
 
   openNotificationTargetRef.current = (targetUrl: string, targetKind?: string) => {
     if (targetKind === 'settings') {
-      openSettingsModal('general');
+      openSettingsModal('updates');
       return;
     }
     if (targetUrl) {
@@ -2543,7 +2543,7 @@ export default function App() {
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
         onSendTestNotification={() => void handleSendTestNotification()}
         onOpenNotificationSettings={() => openSettingsModal('notifications')}
-        onOpenUpdateSettings={() => openSettingsModal('general')}
+        onOpenUpdateSettings={() => openSettingsModal('updates')}
         hasAppUpdate={Boolean(appUpdateResult?.hasUpdate)}
         latestRelease={appUpdateResult?.latestRelease || null}
         onOpenSettings={() => openSettingsModal('general')}

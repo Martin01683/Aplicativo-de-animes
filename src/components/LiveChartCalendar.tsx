@@ -288,12 +288,12 @@ export function LiveChartCalendar({
               </span>
               {countdown && (
                 <span
-                  className={`rounded-md border px-1.5 py-0.5 text-[10px] font-semibold tabular-nums backdrop-blur-md ${
+                  className={`rounded-md border px-2 py-0.5 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${
                     countdown.state === 'now'
-                      ? 'border-emerald-400/45 bg-emerald-500/25 text-emerald-200'
+                      ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
                       : countdown.state === 'future'
-                        ? 'border-[#f97316]/45 bg-[#f97316]/20 text-[#fed7aa]'
-                        : 'border-white/10 bg-[#0d0f12]/75 text-slate-400'
+                        ? 'border-[#f97316]/85 bg-[#1b0e05]/92 text-[#ffedd5]'
+                        : 'border-white/25 bg-[#0d0f12]/92 text-slate-200'
                   }`}
                 >
                   {countdown.label}
