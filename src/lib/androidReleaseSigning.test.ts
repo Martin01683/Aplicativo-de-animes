@@ -20,7 +20,7 @@ describe('android/app/build.gradle - release signing and versioning', () => {
 
   it('signs the release build type with a dedicated signing config', () => {
     assert.match(gradle, /signingConfigs\s*\{\s*release\s*\{/);
-    assert.match(gradle, /signingConfig\s+signingConfigs\.release/);
+    assert.match(gradle, /signingConfig(?:\s*=|\s+)\s*signingConfigs\.release/);
   });
 
   it('reads the keystore location and credentials from environment variables', () => {

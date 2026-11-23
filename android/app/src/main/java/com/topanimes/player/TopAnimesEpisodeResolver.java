@@ -1,6 +1,5 @@
 package com.topanimes.player;
 
-import android.os.Build;
 import android.text.Html;
 import android.util.Log;
 
@@ -1660,12 +1659,7 @@ public final class TopAnimesEpisodeResolver {
     private static String cleanHtmlText(String raw) {
         if (raw == null || raw.isEmpty()) return "";
         String noTags = TAG_STRIP_PATTERN.matcher(raw).replaceAll(" ");
-        String decoded;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            decoded = Html.fromHtml(noTags, Html.FROM_HTML_MODE_LEGACY).toString();
-        } else {
-            decoded = Html.fromHtml(noTags).toString();
-        }
+        String decoded = Html.fromHtml(noTags, Html.FROM_HTML_MODE_LEGACY).toString();
         return decoded.replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
     }
 

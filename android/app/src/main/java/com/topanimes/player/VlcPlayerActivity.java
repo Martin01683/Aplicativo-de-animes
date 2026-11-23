@@ -3107,7 +3107,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         return name != null && !name.isEmpty() ? name : "Padrão";
     }
 
-    private static final Locale PT_BR = new Locale("pt", "BR");
+    private static final Locale PT_BR = Locale.forLanguageTag("pt-BR");
     private static final java.util.regex.Pattern VLC_TRACK_NAME =
         java.util.regex.Pattern.compile("^(.*?)(?:\\s*-\\s*\\[([^\\]]+)\\])?$");
     private static final java.util.regex.Pattern VLC_GENERIC_TRACK =
@@ -3471,29 +3471,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 uiHandler.post(() -> pausePlaybackForAudioRouteOrControl());
             }
         };
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                .setAudioAttributes(
-                    new AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                        .build()
-                )
-                .setOnAudioFocusChangeListener(audioFocusChangeListener)
-                .build();
-        }
+        audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(
+                new AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+            )
+            .setOnAudioFocusChangeListener(audioFocusChangeListener)
+            .build();
         requestAudioFocus();
     }
 
-    @SuppressWarnings("deprecation")
     private void setupMediaSession() {
         if (mediaSession != null) return;
         try {
             mediaSession = new MediaSession(this, TAG);
-            mediaSession.setFlags(
-                MediaSession.FLAG_HANDLES_MEDIA_BUTTONS
-                    | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
-            );
             mediaSession.setCallback(new MediaSession.Callback() {
                 @Override
                 public void onPlay() {
@@ -3653,18 +3646,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void requestAudioFocus() {
-        if (audioManager == null) return;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            if (audioFocusRequest != null) {
-                audioManager.requestAudioFocus(audioFocusRequest);
-            }
-        } else if (audioFocusChangeListener != null) {
-            audioManager.requestAudioFocus(
-                audioFocusChangeListener,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN
-            );
-        }
+        if (audioManager == null || audioFocusRequest == null) return;
+        audioManager.requestAudioFocus(audioFocusRequest);
     }
 
     private void finishWithAction(String action) {
@@ -3920,13 +3903,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
             }
             libVlc = null;
         }
-        if (audioManager != null) {
+        if (audioManager != null && audioFocusRequest != null) {
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioFocusRequest != null) {
-                    audioManager.abandonAudioFocusRequest(audioFocusRequest);
-                } else if (audioFocusChangeListener != null) {
-                    audioManager.abandonAudioFocus(audioFocusChangeListener);
-                }
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
             } catch (Exception ignored) {
             }
         }

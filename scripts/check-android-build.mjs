@@ -115,7 +115,7 @@ export function decideAndroidCheckAction({
   }
 
   const missingParts = [];
-  if (!javaAvailable) missingParts.push('Java (JDK 17+)');
+  if (!javaAvailable) missingParts.push('Java (JDK 21+)');
   if (!androidSdkDir) missingParts.push('Android SDK (ANDROID_HOME)');
   const missingText = missingParts.join(' e ');
 
@@ -238,15 +238,22 @@ function main() {
 
   const gradlew = getGradleWrapperCommand();
   console.log(
-    `🔨 Validando compilação Android Release (${gradlew} :app:compileReleaseJavaWithJavac :app:testReleaseUnitTest --no-daemon)...`,
+    `🔨 Validando compilação Android Release (${gradlew} :app:checkReleaseAarMetadata :app:compileReleaseJavaWithJavac :app:testReleaseUnitTest --no-daemon)...`,
   );
   runCommandOrExit(
     gradlew,
-    [':app:compileReleaseJavaWithJavac', ':app:testReleaseUnitTest', '--no-daemon'],
+    [
+      ':app:checkReleaseAarMetadata',
+      ':app:compileReleaseJavaWithJavac',
+      ':app:testReleaseUnitTest',
+      '--no-daemon',
+    ],
     { cwd: ANDROID_DIR, env: childEnv },
   );
 
-  console.log('✅ Build Android (compileReleaseJavaWithJavac + unit tests) passou!');
+  console.log(
+    '✅ Build Android (checkReleaseAarMetadata + compileReleaseJavaWithJavac + unit tests) passou!',
+  );
 }
 
 const isEntryPoint =

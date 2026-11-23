@@ -351,6 +351,7 @@ describe('Pre-push build checks and Android Gradle gate', () => {
     assert.match(pkg.scripts['apk:check'], /scripts\/check-android-build\.mjs/);
     assert.match(pkg.scripts['prepush:check'], /npm run validate/);
     assert.match(pkg.scripts['prepush:check'], /scripts\/check-android-build\.mjs --pre-push/);
+    assert.match(scriptSource, /:app:checkReleaseAarMetadata/);
     assert.match(scriptSource, /:app:compileReleaseJavaWithJavac/);
   });
 

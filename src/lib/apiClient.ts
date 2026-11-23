@@ -5,7 +5,6 @@ import {
   type ApkDownloadProgressState,
 } from './appUpdater.ts';
 import type { HttpFetchOptions, HttpFetchResult, HttpFetcher } from './httpTypes.ts';
-import { dispatchAnisyncApiRequest } from './anisyncApiRouter.ts';
 import { loadAppSettings } from './storage.ts';
 import type { CatalogPreferences, MediaKind } from './types.ts';
 import type { NotificationPermissionStatus } from './notifications.ts';
@@ -321,7 +320,12 @@ function encodeBase64Json(value: unknown): string | null {
   try {
     const json = JSON.stringify(value);
     if (typeof btoa === 'function') {
-      return btoa(unescape(encodeURIComponent(json)));
+      const bytes = new TextEncoder().encode(json);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += 1) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
     }
     return Buffer.from(json, 'utf8').toString('base64');
   } catch {
@@ -337,6 +341,17 @@ function encodeCatalogConfigHeader(prefs?: CatalogPreferences): string | null {
 }
 
 const defaultBrowserSnapshotReader: SnapshotFetcher = async () => null;
+let routerModulePromise: Promise<typeof import('./anisyncApiRouter.ts')> | null = null;
+
+function loadAnisyncApiRouter(): Promise<typeof import('./anisyncApiRouter.ts')> {
+  if (!routerModulePromise) {
+    routerModulePromise = import('./anisyncApiRouter.ts').catch((err) => {
+      routerModulePromise = null;
+      throw err;
+    });
+  }
+  return routerModulePromise;
+}
 
 export async function routeNativeApiRequest(
   pathWithQuery: string,
@@ -360,6 +375,7 @@ export async function routeNativeApiRequest(
     }
   }
 
+  const { dispatchAnisyncApiRequest } = await loadAnisyncApiRouter();
   return dispatchAnisyncApiRequest(
     pathWithQuery,
     {

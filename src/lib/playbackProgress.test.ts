@@ -284,8 +284,8 @@ test('formatHistoryEpisodeTitle prefixes bare episode titles with seriesTitle wi
 
 test('storage syncs loadHistory, pushHistoryEntry, saveEpisodeProgress with meta, and route session across restarts', async () => {
   const store = new Map<string, string>();
-  const prevStorage = (globalThis as { localStorage?: Storage }).localStorage;
-  (globalThis as { localStorage?: Storage }).localStorage = {
+  const prevDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const mockStorage: Storage = {
     getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
     setItem: (k: string, v: string) => {
       store.set(k, String(v));
@@ -301,6 +301,11 @@ test('storage syncs loadHistory, pushHistoryEntry, saveEpisodeProgress with meta
       return store.size;
     },
   };
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    writable: true,
+    value: mockStorage,
+  });
 
   try {
     const {
@@ -384,7 +389,11 @@ test('storage syncs loadHistory, pushHistoryEntry, saveEpisodeProgress with meta
     assert.equal(restoredSession.routeStack.length, 3);
     assert.deepEqual(restoredSession.routeStack[2], { view: 'episode', url: ep2Url });
   } finally {
-    (globalThis as { localStorage?: Storage }).localStorage = prevStorage;
+    if (prevDescriptor) {
+      Object.defineProperty(globalThis, 'localStorage', prevDescriptor);
+    } else {
+      delete (globalThis as { localStorage?: Storage }).localStorage;
+    }
   }
 });
 

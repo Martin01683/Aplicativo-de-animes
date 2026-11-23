@@ -31,8 +31,15 @@ def appVersionCode = (System.getenv('APP_VERSION_CODE') ?: '1').toInteger()
 def appVersionName = System.getenv('APP_VERSION_NAME') ?: '1.0'
 
 android {
-    namespace "com.topanimes.player"
-    compileSdk rootProject.ext.compileSdkVersion
+    namespace = "com.topanimes.player"
+    compileSdk = rootProject.ext.compileSdkVersion
+    def envNdkHome = System.getenv('ANDROID_NDK_HOME') ?: System.getenv('ANDROID_NDK_ROOT')
+    if (envNdkHome) {
+        def ndkDir = file(envNdkHome)
+        if (ndkDir.isDirectory() && ndkDir.parentFile?.name == 'ndk' && ndkDir.name ==~ /^\d+\.\d+\.\d+$/) {
+            ndkVersion = ndkDir.name
+        }
+    }
     defaultConfig {
         applicationId "com.topanimes.player"
         minSdkVersion rootProject.ext.minSdkVersion
@@ -42,8 +49,8 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
-             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
-            ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf2b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
     signingConfigs {
@@ -59,17 +66,11 @@ android {
     buildTypes {
         release {
             minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             if (hasReleaseKeystore) {
-                signingConfig signingConfigs.release
+                signingConfig = signingConfigs.release
             }
         }
-    }
-}
-
-repositories {
-    flatDir{
-        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
     }
 }
 

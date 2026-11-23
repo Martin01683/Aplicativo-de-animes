@@ -20,6 +20,7 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.app.PendingIntentCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.pm.PackageInfoCompat;
 
 import com.getcapacitor.JSObject;
 import com.getcapacitor.PermissionState;
@@ -359,9 +360,7 @@ public class LocalProxyPlugin extends Plugin {
     public void getAppBuildInfo(PluginCall call) {
         try {
             PackageInfo info = getContext().getPackageManager().getPackageInfo(getContext().getPackageName(), 0);
-            long versionCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
-                ? info.getLongVersionCode()
-                : info.versionCode;
+            long versionCode = PackageInfoCompat.getLongVersionCode(info);
             JSObject ret = new JSObject();
             ret.put("versionName", info.versionName != null ? info.versionName : "1.0");
             ret.put("versionCode", versionCode);
@@ -392,7 +391,6 @@ public class LocalProxyPlugin extends Plugin {
     }
 
     private void ensureNotificationChannels(Context ctx) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
         NotificationManager manager = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager == null) return;
 
@@ -608,7 +606,7 @@ public class LocalProxyPlugin extends Plugin {
         Context ctx = getContext();
         String pkgName = ctx.getPackageName();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !ctx.getPackageManager().canRequestPackageInstalls()) {
+        if (!ctx.getPackageManager().canRequestPackageInstalls()) {
             try {
                 Intent permIntent = new Intent(
                     Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
@@ -735,9 +733,7 @@ public class LocalProxyPlugin extends Plugin {
                 );
                 params.setAppPackageName(pkgName);
                 params.setSize(stagingApk.length());
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    params.setInstallReason(PackageManager.INSTALL_REASON_USER);
-                }
+                params.setInstallReason(PackageManager.INSTALL_REASON_USER);
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED);
                 }

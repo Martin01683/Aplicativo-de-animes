@@ -1,12 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Trash2, WifiOff } from 'lucide-react';
-import { AnimeDetailView } from './components/AnimeDetailView';
 import { CatalogView } from './components/CatalogView';
-import { EpisodeWorkspace } from './components/EpisodeWorkspace';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
 import { NotificationToastStack } from './components/NotificationToastStack';
-import { SettingsModal } from './components/SettingsModal';
+
+const AnimeDetailView = lazy(() =>
+  import('./components/AnimeDetailView').then((m) => ({ default: m.AnimeDetailView })),
+);
+const EpisodeWorkspace = lazy(() =>
+  import('./components/EpisodeWorkspace').then((m) => ({ default: m.EpisodeWorkspace })),
+);
+const SettingsModal = lazy(() =>
+  import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal })),
+);
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import {
   addApkDownloadProgressListener,
@@ -2665,24 +2672,33 @@ export default function App() {
                 </div>
               </div>
             ) : animeDetails ? (
-              <AnimeDetailView
-                anime={animeDetails}
-                isFavorite={isItemFavorited(animeDetails.url, favorites)}
-                isMuted={isFavoriteMuted(animeDetails.url, mutedFavoriteUrls)}
-                watchedUrls={watchedUrls}
-                progressMap={progressMap}
-                onToggleFavorite={toggleFavorite}
-                onToggleMuteFavorite={handleToggleMuteFavorite}
-                onToggleEpisodesWatched={(eps, watched, label) =>
-                  handleToggleEpisodesWatched(eps, watched, {
-                    animeUrl: animeDetails.url,
-                    toastMessage: label,
-                  })
+              <Suspense
+                fallback={
+                  <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
+                    <div className="h-64 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
+                    <div className="h-44 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
+                  </div>
                 }
-                onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
-                onOpenAnime={(animeUrl) => void openMediaUrl(animeUrl, 'anime')}
-                onBack={() => navigateBackStep()}
-              />
+              >
+                <AnimeDetailView
+                  anime={animeDetails}
+                  isFavorite={isItemFavorited(animeDetails.url, favorites)}
+                  isMuted={isFavoriteMuted(animeDetails.url, mutedFavoriteUrls)}
+                  watchedUrls={watchedUrls}
+                  progressMap={progressMap}
+                  onToggleFavorite={toggleFavorite}
+                  onToggleMuteFavorite={handleToggleMuteFavorite}
+                  onToggleEpisodesWatched={(eps, watched, label) =>
+                    handleToggleEpisodesWatched(eps, watched, {
+                      animeUrl: animeDetails.url,
+                      toastMessage: label,
+                    })
+                  }
+                  onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
+                  onOpenAnime={(animeUrl) => void openMediaUrl(animeUrl, 'anime')}
+                  onBack={() => navigateBackStep()}
+                />
+              </Suspense>
             ) : null}
           </>
         )}
@@ -2708,78 +2724,87 @@ export default function App() {
                 </div>
               </div>
             ) : episodeDetails ? (
-              <EpisodeWorkspace
-                episode={episodeDetails}
-                isFavorite={isItemFavorited(
-                  episodeDetails.seriesUrl || episodeDetails.url,
-                  favorites
-                )}
-                watchedUrls={watchedUrls}
-                progressMap={progressMap}
-                initialSeriesEpisodes={
-                  animeDetails &&
-                  episodeDetails.seriesUrl &&
-                  isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
-                    ? animeDetails.episodes
-                    : undefined
+              <Suspense
+                fallback={
+                  <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
+                    <div className="aspect-video animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
+                    <div className="h-44 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
+                  </div>
                 }
-                loadingEpisode={loadingDetail}
-                loadingExtraServers={Boolean(
-                  loadingExtraServers &&
-                    isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
-                )}
-                loadingExtraServerNames={
-                  loadingExtraServers &&
-                  isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
-                    ? loadingExtraServers.sourceNames
-                    : []
-                }
-                onToggleFavorite={toggleFavorite}
-                onToggleEpisodeWatched={(ep, watched) =>
-                  handleToggleEpisodesWatched(
-                    [
-                      {
-                        url: ep.url,
-                        title: ep.title,
-                        numberLabel: ep.episodeLabel || '',
-                      },
-                    ],
-                    watched,
-                    {
-                      animeUrl: ep.seriesUrl || ep.url,
-                    }
-                  )
-                }
-                onBack={() => navigateBackStep()}
-                onNavigateUrl={openMediaUrl}
-                onRefreshSources={handleRefreshEpisodeSources}
-                onNativeSessionSync={(result) => {
-                  syncNativeSessionResult(result, {
-                    url: episodeDetails.url,
-                    title: episodeDetails.title,
-                    seriesTitle: episodeDetails.seriesTitle,
-                    seriesUrl: episodeDetails.seriesUrl,
-                    poster: episodeDetails.backdrop || episodeDetails.poster,
-                    isMovie: episodeDetails.isMovie,
-                  });
-                  if (
-                    result.episodeUrl &&
-                    !isSameEpisodeUrl(result.episodeUrl, episodeDetails.url)
-                  ) {
-                    void openMediaUrl(result.episodeUrl, 'episode');
-                  } else if (result.action === 'prev' && episodeDetails.prevUrl) {
-                    void openMediaUrl(episodeDetails.prevUrl, 'episode');
-                  } else if (result.action === 'next' && episodeDetails.nextUrl) {
-                    void openMediaUrl(episodeDetails.nextUrl, 'episode');
+              >
+                <EpisodeWorkspace
+                  episode={episodeDetails}
+                  isFavorite={isItemFavorited(
+                    episodeDetails.seriesUrl || episodeDetails.url,
+                    favorites
+                  )}
+                  watchedUrls={watchedUrls}
+                  progressMap={progressMap}
+                  initialSeriesEpisodes={
+                    animeDetails &&
+                    episodeDetails.seriesUrl &&
+                    isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)
+                      ? animeDetails.episodes
+                      : undefined
                   }
-                }}
-                onPlaybackProgress={refreshProgressState}
-                onToast={showToast}
-                skipIntroSeconds={85}
-                autoPlayNextEpisode={settings.autoPlayNextEpisode}
-                videoScale={settings.videoScale}
-                onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
-              />
+                  loadingEpisode={loadingDetail}
+                  loadingExtraServers={Boolean(
+                    loadingExtraServers &&
+                      isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
+                  )}
+                  loadingExtraServerNames={
+                    loadingExtraServers &&
+                    isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
+                      ? loadingExtraServers.sourceNames
+                      : []
+                  }
+                  onToggleFavorite={toggleFavorite}
+                  onToggleEpisodeWatched={(ep, watched) =>
+                    handleToggleEpisodesWatched(
+                      [
+                        {
+                          url: ep.url,
+                          title: ep.title,
+                          numberLabel: ep.episodeLabel || '',
+                        },
+                      ],
+                      watched,
+                      {
+                        animeUrl: ep.seriesUrl || ep.url,
+                      }
+                    )
+                  }
+                  onBack={() => navigateBackStep()}
+                  onNavigateUrl={openMediaUrl}
+                  onRefreshSources={handleRefreshEpisodeSources}
+                  onNativeSessionSync={(result) => {
+                    syncNativeSessionResult(result, {
+                      url: episodeDetails.url,
+                      title: episodeDetails.title,
+                      seriesTitle: episodeDetails.seriesTitle,
+                      seriesUrl: episodeDetails.seriesUrl,
+                      poster: episodeDetails.backdrop || episodeDetails.poster,
+                      isMovie: episodeDetails.isMovie,
+                    });
+                    if (
+                      result.episodeUrl &&
+                      !isSameEpisodeUrl(result.episodeUrl, episodeDetails.url)
+                    ) {
+                      void openMediaUrl(result.episodeUrl, 'episode');
+                    } else if (result.action === 'prev' && episodeDetails.prevUrl) {
+                      void openMediaUrl(episodeDetails.prevUrl, 'episode');
+                    } else if (result.action === 'next' && episodeDetails.nextUrl) {
+                      void openMediaUrl(episodeDetails.nextUrl, 'episode');
+                    }
+                  }}
+                  onPlaybackProgress={refreshProgressState}
+                  onToast={showToast}
+                  skipIntroSeconds={85}
+                  autoPlayNextEpisode={settings.autoPlayNextEpisode}
+                  videoScale={settings.videoScale}
+                  onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
+                />
+              </Suspense>
             ) : null}
           </>
         )}
@@ -2791,47 +2816,51 @@ export default function App() {
         onSelectSection={handleSelectSection}
       />
 
-      <SettingsModal
-        open={settingsOpen}
-        focusSection={settingsFocusSection}
-        onClose={closeSettingsModal}
-        settings={settings}
-        settingsMeta={settingsMeta}
-        onUpdateSettings={updateSettings}
-        onResetSettings={resetSettings}
-        favoritesCount={favorites.length}
-        mutedFavoritesCount={mutedFavoriteUrls.length}
-        checkingEpisodes={checkingAlerts}
-        notificationPermission={notificationPermission}
-        onCheckEpisodesNow={() => {
-          void fetchCatalog();
-          void checkFavoriteUpdates({ manual: true });
-        }}
-        onRequestPushNotifications={() => void handleRequestPushNotifications()}
-        onSendTestNotification={() => void handleSendTestNotification()}
-        onUnmuteAllFavorites={handleUnmuteAllFavorites}
-        buildInfo={buildInfo}
-        isNativeAndroid={isNativeAndroidApp()}
-        appUpdateResult={appUpdateResult}
-        checkingAppUpdate={checkingAppUpdate}
-        appUpdateError={appUpdateError}
-        downloadingAppUpdate={downloadingAppUpdate}
-        apkDownloadProgress={apkDownloadProgress}
-        swUpdateAvailable={swUpdateAvailable}
-        onCheckAppUpdateNow={() => void checkForAppUpdates({ manual: true })}
-        onDownloadAppUpdate={() => void handleDownloadAppUpdate()}
-        onCancelAppUpdate={handleCancelAppUpdate}
-        onDismissApkProgress={handleDismissApkProgress}
-        onApplySwUpdate={handleApplySwUpdate}
-        historyCount={history.length}
-        alertsCount={alerts.length}
-        onClearHistory={requestClearAllHistory}
-        onClearAlerts={() => {
-          clearFavoriteAlerts();
-          setAlerts([]);
-          showToast('Avisos limpos.');
-        }}
-      />
+      {settingsOpen && (
+        <Suspense fallback={null}>
+          <SettingsModal
+            open={settingsOpen}
+            focusSection={settingsFocusSection}
+            onClose={closeSettingsModal}
+            settings={settings}
+            settingsMeta={settingsMeta}
+            onUpdateSettings={updateSettings}
+            onResetSettings={resetSettings}
+            favoritesCount={favorites.length}
+            mutedFavoritesCount={mutedFavoriteUrls.length}
+            checkingEpisodes={checkingAlerts}
+            notificationPermission={notificationPermission}
+            onCheckEpisodesNow={() => {
+              void fetchCatalog();
+              void checkFavoriteUpdates({ manual: true });
+            }}
+            onRequestPushNotifications={() => void handleRequestPushNotifications()}
+            onSendTestNotification={() => void handleSendTestNotification()}
+            onUnmuteAllFavorites={handleUnmuteAllFavorites}
+            buildInfo={buildInfo}
+            isNativeAndroid={isNativeAndroidApp()}
+            appUpdateResult={appUpdateResult}
+            checkingAppUpdate={checkingAppUpdate}
+            appUpdateError={appUpdateError}
+            downloadingAppUpdate={downloadingAppUpdate}
+            apkDownloadProgress={apkDownloadProgress}
+            swUpdateAvailable={swUpdateAvailable}
+            onCheckAppUpdateNow={() => void checkForAppUpdates({ manual: true })}
+            onDownloadAppUpdate={() => void handleDownloadAppUpdate()}
+            onCancelAppUpdate={handleCancelAppUpdate}
+            onDismissApkProgress={handleDismissApkProgress}
+            onApplySwUpdate={handleApplySwUpdate}
+            historyCount={history.length}
+            alertsCount={alerts.length}
+            onClearHistory={requestClearAllHistory}
+            onClearAlerts={() => {
+              clearFavoriteAlerts();
+              setAlerts([]);
+              showToast('Avisos limpos.');
+            }}
+          />
+        </Suspense>
+      )}
 
       {pendingHistoryRemoval && (
         <div

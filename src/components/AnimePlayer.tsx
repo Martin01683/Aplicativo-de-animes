@@ -7,7 +7,7 @@ import {
   type ChangeEvent,
   type DragEvent,
 } from 'react';
-import Hls from 'hls.js';
+import type Hls from 'hls.js';
 import {
   Calendar,
   Camera,
@@ -822,65 +822,88 @@ export function AnimePlayer({
       video.removeAttribute('crossorigin');
     }
 
-    if (useHls && Hls.isSupported()) {
-      let networkRetries = 0;
-      const hls = new Hls({
-        enableWorker: true,
-        lowLatencyMode: false,
-        startLevel: -1,
-      });
-      hlsRef.current = hls;
-      hls.loadSource(activeMediaUrl);
-      hls.attachMedia(video);
-
-      hls.on(Hls.Events.MANIFEST_PARSED, (_e, data) => {
-        if (disposed) return;
-        if (data.levels && data.levels.length > 0) {
-          const lvls: HlsQualityLevel[] = data.levels
-            .map((lvl, index) => ({
-              index,
-              height: lvl.height || 0,
-              label: lvl.height ? `${lvl.height}p` : `Nível ${index + 1}`,
-            }))
-            .sort((a, b) => b.height - a.height);
-          setHlsLevels(lvls);
-          const highest = lvls[0];
-          if (highest && lvls.length > 1) {
-            hls.currentLevel = highest.index;
-            setActiveHlsLevel(highest.index);
-          } else {
-            setActiveHlsLevel(-1);
+    if (useHls) {
+      let activeHls: Hls | null = null;
+      void import('hls.js/light')
+        .then(({ default: HlsLib }) => {
+          if (disposed) return;
+          if (!HlsLib.isSupported()) {
+            video.src = activeMediaUrl;
+            if (shouldAutoPlay) {
+              autoStartNextRef.current = false;
+              video.play().catch(() => {});
+            }
+            return;
           }
-        }
-        if (shouldAutoPlay) {
-          autoStartNextRef.current = false;
-          video.play().catch(() => {});
-        }
-      });
 
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (disposed || !data.fatal) return;
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries < 1) {
-          networkRetries += 1;
-          hls.startLoad();
-          return;
-        }
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          hls.recoverMediaError();
-          return;
-        }
-        hls.destroy();
-        if (hlsRef.current === hls) hlsRef.current = null;
-        advanceFallbackOrFail();
-      });
+          let networkRetries = 0;
+          const hls = new HlsLib({
+            enableWorker: true,
+            lowLatencyMode: false,
+            startLevel: -1,
+          });
+          activeHls = hls;
+          hlsRef.current = hls;
+          hls.loadSource(activeMediaUrl);
+          hls.attachMedia(video);
+
+          hls.on(HlsLib.Events.MANIFEST_PARSED, (_e, data) => {
+            if (disposed) return;
+            if (data.levels && data.levels.length > 0) {
+              const lvls: HlsQualityLevel[] = data.levels
+                .map((lvl, index) => ({
+                  index,
+                  height: lvl.height || 0,
+                  label: lvl.height ? `${lvl.height}p` : `Nível ${index + 1}`,
+                }))
+                .sort((a, b) => b.height - a.height);
+              setHlsLevels(lvls);
+              const highest = lvls[0];
+              if (highest && lvls.length > 1) {
+                hls.currentLevel = highest.index;
+                setActiveHlsLevel(highest.index);
+              } else {
+                setActiveHlsLevel(-1);
+              }
+            }
+            if (shouldAutoPlay) {
+              autoStartNextRef.current = false;
+              video.play().catch(() => {});
+            }
+          });
+
+          hls.on(HlsLib.Events.ERROR, (_event, data) => {
+            if (disposed || !data.fatal) return;
+            if (data.type === HlsLib.ErrorTypes.NETWORK_ERROR && networkRetries < 1) {
+              networkRetries += 1;
+              hls.startLoad();
+              return;
+            }
+            if (data.type === HlsLib.ErrorTypes.MEDIA_ERROR) {
+              hls.recoverMediaError();
+              return;
+            }
+            hls.destroy();
+            if (hlsRef.current === hls) hlsRef.current = null;
+            if (activeHls === hls) activeHls = null;
+            advanceFallbackOrFail();
+          });
+        })
+        .catch(() => {
+          if (disposed) return;
+          advanceFallbackOrFail();
+        });
 
       return () => {
         disposed = true;
         disposedEffectRef.current = true;
         loadedMediaEpisodeUrlRef.current = null;
         clearLoadWatchdog();
-        hls.destroy();
-        if (hlsRef.current === hls) hlsRef.current = null;
+        if (activeHls) {
+          activeHls.destroy();
+          if (hlsRef.current === activeHls) hlsRef.current = null;
+          activeHls = null;
+        }
       };
     }
 
