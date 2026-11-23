@@ -812,6 +812,50 @@ export async function getServerRandomMedia(
   return { url: pick.url, kind: pick.kind };
 }
 
+function buildProgressiveServerSearchTerms(titles: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string) => {
+    const cleaned = cleanText(raw);
+    if (cleaned.length < 3) return;
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(cleaned);
+  };
+
+  for (const title of titles) {
+    const cleaned = cleanText(title);
+    if (!cleaned) continue;
+    const withoutTrailingPunct = cleaned.replace(/[.!?…]+$/g, '').trim();
+    const strippedSeason = stripSeasonFromTitle(withoutTrailingPunct);
+
+    add(withoutTrailingPunct);
+    if (strippedSeason && strippedSeason !== withoutTrailingPunct) {
+      add(strippedSeason);
+    }
+
+    // Clause before colon/dash for long subtitle titles
+    const beforeColon = withoutTrailingPunct.split(/\s*[:–—]\s*/)[0]?.trim() || '';
+    if (beforeColon.length >= 4 && beforeColon !== withoutTrailingPunct) {
+      add(beforeColon);
+    }
+
+    // WordPress/DooPlay search fails on long titles with commas/punctuation mismatches ->
+    // add a concise 4-word punctuation-free prefix when the title has 5+ words.
+    const words = withoutTrailingPunct
+      .replace(/[,.:;!?()[\]"'“”‘’/]+/g, ' ')
+      .split(/\s+/)
+      .filter(Boolean);
+    if (words.length >= 5) {
+      add(words.slice(0, 4).join(' '));
+      add(words.slice(0, 3).join(' '));
+    }
+  }
+
+  return out.slice(0, 6);
+}
+
 /**
  * Checks whether a calendar anime title (e.g. from LiveChart.me) already exists on any
  * integrated server (TopAnimes or Hinata Soul) so clicking a calendar card can immediately load playable episodes!
@@ -825,28 +869,26 @@ export async function findServerAnimePageForTitles(
 
   const cleanTerms = Array.from(
     new Set(titles.map((t) => cleanText(t)).filter((t) => t.length >= 2))
-  ).slice(0, 3);
+  ).slice(0, 4);
   if (!cleanTerms.length) return null;
 
   const targetSeason = Math.max(...cleanTerms.map((t) => extractHinataSoulSeasonNumber(t)));
+  const searchTerms = buildProgressiveServerSearchTerms(cleanTerms);
 
-  const searchTerms = Array.from(
-    new Set([
-      ...cleanTerms,
-      ...cleanTerms.map((t) => stripSeasonFromTitle(t)).filter((t) => t.length >= 3),
-    ])
-  ).slice(0, 3);
+  type MatchedServerCandidate = {
+    url: string;
+    title: string;
+    score: number;
+    isHinataSoul: boolean;
+  };
+  let best: MatchedServerCandidate | null = null;
 
-  let best: { url: string; title: string; score: number; isHinataSoul: boolean } | null = null;
-
-  for (const term of searchTerms) {
-    const suggest = await getServerSearchSuggest(fetchHttp, term).catch(() => ({
-      query: term,
-      results: [] as SearchResultItem[],
-      sourceMode: 'fallback' as const,
-    }));
-
-    for (const r of suggest.results) {
+  const evaluateResults = (
+    results: SearchResultItem[],
+    currentBest: MatchedServerCandidate | null
+  ): MatchedServerCandidate | null => {
+    let nextBest = currentBest;
+    for (const r of results) {
       if (r.kind === 'episode') continue;
       const rawSim = Math.max(...cleanTerms.map((ref) => scoreTitleSimilarity(ref, r.title)));
       const candSeason = extractHinataSoulSeasonNumber(r.title);
@@ -858,8 +900,8 @@ export async function findServerAnimePageForTitles(
         adjusted -= 0.25;
       }
 
-      if (rawSim >= 0.6 && adjusted >= 0.65 && (!best || adjusted > best.score)) {
-        best = {
+      if (rawSim >= 0.6 && adjusted >= 0.65 && (!nextBest || adjusted > nextBest.score)) {
+        nextBest = {
           url: r.url,
           title: r.title,
           score: adjusted,
@@ -867,7 +909,29 @@ export async function findServerAnimePageForTitles(
         };
       }
     }
-    if (best && best.score >= 0.95) break;
+    return nextBest;
+  };
+
+  for (const term of searchTerms) {
+    const suggest = await getServerSearchSuggest(fetchHttp, term).catch(() => ({
+      query: term,
+      results: [] as SearchResultItem[],
+      sourceMode: 'fallback' as const,
+    }));
+    best = evaluateResults(suggest.results, best);
+    if (best && best.score >= 0.92) break;
+  }
+
+  // Fallback to full server search HTML (/?s=... + Hinata Soul) if fast suggest missed a valid match
+  if (!best || best.score < 0.8) {
+    const fallbackTerms = searchTerms.slice(0, 2);
+    for (const term of fallbackTerms) {
+      const full = await getServerSearch(fetchHttp, term, 1).catch(() => null);
+      if (full?.results?.length) {
+        best = evaluateResults(full.results, best);
+      }
+      if (best && best.score >= 0.92) break;
+    }
   }
 
   if (!best) return null;

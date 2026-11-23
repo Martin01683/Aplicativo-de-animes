@@ -12,13 +12,17 @@ import type {
   SearchSuggestResponse,
   WeeklyCalendarResponse,
 } from '../types.ts';
+import { mergeServerAndCatalogEpisodes } from '../episodeAvailability.ts';
 import {
   buildExternalDatabaseLinks,
   parseAnisyncUri,
   parseLiveChartExternalId,
   type CanonicalMediaType,
 } from './idCodec.ts';
-import { fetchLiveChartWeeklySchedule } from './providers/livechartProvider.ts';
+import {
+  fetchLiveChartWeeklySchedule,
+  findLiveChartScheduleHint,
+} from './providers/livechartProvider.ts';
 import {
   enrichServerDetailsWithTheTvdb,
   fetchTheTvdbDetails,
@@ -178,17 +182,40 @@ export async function getAggregatedMediaDetails(
     const searchTerms = [lc.title, lc.englishTitle].filter((t): t is string => Boolean(t));
     if (!searchTerms.length) return null;
 
-    const [serverMatch, tvdbMatch] = await Promise.all([
+    const [serverMatch, tvdbMatch, liveChartHint] = await Promise.all([
       findServerAnimePageForTitles(fetchHttp, searchTerms).catch(() => null),
       findBestTheTvdbMatch(fetchHttp, searchTerms, { mediaType: 'anime' }).catch(() => null),
+      findLiveChartScheduleHint(fetchHttp, {
+        livechartId: lc.livechartId || undefined,
+        titles: searchTerms,
+      }).catch(() => null),
     ]);
 
-    if (serverMatch) {
+    let resolvedServerMatch = serverMatch;
+    if (!resolvedServerMatch && tvdbMatch) {
+      const extraTitles = [
+        tvdbMatch.title,
+        tvdbMatch.originalTitle,
+        tvdbMatch.englishTitle,
+        ...tvdbMatch.alternativeTitles,
+      ]
+        .filter((t): t is string => Boolean(t && t.trim()))
+        .filter((t) => !searchTerms.some((existing) => existing.toLowerCase() === t.toLowerCase()));
+      if (extraTitles.length > 0) {
+        resolvedServerMatch = await findServerAnimePageForTitles(
+          fetchHttp,
+          extraTitles.slice(0, 3)
+        ).catch(() => null);
+      }
+    }
+
+    if (resolvedServerMatch) {
       const enriched = await enrichServerDetailsWithTheTvdb(
         fetchHttp,
-        serverMatch.details,
-        prefs?.credentials
-      ).catch(() => serverMatch.details);
+        resolvedServerMatch.details,
+        prefs?.credentials,
+        { livechartId: lc.livechartId || undefined }
+      ).catch(() => resolvedServerMatch.details);
 
       const mergedIds = {
         ...enriched.externalIds,
@@ -234,12 +261,28 @@ export async function getAggregatedMediaDetails(
         episodes: [],
       };
 
+      const scheduledEpisodes =
+        base.kind === 'movie'
+          ? base.episodes
+          : mergeServerAndCatalogEpisodes({
+              serverTitle: lc.title || base.title,
+              serverUrl: targetUri,
+              serverEpisodes: [],
+              catalogEpisodes: base.episodes,
+              liveChartHint,
+              serverMatched: false,
+              tvdbId: tvdbMatch.tvdbId,
+              mediaType: (base.kind as CanonicalMediaType) || 'anime',
+            });
+
       const mergedIds = {
         ...base.externalIds,
         livechartId: lc.livechartId || undefined,
       };
       return {
         ...base,
+        poster: base.poster || liveChartHint?.poster || '',
+        episodes: scheduledEpisodes,
         externalIds: mergedIds,
         externalLinks: buildExternalDatabaseLinks(mergedIds, {
           mediaType: (base.kind as CanonicalMediaType) || 'anime',
@@ -249,6 +292,17 @@ export async function getAggregatedMediaDetails(
 
     // Minimal graceful fallback if neither server nor TheTVDB matched
     const fallbackIds = lc.livechartId ? { livechartId: lc.livechartId } : undefined;
+    const fallbackEpisodes = liveChartHint
+      ? mergeServerAndCatalogEpisodes({
+          serverTitle: lc.title || lc.englishTitle || 'Anime',
+          serverUrl: targetUri,
+          serverEpisodes: [],
+          catalogEpisodes: [],
+          liveChartHint,
+          serverMatched: false,
+          mediaType: 'anime',
+        })
+      : [];
     return {
       title: lc.title || lc.englishTitle || 'Anime',
       alternativeTitle: lc.englishTitle && lc.englishTitle !== lc.title ? lc.englishTitle : undefined,
@@ -257,13 +311,13 @@ export async function getAggregatedMediaDetails(
       catalogSource: 'livechart',
       externalIds: fallbackIds,
       externalLinks: buildExternalDatabaseLinks(fallbackIds, { mediaType: 'anime' }),
-      poster: '',
+      poster: liveChartHint?.poster || '',
       backdrop: '',
       synopsis:
         'Ainda não encontramos episódios disponíveis no servidor ativo para este título do calendário.',
       genres: [],
       audioType: null,
-      episodes: [],
+      episodes: fallbackEpisodes,
     };
   }
 

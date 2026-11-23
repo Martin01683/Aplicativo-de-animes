@@ -10,6 +10,7 @@ import {
   Check,
   CheckCheck,
   Clock,
+  CloudOff,
   ExternalLink,
   Film,
   Globe,
@@ -24,6 +25,11 @@ import {
   X,
 } from 'lucide-react';
 import { isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
+import {
+  formatEpisodeCountdown,
+  formatEpisodeReleaseDate,
+  isEpisodeAvailableOnServer,
+} from '../lib/episodeAvailability';
 import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
@@ -81,19 +87,37 @@ export function AnimeDetailView({
 }: AnimeDetailViewProps) {
   const [episodeFilter, setEpisodeFilter] = useState('');
   const [sortDesc, setSortDesc] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     setEpisodeFilter('');
     setSortDesc(false);
   }, [anime.url]);
 
+  const hasScheduledEpisodes = useMemo(
+    () => anime.episodes.some((ep) => !isEpisodeAvailableOnServer(ep)),
+    [anime.episodes]
+  );
+
+  useEffect(() => {
+    if (!hasScheduledEpisodes) return;
+    const id = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, [hasScheduledEpisodes]);
+
   const isMovie = anime.kind === 'movie';
   const isSeries = anime.kind === 'series';
 
-  const latestEpisode = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster);
-  const firstEpisode = anime.episodes[0];
+  const playableEpisodes = useMemo(
+    () => anime.episodes.filter(isEpisodeAvailableOnServer),
+    [anime.episodes]
+  );
+  const unavailableCount = anime.episodes.length - playableEpisodes.length;
+
+  const latestEpisode = pickLatestAnimeEpisode(playableEpisodes, anime.title, anime.poster);
+  const firstEpisode = playableEpisodes[0];
   const lastEpisodeItem =
-    anime.episodes.length > 1 ? anime.episodes[anime.episodes.length - 1] : null;
+    playableEpisodes.length > 1 ? playableEpisodes[playableEpisodes.length - 1] : null;
   const quickLastEpisode =
     !isMovie && latestEpisode && firstEpisode && latestEpisode.episodeUrl !== firstEpisode.url
       ? {
@@ -151,9 +175,9 @@ export function AnimeDetailView({
   const isWatchedEpisode = (ep: AnimeEpisodeLink) =>
     isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls);
 
-  const totalWatchedCount = anime.episodes.filter(isWatchedEpisode).length;
+  const totalWatchedCount = playableEpisodes.filter(isWatchedEpisode).length;
   const allEpisodesWatched =
-    anime.episodes.length > 0 && totalWatchedCount === anime.episodes.length;
+    playableEpisodes.length > 0 && totalWatchedCount === playableEpisodes.length;
 
   const subtitleParts: string[] = [];
   if (anime.alternativeTitle) subtitleParts.push(anime.alternativeTitle);
@@ -486,7 +510,15 @@ export function AnimeDetailView({
             </h2>
             {!isMovie && anime.episodes.length > 0 && (
               <span className="font-mono text-xs tabular-nums text-slate-400">
-                {totalWatchedCount}/{anime.episodes.length} vistos
+                {playableEpisodes.length > 0
+                  ? `${totalWatchedCount}/${playableEpisodes.length} vistos`
+                  : `${anime.episodes.length} episódio${anime.episodes.length === 1 ? '' : 's'}`}
+                {unavailableCount > 0 && (
+                  <span className="text-[#fb923c]">
+                    {' '}
+                    · {unavailableCount} {unavailableCount === 1 ? 'indisponível' : 'indisponíveis'}
+                  </span>
+                )}
               </span>
             )}
           </div>
@@ -533,12 +565,12 @@ export function AnimeDetailView({
               </>
             )}
 
-            {anime.episodes.length > 0 && baseSeasonGroups.length > 1 && (
+            {playableEpisodes.length > 0 && baseSeasonGroups.length > 1 && (
               <button
                 type="button"
                 onClick={() =>
                   onToggleEpisodesWatched(
-                    anime.episodes,
+                    playableEpisodes,
                     !allEpisodesWatched,
                     allEpisodesWatched
                       ? 'Todas as temporadas desmarcadas'
@@ -585,9 +617,13 @@ export function AnimeDetailView({
             {visibleSeasonGroups.map((group) => {
               const fullGroup =
                 baseSeasonGroups.find((g) => g.seasonNumber === group.seasonNumber) || group;
-              const seasonWatchedCount = fullGroup.episodes.filter(isWatchedEpisode).length;
+              const seasonPlayableEpisodes = fullGroup.episodes.filter(isEpisodeAvailableOnServer);
+              const seasonUnavailableCount =
+                fullGroup.episodes.length - seasonPlayableEpisodes.length;
+              const seasonWatchedCount = seasonPlayableEpisodes.filter(isWatchedEpisode).length;
               const seasonAllWatched =
-                fullGroup.episodes.length > 0 && seasonWatchedCount === fullGroup.episodes.length;
+                seasonPlayableEpisodes.length > 0 &&
+                seasonWatchedCount === seasonPlayableEpisodes.length;
 
               return (
                 <div
@@ -600,43 +636,133 @@ export function AnimeDetailView({
                         {group.label}
                       </span>
                       <span className="font-mono text-[11px] tabular-nums text-slate-400">
-                        {seasonWatchedCount}/{fullGroup.episodes.length} vistos
+                        {seasonPlayableEpisodes.length > 0
+                          ? `${seasonWatchedCount}/${seasonPlayableEpisodes.length} vistos`
+                          : `${fullGroup.episodes.length} eps`}
+                        {seasonUnavailableCount > 0 && (
+                          <span className="text-[#fb923c]">
+                            {' '}
+                            · {seasonUnavailableCount} em breve
+                          </span>
+                        )}
                       </span>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onToggleEpisodesWatched(
-                          fullGroup.episodes,
-                          !seasonAllWatched,
+                    {seasonPlayableEpisodes.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onToggleEpisodesWatched(
+                            seasonPlayableEpisodes,
+                            !seasonAllWatched,
+                            seasonAllWatched
+                              ? `${group.label} desmarcada`
+                              : `${group.label} marcada como vista`
+                          )
+                        }
+                        aria-pressed={seasonAllWatched}
+                        className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
                           seasonAllWatched
-                            ? `${group.label} desmarcada`
-                            : `${group.label} marcada como vista`
-                        )
-                      }
-                      aria-pressed={seasonAllWatched}
-                      className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
-                        seasonAllWatched
-                          ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                          : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
-                      }`}
-                    >
-                      <CheckCheck className="h-3.5 w-3.5" />
-                      <span>
-                        {seasonAllWatched
-                          ? isMovie
-                            ? 'Visto'
-                            : 'Temporada vista'
-                          : isMovie
-                            ? 'Marcar como visto'
-                            : 'Marcar temporada como vista'}
-                      </span>
-                    </button>
+                            ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                            : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
+                        }`}
+                      >
+                        <CheckCheck className="h-3.5 w-3.5" />
+                        <span>
+                          {seasonAllWatched
+                            ? isMovie
+                              ? 'Visto'
+                              : 'Temporada vista'
+                            : isMovie
+                              ? 'Marcar como visto'
+                              : 'Marcar temporada como vista'}
+                        </span>
+                      </button>
+                    )}
                   </div>
 
                   <div className="divide-y divide-white/8">
                     {group.episodes.map((ep) => {
+                      const available = isEpisodeAvailableOnServer(ep);
+                      const formattedDate = formatEpisodeReleaseDate(
+                        ep.date,
+                        ep.airingAt,
+                        ep.hasExactAiringTime
+                      );
+
+                      if (!available) {
+                        const countdown = formatEpisodeCountdown(ep.airingAt, nowMs, ep.date);
+                        return (
+                          <div
+                            key={`${ep.url}-${ep.seasonNumber || 1}-${ep.episodeNumber || ep.numberLabel}`}
+                            data-episode-unavailable="true"
+                            className="flex items-center justify-between gap-2.5 bg-[#0d0f12]/35 px-4 py-3 sm:gap-4"
+                          >
+                            <div className="flex min-w-0 flex-1 items-center gap-2.5 sm:gap-4">
+                              {ep.thumb ? (
+                                <MediaPoster
+                                  src={ep.thumb}
+                                  alt={ep.title}
+                                  aspect="landscape"
+                                  className="hidden h-12 w-20 shrink-0 rounded-md border border-white/10 opacity-60 sm:block"
+                                />
+                              ) : null}
+                              <span className="w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-500 sm:w-20">
+                                {ep.numberLabel || 'EP'}
+                              </span>
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-sm font-medium text-slate-300">
+                                  {ep.title}
+                                </div>
+                                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs tabular-nums text-slate-400">
+                                  <span className="inline-flex items-center gap-1">
+                                    <Calendar className="h-3 w-3 shrink-0 text-slate-500" />
+                                    <span>{formattedDate || 'Data ainda não confirmada'}</span>
+                                  </span>
+                                  {ep.durationMinutes && (
+                                    <span className="text-slate-500">{ep.durationMinutes} min</span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="flex shrink-0 items-center">
+                              <span
+                                title={
+                                  countdown.state === 'pending'
+                                    ? 'Episódio já exibido, mas ainda não publicado nos servidores.'
+                                    : undefined
+                                }
+                                className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${
+                                  countdown.state === 'now'
+                                    ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
+                                    : countdown.state === 'future'
+                                      ? 'border-[#f97316]/85 bg-[#1b0e05]/92 text-[#ffedd5]'
+                                      : countdown.state === 'pending'
+                                        ? 'border-white/20 bg-[#0d0f12]/92 text-slate-300'
+                                        : 'border-white/20 bg-[#0d0f12]/90 text-slate-300'
+                                }`}
+                              >
+                                {countdown.state === 'pending' ? (
+                                  <CloudOff className="h-3 w-3 shrink-0 text-slate-400" />
+                                ) : (
+                                  <Clock
+                                    className={`h-3 w-3 shrink-0 ${
+                                      countdown.state === 'now'
+                                        ? 'text-emerald-300'
+                                        : countdown.state === 'future'
+                                          ? 'text-[#f97316]'
+                                          : 'text-slate-400'
+                                    }`}
+                                  />
+                                )}
+                                <span>{countdown.label}</span>
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      }
+
                       const epKey = canonicalEpisodeProgressKey(ep.url);
                       const epProgress = epKey ? progressMap?.[epKey] : undefined;
                       const resumeSec = getResumePositionSec(epProgress);
@@ -667,9 +793,9 @@ export function AnimeDetailView({
                                 <div className="truncate text-sm font-medium text-white group-hover:text-[#f97316]">
                                   {ep.title}
                                 </div>
-                                {(ep.date || ep.durationMinutes || ep.rating || resumeSec >= 2) && (
+                                {(formattedDate || ep.durationMinutes || ep.rating || resumeSec >= 2) && (
                                   <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs tabular-nums text-slate-500">
-                                    {ep.date && <span>{ep.date}</span>}
+                                    {formattedDate && <span>{formattedDate}</span>}
                                     {ep.durationMinutes && <span>{ep.durationMinutes} min</span>}
                                     {ep.rating && (
                                       <span className="text-amber-400/90">★ {ep.rating}</span>

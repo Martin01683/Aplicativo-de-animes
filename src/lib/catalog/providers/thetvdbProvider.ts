@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import { mergeServerAndCatalogEpisodes } from '../../episodeAvailability.ts';
 import type { HttpFetcher } from '../../httpTypes.ts';
 import type {
   AnimeDetails,
@@ -17,6 +18,7 @@ import {
   stripSeasonFromTitle,
   type CanonicalMediaType,
 } from '../idCodec.ts';
+import { findLiveChartScheduleHint } from './livechartProvider.ts';
 
 const TVDB_V4_API_BASE = 'https://api4.thetvdb.com/v4';
 const TVDB_WEB_SEARCH_URL = 'https://api4.thetvdb.com/web/search/queries';
@@ -1163,14 +1165,15 @@ export async function fetchTheTvdbDetails(
 }
 
 /**
- * Enriches media details coming from the streaming server (TopAnimes)
- * with complete metadata from TheTVDB (PT-BR synopsis, studio, network, genres, runtime, status,
- * release dates, high-res artwork, and TheTVDB link) while preserving the server's playable episode list!
+ * Enriches media details coming from the streaming server (TopAnimes / Hinata Soul)
+ * with complete metadata & official episode schedule from TheTVDB + LiveChart.me
+ * while preserving all playable server episodes and flagging missing/upcoming ones!
  */
 export async function enrichServerDetailsWithTheTvdb(
   fetchHttp: HttpFetcher,
   serverDetails: AnimeDetails,
-  credentials?: CatalogSourceCredentials
+  credentials?: CatalogSourceCredentials,
+  extra?: { livechartId?: number }
 ): Promise<AnimeDetails> {
   const queryTerms = [
     serverDetails.title,
@@ -1181,26 +1184,71 @@ export async function enrichServerDetailsWithTheTvdb(
 
   if (!queryTerms.length) return serverDetails;
 
-  const bestMatch = await findBestTheTvdbMatch(fetchHttp, queryTerms, {
-    mediaType: serverDetails.kind || (/\/filmes\//i.test(serverDetails.url) ? 'movie' : 'anime'),
-    year: serverDetails.year,
-  });
+  const isMovie = serverDetails.kind === 'movie' || /\/filmes\//i.test(serverDetails.url);
+  const [bestMatch, liveChartHint] = await Promise.all([
+    findBestTheTvdbMatch(fetchHttp, queryTerms, {
+      mediaType: serverDetails.kind || (isMovie ? 'movie' : 'anime'),
+      year: serverDetails.year,
+    }),
+    !isMovie
+      ? findLiveChartScheduleHint(fetchHttp, {
+          livechartId: extra?.livechartId ?? serverDetails.externalIds?.livechartId,
+          titles: queryTerms,
+        }).catch(() => null)
+      : Promise.resolve(null),
+  ]);
 
-  if (!bestMatch) return serverDetails;
+  if (!bestMatch) {
+    if (!isMovie && liveChartHint) {
+      const mergedWithSchedule = mergeServerAndCatalogEpisodes({
+        serverTitle: serverDetails.title,
+        serverUrl: serverDetails.url,
+        serverEpisodes: serverDetails.episodes,
+        catalogEpisodes: [],
+        liveChartHint,
+        serverMatched: serverDetails.episodes.length > 0,
+        mediaType: (serverDetails.kind as CanonicalMediaType) || 'anime',
+      });
+      return {
+        ...serverDetails,
+        episodes: mergedWithSchedule,
+      };
+    }
+    return serverDetails;
+  }
 
-  // Fetch full TheTVDB details page for runtime, studio, network, exact dates & rich synopsis
+  // Fetch full TheTVDB details page + official episodes guide for non-movies
   const fullTvdb = await fetchTheTvdbDetails(fetchHttp, bestMatch.tvdbId, {
     mediaType: bestMatch.mediaType,
     credentials,
     slugHint: bestMatch.slug,
-    includeEpisodes: false,
+    includeEpisodes: !isMovie && bestMatch.mediaType !== 'movie',
   }).catch(() => null);
 
   const tvdb = fullTvdb || null;
+  const resolvedLiveChartHint =
+    liveChartHint ||
+    (!isMovie
+      ? await findLiveChartScheduleHint(fetchHttp, {
+          livechartId: extra?.livechartId ?? serverDetails.externalIds?.livechartId,
+          titles: [
+            ...queryTerms,
+            tvdb?.title || '',
+            tvdb?.originalTitle || '',
+            tvdb?.alternativeTitle || '',
+            bestMatch.title,
+            bestMatch.englishTitle || '',
+          ].filter(Boolean),
+        }).catch(() => null)
+      : null);
+
   const mergedIds: ExternalMediaIds = {
     ...serverDetails.externalIds,
     ...bestMatch.externalIds,
     ...tvdb?.externalIds,
+    ...(resolvedLiveChartHint?.livechartId
+      ? { livechartId: resolvedLiveChartHint.livechartId }
+      : {}),
   };
   const resolvedKind: CanonicalMediaType =
     serverDetails.kind === 'movie' || bestMatch.mediaType === 'movie'
@@ -1232,6 +1280,20 @@ export async function enrichServerDetailsWithTheTvdb(
   const tvdbGenres = tvdb?.genres?.length ? tvdb.genres : bestMatch.genres;
   const tvdbSynopsis = tvdb?.synopsis || bestMatch.synopsis;
 
+  const mergedEpisodes =
+    resolvedKind === 'movie'
+      ? serverDetails.episodes
+      : mergeServerAndCatalogEpisodes({
+          serverTitle: serverDetails.title,
+          serverUrl: serverDetails.url,
+          serverEpisodes: serverDetails.episodes,
+          catalogEpisodes: tvdb?.episodes || [],
+          liveChartHint: resolvedLiveChartHint,
+          serverMatched: serverDetails.episodes.length > 0,
+          tvdbId: bestMatch.tvdbId,
+          mediaType: resolvedKind,
+        });
+
   return {
     ...serverDetails,
     kind: resolvedKind,
@@ -1259,5 +1321,6 @@ export async function enrichServerDetailsWithTheTvdb(
     originalCountry: tvdb?.originalCountry || bestMatch.originalCountry,
     originalLanguage: tvdb?.originalLanguage || bestMatch.originalLanguage,
     genres: tvdbGenres.length > 0 ? tvdbGenres : serverDetails.genres,
+    episodes: mergedEpisodes,
   };
 }

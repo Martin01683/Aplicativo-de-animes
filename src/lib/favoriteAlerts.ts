@@ -232,6 +232,7 @@ export function pickLatestAnimeEpisode(
     title: string;
     url: string;
     thumb?: string;
+    availableOnServer?: boolean;
   }>,
   seriesTitle: string,
   fallbackPoster: string,
@@ -253,14 +254,16 @@ export function pickRecentAnimeEpisodes(
     title: string;
     url: string;
     thumb?: string;
+    availableOnServer?: boolean;
   }>,
   seriesTitle: string,
   fallbackPoster: string,
   limit = 5,
   meta?: { audioType?: CatalogMediaItem['audioType']; sourceServerName?: string }
 ): FavoriteLatestInfo[] {
-  if (!episodes.length) return [];
-  const mapped: Array<{ info: FavoriteLatestInfo; orderIndex: number }> = episodes.map((ep, idx) => {
+  const playableEpisodes = episodes.filter((ep) => ep.availableOnServer !== false);
+  if (!playableEpisodes.length) return [];
+  const mapped: Array<{ info: FavoriteLatestInfo; orderIndex: number }> = playableEpisodes.map((ep, idx) => {
     const num = ep.episodeNumber ?? extractEpisodeNumber(ep.url) ?? extractEpisodeNumber(ep.title);
     return {
       orderIndex: idx,

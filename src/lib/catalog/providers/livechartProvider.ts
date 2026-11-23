@@ -1,4 +1,9 @@
 import * as cheerio from 'cheerio';
+import {
+  extractExplicitSeasonNumber,
+  parseEpisodeNumberFromLabel,
+  type LiveChartAnimeScheduleHint,
+} from '../../episodeAvailability.ts';
 import type { HttpFetcher } from '../../httpTypes.ts';
 import type {
   AudioType,
@@ -9,7 +14,7 @@ import type {
   WeeklyCalendarResponse,
 } from '../../types.ts';
 import { isSafeExternalHttpUrl } from '../../urlSafety.ts';
-import { buildLiveChartScheduleUri } from '../idCodec.ts';
+import { buildLiveChartScheduleUri, scoreTitleSimilarity } from '../idCodec.ts';
 
 const LIVECHART_ORIGIN = 'https://www.livechart.me';
 const LIVECHART_SCHEDULE_URL = `${LIVECHART_ORIGIN}/schedule?layout=compact_grid`;
@@ -526,6 +531,24 @@ export function parseLiveChartScheduleHtml(
   };
 }
 
+const LIVECHART_HINT_CACHE_TTL_MS = 15 * 60 * 1000;
+let cachedLiveChartScheduleItems: { items: CatalogMediaItem[]; expiresAt: number } | null = null;
+
+function rememberLiveChartItems(response: WeeklyCalendarResponse): void {
+  const flat: CatalogMediaItem[] = [];
+  for (const day of response.days) {
+    for (const item of day.items) {
+      flat.push(item);
+    }
+  }
+  if (flat.length > 0) {
+    cachedLiveChartScheduleItems = {
+      items: flat,
+      expiresAt: Date.now() + LIVECHART_HINT_CACHE_TTL_MS,
+    };
+  }
+}
+
 export async function fetchLiveChartWeeklySchedule(
   fetchHttp: HttpFetcher,
   options: {
@@ -547,8 +570,93 @@ export async function fetchLiveChartWeeklySchedule(
     throw new Error(`LiveChart.me retornou HTTP ${res.status}.`);
   }
 
-  return parseLiveChartScheduleHtml(res.body, {
+  const parsed = parseLiveChartScheduleHtml(res.body, {
     mode,
     tzOffsetMinutes: options.tzOffsetMinutes,
   });
+  if (mode === 'streams') {
+    rememberLiveChartItems(parsed);
+  }
+  return parsed;
+}
+
+/**
+ * Looks up an anime in the cached LiveChart.me weekly schedule (fetching once every 15m if empty)
+ * to retrieve the exact upcoming episode airing timestamp and total episode count.
+ */
+export async function findLiveChartScheduleHint(
+  fetchHttp: HttpFetcher,
+  options: {
+    livechartId?: number;
+    titles?: string[];
+  }
+): Promise<LiveChartAnimeScheduleHint | null> {
+  const queryTitles = (options.titles || []).map((t) => cleanText(t)).filter(Boolean);
+  if (!options.livechartId && queryTitles.length === 0) return null;
+
+  let items =
+    cachedLiveChartScheduleItems && cachedLiveChartScheduleItems.expiresAt > Date.now()
+      ? cachedLiveChartScheduleItems.items
+      : null;
+
+  if (!items) {
+    try {
+      const fetched = await fetchLiveChartWeeklySchedule(fetchHttp, { mode: 'streams' });
+      items = fetched.days.flatMap((d) => d.items);
+    } catch {
+      return null;
+    }
+  }
+
+  if (!items || items.length === 0) return null;
+
+  const querySeason = queryTitles
+    .map((t) => extractExplicitSeasonNumber(t))
+    .find((s): s is number => s !== null);
+
+  let bestItem: CatalogMediaItem | null = null;
+  let bestScore = 0;
+
+  for (const item of items) {
+    if (!item.airingAt || item.airingAt <= 0) continue;
+    if (options.livechartId && item.externalIds?.livechartId === options.livechartId) {
+      bestItem = item;
+      break;
+    }
+
+    const candidates = [
+      item.title,
+      item.scheduleMeta?.englishTitle,
+      item.scheduleMeta?.nativeTitle,
+    ].filter((c): c is string => Boolean(c && c.trim()));
+
+    const candSeason = candidates
+      .map((c) => extractExplicitSeasonNumber(c))
+      .find((s): s is number => s !== null);
+    if (querySeason && candSeason && querySeason !== candSeason) continue;
+
+    let sim = 0;
+    for (const q of queryTitles) {
+      for (const c of candidates) {
+        sim = Math.max(sim, scoreTitleSimilarity(q, c));
+      }
+    }
+    if (sim >= 0.84 && sim > bestScore) {
+      bestScore = sim;
+      bestItem = item;
+    }
+  }
+
+  if (!bestItem || !bestItem.airingAt) return null;
+  const epNum = parseEpisodeNumberFromLabel(bestItem.episodeLabel);
+  if (!epNum) return null;
+
+  return {
+    livechartId: bestItem.externalIds?.livechartId,
+    episodeNumber: epNum,
+    airingAt: bestItem.airingAt,
+    totalEpisodes: bestItem.scheduleMeta?.totalEpisodes,
+    serviceName: bestItem.scheduleMeta?.serviceName,
+    poster: bestItem.poster || undefined,
+  };
 }

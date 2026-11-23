@@ -181,6 +181,9 @@ export interface AnimeEpisodeLink {
   overview?: string;
   durationMinutes?: number;
   rating?: string;
+  availableOnServer?: boolean;
+  airingAt?: number;
+  hasExactAiringTime?: boolean;
 }
 
 export interface ExternalDatabaseLinkItem {
