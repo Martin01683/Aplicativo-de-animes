@@ -3,6 +3,8 @@ import {
   ArrowDownNarrowWide,
   ArrowLeft,
   ArrowUpWideNarrow,
+  Bell,
+  BellOff,
   Building2,
   Calendar,
   Check,
@@ -43,9 +45,11 @@ import { MediaPoster } from './MediaPoster';
 interface AnimeDetailViewProps {
   anime: AnimeDetails;
   isFavorite: boolean;
+  isMuted?: boolean;
   watchedUrls: Set<string>;
   progressMap?: EpisodeProgressMap;
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
+  onToggleMuteFavorite?: (animeUrl: string) => void;
   onToggleEpisodesWatched: (
     episodes: AnimeEpisodeLink[],
     watched: boolean,
@@ -65,9 +69,11 @@ const SOURCE_BADGE_STYLE: Record<CatalogSourceId, string> = {
 export function AnimeDetailView({
   anime,
   isFavorite,
+  isMuted = false,
   watchedUrls,
   progressMap,
   onToggleFavorite,
+  onToggleMuteFavorite,
   onToggleEpisodesWatched,
   onOpenEpisode,
   onOpenAnime,
@@ -237,21 +243,43 @@ export function AnimeDetailView({
           <span>Voltar</span>
         </button>
 
-        <button
-          type="button"
-          onClick={handleToggleFav}
-          aria-pressed={isFavorite}
-          className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors md:hidden ${
-            isFavorite
-              ? 'border-rose-500/50 bg-rose-500/15 text-rose-200 hover:bg-rose-500/20'
-              : 'border-white/15 bg-[#151921] text-white hover:border-rose-400/60 hover:text-rose-200'
-          }`}
-        >
-          <Heart
-            className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : 'text-rose-400'}`}
-          />
-          <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
-        </button>
+        <div className="flex items-center gap-2 md:hidden">
+          {isFavorite && onToggleMuteFavorite && (
+            <button
+              type="button"
+              onClick={() => onToggleMuteFavorite(anime.url)}
+              aria-pressed={isMuted}
+              aria-label={
+                isMuted
+                  ? `Ativar avisos de ${anime.title}`
+                  : `Silenciar avisos de ${anime.title}`
+              }
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
+                isMuted
+                  ? 'border-white/15 bg-[#151921] text-slate-400 hover:text-white'
+                  : 'border-[#f97316]/40 bg-[#f97316]/12 text-[#fb923c] hover:bg-[#f97316]/20'
+              }`}
+            >
+              {isMuted ? <BellOff className="h-3.5 w-3.5" /> : <Bell className="h-3.5 w-3.5" />}
+              <span>{isMuted ? 'Silenciado' : 'Avisos'}</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleToggleFav}
+            aria-pressed={isFavorite}
+            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
+              isFavorite
+                ? 'border-rose-500/50 bg-rose-500/15 text-rose-200 hover:bg-rose-500/20'
+                : 'border-white/15 bg-[#151921] text-white hover:border-rose-400/60 hover:text-rose-200'
+            }`}
+          >
+            <Heart
+              className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : 'text-rose-400'}`}
+            />
+            <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
+          </button>
+        </div>
       </div>
 
       {/* Hero Info Card enriched by TheTVDB */}
@@ -375,6 +403,27 @@ export function AnimeDetailView({
                   />
                   <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
                 </button>
+
+                {isFavorite && onToggleMuteFavorite && (
+                  <button
+                    type="button"
+                    onClick={() => onToggleMuteFavorite(anime.url)}
+                    aria-pressed={isMuted}
+                    aria-label={
+                      isMuted
+                        ? `Ativar avisos de novos episódios de ${anime.title}`
+                        : `Silenciar avisos de novos episódios de ${anime.title}`
+                    }
+                    className={`inline-flex items-center gap-2 rounded-lg border px-3.5 py-2.5 text-xs font-semibold transition-colors ${
+                      isMuted
+                        ? 'border-white/15 bg-[#0d0f12] text-slate-400 hover:border-white/25 hover:text-white'
+                        : 'border-[#f97316]/40 bg-[#f97316]/12 text-[#fb923c] hover:bg-[#f97316]/20'
+                    }`}
+                  >
+                    {isMuted ? <BellOff className="h-4 w-4" /> : <Bell className="h-4 w-4" />}
+                    <span>{isMuted ? 'Avisos silenciados' : 'Avisos ativos'}</span>
+                  </button>
+                )}
 
                 {anime.allSeasonsUrl && onOpenAnime && (
                   <button

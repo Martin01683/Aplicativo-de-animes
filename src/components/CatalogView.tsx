@@ -9,7 +9,10 @@ import {
   Loader2,
   ChevronDown,
   Bell,
+  BellOff,
+  Check,
   CheckCheck,
+  ExternalLink,
   Play,
   Shuffle,
   Sparkles,
@@ -22,12 +25,18 @@ import {
 import { apiFetch } from '../lib/apiClient';
 import { isItemFavorited } from '../lib/favoriteAlerts';
 import {
+  filterFavoriteAlerts,
+  isFavoriteMuted,
+  type NotificationPermissionStatus,
+} from '../lib/notifications';
+import {
   canonicalEpisodeProgressKey,
   countAnimeEpisodesInHistory,
   formatPlaybackTimestamp,
   getHistoryEntrySeriesName,
   isEpisodeCompleted,
 } from '../lib/playbackProgress';
+import { formatRelativeTimestamp } from '../lib/settings';
 import type {
   AudioType,
   CalendarDaySection,
@@ -116,10 +125,12 @@ interface CatalogViewProps {
   loadingWeeklyCalendar: boolean;
   calendarError: string;
   favorites: CatalogMediaItem[];
+  mutedFavoriteUrls: string[];
   history: WatchHistoryEntry[];
   alerts: FavoriteAlertEntry[];
   checkingAlerts: boolean;
-  notificationPermission: NotificationPermission | 'unsupported';
+  lastEpisodeCheckAt: string | null;
+  notificationPermission: NotificationPermissionStatus;
   onRetryCatalog: () => void;
   onSearch: (query: string) => void;
   onLoadMoreSearch: () => void;
@@ -138,10 +149,16 @@ interface CatalogViewProps {
   onRefreshCalendar: () => void;
   onOpenItem: (url: string, kind: MediaKind) => void;
   onToggleFavorite: (item: CatalogMediaItem) => void;
+  onToggleMuteFavorite: (animeUrl: string) => void;
   onCheckFavoriteUpdates: () => void;
   onMarkAllAlertsRead: () => void;
+  onMarkAlertRead: (alertId: string) => void;
+  onDismissAlert: (alertId: string) => void;
+  onClearReadAlerts: () => void;
   onOpenAlert: (alert: FavoriteAlertEntry) => void;
   onRequestPushNotifications: () => void;
+  onSendTestNotification: () => void;
+  onOpenNotificationSettings: () => void;
   onClearHistory: () => void;
   onRemoveHistoryEntry: (entry: WatchHistoryEntry) => void;
   onRemoveHistoryAnime: (entry: WatchHistoryEntry) => void;
@@ -204,9 +221,11 @@ export function CatalogView({
   loadingWeeklyCalendar,
   calendarError,
   favorites,
+  mutedFavoriteUrls,
   history,
   alerts,
   checkingAlerts,
+  lastEpisodeCheckAt,
   notificationPermission,
   onRetryCatalog,
   onSearch,
@@ -226,10 +245,16 @@ export function CatalogView({
   onRefreshCalendar,
   onOpenItem,
   onToggleFavorite,
+  onToggleMuteFavorite,
   onCheckFavoriteUpdates,
   onMarkAllAlertsRead,
+  onMarkAlertRead,
+  onDismissAlert,
+  onClearReadAlerts,
   onOpenAlert,
   onRequestPushNotifications,
+  onSendTestNotification,
+  onOpenNotificationSettings,
   onClearHistory,
   onRemoveHistoryEntry,
   onRemoveHistoryAnime,
@@ -239,6 +264,7 @@ export function CatalogView({
 }: CatalogViewProps) {
   const [searchInput, setSearchInput] = useState(searchQuery);
   const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>(defaultAudioFilter);
+  const [libraryAlertFilter, setLibraryAlertFilter] = useState<'all' | 'unread'>('all');
   const [glossaryExpanded, setGlossaryExpanded] = useState(false);
   const [suggestions, setSuggestions] = useState<SearchResultItem[]>([]);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
@@ -366,9 +392,15 @@ export function CatalogView({
       entry: WatchHistoryEntry;
       animeEpisodeCount: number;
       animeName: string;
-    }
+    },
+    showMuteButton = false
   ) => {
+    const favActive = isItemFavorited(item.url, favorites);
+    const favMuted = showMuteButton && favActive && isFavoriteMuted(item.url, mutedFavoriteUrls);
     const metaParts: string[] = [];
+    if (favMuted) {
+      metaParts.push('Silenciado');
+    }
     if (progressMeta?.label) {
       metaParts.push(progressMeta.label);
     } else if (
@@ -384,7 +416,6 @@ export function CatalogView({
     if (item.isHiatus && item.statusBadge) metaParts.push(item.statusBadge);
     if (item.sourceServerName) metaParts.push(item.sourceServerName);
 
-    const favActive = isItemFavorited(item.url, favorites);
     const isHistoryMenuOpen = Boolean(
       historyMenu && openHistoryMenuKey === historyMenu.menuKey
     );
@@ -507,6 +538,30 @@ export function CatalogView({
               </div>
             )}
           </div>
+        )}
+
+        {showMuteButton && favActive && !historyMenu && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onToggleMuteFavorite(item.url);
+            }}
+            aria-pressed={favMuted}
+            aria-label={
+              favMuted
+                ? `Ativar avisos de ${item.title}`
+                : `Silenciar avisos de ${item.title}`
+            }
+            title={favMuted ? 'Ativar avisos deste anime' : 'Silenciar avisos deste anime'}
+            className={`absolute right-12 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-full border backdrop-blur-md transition-colors ${
+              favMuted
+                ? 'border-white/20 bg-[#0d0f12]/90 text-slate-400 hover:border-[#f97316]/60 hover:text-white'
+                : 'border-[#f97316]/50 bg-[#0d0f12]/80 text-[#fb923c] hover:bg-[#f97316]/20'
+            }`}
+          >
+            {favMuted ? <BellOff className="h-3.5 w-3.5" /> : <Bell className="h-3.5 w-3.5" />}
+          </button>
         )}
 
         <button
@@ -812,111 +867,252 @@ export function CatalogView({
       ) : activeSection === 'library' ? (
         /* Library View (Notifications, Favorites, Watch History) */
         <div className="space-y-10">
-          <section>
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-3 border-b border-white/10 pb-3">
-              <div className="flex items-center gap-2">
-                <Bell className="h-4 w-4 text-[#f97316]" />
-                <h1 className="text-xl font-bold text-white">Notificações dos Favoritos</h1>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                {notificationPermission !== 'unsupported' &&
-                  notificationPermission === 'default' && (
+          {(() => {
+            const unreadAlertsCount = alerts.filter((a) => !a.read).length;
+            const readAlertsCount = alerts.length - unreadAlertsCount;
+            const visibleAlerts = filterFavoriteAlerts(alerts, libraryAlertFilter);
+            return (
+              <section>
+                <div className="mb-4 flex flex-wrap items-start justify-between gap-3 border-b border-white/10 pb-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Bell className="h-4 w-4 text-[#f97316]" />
+                      <h1 className="text-xl font-bold text-white">Notificações dos Favoritos</h1>
+                      {unreadAlertsCount > 0 && (
+                        <span className="text-xs font-semibold tabular-nums text-[#fb923c]">
+                          · {unreadAlertsCount} nova{unreadAlertsCount === 1 ? '' : 's'}
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-0.5 text-xs tabular-nums text-slate-400">
+                      Última verificação: {formatRelativeTimestamp(lastEpisodeCheckAt)}
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {notificationPermission !== 'unsupported' &&
+                      notificationPermission === 'default' && (
+                        <button
+                          type="button"
+                          onClick={onRequestPushNotifications}
+                          className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-[#f97316]/40 bg-[#f97316]/12 px-3 py-1.5 text-xs font-medium text-[#fb923c] hover:bg-[#f97316]/20"
+                        >
+                          <Bell className="h-3.5 w-3.5" />
+                          <span>Ativar alertas no aparelho</span>
+                        </button>
+                      )}
+
+                    {notificationPermission === 'granted' && (
+                      <button
+                        type="button"
+                        onClick={onSendTestNotification}
+                        className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-[#f97316]/60 hover:text-white"
+                      >
+                        <Bell className="h-3.5 w-3.5 text-emerald-400" />
+                        <span>Testar alerta</span>
+                      </button>
+                    )}
+
+                    {notificationPermission === 'denied' && (
+                      <span className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/10 bg-[#151921] px-3 py-1.5 text-xs text-slate-400">
+                        <BellOff className="h-3.5 w-3.5 text-slate-500" />
+                        <span>Alertas apenas no app</span>
+                      </span>
+                    )}
+
                     <button
                       type="button"
-                      onClick={onRequestPushNotifications}
-                      className="inline-flex items-center gap-1.5 rounded-lg border border-[#f97316]/40 bg-[#f97316]/12 px-3 py-1.5 text-xs font-medium text-[#fb923c] hover:bg-[#f97316]/20"
+                      disabled={checkingAlerts || favorites.length === 0}
+                      onClick={onCheckFavoriteUpdates}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-[#f97316]/60 disabled:opacity-50"
                     >
-                      <Bell className="h-3.5 w-3.5" />
-                      <span>Ativar alertas no celular</span>
+                      {checkingAlerts ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                      ) : (
+                        <RefreshCw className="h-3.5 w-3.5 text-[#f97316]" />
+                      )}
+                      <span>{checkingAlerts ? 'Verificando...' : 'Verificar agora'}</span>
                     </button>
-                  )}
 
-                {notificationPermission === 'denied' && (
-                  <span className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-[#151921] px-3 py-1.5 text-xs text-slate-400">
-                    <Bell className="h-3.5 w-3.5 text-slate-500" />
-                    <span>Alertas apenas no app</span>
-                  </span>
-                )}
+                    <button
+                      type="button"
+                      onClick={onOpenNotificationSettings}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-[#f97316]/60 hover:text-white"
+                    >
+                      <SlidersHorizontal className="h-3.5 w-3.5 text-[#f97316]" />
+                      <span>Configurar</span>
+                    </button>
+                  </div>
+                </div>
 
-                <button
-                  type="button"
-                  disabled={checkingAlerts || favorites.length === 0}
-                  onClick={onCheckFavoriteUpdates}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 hover:border-[#f97316]/60 disabled:opacity-50"
-                >
-                  {checkingAlerts ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
-                  ) : (
-                    <RefreshCw className="h-3.5 w-3.5 text-[#f97316]" />
-                  )}
-                  <span>{checkingAlerts ? 'Verificando...' : 'Verificar novos episódios'}</span>
-                </button>
-
-                {alerts.some((a) => !a.read) && (
-                  <button
-                    type="button"
-                    onClick={onMarkAllAlertsRead}
-                    className="inline-flex items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-300 hover:text-white"
-                  >
-                    <CheckCheck className="h-3.5 w-3.5 text-emerald-400" />
-                    <span>Marcar lidas</span>
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {alerts.length === 0 ? (
-              <div className="rounded-xl border border-white/10 bg-[#151921] px-4 py-3.5 text-xs leading-relaxed text-slate-400">
-                {favorites.length === 0
-                  ? 'Favorite qualquer título pelo coração nos cards ou na página de detalhes para receber avisos de novos episódios.'
-                  : 'Nenhum episódio novo detectado desde a última verificação.'}
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {alerts.slice(0, 9).map((alert) => (
-                  <button
-                    key={alert.id}
-                    type="button"
-                    onClick={() => onOpenAlert(alert)}
-                    className={`flex items-center gap-3.5 rounded-xl border p-3 text-left transition-colors hover:border-[#f97316]/60 ${
-                      alert.read
-                        ? 'border-white/10 bg-[#151921] opacity-80'
-                        : 'border-[#f97316]/45 bg-[#f97316]/10'
-                    }`}
-                  >
-                    <MediaPoster
-                      src={alert.poster}
-                      alt={alert.animeTitle}
-                      aspect="portrait"
-                      className="h-16 w-12 shrink-0 rounded-lg border border-white/10"
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        {!alert.read && (
-                          <span className="h-2 w-2 shrink-0 rounded-full bg-[#f97316]" />
-                        )}
-                        <h3 className="truncate text-sm font-semibold text-white">
-                          {alert.animeTitle}
-                        </h3>
-                      </div>
-                      <p className="mt-1 text-xs font-medium text-[#fb923c]">
-                        {alert.episodeLabel} disponível
-                      </p>
-                      <span className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium text-slate-300">
-                        <Play className="h-3 w-3 text-[#f97316]" />
-                        Assistir agora
-                      </span>
+                {alerts.length > 0 && (
+                  <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                    <div
+                      role="tablist"
+                      aria-label="Filtrar avisos dos favoritos"
+                      className="inline-flex rounded-lg border border-white/10 bg-[#151921] p-1"
+                    >
+                      {(
+                        [
+                          { id: 'all', label: `Todas (${alerts.length})` },
+                          { id: 'unread', label: `Não lidas (${unreadAlertsCount})` },
+                        ] as const
+                      ).map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          role="tab"
+                          aria-selected={libraryAlertFilter === tab.id}
+                          onClick={() => setLibraryAlertFilter(tab.id)}
+                          className={`min-h-[32px] whitespace-nowrap rounded-md px-3 py-1 text-xs font-medium tabular-nums transition-colors ${
+                            libraryAlertFilter === tab.id
+                              ? 'bg-[#f97316] text-[#0d0f12]'
+                              : 'text-slate-300 hover:text-white'
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
                     </div>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {unreadAlertsCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={onMarkAllAlertsRead}
+                          className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-emerald-300 hover:border-emerald-500/50"
+                        >
+                          <CheckCheck className="h-3.5 w-3.5" />
+                          <span>Marcar todas como lidas</span>
+                        </button>
+                      )}
+                      {readAlertsCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={onClearReadAlerts}
+                          className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-300 hover:border-rose-500/45 hover:text-rose-300"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                          <span>Limpar lidas</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {visibleAlerts.length === 0 ? (
+                  <div className="rounded-xl border border-white/10 bg-[#151921] px-4 py-4 text-xs leading-relaxed text-slate-400">
+                    {favorites.length === 0
+                      ? 'Favorite qualquer título pelo coração nos cards ou na página de detalhes para receber avisos de novos episódios.'
+                      : libraryAlertFilter === 'unread' && alerts.length > 0
+                        ? 'Você já leu todas as notificações recentes.'
+                        : 'Nenhum episódio novo detectado desde a última verificação.'}
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {visibleAlerts.slice(0, 30).map((alert) => {
+                      const metaLine = [
+                        alert.episodeLabel,
+                        alert.audioType || null,
+                        formatRelativeTimestamp(alert.detectedAt),
+                      ]
+                        .filter(Boolean)
+                        .join(' · ');
+
+                      return (
+                        <div
+                          key={alert.id}
+                          className={`group flex items-start gap-3 rounded-xl border p-3 transition-colors hover:border-[#f97316]/60 ${
+                            alert.read
+                              ? 'border-white/10 bg-[#151921] opacity-80'
+                              : 'border-[#f97316]/45 bg-[#f97316]/10'
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => onOpenAlert(alert)}
+                            className="flex min-w-0 flex-1 items-start gap-3 text-left"
+                          >
+                            <MediaPoster
+                              src={alert.poster}
+                              alt={alert.animeTitle}
+                              aspect="portrait"
+                              className="h-16 w-12 shrink-0 rounded-lg border border-white/10"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <h3 className="truncate text-sm font-semibold text-white group-hover:text-[#fb923c]">
+                                  {alert.animeTitle}
+                                </h3>
+                                {!alert.read && (
+                                  <span className="shrink-0 text-[10px] font-semibold text-[#fb923c]">
+                                    · Novo
+                                  </span>
+                                )}
+                              </div>
+                              <p className="mt-1 truncate text-xs font-medium tabular-nums text-slate-300">
+                                {metaLine}
+                              </p>
+                              <span className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-semibold text-[#fb923c]">
+                                <Play className="h-3 w-3 fill-current" />
+                                <span>Assistir agora</span>
+                              </span>
+                            </div>
+                          </button>
+
+                          <div className="flex shrink-0 items-center gap-1">
+                            {!alert.read && (
+                              <button
+                                type="button"
+                                onClick={() => onMarkAlertRead(alert.id)}
+                                aria-label={`Marcar ${alert.animeTitle} ${alert.episodeLabel} como lida`}
+                                title="Marcar como lida"
+                                className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-[#0d0f12] text-slate-300 transition-colors hover:border-emerald-500/50 hover:text-emerald-300"
+                              >
+                                <Check className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            {alert.animeUrl && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenItem(alert.animeUrl, 'anime')}
+                                aria-label={`Abrir página de ${alert.animeTitle}`}
+                                title="Abrir página do anime"
+                                className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-[#0d0f12] text-slate-300 transition-colors hover:border-[#f97316]/50 hover:text-white"
+                              >
+                                <ExternalLink className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => onDismissAlert(alert.id)}
+                              aria-label={`Dispensar aviso de ${alert.animeTitle} ${alert.episodeLabel}`}
+                              title="Dispensar aviso"
+                              className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-[#0d0f12] text-slate-400 transition-colors hover:border-rose-500/50 hover:text-rose-300"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </section>
+            );
+          })()}
 
           <section>
-            <div className="mb-4 flex items-center gap-2 border-b border-white/10 pb-3">
-              <Heart className="h-4 w-4 text-rose-400" />
-              <h2 className="text-xl font-bold text-white">Meus Favoritos</h2>
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-2 border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <Heart className="h-4 w-4 text-rose-400" />
+                <h2 className="text-xl font-bold text-white">Meus Favoritos</h2>
+              </div>
+              {favorites.length > 0 && (
+                <span className="text-xs text-slate-400">
+                  Use o sininho no card para silenciar ou ativar avisos por anime
+                </span>
+              )}
             </div>
 
             {favorites.length === 0 ? (
@@ -925,7 +1121,7 @@ export function CatalogView({
               </div>
             ) : (
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                {favorites.map((fav) => renderCard(fav, 'portrait'))}
+                {favorites.map((fav) => renderCard(fav, 'portrait', undefined, undefined, true))}
               </div>
             )}
           </section>

@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bell, BellRing, CheckCheck, Loader2, RefreshCw, Settings } from 'lucide-react';
+import { Bell, BellRing, Settings } from 'lucide-react';
+import type { RemoteAppRelease } from '../lib/appUpdater';
+import type { NotificationPermissionStatus } from '../lib/notifications';
 import type { FavoriteAlertEntry } from '../lib/types';
+import { NotificationCenter } from './NotificationCenter';
 
 export type NavSection = 'releases' | 'calendar' | 'catalog' | 'library';
 
@@ -11,12 +14,23 @@ interface HeaderProps {
   alerts: FavoriteAlertEntry[];
   unreadCount: number;
   checkingAlerts: boolean;
-  notificationPermission: NotificationPermission | 'unsupported';
+  lastEpisodeCheckAt: string | null;
+  notificationPermission: NotificationPermissionStatus;
+  quietHoursActive: boolean;
+  quietHoursEnd: number;
   onCheckAlerts: () => void;
   onMarkAllRead: () => void;
+  onMarkAlertRead: (alertId: string) => void;
+  onDismissAlert: (alertId: string) => void;
+  onClearReadAlerts: () => void;
   onOpenAlert: (alert: FavoriteAlertEntry) => void;
+  onOpenAlertAnime: (animeUrl: string) => void;
   onRequestPushNotifications: () => void;
+  onSendTestNotification: () => void;
+  onOpenNotificationSettings: () => void;
+  onOpenUpdateSettings: () => void;
   hasAppUpdate: boolean;
+  latestRelease: RemoteAppRelease | null;
   onOpenSettings: () => void;
 }
 
@@ -34,12 +48,23 @@ export function Header({
   alerts,
   unreadCount,
   checkingAlerts,
+  lastEpisodeCheckAt,
   notificationPermission,
+  quietHoursActive,
+  quietHoursEnd,
   onCheckAlerts,
   onMarkAllRead,
+  onMarkAlertRead,
+  onDismissAlert,
+  onClearReadAlerts,
   onOpenAlert,
+  onOpenAlertAnime,
   onRequestPushNotifications,
+  onSendTestNotification,
+  onOpenNotificationSettings,
+  onOpenUpdateSettings,
   hasAppUpdate,
+  latestRelease,
   onOpenSettings,
 }: HeaderProps) {
   const [openPopover, setOpenPopover] = useState(false);
@@ -48,13 +73,17 @@ export function Header({
   useEffect(() => {
     if (!openPopover) return;
     const handleOutside = (e: MouseEvent) => {
-      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-notification-center-portal]')) return;
+      if (popoverRef.current && !popoverRef.current.contains(target)) {
         setOpenPopover(false);
       }
     };
     document.addEventListener('mousedown', handleOutside);
     return () => document.removeEventListener('mousedown', handleOutside);
   }, [openPopover]);
+
+  const totalBadgeCount = unreadCount + (hasAppUpdate && latestRelease ? 1 : 0);
 
   return (
     <header
@@ -96,7 +125,7 @@ export function Header({
                 key={item.id}
                 type="button"
                 onClick={() => onSelectSection(item.id)}
-                className={`relative whitespace-nowrap shrink-0 rounded-lg px-3.5 py-2 text-sm font-medium transition-colors ${
+                className={`relative shrink-0 whitespace-nowrap rounded-lg px-3.5 py-2 text-sm font-medium transition-colors ${
                   active
                     ? 'bg-white/10 text-white'
                     : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'
@@ -104,7 +133,7 @@ export function Header({
               >
                 {item.label}
                 {item.id === 'library' && unreadCount > 0 && (
-                  <span className="ml-1.5 inline-flex min-w-[18px] items-center justify-center rounded-full bg-[#f97316] px-1.5 py-0.5 text-[10px] font-bold leading-none text-[#0d0f12] tabular-nums">
+                  <span className="ml-1.5 inline-flex min-w-[18px] items-center justify-center rounded-full bg-[#f97316] px-1.5 py-0.5 text-[10px] font-bold leading-none tabular-nums text-[#0d0f12]">
                     {unreadCount > 9 ? '9+' : unreadCount}
                   </span>
                 )}
@@ -119,151 +148,55 @@ export function Header({
               type="button"
               onClick={() => setOpenPopover((prev) => !prev)}
               aria-expanded={openPopover}
+              aria-haspopup="dialog"
               aria-label={
-                unreadCount > 0
-                  ? `Notificações (${unreadCount} novos episódios)`
-                  : 'Notificações de novos episódios'
+                totalBadgeCount > 0
+                  ? `Notificações (${totalBadgeCount} ${totalBadgeCount === 1 ? 'novo aviso' : 'novos avisos'})`
+                  : 'Notificações'
               }
-              className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-[#151921] text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+              className={`relative flex h-10 w-10 items-center justify-center rounded-lg border transition-colors ${
+                openPopover
+                  ? 'border-[#f97316]/70 bg-[#151921] text-white'
+                  : 'border-white/10 bg-[#151921] text-slate-200 hover:border-[#f97316]/60 hover:text-white'
+              }`}
             >
-              {unreadCount > 0 ? (
+              {totalBadgeCount > 0 ? (
                 <BellRing className="h-4.5 w-4.5 text-[#f97316]" />
               ) : (
                 <Bell className="h-4.5 w-4.5" />
               )}
-              {unreadCount > 0 && (
-                <span className="absolute -right-1 -top-1 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#f97316] px-1 text-[10px] font-bold leading-none text-[#0d0f12] tabular-nums">
-                  {unreadCount > 9 ? '9+' : unreadCount}
+              {totalBadgeCount > 0 && (
+                <span className="absolute -right-1 -top-1 flex h-5 min-w-[20px] items-center justify-center rounded-full bg-[#f97316] px-1 text-[10px] font-bold leading-none tabular-nums text-[#0d0f12]">
+                  {totalBadgeCount > 9 ? '9+' : totalBadgeCount}
                 </span>
               )}
             </button>
 
-            {openPopover && (
-              <div className="absolute right-0 mt-2 w-[320px] max-w-[calc(100vw-2rem)] overflow-hidden rounded-xl border border-white/15 bg-[#151921] shadow-2xl sm:w-[360px]">
-                <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
-                  <div>
-                    <h2 className="text-sm font-semibold text-white">
-                      Novos Episódios
-                    </h2>
-                    <p className="text-[11px] text-slate-400">
-                      Avisos dos títulos favoritados
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      disabled={checkingAlerts}
-                      onClick={onCheckAlerts}
-                      aria-label="Verificar novos episódios"
-                      className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#0d0f12] px-2 py-1 text-[11px] font-medium text-slate-300 hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
-                    >
-                      {checkingAlerts ? (
-                        <Loader2 className="h-3 w-3 animate-spin text-[#f97316]" />
-                      ) : (
-                        <RefreshCw className="h-3 w-3 text-[#f97316]" />
-                      )}
-                      <span>Verificar</span>
-                    </button>
-                    {unreadCount > 0 && (
-                      <button
-                        type="button"
-                        onClick={onMarkAllRead}
-                        aria-label="Marcar notificações como lidas"
-                        className="inline-flex items-center gap-1 rounded-md border border-white/10 bg-[#0d0f12] px-2 py-1 text-[11px] font-medium text-slate-300 hover:text-white"
-                      >
-                        <CheckCheck className="h-3 w-3 text-emerald-400" />
-                        <span>Lidas</span>
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {notificationPermission !== 'unsupported' && (
-                  <div className="border-b border-white/8 bg-[#0d0f12]/60 px-4 py-2.5">
-                    {notificationPermission === 'granted' ? (
-                      <div className="flex items-center justify-between text-[11px] text-emerald-300">
-                        <span>Notificações no aparelho ativas</span>
-                        <span className="font-semibold">Ativado</span>
-                      </div>
-                    ) : notificationPermission === 'denied' ? (
-                      <p className="text-[11px] text-slate-400">
-                        Notificações bloqueadas nas configurações do navegador. Alertas continuam aparecendo aqui.
-                      </p>
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={onRequestPushNotifications}
-                        className="flex w-full items-center justify-between rounded-lg border border-[#f97316]/35 bg-[#f97316]/10 px-3 py-1.5 text-left text-xs font-medium text-[#fb923c] transition-colors hover:bg-[#f97316]/20"
-                      >
-                        <span>Ativar alertas no celular / navegador</span>
-                        <span className="font-semibold">Ativar</span>
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                <div className="max-h-80 divide-y divide-white/8 overflow-y-auto">
-                  {alerts.length === 0 ? (
-                    <div className="px-4 py-7 text-center text-xs leading-relaxed text-slate-400">
-                      Nenhum novo episódio detectado ainda. Favorite seus animes e toque em Verificar quando quiser atualizar.
-                    </div>
-                  ) : (
-                    alerts.slice(0, 8).map((alert) => (
-                      <button
-                        key={alert.id}
-                        type="button"
-                        onClick={() => {
-                          setOpenPopover(false);
-                          onOpenAlert(alert);
-                        }}
-                        className={`flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-white/5 ${
-                          alert.read ? 'opacity-75' : 'bg-[#f97316]/5'
-                        }`}
-                      >
-                        {alert.poster ? (
-                          <img
-                            src={alert.poster}
-                            alt={alert.animeTitle}
-                            className="h-12 w-9 shrink-0 rounded object-cover"
-                          />
-                        ) : (
-                          <div className="h-12 w-9 shrink-0 rounded bg-white/10" />
-                        )}
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-2">
-                            {!alert.read && (
-                              <span className="h-2 w-2 shrink-0 rounded-full bg-[#f97316]" />
-                            )}
-                            <span className="truncate text-xs font-semibold text-white">
-                              {alert.animeTitle}
-                            </span>
-                          </div>
-                          <div className="mt-0.5 truncate text-[11px] font-medium text-[#fb923c]">
-                            {alert.episodeLabel} disponível
-                          </div>
-                        </div>
-                        <span className="shrink-0 rounded-md bg-white/10 px-2 py-1 text-[11px] font-medium text-white">
-                          Assistir
-                        </span>
-                      </button>
-                    ))
-                  )}
-                </div>
-
-                <div className="border-t border-white/10 bg-[#0d0f12]/60 px-4 py-2 text-center">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setOpenPopover(false);
-                      onSelectSection('library');
-                    }}
-                    className="text-xs font-medium text-slate-300 hover:text-[#f97316]"
-                  >
-                    Ver tudo em Minha Lista
-                  </button>
-                </div>
-              </div>
-            )}
+            <NotificationCenter
+              open={openPopover}
+              onClose={() => setOpenPopover(false)}
+              alerts={alerts}
+              unreadCount={unreadCount}
+              checkingAlerts={checkingAlerts}
+              lastEpisodeCheckAt={lastEpisodeCheckAt}
+              notificationPermission={notificationPermission}
+              quietHoursActive={quietHoursActive}
+              quietHoursEnd={quietHoursEnd}
+              hasAppUpdate={hasAppUpdate}
+              latestRelease={latestRelease}
+              onCheckAlerts={onCheckAlerts}
+              onMarkAllRead={onMarkAllRead}
+              onMarkAlertRead={onMarkAlertRead}
+              onDismissAlert={onDismissAlert}
+              onClearReadAlerts={onClearReadAlerts}
+              onOpenAlert={onOpenAlert}
+              onOpenAlertAnime={onOpenAlertAnime}
+              onRequestPushNotifications={onRequestPushNotifications}
+              onSendTestNotification={onSendTestNotification}
+              onOpenNotificationSettings={onOpenNotificationSettings}
+              onOpenUpdateSettings={onOpenUpdateSettings}
+              onOpenLibrary={() => onSelectSection('library')}
+            />
           </div>
 
           <button

@@ -1,5 +1,8 @@
 package com.topanimes.player;
 
+import android.Manifest;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
@@ -13,13 +16,19 @@ import android.os.Build;
 import android.provider.Settings;
 import android.util.Log;
 
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
 import androidx.core.app.PendingIntentCompat;
+import androidx.core.content.ContextCompat;
 
 import com.getcapacitor.JSObject;
+import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
 import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -53,9 +62,16 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-@CapacitorPlugin(name = "LocalProxy")
+@CapacitorPlugin(
+    name = "LocalProxy",
+    permissions = {
+        @Permission(alias = "notifications", strings = { Manifest.permission.POST_NOTIFICATIONS })
+    }
+)
 public class LocalProxyPlugin extends Plugin {
     private static final String TAG = "TopAnimesLocalProxy";
+    private static final String CHANNEL_EPISODES_ID = "anisync_episodes";
+    private static final String CHANNEL_UPDATES_ID = "anisync_updates";
     private static final String DEFAULT_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     private static final Pattern DIRECT_HOSTS_PATTERN = Pattern.compile(
@@ -356,6 +372,165 @@ public class LocalProxyPlugin extends Plugin {
             ret.put("versionCode", 1);
             call.resolve(ret);
         }
+    }
+
+    private String resolveNotificationPermissionStatus() {
+        Context ctx = getContext();
+        if (ctx == null) return "unsupported";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            int granted = ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS);
+            if (granted == PackageManager.PERMISSION_GRANTED) {
+                return NotificationManagerCompat.from(ctx).areNotificationsEnabled() ? "granted" : "denied";
+            }
+            PermissionState state = getPermissionState("notifications");
+            if (state == PermissionState.DENIED) {
+                return "denied";
+            }
+            return "default";
+        }
+        return NotificationManagerCompat.from(ctx).areNotificationsEnabled() ? "granted" : "denied";
+    }
+
+    private void ensureNotificationChannels(Context ctx) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return;
+        NotificationManager manager = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+        if (manager == null) return;
+
+        NotificationChannel episodesChannel = new NotificationChannel(
+            CHANNEL_EPISODES_ID,
+            "Novos Episódios",
+            NotificationManager.IMPORTANCE_HIGH
+        );
+        episodesChannel.setDescription("Avisos quando novos episódios dos seus animes favoritos ficam disponíveis.");
+        manager.createNotificationChannel(episodesChannel);
+
+        NotificationChannel updatesChannel = new NotificationChannel(
+            CHANNEL_UPDATES_ID,
+            "Atualizações do Anisync",
+            NotificationManager.IMPORTANCE_DEFAULT
+        );
+        updatesChannel.setDescription("Avisos quando uma nova versão do aplicativo está disponível.");
+        manager.createNotificationChannel(updatesChannel);
+    }
+
+    @PluginMethod
+    public void getNotificationPermission(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("status", resolveNotificationPermissionStatus());
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void requestNotificationPermission(PluginCall call) {
+        Context ctx = getContext();
+        if (ctx == null) {
+            JSObject ret = new JSObject();
+            ret.put("status", "unsupported");
+            call.resolve(ret);
+            return;
+        }
+        ensureNotificationChannels(ctx);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            int granted = ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS);
+            if (granted == PackageManager.PERMISSION_GRANTED) {
+                JSObject ret = new JSObject();
+                ret.put("status", resolveNotificationPermissionStatus());
+                call.resolve(ret);
+                return;
+            }
+            requestPermissionForAlias("notifications", call, "notificationPermissionsCallback");
+            return;
+        }
+        JSObject ret = new JSObject();
+        ret.put("status", resolveNotificationPermissionStatus());
+        call.resolve(ret);
+    }
+
+    @PermissionCallback
+    private void notificationPermissionsCallback(PluginCall call) {
+        JSObject ret = new JSObject();
+        ret.put("status", resolveNotificationPermissionStatus());
+        call.resolve(ret);
+    }
+
+    @PluginMethod
+    public void showLocalNotification(PluginCall call) {
+        Context ctx = getContext();
+        if (ctx == null) {
+            JSObject ret = new JSObject();
+            ret.put("shown", false);
+            call.resolve(ret);
+            return;
+        }
+        if (!"granted".equals(resolveNotificationPermissionStatus())) {
+            JSObject ret = new JSObject();
+            ret.put("shown", false);
+            call.resolve(ret);
+            return;
+        }
+
+        String title = call.getString("title", "Anisync");
+        String body = call.getString("body", "");
+        String channelRaw = call.getString("channelId", CHANNEL_EPISODES_ID);
+        String channelId = CHANNEL_UPDATES_ID.equals(channelRaw) ? CHANNEL_UPDATES_ID : CHANNEL_EPISODES_ID;
+        String targetUrl = call.getString("targetUrl", "");
+        String mediaKind = call.getString("mediaKind", "episode");
+        int notifId = call.getInt("id", (int) (System.currentTimeMillis() & 0x7fffffff));
+
+        try {
+            ensureNotificationChannels(ctx);
+
+            Intent launchIntent = new Intent(ctx, MainActivity.class);
+            launchIntent.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            if (targetUrl != null && !targetUrl.trim().isEmpty()) {
+                launchIntent.putExtra(MainActivity.EXTRA_NOTIFICATION_URL, targetUrl.trim());
+                launchIntent.putExtra(MainActivity.EXTRA_NOTIFICATION_KIND, mediaKind != null ? mediaKind : "episode");
+            }
+
+            PendingIntent pendingIntent = PendingIntentCompat.getActivity(
+                ctx,
+                notifId,
+                launchIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT,
+                false
+            );
+
+            NotificationCompat.Builder builder = new NotificationCompat.Builder(ctx, channelId)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setStyle(new NotificationCompat.BigTextStyle().bigText(body))
+                .setPriority(CHANNEL_EPISODES_ID.equals(channelId)
+                    ? NotificationCompat.PRIORITY_HIGH
+                    : NotificationCompat.PRIORITY_DEFAULT)
+                .setAutoCancel(true);
+
+            if (pendingIntent != null) {
+                builder.setContentIntent(pendingIntent);
+            }
+
+            NotificationManagerCompat.from(ctx).notify(notifId, builder.build());
+
+            JSObject ret = new JSObject();
+            ret.put("shown", true);
+            call.resolve(ret);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to post local notification: " + e.getMessage());
+            JSObject ret = new JSObject();
+            ret.put("shown", false);
+            call.resolve(ret);
+        }
+    }
+
+    @PluginMethod
+    public void consumePendingNotificationTarget(PluginCall call) {
+        String[] target = MainActivity.consumePendingNotificationTarget();
+        JSObject ret = new JSObject();
+        if (target != null && target[0] != null) {
+            ret.put("url", target[0]);
+            ret.put("kind", target[1] != null ? target[1] : "episode");
+        }
+        call.resolve(ret);
     }
 
     @PluginMethod

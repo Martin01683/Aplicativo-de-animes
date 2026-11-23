@@ -169,14 +169,15 @@ export function isItemFavorited(url: string, favorites: CatalogMediaItem[]): boo
   return Boolean(findMatchingFavorite(url, favorites));
 }
 
-function findLatestReleaseForFavorite(
+function findMatchingReleasesForFavorite(
   favorite: CatalogMediaItem,
   releases: CatalogMediaItem[]
-): FavoriteLatestInfo | null {
+): FavoriteLatestInfo[] {
   const favSlug = extractMediaSlug(favorite.url);
   const favTitleNorm = cleanEpisodeSeriesTitle(favorite.title).toLowerCase();
 
-  let best: FavoriteLatestInfo | null = null;
+  const matches: FavoriteLatestInfo[] = [];
+  const seenUrls = new Set<string>();
   for (const rel of releases) {
     const relSlug = extractMediaSlug(rel.url);
     const relTitleNorm = cleanEpisodeSeriesTitle(rel.title).toLowerCase();
@@ -184,31 +185,44 @@ function findLatestReleaseForFavorite(
     const matchesTitle = Boolean(favTitleNorm && relTitleNorm && favTitleNorm === relTitleNorm);
     if (!matchesSlug && !matchesTitle) continue;
 
+    const normUrl = normalizeTopAnimesUrl(rel.url);
+    if (seenUrls.has(normUrl)) continue;
+    seenUrls.add(normUrl);
+
     const epNum =
       extractEpisodeNumber(rel.episodeLabel || '') ??
       extractEpisodeNumber(rel.title) ??
       extractEpisodeNumber(rel.url);
 
-    const candidate: FavoriteLatestInfo = {
-      episodeUrl: normalizeTopAnimesUrl(rel.url),
+    matches.push({
+      episodeUrl: normUrl,
       episodeTitle: rel.episodeLabel
         ? `${cleanEpisodeSeriesTitle(rel.title)} — ${rel.episodeLabel}`
         : rel.title,
       episodeLabel: rel.episodeLabel || (epNum !== null ? `EP ${epNum}` : 'Novo episódio'),
       episodeNumber: epNum,
       poster: rel.poster || favorite.poster,
-    };
-
-    if (!best) {
-      best = candidate;
-    } else if (
-      candidate.episodeNumber !== null &&
-      (best.episodeNumber === null || candidate.episodeNumber > best.episodeNumber)
-    ) {
-      best = candidate;
-    }
+      audioType: rel.audioType ?? favorite.audioType ?? null,
+      sourceServerName: rel.sourceServerName || favorite.sourceServerName,
+    });
   }
-  return best;
+
+  return matches.sort((a, b) => {
+    if (a.episodeNumber !== null && b.episodeNumber !== null) {
+      return b.episodeNumber - a.episodeNumber;
+    }
+    if (b.episodeNumber !== null) return 1;
+    if (a.episodeNumber !== null) return -1;
+    return 0;
+  });
+}
+
+function findLatestReleaseForFavorite(
+  favorite: CatalogMediaItem,
+  releases: CatalogMediaItem[]
+): FavoriteLatestInfo | null {
+  const matches = findMatchingReleasesForFavorite(favorite, releases);
+  return matches[0] || null;
 }
 
 export function pickLatestAnimeEpisode(
@@ -220,28 +234,66 @@ export function pickLatestAnimeEpisode(
     thumb?: string;
   }>,
   seriesTitle: string,
-  fallbackPoster: string
+  fallbackPoster: string,
+  meta?: { audioType?: CatalogMediaItem['audioType']; sourceServerName?: string }
 ): FavoriteLatestInfo | null {
-  if (!episodes.length) return null;
-  let best = episodes[episodes.length - 1];
-  let bestNum =
-    best.episodeNumber ?? extractEpisodeNumber(best.url) ?? extractEpisodeNumber(best.title);
-
-  for (const ep of episodes) {
-    const num = ep.episodeNumber ?? extractEpisodeNumber(ep.url) ?? extractEpisodeNumber(ep.title);
-    if (num !== null && (bestNum === null || num > bestNum)) {
-      best = ep;
-      bestNum = num;
-    }
-  }
-
+  const recent = pickRecentAnimeEpisodes(episodes, seriesTitle, fallbackPoster, 5, meta);
+  if (recent.length === 0) return null;
+  const top = recent[0];
   return {
-    episodeUrl: normalizeTopAnimesUrl(best.url),
-    episodeTitle: `${seriesTitle} — ${best.title}`,
-    episodeLabel: bestNum !== null ? `EP ${bestNum}` : best.numberLabel || best.title,
-    episodeNumber: bestNum,
-    poster: best.thumb || fallbackPoster,
+    ...top,
+    recentEpisodes: recent,
   };
+}
+
+export function pickRecentAnimeEpisodes(
+  episodes: Array<{
+    numberLabel: string;
+    episodeNumber: number | null;
+    title: string;
+    url: string;
+    thumb?: string;
+  }>,
+  seriesTitle: string,
+  fallbackPoster: string,
+  limit = 5,
+  meta?: { audioType?: CatalogMediaItem['audioType']; sourceServerName?: string }
+): FavoriteLatestInfo[] {
+  if (!episodes.length) return [];
+  const mapped: Array<{ info: FavoriteLatestInfo; orderIndex: number }> = episodes.map((ep, idx) => {
+    const num = ep.episodeNumber ?? extractEpisodeNumber(ep.url) ?? extractEpisodeNumber(ep.title);
+    return {
+      orderIndex: idx,
+      info: {
+        episodeUrl: normalizeTopAnimesUrl(ep.url),
+        episodeTitle: `${seriesTitle} — ${ep.title}`,
+        episodeLabel: num !== null ? `EP ${num}` : ep.numberLabel || ep.title,
+        episodeNumber: num,
+        poster: ep.thumb || fallbackPoster,
+        audioType: meta?.audioType ?? null,
+        sourceServerName: meta?.sourceServerName,
+      },
+    };
+  });
+
+  mapped.sort((a, b) => {
+    if (a.info.episodeNumber !== null && b.info.episodeNumber !== null) {
+      return b.info.episodeNumber - a.info.episodeNumber;
+    }
+    if (b.info.episodeNumber !== null) return 1;
+    if (a.info.episodeNumber !== null) return -1;
+    return b.orderIndex - a.orderIndex;
+  });
+
+  const seen = new Set<string>();
+  const out: FavoriteLatestInfo[] = [];
+  for (const entry of mapped) {
+    if (seen.has(entry.info.episodeUrl)) continue;
+    seen.add(entry.info.episodeUrl);
+    out.push(entry.info);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 export function buildFavoriteBaseline(
@@ -271,6 +323,28 @@ function pickNewerCandidate(
   }
   if (b.episodeNumber !== null && a.episodeNumber === null) return b;
   return a;
+}
+
+function isFavoriteEntryMuted(favorite: CatalogMediaItem, mutedFavoriteUrls?: string[]): boolean {
+  if (!mutedFavoriteUrls || mutedFavoriteUrls.length === 0) return false;
+  const favNorm = normalizeTopAnimesUrl(favorite.url);
+  const favSlug = extractMediaSlug(favorite.url);
+  return mutedFavoriteUrls.some((entry) => {
+    if (normalizeTopAnimesUrl(entry) === favNorm) return true;
+    const slug = extractMediaSlug(entry);
+    return Boolean(favSlug && slug && slug === favSlug);
+  });
+}
+
+function matchesAudioNotificationFilter(
+  candidateAudio: CatalogMediaItem['audioType'] | undefined,
+  favoriteAudio: CatalogMediaItem['audioType'] | undefined,
+  filter?: 'ALL' | 'DUB' | 'LEG'
+): boolean {
+  if (!filter || filter === 'ALL') return true;
+  const effective = candidateAudio ?? favoriteAudio ?? null;
+  if (!effective) return true;
+  return effective === filter;
 }
 
 export function advanceBaselineWithWatchedEpisodes(params: {
@@ -334,6 +408,8 @@ export function detectNewFavoriteEpisodes(params: {
   existingAlerts: FavoriteAlertEntry[];
   latestByAnimeUrl?: Record<string, FavoriteLatestInfo>;
   watchedEpisodeKeys?: Set<string>;
+  mutedFavoriteUrls?: string[];
+  notifyAudioFilter?: 'ALL' | 'DUB' | 'LEG';
   nowIso?: string;
 }): {
   newAlerts: FavoriteAlertEntry[];
@@ -347,6 +423,8 @@ export function detectNewFavoriteEpisodes(params: {
     existingAlerts,
     latestByAnimeUrl = {},
     watchedEpisodeKeys,
+    mutedFavoriteUrls,
+    notifyAudioFilter = 'ALL',
     nowIso = new Date().toISOString(),
   } = params;
 
@@ -362,18 +440,48 @@ export function detectNewFavoriteEpisodes(params: {
       latestByAnimeUrl[fav.url] ||
       latestByAnimeUrl[favNormUrl] ||
       null;
-    const fromReleases = findLatestReleaseForFavorite(fav, releases);
-    const latest = pickNewerCandidate(fromCheck, fromReleases);
+    const matchingReleases = findMatchingReleasesForFavorite(fav, releases);
+
+    // Collect all candidate episodes from both /api/favorites/check (including recentEpisodes) and releases feed
+    const candidateMap = new Map<string, FavoriteLatestInfo>();
+    const addCandidate = (cand: FavoriteLatestInfo | null | undefined) => {
+      if (!cand?.episodeUrl) return;
+      const normEpUrl = normalizeTopAnimesUrl(cand.episodeUrl);
+      if (!candidateMap.has(normEpUrl)) {
+        candidateMap.set(normEpUrl, {
+          ...cand,
+          episodeUrl: normEpUrl,
+          audioType: cand.audioType ?? fav.audioType ?? null,
+          sourceServerName: cand.sourceServerName || fav.sourceServerName,
+        });
+      }
+    };
+
+    if (fromCheck) {
+      addCandidate(fromCheck);
+      if (Array.isArray(fromCheck.recentEpisodes)) {
+        for (const recent of fromCheck.recentEpisodes) {
+          addCandidate(recent);
+        }
+      }
+    }
+    for (const rel of matchingReleases) {
+      addCandidate(rel);
+    }
+
+    const candidates = Array.from(candidateMap.values()).sort((a, b) => {
+      if (a.episodeNumber !== null && b.episodeNumber !== null) {
+        return b.episodeNumber - a.episodeNumber;
+      }
+      if (b.episodeNumber !== null) return 1;
+      if (a.episodeNumber !== null) return -1;
+      return 0;
+    });
+
+    const latest = candidates[0] || null;
     if (!latest) continue;
 
     const latestEpUrl = normalizeTopAnimesUrl(latest.episodeUrl);
-    const latestCanonicalKey = canonicalEpisodeKey(latest.episodeUrl);
-    const alreadyWatched = Boolean(
-      watchedEpisodeKeys &&
-        (watchedEpisodeKeys.has(latestCanonicalKey) ||
-          watchedEpisodeKeys.has(latestEpUrl) ||
-          watchedEpisodeKeys.has(latest.episodeUrl))
-    );
     const baselineKey = favNormUrl || fav.url;
     const existingBaseline = nextBaselines[baselineKey] || nextBaselines[fav.url];
 
@@ -390,39 +498,74 @@ export function detectNewFavoriteEpisodes(params: {
     const baselineUrl = normalizeTopAnimesUrl(existingBaseline.lastEpisodeUrl);
     if (latestEpUrl === baselineUrl) continue;
 
-    const isStrictlyOlder =
+    const isLatestOlderOrEqual =
       latest.episodeNumber !== null &&
       existingBaseline.lastEpisodeNumber !== null &&
       latest.episodeNumber <= existingBaseline.lastEpisodeNumber;
 
-    if (isStrictlyOlder) continue;
+    if (isLatestOlderOrEqual) continue;
 
+    // Advance baseline to the newest detected episode
     nextBaselines[baselineKey] = {
       lastEpisodeUrl: latestEpUrl,
       lastEpisodeNumber: latest.episodeNumber,
       updatedAt: nowIso,
     };
 
-    if (alreadyWatched) {
+    // If this anime is muted by the user, advance baseline silently without creating alerts
+    if (isFavoriteEntryMuted(fav, mutedFavoriteUrls)) {
       continue;
     }
 
-    if (!existingEpisodeUrls.has(latestEpUrl)) {
-      existingEpisodeUrls.add(latestEpUrl);
-      newAlerts.push({
-        id: `${baselineKey}::${latestEpUrl}`,
-        animeUrl: fav.url,
-        animeTitle: fav.title,
-        episodeTitle: latest.episodeTitle,
-        episodeLabel: latest.episodeLabel,
-        episodeUrl: latest.episodeUrl,
-        poster: latest.poster || fav.poster,
-        detectedAt: nowIso,
-        read: false,
-      });
+    // Collect every candidate episode strictly newer than the previous baseline (capped at 5 per anime)
+    const newerCandidates = candidates
+      .filter((cand) => {
+        const candUrl = normalizeTopAnimesUrl(cand.episodeUrl);
+        if (candUrl === baselineUrl) return false;
+        if (
+          cand.episodeNumber !== null &&
+          existingBaseline.lastEpisodeNumber !== null
+        ) {
+          return cand.episodeNumber > existingBaseline.lastEpisodeNumber;
+        }
+        return candUrl === latestEpUrl;
+      })
+      .slice(0, 5);
+
+    for (const cand of newerCandidates) {
+      const candEpUrl = normalizeTopAnimesUrl(cand.episodeUrl);
+      const candCanonicalKey = canonicalEpisodeKey(cand.episodeUrl);
+      const alreadyWatched = Boolean(
+        watchedEpisodeKeys &&
+          (watchedEpisodeKeys.has(candCanonicalKey) ||
+            watchedEpisodeKeys.has(candEpUrl) ||
+            watchedEpisodeKeys.has(cand.episodeUrl))
+      );
+      if (alreadyWatched) continue;
+
+      if (!matchesAudioNotificationFilter(cand.audioType, fav.audioType, notifyAudioFilter)) {
+        continue;
+      }
+
+      if (!existingEpisodeUrls.has(candEpUrl)) {
+        existingEpisodeUrls.add(candEpUrl);
+        newAlerts.push({
+          id: `${baselineKey}::${candEpUrl}`,
+          animeUrl: fav.url,
+          animeTitle: fav.title,
+          episodeTitle: cand.episodeTitle,
+          episodeLabel: cand.episodeLabel,
+          episodeUrl: cand.episodeUrl,
+          poster: cand.poster || fav.poster,
+          detectedAt: nowIso,
+          read: false,
+          audioType: cand.audioType ?? fav.audioType ?? null,
+          sourceServerName: cand.sourceServerName || fav.sourceServerName,
+        });
+      }
     }
   }
 
-  const nextAlerts = [...newAlerts, ...existingAlerts].slice(0, 40);
+  const nextAlerts = [...newAlerts, ...existingAlerts].slice(0, 60);
   return { newAlerts, nextAlerts, nextBaselines };
 }

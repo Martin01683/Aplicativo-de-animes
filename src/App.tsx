@@ -5,15 +5,20 @@ import { CatalogView } from './components/CatalogView';
 import { EpisodeWorkspace } from './components/EpisodeWorkspace';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
+import { NotificationToastStack } from './components/NotificationToastStack';
 import { SettingsModal } from './components/SettingsModal';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import {
   addApkDownloadProgressListener,
   apiFetch,
   cancelAppUpdateDownload,
+  consumePendingNotificationTarget,
   downloadAppUpdateApk,
+  getDeviceNotificationPermission,
   getNativeAppBuildInfo,
   isNativeAndroidApp,
+  requestDeviceNotificationPermission,
+  showNativeLocalNotification,
   type ApkDownloadProgressEvent,
 } from './lib/apiClient';
 import {
@@ -42,6 +47,24 @@ import {
   setNativeVlcVideoScale,
   type NativeVlcPlayResult,
 } from './lib/nativeVlcPlayer';
+import {
+  clearReadFavoriteAlerts,
+  dismissSingleAlert,
+  dismissToastItem,
+  enqueueToastItem,
+  isFavoriteMuted,
+  isWithinQuietHours,
+  markSingleAlertRead,
+  playNotificationChime,
+  pruneAlertsForRemovedFavorite,
+  removeFavoriteMutedUrl,
+  shouldRunCatchUpEpisodeCheck,
+  syncAppBadge,
+  toggleFavoriteMutedUrl,
+  type AppNotificationToast,
+  type NotificationPermissionStatus,
+  type ToastKind,
+} from './lib/notifications';
 import {
   canonicalEpisodeProgressKey,
   countAnimeEpisodesInHistory,
@@ -74,6 +97,7 @@ import {
   loadFavoriteBaselines,
   loadFavorites,
   loadHistory,
+  loadMutedFavoriteUrls,
   pushHistoryEntry,
   removeHistoryAnime,
   removeHistoryEpisode,
@@ -85,6 +109,7 @@ import {
   saveFavoriteAlerts,
   saveFavoriteBaselines,
   saveFavorites,
+  saveMutedFavoriteUrls,
   setEpisodesWatched,
 } from './lib/storage';
 import type {
@@ -114,6 +139,7 @@ type ActiveRoute = AppRouteFrame;
 declare global {
   interface Window {
     __topAnimesHandleAndroidBack?: () => boolean;
+    __anisyncOpenNotificationTarget?: (url: string, kind?: string) => void;
   }
 }
 
@@ -164,7 +190,7 @@ export default function App() {
   );
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsFocusSection, setSettingsFocusSection] = useState<
-    'sources' | 'catalog' | 'general'
+    'sources' | 'catalog' | 'notifications' | 'general'
   >('general');
 
   const initialRouteSession = useMemo(() => loadActiveRouteSession(), []);
@@ -242,16 +268,20 @@ export default function App() {
   const [detailError, setDetailError] = useState('');
 
   const [favorites, setFavorites] = useState<CatalogMediaItem[]>(() => loadFavorites());
+  const [mutedFavoriteUrls, setMutedFavoriteUrls] = useState<string[]>(() =>
+    loadMutedFavoriteUrls()
+  );
   const [baselines, setBaselines] = useState<FavoriteBaselineMap>(() => loadFavoriteBaselines());
   const [alerts, setAlerts] = useState<FavoriteAlertEntry[]>(() => loadFavoriteAlerts());
   const [checkingAlerts, setCheckingAlerts] = useState(false);
-  const [notificationPermission, setNotificationPermission] = useState<
-    NotificationPermission | 'unsupported'
-  >(() =>
-    typeof window !== 'undefined' && 'Notification' in window
-      ? Notification.permission
-      : 'unsupported'
-  );
+  const [notificationPermission, setNotificationPermission] =
+    useState<NotificationPermissionStatus>(() => {
+      if (isNativeAndroidApp()) return 'default';
+      if (typeof window !== 'undefined' && 'Notification' in window) {
+        return Notification.permission;
+      }
+      return 'unsupported';
+    });
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
   const [pendingHistoryRemoval, setPendingHistoryRemoval] = useState<
     | { kind: 'all'; count: number }
@@ -261,7 +291,8 @@ export default function App() {
   const [progressMap, setProgressMap] = useState<EpisodeProgressMap>(() =>
     loadEpisodeProgressMap()
   );
-  const [toast, setToast] = useState<string>('');
+  const [toasts, setToasts] = useState<AppNotificationToast[]>([]);
+  const toastCounterRef = useRef(0);
 
   const [buildInfo, setBuildInfo] = useState<AppBuildInfo>(() => getAppBuildInfo());
   const [appUpdateResult, setAppUpdateResult] = useState<AppUpdateCheckResult | null>(null);
@@ -278,8 +309,10 @@ export default function App() {
   const apkInstalledClearTimerRef = useRef<number | null>(null);
 
   const favoritesRef = useRef(favorites);
+  const mutedFavoriteUrlsRef = useRef(mutedFavoriteUrls);
   const baselinesRef = useRef(baselines);
   const alertsRef = useRef(alerts);
+  const checkingAlertsRef = useRef(checkingAlerts);
   const releasesRef = useRef(releases);
   const historyRef = useRef(history);
   const animeDetailsRef = useRef(animeDetails);
@@ -304,8 +337,10 @@ export default function App() {
   const updateToastNotifiedForRef = useRef<string | null>(null);
 
   favoritesRef.current = favorites;
+  mutedFavoriteUrlsRef.current = mutedFavoriteUrls;
   baselinesRef.current = baselines;
   alertsRef.current = alerts;
+  checkingAlertsRef.current = checkingAlerts;
   releasesRef.current = releases;
   historyRef.current = history;
   animeDetailsRef.current = animeDetails;
@@ -322,12 +357,46 @@ export default function App() {
     saveActiveRouteSession({ routeStack, activeSection });
   }, [routeStack, activeSection]);
 
-  const showToast = useCallback((message: string) => {
-    setToast(message);
-    window.setTimeout(() => {
-      setToast((current) => (current === message ? '' : current));
-    }, 3500);
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => dismissToastItem(prev, id));
   }, []);
+
+  const showToast = useCallback(
+    (
+      message: string,
+      options?: {
+        kind?: ToastKind;
+        description?: string;
+        poster?: string;
+        actionLabel?: string;
+        onAction?: () => void;
+        durationMs?: number;
+        dedupeKey?: string;
+      }
+    ) => {
+      const id = `toast-${++toastCounterRef.current}-${Date.now()}`;
+      const inferredKind: ToastKind =
+        options?.kind ||
+        (/falha|erro|não foi possível|bloquead/i.test(message)
+          ? 'warning'
+          : /ativad|adicionado|concluíd|restaurad|reativad/i.test(message)
+            ? 'success'
+            : 'info');
+      const item: AppNotificationToast = {
+        id,
+        kind: inferredKind,
+        title: message,
+        description: options?.description,
+        poster: options?.poster,
+        actionLabel: options?.actionLabel,
+        onAction: options?.onAction,
+        durationMs: options?.durationMs ?? (options?.actionLabel ? 6500 : 3800),
+        dedupeKey: options?.dedupeKey,
+      };
+      setToasts((prev) => enqueueToastItem(prev, item, 3));
+    },
+    []
+  );
 
   const refreshProgressState = useCallback(() => {
     setProgressMap(loadEpisodeProgressMap());
@@ -371,43 +440,106 @@ export default function App() {
     showToast('Configurações restauradas para o padrão.');
   }, [showToast]);
 
-  const dispatchDeviceNotifications = useCallback(async (newAlerts: FavoriteAlertEntry[]) => {
-    if (!settingsRef.current.notifyNewEpisodes) return;
-    if (!newAlerts.length) return;
-    if (typeof window === 'undefined' || !('Notification' in window)) return;
-    if (Notification.permission !== 'granted') return;
+  const openNotificationTargetRef = useRef<(url: string, kind?: string) => void>(() => undefined);
 
-    const first = newAlerts[0];
-    const title =
-      newAlerts.length === 1
-        ? `Novo episódio: ${first.animeTitle}`
-        : `${newAlerts.length} novos episódios dos favoritos`;
-    const body =
-      newAlerts.length === 1
-        ? `${first.episodeLabel} já está disponível para assistir.`
-        : `${first.animeTitle} (${first.episodeLabel}) e mais ${newAlerts.length - 1} título(s).`;
+  const deliverSystemNotification = useCallback(
+    async (payload: {
+      title: string;
+      body: string;
+      channel: 'episodes' | 'updates';
+      tag: string;
+      targetUrl?: string;
+      targetKind?: string;
+      bypassQuietHours?: boolean;
+      bypassSetting?: boolean;
+    }): Promise<boolean> => {
+      if (!payload.bypassSetting && !settingsRef.current.notifyNewEpisodes) return false;
+      if (!payload.bypassQuietHours && isWithinQuietHours(settingsRef.current)) return false;
 
-    try {
-      if ('serviceWorker' in navigator) {
-        const reg = await navigator.serviceWorker.ready;
-        if (reg && typeof reg.showNotification === 'function') {
-          await reg.showNotification(title, {
-            body,
-            icon: '/pwa-192x192.png',
-            badge: '/pwa-192x192.png',
-            tag: `anisync-${first.id}`,
-          });
-          return;
-        }
+      if (isNativeAndroidApp()) {
+        const mediaKind: MediaKind | 'settings' | undefined =
+          payload.targetKind === 'settings' ||
+          payload.targetKind === 'episode' ||
+          payload.targetKind === 'anime' ||
+          payload.targetKind === 'movie' ||
+          payload.targetKind === 'series'
+            ? payload.targetKind
+            : undefined;
+        return showNativeLocalNotification({
+          title: payload.title,
+          body: payload.body,
+          channelId: payload.channel === 'updates' ? 'anisync_updates' : 'anisync_episodes',
+          targetUrl: payload.targetUrl || (mediaKind === 'settings' ? 'anisync://settings' : undefined),
+          mediaKind,
+        });
       }
-      new Notification(title, {
+
+      if (typeof window === 'undefined' || !('Notification' in window)) return false;
+      if (Notification.permission !== 'granted') return false;
+
+      try {
+        const notification = new Notification(payload.title, {
+          body: payload.body,
+          icon: '/pwa-192x192.png',
+          badge: '/pwa-192x192.png',
+          tag: payload.tag,
+        });
+        notification.onclick = () => {
+          window.focus();
+          if (payload.targetUrl || payload.targetKind === 'settings') {
+            openNotificationTargetRef.current(payload.targetUrl || '', payload.targetKind);
+          }
+          notification.close();
+        };
+        return true;
+      } catch {
+        // Fallback for mobile browsers that require ServiceWorkerRegistration.showNotification
+        try {
+          if ('serviceWorker' in navigator) {
+            const reg = await navigator.serviceWorker.ready;
+            if (reg && typeof reg.showNotification === 'function') {
+              await reg.showNotification(payload.title, {
+                body: payload.body,
+                icon: '/pwa-192x192.png',
+                badge: '/pwa-192x192.png',
+                tag: payload.tag,
+              });
+              return true;
+            }
+          }
+        } catch {
+          // Ignore browser notification restrictions
+        }
+        return false;
+      }
+    },
+    []
+  );
+
+  const dispatchDeviceNotifications = useCallback(
+    async (newAlerts: FavoriteAlertEntry[]) => {
+      if (!newAlerts.length) return;
+      const first = newAlerts[0];
+      const title =
+        newAlerts.length === 1
+          ? `Novo episódio: ${first.animeTitle}`
+          : `${newAlerts.length} novos episódios dos favoritos`;
+      const body =
+        newAlerts.length === 1
+          ? `${first.episodeLabel}${first.audioType ? ` (${first.audioType})` : ''} já está disponível para assistir.`
+          : `${first.animeTitle} (${first.episodeLabel}) e mais ${newAlerts.length - 1} episódio(s).`;
+
+      await deliverSystemNotification({
+        title,
         body,
-        icon: '/pwa-192x192.png',
+        channel: 'episodes',
+        tag: `anisync-${first.id}`,
+        targetUrl: first.episodeUrl,
+        targetKind: 'episode',
       });
-    } catch {
-      // Ignore browser notification restrictions
-    }
-  }, []);
+    },
+    [deliverSystemNotification]
+  );
 
   const checkFavoriteUpdates = useCallback(
     async (options: { manual?: boolean; currentReleases?: CatalogMediaItem[] } = {}) => {
@@ -426,7 +558,7 @@ export default function App() {
         const seriesUrls = currentFavs
           .filter((f) => f.kind !== 'movie' && !/\/filmes\//i.test(f.url))
           .map((f) => f.url)
-          .slice(0, 10);
+          .slice(0, 30);
 
         if (seriesUrls.length > 0 && navigator.onLine) {
           try {
@@ -453,6 +585,8 @@ export default function App() {
           existingAlerts: alertsRef.current,
           latestByAnimeUrl,
           watchedEpisodeKeys: watchedEpisodeKeysRef.current,
+          mutedFavoriteUrls: mutedFavoriteUrlsRef.current,
+          notifyAudioFilter: settingsRef.current.notifyAudioFilter,
         });
 
         setBaselines(detection.nextBaselines);
@@ -469,11 +603,44 @@ export default function App() {
 
         if (detection.newAlerts.length > 0) {
           const first = detection.newAlerts[0];
-          showToast(
-            detection.newAlerts.length === 1
-              ? `Novo episódio: ${first.animeTitle} (${first.episodeLabel})`
-              : `${detection.newAlerts.length} novos episódios dos favoritos!`
-          );
+          const inQuietHours = isWithinQuietHours(settingsRef.current);
+
+          if (settingsRef.current.showInAppEpisodeToasts) {
+            showToast(
+              detection.newAlerts.length === 1
+                ? `Novo episódio: ${first.animeTitle}`
+                : `${detection.newAlerts.length} novos episódios disponíveis`,
+              {
+                kind: 'episode',
+                description:
+                  detection.newAlerts.length === 1
+                    ? `${first.episodeLabel}${first.audioType ? ` · ${first.audioType}` : ''} pronto para assistir`
+                    : `${first.animeTitle} (${first.episodeLabel}) e mais ${detection.newAlerts.length - 1}`,
+                poster: first.poster || undefined,
+                actionLabel: detection.newAlerts.length === 1 ? 'Assistir' : 'Ver avisos',
+                onAction: () => {
+                  if (detection.newAlerts.length === 1) {
+                    setAlerts((prev) => {
+                      const next = markSingleAlertRead(prev, first.id);
+                      saveFavoriteAlerts(next);
+                      return next;
+                    });
+                    openNotificationTargetRef.current(first.episodeUrl, 'episode');
+                  } else {
+                    setActiveSection('library');
+                    setRouteStack([{ view: 'catalog' }]);
+                  }
+                },
+                dedupeKey: `episode-drop-${first.id}`,
+                durationMs: 7000,
+              }
+            );
+          }
+
+          if (settingsRef.current.notificationSound && !inQuietHours) {
+            playNotificationChime();
+          }
+
           void dispatchDeviceNotifications(detection.newAlerts);
         } else if (options.manual) {
           showToast('Nenhum novo episódio encontrado agora.');
@@ -538,7 +705,7 @@ export default function App() {
       pendingUpdateReleaseRef.current = targetRelease || null;
       setDownloadingAppUpdate(true);
       if (isNativeAndroidApp()) {
-        setToast('');
+        setToasts([]);
       }
       setApkDownloadProgress(
         isNativeAndroidApp()
@@ -635,10 +802,28 @@ export default function App() {
             autoDownloadTriggeredForRef.current = key;
             void handleDownloadAppUpdate(evaluated.latestRelease);
           } else if (options.manual) {
-            showToast(`Nova atualização encontrada: ${evaluated.latestRelease.releaseName}`);
+            showToast(`Nova atualização encontrada: ${evaluated.latestRelease.releaseName}`, {
+              kind: 'update',
+              actionLabel: 'Ver',
+              onAction: () => openNotificationTargetRef.current('', 'settings'),
+              dedupeKey: `app-update-${key}`,
+            });
           } else if (updateToastNotifiedForRef.current !== key) {
             updateToastNotifiedForRef.current = key;
-            showToast('Nova versão do Anisync disponível nas Configurações.');
+            showToast('Nova versão do Anisync disponível', {
+              kind: 'update',
+              description: `${evaluated.latestRelease.releaseName || evaluated.latestRelease.tagName} pronta nas Configurações.`,
+              actionLabel: 'Ver',
+              onAction: () => openNotificationTargetRef.current('', 'settings'),
+              dedupeKey: `app-update-${key}`,
+            });
+            void deliverSystemNotification({
+              title: 'Nova versão do Anisync disponível',
+              body: `${evaluated.latestRelease.releaseName || evaluated.latestRelease.tagName} pronta para instalar nas Configurações.`,
+              channel: 'updates',
+              tag: `anisync-update-${key}`,
+              targetKind: 'settings',
+            });
           }
         } else if (options.manual) {
           showToast('Você já está na versão mais recente.');
@@ -655,7 +840,7 @@ export default function App() {
         setCheckingAppUpdate(false);
       }
     },
-    [handleDownloadAppUpdate, showToast]
+    [deliverSystemNotification, handleDownloadAppUpdate, showToast]
   );
 
   const fetchCatalog = useCallback(async () => {
@@ -718,18 +903,63 @@ export default function App() {
     fetchCatalog();
   }, [fetchCatalog]);
 
-  // Dynamic episode/news check interval configured in Settings
+  // Dynamic episode/news check interval + foreground/reconnect catch-up
   useEffect(() => {
     const intervalMs = getEpisodeCheckIntervalMs(settings.episodeCheckIntervalMinutes);
     if (!intervalMs) return;
+
+    const runIfDue = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        navigator.onLine &&
+        favoritesRef.current.length > 0 &&
+        !checkingAlertsRef.current &&
+        shouldRunCatchUpEpisodeCheck(
+          settingsRef.current.episodeCheckIntervalMinutes,
+          settingsMetaRef.current.lastEpisodeCheckAt
+        )
+      ) {
+        void checkFavoriteUpdates();
+      }
+    };
 
     const interval = window.setInterval(() => {
       if (document.visibilityState === 'visible' && favoritesRef.current.length > 0) {
         void checkFavoriteUpdates();
       }
     }, intervalMs);
-    return () => window.clearInterval(interval);
+
+    document.addEventListener('visibilitychange', runIfDue);
+    window.addEventListener('online', runIfDue);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', runIfDue);
+      window.removeEventListener('online', runIfDue);
+    };
   }, [checkFavoriteUpdates, settings.episodeCheckIntervalMinutes]);
+
+  // Sync device notification permission status (Android + Web)
+  useEffect(() => {
+    let active = true;
+    const refreshPermission = async () => {
+      const status = await getDeviceNotificationPermission();
+      if (active) setNotificationPermission(status);
+    };
+    void refreshPermission();
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshPermission();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', refreshPermission);
+    return () => {
+      active = false;
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', refreshPermission);
+    };
+  }, []);
 
   // Load native Android version info and run one-shot startup GitHub update check
   useEffect(() => {
@@ -1305,6 +1535,19 @@ export default function App() {
       options: { bypassCache?: boolean; preserveExisting?: boolean } = {}
     ) => {
       const epCacheKey = normalizeTopAnimesUrl(url) || url;
+      const openedEpKey = canonicalEpisodeKey(url);
+      if (openedEpKey) {
+        const hasMatchingUnread = alertsRef.current.some(
+          (a) => !a.read && canonicalEpisodeKey(a.episodeUrl) === openedEpKey
+        );
+        if (hasMatchingUnread) {
+          const nextAlerts = alertsRef.current.map((a) =>
+            canonicalEpisodeKey(a.episodeUrl) === openedEpKey ? { ...a, read: true } : a
+          );
+          setAlerts(nextAlerts);
+          saveFavoriteAlerts(nextAlerts);
+        }
+      }
       const knownMeta = resolveKnownEpisodeMeta(url);
       if (!options.bypassCache) {
         const cachedEp = episodeDetailsCacheRef.current.get(epCacheKey);
@@ -1762,6 +2005,18 @@ export default function App() {
         setBaselines(nextBaselines);
         saveFavoriteBaselines(nextBaselines);
 
+        const prunedAlerts = pruneAlertsForRemovedFavorite(alertsRef.current, existing.url);
+        if (prunedAlerts.length !== alertsRef.current.length) {
+          setAlerts(prunedAlerts);
+          saveFavoriteAlerts(prunedAlerts);
+        }
+
+        const nextMuted = removeFavoriteMutedUrl(existing.url, mutedFavoriteUrlsRef.current);
+        if (nextMuted !== mutedFavoriteUrlsRef.current) {
+          setMutedFavoriteUrls(nextMuted);
+          saveMutedFavoriteUrls(nextMuted);
+        }
+
         showToast('Removido dos favoritos.');
         return;
       }
@@ -1798,10 +2053,58 @@ export default function App() {
     });
   }, []);
 
+  const handleMarkAlertRead = useCallback((alertId: string) => {
+    setAlerts((prev) => {
+      const next = markSingleAlertRead(prev, alertId);
+      if (next !== prev) saveFavoriteAlerts(next);
+      return next;
+    });
+  }, []);
+
+  const handleDismissAlert = useCallback((alertId: string) => {
+    setAlerts((prev) => {
+      const next = dismissSingleAlert(prev, alertId);
+      saveFavoriteAlerts(next);
+      return next;
+    });
+  }, []);
+
+  const handleClearReadAlerts = useCallback(() => {
+    setAlerts((prev) => {
+      const next = clearReadFavoriteAlerts(prev);
+      saveFavoriteAlerts(next);
+      return next;
+    });
+    showToast('Avisos lidos removidos.');
+  }, [showToast]);
+
+  const handleToggleMuteFavorite = useCallback(
+    (animeUrl: string) => {
+      const { muted, nextMutedUrls } = toggleFavoriteMutedUrl(
+        animeUrl,
+        mutedFavoriteUrlsRef.current
+      );
+      setMutedFavoriteUrls(nextMutedUrls);
+      saveMutedFavoriteUrls(nextMutedUrls);
+      showToast(
+        muted
+          ? 'Avisos deste anime silenciados.'
+          : 'Avisos deste anime reativados!'
+      );
+    },
+    [showToast]
+  );
+
+  const handleUnmuteAllFavorites = useCallback(() => {
+    setMutedFavoriteUrls([]);
+    saveMutedFavoriteUrls([]);
+    showToast('Avisos reativados para todos os favoritos!');
+  }, [showToast]);
+
   const handleOpenAlert = useCallback(
     (alert: FavoriteAlertEntry) => {
       setAlerts((prev) => {
-        const next = prev.map((a) => (a.id === alert.id ? { ...a, read: true } : a));
+        const next = markSingleAlertRead(prev, alert.id);
         saveFavoriteAlerts(next);
         return next;
       });
@@ -1811,27 +2114,72 @@ export default function App() {
   );
 
   const handleRequestPushNotifications = useCallback(async () => {
-    if (typeof window === 'undefined' || !('Notification' in window)) {
-      showToast('Este navegador não suporta notificações.');
-      return;
-    }
     try {
-      const perm = await Notification.requestPermission();
+      const perm = await requestDeviceNotificationPermission();
       setNotificationPermission(perm);
       if (perm === 'granted') {
         showToast('Notificações ativadas neste dispositivo!');
       } else if (perm === 'denied') {
-        showToast('Notificações bloqueadas no navegador. Alertas continuam no sininho.');
+        showToast(
+          isNativeAndroidApp()
+            ? 'Notificações bloqueadas nas configurações do Android. Alertas continuam no sininho.'
+            : 'Notificações bloqueadas no navegador. Alertas continuam no sininho.'
+        );
+      } else if (perm === 'unsupported') {
+        showToast('Este navegador não suporta notificações do sistema.');
       }
     } catch {
       showToast('Não foi possível solicitar permissão de notificação.');
     }
   }, [showToast]);
 
+  const handleSendTestNotification = useCallback(async () => {
+    const sampleFav = favoritesRef.current[0];
+    const title = sampleFav
+      ? `Teste de alerta: ${sampleFav.title}`
+      : 'Teste de notificação do Anisync';
+    const description =
+      'É assim que os avisos de novos episódios aparecem no app e no seu aparelho.';
+
+    if (settingsRef.current.notificationSound) {
+      playNotificationChime();
+    }
+
+    const systemSent = await deliverSystemNotification({
+      title,
+      body: description,
+      channel: 'episodes',
+      tag: 'anisync-test-notification',
+      targetUrl: sampleFav?.url,
+      targetKind: sampleFav ? 'anime' : undefined,
+      bypassQuietHours: true,
+      bypassSetting: true,
+    });
+
+    showToast(title, {
+      kind: 'episode',
+      description: systemSent
+        ? 'Notificação enviada ao dispositivo e exibida aqui no app.'
+        : description,
+      poster: sampleFav?.poster || '/pwa-192x192.png',
+      actionLabel: sampleFav ? 'Abrir' : undefined,
+      onAction: sampleFav ? () => void openMediaUrl(sampleFav.url, sampleFav.kind) : undefined,
+      dedupeKey: 'test-notification',
+      durationMs: 6000,
+    });
+  }, [deliverSystemNotification, openMediaUrl, showToast]);
+
   const unreadAlertCount = useMemo(
     () => alerts.filter((a) => !a.read).length,
     [alerts]
   );
+
+  const quietHoursActive = isWithinQuietHours(settings);
+
+  // Sync PWA App Badge counter with unread notifications + system updates
+  useEffect(() => {
+    syncAppBadge(unreadAlertCount + (appUpdateResult?.hasUpdate ? 1 : 0));
+  }, [appUpdateResult?.hasUpdate, unreadAlertCount]);
 
   const watchedUrls = useMemo(() => {
     const urls = new Set<string>();
@@ -2088,15 +2436,58 @@ export default function App() {
 
   const settingsSnapshotOnOpenRef = useRef<{ catalog: string; sources: string } | null>(null);
 
-  const openSettingsModal = useCallback((section: 'sources' | 'catalog' | 'general' = 'general') => {
-    settingsSnapshotOnOpenRef.current = {
-      catalog: JSON.stringify({
-        creds: settingsRef.current.catalogCredentials,
-      }),
-      sources: JSON.stringify(settingsRef.current.episodeSources),
+  const openSettingsModal = useCallback(
+    (section: 'sources' | 'catalog' | 'notifications' | 'general' = 'general') => {
+      settingsSnapshotOnOpenRef.current = {
+        catalog: JSON.stringify({
+          creds: settingsRef.current.catalogCredentials,
+        }),
+        sources: JSON.stringify(settingsRef.current.episodeSources),
+      };
+      setSettingsFocusSection(section);
+      setSettingsOpen(true);
+    },
+    []
+  );
+
+  openNotificationTargetRef.current = (targetUrl: string, targetKind?: string) => {
+    if (targetKind === 'settings') {
+      openSettingsModal('general');
+      return;
+    }
+    if (targetUrl) {
+      const mediaKind: MediaKind =
+        targetKind === 'anime' || targetKind === 'movie' || targetKind === 'series'
+          ? targetKind
+          : 'episode';
+      void openMediaUrl(targetUrl, mediaKind);
+    }
+  };
+
+  // Handle deep-link taps from native Android notifications (cold start & warm intent)
+  useEffect(() => {
+    window.__anisyncOpenNotificationTarget = (url: string, kind?: string) => {
+      openNotificationTargetRef.current(url, kind);
     };
-    setSettingsFocusSection(section);
-    setSettingsOpen(true);
+
+    const checkPendingTarget = async () => {
+      const pending = await consumePendingNotificationTarget();
+      if (!pending) return;
+      openNotificationTargetRef.current(pending.url, pending.kind);
+    };
+
+    void checkPendingTarget();
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void checkPendingTarget();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      delete window.__anisyncOpenNotificationTarget;
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, []);
 
   const closeSettingsModal = useCallback(() => {
@@ -2138,12 +2529,23 @@ export default function App() {
         alerts={alerts}
         unreadCount={unreadAlertCount}
         checkingAlerts={checkingAlerts}
+        lastEpisodeCheckAt={settingsMeta.lastEpisodeCheckAt}
         notificationPermission={notificationPermission}
+        quietHoursActive={quietHoursActive}
+        quietHoursEnd={settings.quietHoursEnd}
         onCheckAlerts={() => void checkFavoriteUpdates({ manual: true })}
         onMarkAllRead={handleMarkAllAlertsRead}
+        onMarkAlertRead={handleMarkAlertRead}
+        onDismissAlert={handleDismissAlert}
+        onClearReadAlerts={handleClearReadAlerts}
         onOpenAlert={handleOpenAlert}
+        onOpenAlertAnime={(animeUrl) => void openMediaUrl(animeUrl, 'anime')}
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
+        onSendTestNotification={() => void handleSendTestNotification()}
+        onOpenNotificationSettings={() => openSettingsModal('notifications')}
+        onOpenUpdateSettings={() => openSettingsModal('general')}
         hasAppUpdate={Boolean(appUpdateResult?.hasUpdate)}
+        latestRelease={appUpdateResult?.latestRelease || null}
         onOpenSettings={() => openSettingsModal('general')}
       />
 
@@ -2189,9 +2591,11 @@ export default function App() {
             loadingWeeklyCalendar={loadingWeeklyCalendar}
             calendarError={calendarError}
             favorites={favorites}
+            mutedFavoriteUrls={mutedFavoriteUrls}
             history={history}
             alerts={alerts}
             checkingAlerts={checkingAlerts}
+            lastEpisodeCheckAt={settingsMeta.lastEpisodeCheckAt}
             notificationPermission={notificationPermission}
             onRetryCatalog={fetchCatalog}
             onSearch={handleSearch}
@@ -2216,10 +2620,16 @@ export default function App() {
             onRefreshCalendar={() => void fetchWeeklyCalendar({ refresh: true })}
             onOpenItem={openMediaUrl}
             onToggleFavorite={toggleFavorite}
+            onToggleMuteFavorite={handleToggleMuteFavorite}
             onCheckFavoriteUpdates={() => void checkFavoriteUpdates({ manual: true })}
             onMarkAllAlertsRead={handleMarkAllAlertsRead}
+            onMarkAlertRead={handleMarkAlertRead}
+            onDismissAlert={handleDismissAlert}
+            onClearReadAlerts={handleClearReadAlerts}
             onOpenAlert={handleOpenAlert}
             onRequestPushNotifications={() => void handleRequestPushNotifications()}
+            onSendTestNotification={() => void handleSendTestNotification()}
+            onOpenNotificationSettings={() => openSettingsModal('notifications')}
             onClearHistory={requestClearAllHistory}
             onRemoveHistoryEntry={(entry) => {
               const res = removeHistoryEpisode(entry.url);
@@ -2258,9 +2668,11 @@ export default function App() {
               <AnimeDetailView
                 anime={animeDetails}
                 isFavorite={isItemFavorited(animeDetails.url, favorites)}
+                isMuted={isFavoriteMuted(animeDetails.url, mutedFavoriteUrls)}
                 watchedUrls={watchedUrls}
                 progressMap={progressMap}
                 onToggleFavorite={toggleFavorite}
+                onToggleMuteFavorite={handleToggleMuteFavorite}
                 onToggleEpisodesWatched={(eps, watched, label) =>
                   handleToggleEpisodesWatched(eps, watched, {
                     animeUrl: animeDetails.url,
@@ -2388,6 +2800,7 @@ export default function App() {
         onUpdateSettings={updateSettings}
         onResetSettings={resetSettings}
         favoritesCount={favorites.length}
+        mutedFavoritesCount={mutedFavoriteUrls.length}
         checkingEpisodes={checkingAlerts}
         notificationPermission={notificationPermission}
         onCheckEpisodesNow={() => {
@@ -2395,6 +2808,8 @@ export default function App() {
           void checkFavoriteUpdates({ manual: true });
         }}
         onRequestPushNotifications={() => void handleRequestPushNotifications()}
+        onSendTestNotification={() => void handleSendTestNotification()}
+        onUnmuteAllFavorites={handleUnmuteAllFavorites}
         buildInfo={buildInfo}
         isNativeAndroid={isNativeAndroidApp()}
         appUpdateResult={appUpdateResult}
@@ -2481,14 +2896,7 @@ export default function App() {
         </div>
       )}
 
-      {toast && (
-        <div
-          role="status"
-          className="fixed bottom-20 right-4 z-50 rounded-lg border border-white/15 bg-[#151921] px-4 py-2.5 text-xs font-medium text-white shadow-xl md:bottom-5 md:right-5"
-        >
-          {toast}
-        </div>
-      )}
+      <NotificationToastStack toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 }

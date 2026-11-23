@@ -42,6 +42,7 @@ const LEGACY_SETTINGS_META_KEY = 'topvlc:settings_meta:v1';
 const ACK_RELEASE_KEY = 'anisync:ack_release:v1';
 const LEGACY_ACK_RELEASE_KEY = 'topvlc:ack_release:v1';
 const ROUTE_SESSION_KEY = 'anisync:route_session:v1';
+const MUTED_FAVORITES_KEY = 'anisync:muted_favorites:v1';
 
 function readWithLegacyFallback(primaryKey: string, legacyKey: string): string | null {
   const primary = localStorage.getItem(primaryKey);
@@ -410,7 +411,7 @@ export function loadFavoriteAlerts(): FavoriteAlertEntry[] {
 
 export function saveFavoriteAlerts(alerts: FavoriteAlertEntry[]): void {
   try {
-    localStorage.setItem(ALERTS_KEY, JSON.stringify(alerts.slice(0, 40)));
+    localStorage.setItem(ALERTS_KEY, JSON.stringify(alerts.slice(0, 60)));
   } catch {
     // ignore
   }
@@ -420,6 +421,27 @@ export function clearFavoriteAlerts(): void {
   try {
     localStorage.removeItem(ALERTS_KEY);
     localStorage.removeItem(LEGACY_ALERTS_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function loadMutedFavoriteUrls(): string[] {
+  try {
+    const raw = localStorage.getItem(MUTED_FAVORITES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed)
+      ? parsed.filter((u): u is string => typeof u === 'string' && Boolean(u.trim()))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveMutedFavoriteUrls(urls: string[]): void {
+  try {
+    localStorage.setItem(MUTED_FAVORITES_KEY, JSON.stringify(urls.slice(0, 100)));
   } catch {
     // ignore
   }

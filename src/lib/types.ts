@@ -352,6 +352,8 @@ export interface FavoriteAlertEntry {
   poster: string;
   detectedAt: string;
   read: boolean;
+  audioType?: AudioType;
+  sourceServerName?: string;
 }
 
 export interface FavoriteEpisodeBaseline {
@@ -368,4 +370,15 @@ export interface FavoriteLatestInfo {
   episodeLabel: string;
   episodeNumber: number | null;
   poster?: string;
+  audioType?: AudioType;
+  sourceServerName?: string;
+  recentEpisodes?: Array<{
+    episodeUrl: string;
+    episodeTitle: string;
+    episodeLabel: string;
+    episodeNumber: number | null;
+    poster?: string;
+    audioType?: AudioType;
+    sourceServerName?: string;
+  }>;
 }

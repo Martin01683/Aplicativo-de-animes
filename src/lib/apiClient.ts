@@ -7,7 +7,8 @@ import {
 import type { HttpFetchOptions, HttpFetchResult, HttpFetcher } from './httpTypes.ts';
 import { dispatchAnisyncApiRequest } from './anisyncApiRouter.ts';
 import { loadAppSettings } from './storage.ts';
-import type { CatalogPreferences } from './types.ts';
+import type { CatalogPreferences, MediaKind } from './types.ts';
+import type { NotificationPermissionStatus } from './notifications.ts';
 import { isSafeExternalHttpUrl } from './urlSafety.ts';
 
 export type NativeFetchPageOptions = HttpFetchOptions & {
@@ -28,6 +29,17 @@ export interface LocalProxyPlugin {
   fetchPage(options: NativeFetchPageOptions): Promise<NativeFetchPageResult>;
   openExternalUrl(options: { url: string }): Promise<{ opened: boolean }>;
   getAppBuildInfo(): Promise<NativeAppBuildInfoResult>;
+  getNotificationPermission(): Promise<{ status: NotificationPermissionStatus }>;
+  requestNotificationPermission(): Promise<{ status: NotificationPermissionStatus }>;
+  showLocalNotification(options: {
+    id?: number;
+    title: string;
+    body: string;
+    channelId?: 'anisync_episodes' | 'anisync_updates';
+    targetUrl?: string;
+    mediaKind?: MediaKind | 'settings';
+  }): Promise<{ shown: boolean }>;
+  consumePendingNotificationTarget(): Promise<{ url?: string; kind?: string }>;
   downloadAndInstallApk(options: {
     url: string;
     filename?: string;
@@ -119,6 +131,73 @@ export async function getNativeAppBuildInfo(): Promise<NativeAppBuildInfoResult 
   if (!isNativeAndroidApp()) return null;
   try {
     return await LocalProxy.getAppBuildInfo();
+  } catch {
+    return null;
+  }
+}
+
+export async function getDeviceNotificationPermission(): Promise<NotificationPermissionStatus> {
+  if (isNativeAndroidApp()) {
+    try {
+      const res = await LocalProxy.getNotificationPermission();
+      return res?.status || 'default';
+    } catch {
+      return 'unsupported';
+    }
+  }
+  if (typeof window !== 'undefined' && 'Notification' in window) {
+    return Notification.permission;
+  }
+  return 'unsupported';
+}
+
+export async function requestDeviceNotificationPermission(): Promise<NotificationPermissionStatus> {
+  if (isNativeAndroidApp()) {
+    try {
+      const res = await LocalProxy.requestNotificationPermission();
+      return res?.status || 'denied';
+    } catch {
+      return 'unsupported';
+    }
+  }
+  if (typeof window !== 'undefined' && 'Notification' in window) {
+    try {
+      return await Notification.requestPermission();
+    } catch {
+      return Notification.permission;
+    }
+  }
+  return 'unsupported';
+}
+
+export async function showNativeLocalNotification(options: {
+  id?: number;
+  title: string;
+  body: string;
+  channelId?: 'anisync_episodes' | 'anisync_updates';
+  targetUrl?: string;
+  mediaKind?: MediaKind | 'settings';
+}): Promise<boolean> {
+  if (!isNativeAndroidApp()) return false;
+  try {
+    const res = await LocalProxy.showLocalNotification(options);
+    return Boolean(res?.shown);
+  } catch {
+    return false;
+  }
+}
+
+export async function consumePendingNotificationTarget(): Promise<{
+  url: string;
+  kind: string;
+} | null> {
+  if (!isNativeAndroidApp()) return null;
+  try {
+    const res = await LocalProxy.consumePendingNotificationTarget();
+    if (res?.url && res.url.trim()) {
+      return { url: res.url.trim(), kind: res.kind || 'episode' };
+    }
+    return null;
   } catch {
     return null;
   }

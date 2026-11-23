@@ -610,11 +610,11 @@ export async function dispatchAnisyncApiRequest(
       )
       .map((u) => normalizeTopAnimesUrl(u))
       .filter((u, idx, arr) => Boolean(u) && arr.indexOf(u) === idx)
-      .slice(0, 10);
+      .slice(0, 30);
 
     const latestByUrl: Record<string, FavoriteLatestInfo> = {};
-    for (let i = 0; i < safeUrls.length; i += 3) {
-      const chunk = safeUrls.slice(i, i + 3);
+    for (let i = 0; i < safeUrls.length; i += 4) {
+      const chunk = safeUrls.slice(i, i + 4);
       await Promise.all(
         chunk.map(async (mediaUri) => {
           try {
@@ -625,7 +625,10 @@ export async function dispatchAnisyncApiRequest(
                 catalogPrefs
               );
               if (!details) return;
-              const latest = pickLatestAnimeEpisode(details.episodes, details.title, details.poster);
+              const latest = pickLatestAnimeEpisode(details.episodes, details.title, details.poster, {
+                audioType: details.audioType,
+                sourceServerName: details.sourceServerName,
+              });
               if (latest) latestByUrl[mediaUri] = latest;
               return;
             }
@@ -638,7 +641,11 @@ export async function dispatchAnisyncApiRequest(
               const latest = pickLatestAnimeEpisode(
                 hsDetails.episodes,
                 hsDetails.title,
-                hsDetails.poster
+                hsDetails.poster,
+                {
+                  audioType: hsDetails.audioType,
+                  sourceServerName: HINATASOUL_BUILTIN_SOURCE.name,
+                }
               );
               if (latest) latestByUrl[mediaUri] = latest;
               return;
@@ -650,7 +657,10 @@ export async function dispatchAnisyncApiRequest(
             });
             if (!response.ok) return;
             const anime = parseAnimePageHtml(response.body, mediaUri);
-            const latest = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster);
+            const latest = pickLatestAnimeEpisode(anime.episodes, anime.title, anime.poster, {
+              audioType: anime.audioType,
+              sourceServerName: TOPANIMES_BUILTIN_SOURCE.name,
+            });
             if (latest) latestByUrl[mediaUri] = latest;
           } catch {
             // Skip unreachable titles silently

@@ -43,6 +43,12 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy startu
     episodeCheckIntervalMinutes: 15,
     checkEpisodesOnStartup: false,
     notifyNewEpisodes: false,
+    showInAppEpisodeToasts: false,
+    notificationSound: true,
+    quietHoursEnabled: true,
+    quietHoursStart: 22,
+    quietHoursEnd: 7,
+    notifyAudioFilter: 'LEG',
     autoCheckAppUpdates: true,
     checkAppUpdatesOnStartup: false,
     appUpdateIntervalHours: 6,
@@ -57,6 +63,12 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy startu
   assert.equal(result.episodeCheckIntervalMinutes, 15);
   assert.equal(result.checkEpisodesOnStartup, false);
   assert.equal(result.notifyNewEpisodes, false);
+  assert.equal(result.showInAppEpisodeToasts, false);
+  assert.equal(result.notificationSound, true);
+  assert.equal(result.quietHoursEnabled, true);
+  assert.equal(result.quietHoursStart, 22);
+  assert.equal(result.quietHoursEnd, 7);
+  assert.equal(result.notifyAudioFilter, 'LEG');
   assert.equal(result.checkAppUpdatesOnStartup, false);
   assert.equal(result.appUpdateIntervalHours, 6);
   assert.equal(result.autoDownloadAppUpdates, true);
@@ -65,6 +77,16 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy startu
   assert.equal(result.skipIntroSeconds, 90);
   assert.equal(result.autoPlayNextEpisode, true);
   assert.equal(result.videoScale, 'fill');
+
+  // Invalid quiet hours and audio filter fall back cleanly
+  const badNotificationOpts = sanitizeAppSettings({
+    quietHoursStart: 99,
+    quietHoursEnd: -3,
+    notifyAudioFilter: 'INVALID',
+  });
+  assert.equal(badNotificationOpts.quietHoursStart, DEFAULT_APP_SETTINGS.quietHoursStart);
+  assert.equal(badNotificationOpts.quietHoursEnd, DEFAULT_APP_SETTINGS.quietHoursEnd);
+  assert.equal(badNotificationOpts.notifyAudioFilter, 'ALL');
 
   // Legacy appUpdateIntervalHours: 0 migrates to checkAppUpdatesOnStartup: true + 24h periodic interval
   const migrated = sanitizeAppSettings({ appUpdateIntervalHours: 0 });

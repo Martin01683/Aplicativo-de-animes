@@ -263,3 +263,146 @@ test('advanceBaselineWithWatchedEpisodes updates favorite baseline to highest ma
   );
 });
 
+test('detectNewFavoriteEpisodes detects multiple dropped episodes without losing intermediate episodes', () => {
+  const fav: CatalogMediaItem = {
+    id: 'https://topanimes.net/animes/dandadan/',
+    title: 'Dandadan',
+    url: 'https://topanimes.net/animes/dandadan/',
+    kind: 'anime',
+    poster: 'https://example.com/dandadan.jpg',
+    audioType: 'DUB',
+  };
+
+  const result = detectNewFavoriteEpisodes({
+    favorites: [fav],
+    releases: [],
+    baselines: {
+      [fav.url]: {
+        lastEpisodeUrl: 'https://topanimes.net/episodio/dandadan-episodio-3/',
+        lastEpisodeNumber: 3,
+        updatedAt: '2026-11-20T08:00:00Z',
+      },
+    },
+    existingAlerts: [],
+    latestByAnimeUrl: {
+      [fav.url]: {
+        poster: 'https://example.com/dandadan.jpg',
+        episodeUrl: 'https://topanimes.net/episodio/dandadan-episodio-5/',
+        episodeNumber: 5,
+        episodeLabel: 'EP 5',
+        episodeTitle: 'Episódio 5',
+        audioType: 'DUB',
+        recentEpisodes: [
+          {
+            episodeUrl: 'https://topanimes.net/episodio/dandadan-episodio-5/',
+            episodeNumber: 5,
+            episodeLabel: 'EP 5',
+            episodeTitle: 'Episódio 5',
+          },
+          {
+            episodeUrl: 'https://topanimes.net/episodio/dandadan-episodio-4/',
+            episodeNumber: 4,
+            episodeLabel: 'EP 4',
+            episodeTitle: 'Episódio 4',
+          },
+          {
+            episodeUrl: 'https://topanimes.net/episodio/dandadan-episodio-3/',
+            episodeNumber: 3,
+            episodeLabel: 'EP 3',
+            episodeTitle: 'Episódio 3',
+          },
+        ],
+      },
+    },
+    nowIso: '2026-11-22T12:00:00Z',
+  });
+
+  assert.equal(result.newAlerts.length, 2);
+  assert.deepEqual(
+    result.newAlerts.map((a) => a.episodeLabel),
+    ['EP 5', 'EP 4']
+  );
+  assert.equal(result.newAlerts[0].audioType, 'DUB');
+  assert.equal(result.nextBaselines[fav.url].lastEpisodeNumber, 5);
+});
+
+test('detectNewFavoriteEpisodes suppresses alerts for muted favorites and mismatched audio filter while advancing baseline', () => {
+  const dubFav: CatalogMediaItem = {
+    id: 'https://topanimes.net/animes/anime-dub/',
+    title: 'Anime Dublado',
+    url: 'https://topanimes.net/animes/anime-dub/',
+    kind: 'anime',
+    poster: 'https://example.com/dub.jpg',
+    audioType: 'DUB',
+  };
+  const legFav: CatalogMediaItem = {
+    id: 'https://topanimes.net/animes/anime-leg/',
+    title: 'Anime Legendado',
+    url: 'https://topanimes.net/animes/anime-leg/',
+    kind: 'anime',
+    poster: 'https://example.com/leg.jpg',
+    audioType: 'LEG',
+  };
+
+  const baselines: FavoriteBaselineMap = {
+    [dubFav.url]: {
+      lastEpisodeUrl: 'https://topanimes.net/episodio/anime-dub-episodio-1/',
+      lastEpisodeNumber: 1,
+      updatedAt: '2026-11-20T00:00:00Z',
+    },
+    [legFav.url]: {
+      lastEpisodeUrl: 'https://topanimes.net/episodio/anime-leg-episodio-1/',
+      lastEpisodeNumber: 1,
+      updatedAt: '2026-11-20T00:00:00Z',
+    },
+  };
+
+  const releases: CatalogMediaItem[] = [
+    {
+      id: 'dub-2',
+      title: 'Anime Dublado',
+      episodeLabel: 'EP 2',
+      url: 'https://topanimes.net/episodio/anime-dub-episodio-2/',
+      kind: 'episode',
+      poster: 'https://example.com/dub.jpg',
+      audioType: 'DUB',
+    },
+    {
+      id: 'leg-2',
+      title: 'Anime Legendado',
+      episodeLabel: 'EP 2',
+      url: 'https://topanimes.net/episodio/anime-leg-episodio-2/',
+      kind: 'episode',
+      poster: 'https://example.com/leg.jpg',
+      audioType: 'LEG',
+    },
+  ];
+
+  // Mute dubFav -> only legFav alerts, but dubFav baseline still advances
+  const mutedRun = detectNewFavoriteEpisodes({
+    favorites: [dubFav, legFav],
+    releases,
+    baselines,
+    existingAlerts: [],
+    mutedFavoriteUrls: [dubFav.url],
+    nowIso: '2026-11-22T10:00:00Z',
+  });
+  assert.equal(mutedRun.newAlerts.length, 1);
+  assert.equal(mutedRun.newAlerts[0].animeTitle, 'Anime Legendado');
+  assert.equal(mutedRun.nextBaselines[dubFav.url].lastEpisodeNumber, 2);
+
+  // Filter to DUB only -> only dubFav alerts
+  const audioFilteredRun = detectNewFavoriteEpisodes({
+    favorites: [dubFav, legFav],
+    releases,
+    baselines,
+    existingAlerts: [],
+    notifyAudioFilter: 'DUB',
+    nowIso: '2026-11-22T10:00:00Z',
+  });
+  assert.equal(audioFilteredRun.newAlerts.length, 1);
+  assert.equal(audioFilteredRun.newAlerts[0].animeTitle, 'Anime Dublado');
+  assert.equal(audioFilteredRun.nextBaselines[legFav.url].lastEpisodeNumber, 2);
+});
+
+

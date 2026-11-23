@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   Bell,
+  BellOff,
   CheckCircle2,
   Database,
   Download,
@@ -9,10 +10,13 @@ import {
   Globe,
   KeyRound,
   Loader2,
+  Moon,
   RefreshCw,
   RotateCcw,
+  Send,
   Server,
   Trash2,
+  Volume2,
   X,
 } from 'lucide-react';
 import { apiFetch, type ApkDownloadProgressEvent } from '../lib/apiClient';
@@ -23,6 +27,10 @@ import {
   type AppBuildInfo,
   type AppUpdateCheckResult,
 } from '../lib/appUpdater';
+import {
+  formatHourLabel,
+  type NotificationPermissionStatus,
+} from '../lib/notifications';
 import {
   VIDEO_SCALE_OPTIONS,
   type VideoScaleMode,
@@ -45,9 +53,11 @@ import {
 import type { CatalogSourceCredentials } from '../lib/types';
 import type { NavSection } from './Header';
 
+const HOUR_OPTIONS = Array.from({ length: 24 }, (_, idx) => idx);
+
 interface SettingsModalProps {
   open: boolean;
-  focusSection?: 'sources' | 'catalog' | 'general';
+  focusSection?: 'sources' | 'catalog' | 'notifications' | 'general';
   onClose: () => void;
   settings: AppSettings;
   settingsMeta: AppSettingsMeta;
@@ -55,10 +65,13 @@ interface SettingsModalProps {
   onResetSettings: () => void;
   // News & episode checking
   favoritesCount: number;
+  mutedFavoritesCount: number;
   checkingEpisodes: boolean;
-  notificationPermission: NotificationPermission | 'unsupported';
+  notificationPermission: NotificationPermissionStatus;
   onCheckEpisodesNow: () => void;
   onRequestPushNotifications: () => void;
+  onSendTestNotification: () => void;
+  onUnmuteAllFavorites: () => void;
   // System & GitHub updates
   buildInfo: AppBuildInfo;
   isNativeAndroid: boolean;
@@ -122,10 +135,13 @@ export function SettingsModal({
   onUpdateSettings,
   onResetSettings,
   favoritesCount,
+  mutedFavoritesCount,
   checkingEpisodes,
   notificationPermission,
   onCheckEpisodesNow,
   onRequestPushNotifications,
+  onSendTestNotification,
+  onUnmuteAllFavorites,
   buildInfo,
   isNativeAndroid,
   appUpdateResult,
@@ -145,6 +161,7 @@ export function SettingsModal({
   onClearAlerts,
 }: SettingsModalProps) {
   const sourcesSectionRef = useRef<HTMLElement>(null);
+  const notificationsSectionRef = useRef<HTMLElement>(null);
   const [showCredsPanel, setShowCredsPanel] = useState(false);
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
@@ -161,8 +178,11 @@ export function SettingsModal({
   }, [open, onClose]);
 
   useEffect(() => {
-    if (open && focusSection === 'sources') {
+    if (!open) return;
+    if (focusSection === 'sources') {
       sourcesSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else if (focusSection === 'notifications') {
+      notificationsSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }, [open, focusSection]);
 
@@ -423,13 +443,17 @@ export function SettingsModal({
             )}
           </section>
 
-          {/* 3. Frequência de Busca de Novidades */}
-          <section aria-labelledby="settings-news-heading" className="space-y-4">
+          {/* 3. Notificações e Alertas */}
+          <section
+            ref={notificationsSectionRef}
+            aria-labelledby="settings-news-heading"
+            className="space-y-4"
+          >
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/8 pb-2.5">
               <div className="flex items-center gap-2">
                 <Bell className="h-4 w-4 text-[#f97316]" />
                 <h3 id="settings-news-heading" className="text-base font-semibold text-white">
-                  Frequência de Busca de Novidades
+                  Notificações e Alertas
                 </h3>
               </div>
               <span className="text-xs tabular-nums text-slate-400">
@@ -446,7 +470,7 @@ export function SettingsModal({
                 Intervalo de verificação automática de novos episódios
               </label>
               <p className="text-xs text-slate-400">
-                Define de quanto em quanto tempo o Anisync consulta o catálogo e seus favoritos para detectar episódios recém-lançados.
+                Define de quanto em quanto tempo o Anisync consulta o catálogo e seus favoritos (até 30 títulos) para detectar novos lançamentos.
               </p>
               <div className="grid grid-cols-3 gap-2 pt-1 sm:grid-cols-6">
                 {EPISODE_CHECK_INTERVAL_OPTIONS.map((opt) => {
@@ -481,7 +505,7 @@ export function SettingsModal({
                     Verificar novidades ao abrir o app
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
-                    Checa automaticamente se há episódios novos assim que o catálogo carregar.
+                    Checa automaticamente ao abrir ou ao retornar após o intervalo configurado.
                   </span>
                 </label>
                 <ToggleSwitch
@@ -499,12 +523,14 @@ export function SettingsModal({
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
                     {notificationPermission === 'granted'
-                      ? 'Permissão concedida no navegador/aparelho.'
+                      ? isNativeAndroid
+                        ? 'Permissão ativa no Android — toques abrem o episódio direto no app.'
+                        : 'Permissão ativa no navegador — toques abrem o episódio direto.'
                       : notificationPermission === 'denied'
-                        ? 'Bloqueada no navegador — os avisos continuam visíveis no sininho.'
+                        ? 'Bloqueada no aparelho/navegador — os avisos continuam na Central de Notificações.'
                         : notificationPermission === 'unsupported'
-                          ? 'Alertas exibidos no sininho dentro do aplicativo.'
-                          : 'Ative para receber alertas mesmo em segundo plano.'}
+                          ? 'Alertas exibidos na Central de Notificações dentro do aplicativo.'
+                          : 'Ative para receber alertas do sistema mesmo em segundo plano.'}
                   </span>
                 </label>
                 <div className="flex items-center gap-2">
@@ -525,12 +551,182 @@ export function SettingsModal({
                   />
                 </div>
               </div>
+
+              <div className="flex items-center justify-between gap-4 px-4 py-3.5">
+                <label htmlFor="toggle-inapp-toasts" className="min-w-0 flex-1 cursor-pointer">
+                  <span className="block text-sm font-medium text-slate-200">
+                    Avisos flutuantes de novos episódios
+                  </span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Mostra um cartão com capa e atalho &ldquo;Assistir&rdquo; quando um episódio novo chegar.
+                  </span>
+                </label>
+                <ToggleSwitch
+                  id="toggle-inapp-toasts"
+                  checked={settings.showInAppEpisodeToasts}
+                  onChange={(val) => onUpdateSettings({ showInAppEpisodeToasts: val })}
+                  label="Avisos flutuantes de novos episódios"
+                />
+              </div>
+
+              <div className="flex items-center justify-between gap-4 px-4 py-3.5">
+                <label htmlFor="toggle-notification-sound" className="min-w-0 flex-1 cursor-pointer">
+                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-200">
+                    <Volume2 className="h-3.5 w-3.5 text-[#f97316]" />
+                    <span>Som discreto ao chegar episódio novo</span>
+                  </span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Toca um alerta suave dentro do app fora do horário silencioso.
+                  </span>
+                </label>
+                <ToggleSwitch
+                  id="toggle-notification-sound"
+                  checked={settings.notificationSound}
+                  onChange={(val) => onUpdateSettings({ notificationSound: val })}
+                  label="Som discreto ao chegar episódio novo"
+                />
+              </div>
+
+              <div className="space-y-3 px-4 py-3.5">
+                <div className="flex items-center justify-between gap-4">
+                  <label htmlFor="toggle-quiet-hours" className="min-w-0 flex-1 cursor-pointer">
+                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-200">
+                      <Moon className="h-3.5 w-3.5 text-indigo-300" />
+                      <span>Horário silencioso (Não perturbe)</span>
+                    </span>
+                    <span className="mt-0.5 block text-xs text-slate-400">
+                      Guarda novos episódios no sininho sem enviar alertas barulhentos no dispositivo durante o intervalo escolhido.
+                    </span>
+                  </label>
+                  <ToggleSwitch
+                    id="toggle-quiet-hours"
+                    checked={settings.quietHoursEnabled}
+                    onChange={(val) => onUpdateSettings({ quietHoursEnabled: val })}
+                    label="Horário silencioso (Não perturbe)"
+                  />
+                </div>
+
+                {settings.quietHoursEnabled && (
+                  <div className="grid grid-cols-2 gap-3 rounded-lg border border-white/8 bg-[#151921]/70 p-3">
+                    <div>
+                      <label
+                        htmlFor="quiet-hours-start"
+                        className="mb-1 block text-[11px] font-medium text-slate-400"
+                      >
+                        Início do silêncio
+                      </label>
+                      <select
+                        id="quiet-hours-start"
+                        value={settings.quietHoursStart}
+                        onChange={(e) =>
+                          onUpdateSettings({ quietHoursStart: Number(e.target.value) })
+                        }
+                        className="min-h-[38px] w-full rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1.5 text-xs font-medium tabular-nums text-slate-200 focus:border-[#f97316] focus:outline-none"
+                      >
+                        {HOUR_OPTIONS.map((h) => (
+                          <option key={h} value={h}>
+                            {formatHourLabel(h)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label
+                        htmlFor="quiet-hours-end"
+                        className="mb-1 block text-[11px] font-medium text-slate-400"
+                      >
+                        Fim do silêncio
+                      </label>
+                      <select
+                        id="quiet-hours-end"
+                        value={settings.quietHoursEnd}
+                        onChange={(e) =>
+                          onUpdateSettings({ quietHoursEnd: Number(e.target.value) })
+                        }
+                        className="min-h-[38px] w-full rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1.5 text-xs font-medium tabular-nums text-slate-200 focus:border-[#f97316] focus:outline-none"
+                      >
+                        {HOUR_OPTIONS.map((h) => (
+                          <option key={h} value={h}>
+                            {formatHourLabel(h)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
+                <div className="w-full min-w-0 sm:flex-1">
+                  <span className="block text-sm font-medium text-slate-200">
+                    Filtro de áudio para notificações
+                  </span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Receba avisos apenas de episódios dublados, legendados ou ambos.
+                  </span>
+                </div>
+                <div className="grid w-full shrink-0 grid-cols-3 gap-1 rounded-lg border border-white/10 bg-[#151921] p-1 sm:flex sm:w-auto sm:items-center">
+                  {(
+                    [
+                      { id: 'ALL', label: 'Todos' },
+                      { id: 'DUB', label: 'Dublados' },
+                      { id: 'LEG', label: 'Legendados' },
+                    ] as Array<{ id: DefaultAudioFilter; label: string }>
+                  ).map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => onUpdateSettings({ notifyAudioFilter: opt.id })}
+                      aria-pressed={settings.notifyAudioFilter === opt.id}
+                      className={`min-h-[36px] whitespace-nowrap rounded-md px-3 py-1 text-center text-xs font-medium transition-colors ${
+                        settings.notifyAudioFilter === opt.id
+                          ? 'bg-[#f97316] text-[#0d0f12]'
+                          : 'text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {mutedFavoritesCount > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3.5">
+                  <div className="min-w-0 flex-1">
+                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-200">
+                      <BellOff className="h-3.5 w-3.5 text-slate-400" />
+                      <span>
+                        {mutedFavoritesCount}{' '}
+                        {mutedFavoritesCount === 1
+                          ? 'anime silenciado'
+                          : 'animes silenciados'}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 block text-xs text-slate-400">
+                      Títulos silenciados na Minha Lista não geram novos avisos.
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={onUnmuteAllFavorites}
+                    className="min-h-[38px] whitespace-nowrap rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+                  >
+                    Reativar todos
+                  </button>
+                </div>
+              )}
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <span className="text-xs text-slate-400">
-                Atualiza o catálogo e verifica os favoritos imediatamente.
-              </span>
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <button
+                type="button"
+                onClick={onSendTestNotification}
+                className="inline-flex min-h-[42px] items-center gap-2 rounded-lg border border-white/12 bg-[#0d0f12] px-3.5 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+              >
+                <Send className="h-3.5 w-3.5 text-[#f97316]" />
+                <span>Enviar notificação de teste</span>
+              </button>
+
               <button
                 type="button"
                 disabled={checkingEpisodes}

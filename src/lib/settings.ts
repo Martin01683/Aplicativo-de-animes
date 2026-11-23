@@ -20,6 +20,12 @@ export interface AppSettings {
   episodeCheckIntervalMinutes: EpisodeCheckIntervalMinutes;
   checkEpisodesOnStartup: boolean;
   notifyNewEpisodes: boolean;
+  showInAppEpisodeToasts: boolean;
+  notificationSound: boolean;
+  quietHoursEnabled: boolean;
+  quietHoursStart: number;
+  quietHoursEnd: number;
+  notifyAudioFilter: DefaultAudioFilter;
   autoCheckAppUpdates: boolean;
   checkAppUpdatesOnStartup: boolean;
   appUpdateIntervalHours: AppUpdateIntervalHours;
@@ -43,6 +49,12 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   episodeCheckIntervalMinutes: 15,
   checkEpisodesOnStartup: true,
   notifyNewEpisodes: true,
+  showInAppEpisodeToasts: true,
+  notificationSound: false,
+  quietHoursEnabled: false,
+  quietHoursStart: 23,
+  quietHoursEnd: 8,
+  notifyAudioFilter: 'ALL',
   autoCheckAppUpdates: true,
   checkAppUpdatesOnStartup: true,
   appUpdateIntervalHours: 24,
@@ -95,6 +107,13 @@ const VALID_SECTIONS = new Set<NavSection>(['releases', 'calendar', 'catalog', '
 const VALID_AUDIO_FILTERS = new Set<DefaultAudioFilter>(['ALL', 'DUB', 'LEG']);
 const VALID_SCHEDULE_MODES = new Set<LiveChartScheduleMode>(['streams', 'dub', 'jp']);
 const VALID_SKIP_SECONDS = new Set<number>([30, 60, 85, 90]);
+
+function sanitizeHour(raw: unknown, fallback: number): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return fallback;
+  const h = Math.floor(n);
+  return h >= 0 && h <= 23 ? h : fallback;
+}
 
 function sanitizeCatalogCredentials(raw: unknown): CatalogSourceCredentials {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
@@ -153,6 +172,12 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
     ? (input.defaultAudioFilter as DefaultAudioFilter)
     : DEFAULT_APP_SETTINGS.defaultAudioFilter;
 
+  const notifyAudioFilter = VALID_AUDIO_FILTERS.has(
+    input.notifyAudioFilter as DefaultAudioFilter
+  )
+    ? (input.notifyAudioFilter as DefaultAudioFilter)
+    : DEFAULT_APP_SETTINGS.notifyAudioFilter;
+
   const calendarScheduleMode = VALID_SCHEDULE_MODES.has(
     input.calendarScheduleMode as LiveChartScheduleMode
   )
@@ -173,6 +198,21 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
       typeof input.notifyNewEpisodes === 'boolean'
         ? input.notifyNewEpisodes
         : DEFAULT_APP_SETTINGS.notifyNewEpisodes,
+    showInAppEpisodeToasts:
+      typeof input.showInAppEpisodeToasts === 'boolean'
+        ? input.showInAppEpisodeToasts
+        : DEFAULT_APP_SETTINGS.showInAppEpisodeToasts,
+    notificationSound:
+      typeof input.notificationSound === 'boolean'
+        ? input.notificationSound
+        : DEFAULT_APP_SETTINGS.notificationSound,
+    quietHoursEnabled:
+      typeof input.quietHoursEnabled === 'boolean'
+        ? input.quietHoursEnabled
+        : DEFAULT_APP_SETTINGS.quietHoursEnabled,
+    quietHoursStart: sanitizeHour(input.quietHoursStart, DEFAULT_APP_SETTINGS.quietHoursStart),
+    quietHoursEnd: sanitizeHour(input.quietHoursEnd, DEFAULT_APP_SETTINGS.quietHoursEnd),
+    notifyAudioFilter,
     autoCheckAppUpdates:
       typeof input.autoCheckAppUpdates === 'boolean'
         ? input.autoCheckAppUpdates
