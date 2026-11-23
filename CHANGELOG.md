@@ -2,6 +2,14 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.23] — 2026-11-23
+
+### Novidades
+- Add anime synopses with Google Translate, prioritize TheTVDB artwork, and move episode synopsis/button above actions (`ed97e98`)
+
+### Correções
+- Eliminate LibVLC audio dropouts on seek and pause/resume (`7926bbd`)
+
 ## [v1.0.22] — 2026-11-23
 
 ### Correções
