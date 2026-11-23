@@ -15,6 +15,7 @@ import {
   Film,
   Globe,
   Heart,
+  Info,
   Layers,
   Play,
   Radio,
@@ -594,6 +595,21 @@ export function AnimeDetailView({
             )}
           </div>
         </div>
+
+        {!isMovie && unavailableCount > 0 && (
+          <div
+            role="note"
+            data-schedule-disclaimer="true"
+            className="mb-4 flex items-start gap-2.5 rounded-xl border border-[#f97316]/25 bg-[#f97316]/[0.07] px-3.5 py-2.5 text-xs leading-relaxed text-slate-300"
+          >
+            <Info className="mt-0.5 h-4 w-4 shrink-0 text-[#fb923c]" />
+            <p>
+              As datas e contagens regressivas indicam a{' '}
+              <strong className="font-semibold text-white">previsão de lançamento oficial</strong>, e
+              não o horário exato em que o episódio ficará disponível nos servidores.
+            </p>
+          </div>
+        )}
 
         {anime.episodes.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">

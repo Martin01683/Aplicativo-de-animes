@@ -3,6 +3,7 @@ import {
   Calendar,
   Clock,
   Heart,
+  Info,
   LayoutGrid,
   List,
   Loader2,
@@ -474,6 +475,18 @@ export function LiveChartCalendar({
             </div>
             <p className="mt-1 text-xs text-slate-400">
               Horários no seu fuso local, áudio/legenda (Dub · Sub) e plataformas oficiais. Toque em um anime para ver detalhes no TheTVDB e assistir.
+            </p>
+            <p
+              role="note"
+              data-schedule-disclaimer="true"
+              className="mt-2 inline-flex items-start gap-1.5 rounded-lg border border-[#f97316]/25 bg-[#f97316]/[0.07] px-2.5 py-1.5 text-[11px] leading-relaxed text-slate-300"
+            >
+              <Info className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#fb923c]" />
+              <span>
+                Os horários e contagens regressivas são{' '}
+                <strong className="font-semibold text-white">previsões de lançamentos oficiais</strong>,
+                e não o momento em que o episódio ficará disponível nos servidores.
+              </span>
             </p>
           </div>
 
