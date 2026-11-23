@@ -4,6 +4,7 @@ import {
   extractExplicitSeasonNumber,
   formatEpisodeCountdown,
   formatEpisodeReleaseDate,
+  formatUpcomingEpisodeNotice,
   isEpisodeAvailableOnServer,
   mergeServerAndCatalogEpisodes,
   parseEpisodeDateToTimestampSec,
@@ -310,5 +311,50 @@ test('mergeServerAndCatalogEpisodes does not dump mismatched historical seasons 
   assert.equal(merged[0].seasonNumber, 2);
   assert.equal(merged[0].url, 'https://topanimes.net/episodio/owari-2-ep-1/');
 });
+
+test('formatUpcomingEpisodeNotice builds clear official forecast messages for player controls', () => {
+  const nowMs = Date.parse('2026-11-23T12:00:00Z');
+  const nowSec = Math.floor(nowMs / 1000);
+
+  const futureMsg = formatUpcomingEpisodeNotice(
+    {
+      numberLabel: 'EP 8',
+      episodeNumber: 8,
+      airingAt: nowSec + 3 * 86400 + 4 * 3600,
+      hasExactAiringTime: true,
+    },
+    nowMs
+  );
+  assert.match(futureMsg, /^EP 8 ainda não disponível · Previsão oficial:/);
+  assert.match(futureMsg, /\(Em 3d 4h\)$/);
+
+  const nowMsg = formatUpcomingEpisodeNotice(
+    { numberLabel: 'EP 8', episodeNumber: 8, airingAt: nowSec - 600, hasExactAiringTime: true },
+    nowMs
+  );
+  assert.match(nowMsg, /acabou de estrear/);
+
+  const pendingMsg = formatUpcomingEpisodeNotice(
+    { numberLabel: 'EP 3', episodeNumber: 3, date: '2026-10-25', airingAt: nowSec - 86400 * 10 },
+    nowMs
+  );
+  assert.match(pendingMsg, /ainda não está disponível nos servidores/);
+
+  const bareNumMsg = formatUpcomingEpisodeNotice(
+    {
+      numberLabel: '3',
+      episodeNumber: 3,
+      airingAt: nowSec + 2 * 86400 + 5 * 3600,
+      hasExactAiringTime: true,
+    },
+    nowMs
+  );
+  assert.match(bareNumMsg, /^EP 3 ainda não disponível · Previsão oficial:/);
+  assert.match(bareNumMsg, /\(Em 2d 5h\)$/);
+
+  const tbaMsg = formatUpcomingEpisodeNotice({ numberLabel: 'EP 9', episodeNumber: 9 }, nowMs);
+  assert.match(tbaMsg, /data oficial não confirmada/);
+});
+
 
 

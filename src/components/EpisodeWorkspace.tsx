@@ -4,6 +4,8 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Clock,
+  CloudOff,
   Heart,
   Keyboard,
   Loader2,
@@ -16,8 +18,16 @@ import {
   isEmbedCacheEntryValid,
   type CachedEmbedEntry,
 } from '../lib/embedCache';
+import {
+  formatEpisodeCountdown,
+  formatEpisodeReleaseDate,
+  formatUpcomingEpisodeNotice,
+  formatUpcomingEpisodeShortLabel,
+  isEpisodeAvailableOnServer,
+} from '../lib/episodeAvailability';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
 import {
+  findUpcomingNextEpisode,
   isDesktopShortcutsEnabled,
   isSameEpisodeUrl,
   resolveSeriesPrevNext,
@@ -35,6 +45,8 @@ import type {
   AnimeEpisodeLink,
   CatalogMediaItem,
   EpisodeDetails,
+  EpisodeSynopsisResult,
+  ExternalMediaIds,
   FavoriteLatestInfo,
   PlayerOption,
   ResolvedEmbed,
@@ -133,9 +145,27 @@ export function EpisodeWorkspace({
   activeEpisodeUrlRef.current = episode.url;
 
   const seriesCacheRef = useRef<Map<string, AnimeEpisodeLink[]>>(new Map());
+  const seriesExternalIdsCacheRef = useRef<Map<string, ExternalMediaIds>>(new Map());
   const [seriesEpisodes, setSeriesEpisodes] = useState<AnimeEpisodeLink[]>(
     initialSeriesEpisodes || []
   );
+  const [seriesExternalIds, setSeriesExternalIds] = useState<ExternalMediaIds | undefined>(
+    episode.externalIds
+  );
+  const [seriesMediaReadyForUrl, setSeriesMediaReadyForUrl] = useState<string>(
+    initialSeriesEpisodes && initialSeriesEpisodes.length > 0 ? episode.seriesUrl || '' : ''
+  );
+
+  const synopsisCacheRef = useRef<Map<string, EpisodeSynopsisResult | null>>(new Map());
+  const [localizedSynopsisState, setLocalizedSynopsisState] = useState<{
+    episodeUrl: string;
+    loading: boolean;
+    result: EpisodeSynopsisResult | null;
+  }>({
+    episodeUrl: episode.url,
+    loading: false,
+    result: null,
+  });
 
   const resolved =
     resolvedState &&
@@ -186,42 +216,189 @@ export function EpisodeWorkspace({
     }
   }, [episode.url, failoverExhaustedMsg, playableOptions]);
 
-  // Fetch and cache the series episode list so in-fullscreen episode selection is always populated
+  // Fetch and cache the series episode list so in-fullscreen episode selection & TheTVDB IDs are populated
   useEffect(() => {
     if (episode.isMovie || !episode.seriesUrl) {
       setSeriesEpisodes([]);
+      setSeriesExternalIds(episode.externalIds);
+      setSeriesMediaReadyForUrl(episode.seriesUrl || '__none__');
       return;
     }
 
-    const seriesKey = normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl;
+    const seriesUrl = episode.seriesUrl;
+    const seriesKey = normalizeTopAnimesUrl(seriesUrl) || seriesUrl;
     if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
       seriesCacheRef.current.set(seriesKey, initialSeriesEpisodes);
       setSeriesEpisodes(initialSeriesEpisodes);
+      const cachedIds = seriesExternalIdsCacheRef.current.get(seriesKey);
+      setSeriesExternalIds(episode.externalIds || cachedIds);
+      setSeriesMediaReadyForUrl(seriesUrl);
       return;
     }
 
     const cached = seriesCacheRef.current.get(seriesKey);
     if (cached && cached.length > 0) {
       setSeriesEpisodes(cached);
+      setSeriesExternalIds(episode.externalIds || seriesExternalIdsCacheRef.current.get(seriesKey));
+      setSeriesMediaReadyForUrl(seriesUrl);
       return;
     }
 
     let cancelled = false;
-    apiFetch(`/api/media?url=${encodeURIComponent(episode.seriesUrl)}`)
+    apiFetch(`/api/media?url=${encodeURIComponent(seriesUrl)}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data: AnimeDetails | null) => {
-        if (cancelled || !data || !Array.isArray(data.episodes)) return;
-        seriesCacheRef.current.set(seriesKey, data.episodes);
-        setSeriesEpisodes(data.episodes);
+        if (cancelled) return;
+        if (data && Array.isArray(data.episodes)) {
+          seriesCacheRef.current.set(seriesKey, data.episodes);
+          setSeriesEpisodes(data.episodes);
+        }
+        if (data?.externalIds) {
+          seriesExternalIdsCacheRef.current.set(seriesKey, data.externalIds);
+          setSeriesExternalIds((prev) => ({ ...data.externalIds, ...prev }));
+        }
+        setSeriesMediaReadyForUrl(seriesUrl);
       })
       .catch(() => {
-        // Ignore silent series fetch failures
+        if (!cancelled) {
+          setSeriesMediaReadyForUrl(seriesUrl);
+        }
       });
 
     return () => {
       cancelled = true;
     };
-  }, [episode.isMovie, episode.seriesUrl, initialSeriesEpisodes]);
+  }, [episode.externalIds, episode.isMovie, episode.seriesUrl, initialSeriesEpisodes]);
+
+  const matchedSeriesEpisode = useMemo(() => {
+    if (!seriesEpisodes.length) return undefined;
+    const byUrl = seriesEpisodes.find((ep) => isSameEpisodeUrl(ep.url, episode.url));
+    if (byUrl) return byUrl;
+    const targetEpNum =
+      episode.episodeNumber ??
+      extractEpisodeNumber(episode.episodeLabel || '') ??
+      extractEpisodeNumber(episode.title) ??
+      extractEpisodeNumber(episode.url);
+    if (!targetEpNum) return undefined;
+    const targetSeason = episode.seasonNumber || 1;
+    return (
+      seriesEpisodes.find(
+        (ep) => (ep.seasonNumber || 1) === targetSeason && ep.episodeNumber === targetEpNum
+      ) || seriesEpisodes.find((ep) => ep.episodeNumber === targetEpNum)
+    );
+  }, [episode.episodeLabel, episode.episodeNumber, episode.seasonNumber, episode.title, episode.url, seriesEpisodes]);
+
+  // Fetch TheTVDB episode synopsis (PT-BR -> Google Translate -> EN fallback) asynchronously
+  useEffect(() => {
+    if (episode.isMovie) {
+      setLocalizedSynopsisState({ episodeUrl: episode.url, loading: false, result: null });
+      return;
+    }
+
+    const epCacheKey = normalizeTopAnimesUrl(episode.url) || episode.url;
+    if (synopsisCacheRef.current.has(epCacheKey)) {
+      setLocalizedSynopsisState({
+        episodeUrl: episode.url,
+        loading: false,
+        result: synopsisCacheRef.current.get(epCacheKey) ?? null,
+      });
+      return;
+    }
+
+    const tvdbId = episode.externalIds?.tvdbId || seriesExternalIds?.tvdbId;
+    const tvdbSlug = episode.externalIds?.tvdbSlug || seriesExternalIds?.tvdbSlug;
+    const tvdbEpisodeId = matchedSeriesEpisode?.tvdbEpisodeId;
+    const seasonNum = matchedSeriesEpisode?.seasonNumber || episode.seasonNumber || 1;
+    const epNum =
+      matchedSeriesEpisode?.episodeNumber ??
+      episode.episodeNumber ??
+      extractEpisodeNumber(episode.episodeLabel || '') ??
+      extractEpisodeNumber(episode.title) ??
+      extractEpisodeNumber(episode.url) ??
+      undefined;
+
+    // Wait for /api/media if we don't yet have TheTVDB identifiers so we avoid duplicate searches
+    const waitingForSeriesIds =
+      Boolean(episode.seriesUrl) &&
+      seriesMediaReadyForUrl !== episode.seriesUrl &&
+      !tvdbEpisodeId &&
+      !tvdbId &&
+      !tvdbSlug;
+
+    if (waitingForSeriesIds) {
+      setLocalizedSynopsisState({ episodeUrl: episode.url, loading: true, result: null });
+      return;
+    }
+
+    if (!tvdbEpisodeId && !epNum) {
+      setLocalizedSynopsisState({ episodeUrl: episode.url, loading: false, result: null });
+      return;
+    }
+
+    const params = new URLSearchParams();
+    if (episode.seriesTitle) params.set('title', episode.seriesTitle);
+    if (episode.originalTitle) params.set('originalTitle', episode.originalTitle);
+    if (episode.year) params.set('year', episode.year);
+    if (episode.mediaType) params.set('mediaType', episode.mediaType);
+    if (seasonNum > 0) params.set('season', String(seasonNum));
+    if (epNum && epNum > 0) params.set('episode', String(epNum));
+    if (tvdbId && tvdbId > 0) params.set('tvdbId', String(tvdbId));
+    if (tvdbSlug) params.set('tvdbSlug', tvdbSlug);
+    if (tvdbEpisodeId && tvdbEpisodeId > 0) params.set('tvdbEpisodeId', String(tvdbEpisodeId));
+    if (matchedSeriesEpisode?.overview) {
+      params.set('englishOverview', matchedSeriesEpisode.overview.slice(0, 1800));
+    }
+
+    let cancelled = false;
+    setLocalizedSynopsisState({ episodeUrl: episode.url, loading: true, result: null });
+
+    apiFetch(`/api/episode-synopsis?${params.toString()}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((payload: { result?: EpisodeSynopsisResult | null } | null) => {
+        if (cancelled) return;
+        const resolvedResult = payload?.result ?? null;
+        synopsisCacheRef.current.set(epCacheKey, resolvedResult);
+        setLocalizedSynopsisState({
+          episodeUrl: episode.url,
+          loading: false,
+          result: resolvedResult,
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLocalizedSynopsisState({
+            episodeUrl: episode.url,
+            loading: false,
+            result: null,
+          });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    episode.episodeLabel,
+    episode.episodeNumber,
+    episode.externalIds?.tvdbId,
+    episode.externalIds?.tvdbSlug,
+    episode.isMovie,
+    episode.mediaType,
+    episode.originalTitle,
+    episode.seasonNumber,
+    episode.seriesTitle,
+    episode.seriesUrl,
+    episode.title,
+    episode.url,
+    episode.year,
+    matchedSeriesEpisode?.episodeNumber,
+    matchedSeriesEpisode?.overview,
+    matchedSeriesEpisode?.seasonNumber,
+    matchedSeriesEpisode?.tvdbEpisodeId,
+    seriesExternalIds?.tvdbId,
+    seriesExternalIds?.tvdbSlug,
+    seriesMediaReadyForUrl,
+  ]);
 
   const resolveEmbedCached = useCallback(async (opt: PlayerOption): Promise<ResolvedEmbed> => {
     // Short-circuit immediately for pre-resolved direct streams
@@ -442,8 +619,38 @@ export function EpisodeWorkspace({
     [seriesEpisodes, episode.url]
   );
 
-  const effectivePrevUrl = episode.prevUrl || adjacent.prevUrl;
-  const effectiveNextUrl = episode.nextUrl || adjacent.nextUrl;
+  const upcomingNextEpisode = useMemo(
+    () => findUpcomingNextEpisode(seriesEpisodes, episode.url),
+    [seriesEpisodes, episode.url]
+  );
+
+  const isUrlMarkedUnavailable = useCallback(
+    (targetUrl?: string) =>
+      Boolean(
+        targetUrl &&
+          seriesEpisodes.some(
+            (ep) => isSameEpisodeUrl(ep.url, targetUrl) && !isEpisodeAvailableOnServer(ep)
+          )
+      ),
+    [seriesEpisodes]
+  );
+
+  const effectivePrevUrl =
+    (episode.prevUrl && !isUrlMarkedUnavailable(episode.prevUrl) ? episode.prevUrl : undefined) ||
+    adjacent.prevUrl;
+  const effectiveNextUrl =
+    (episode.nextUrl && !isUrlMarkedUnavailable(episode.nextUrl) ? episode.nextUrl : undefined) ||
+    adjacent.nextUrl;
+
+  const activeUpcomingNext = !effectiveNextUrl ? upcomingNextEpisode : undefined;
+
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!activeUpcomingNext) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, [activeUpcomingNext]);
 
   const isTransitioning = loadingEpisode || loadingEmbed;
   const hasResolvedStreams =
@@ -493,7 +700,7 @@ export function EpisodeWorkspace({
         </div>
 
         {!episode.isMovie && (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               disabled={!effectivePrevUrl || isTransitioning}
@@ -503,15 +710,63 @@ export function EpisodeWorkspace({
               <ChevronLeft className="h-4 w-4" />
               <span>Anterior</span>
             </button>
-            <button
-              type="button"
-              disabled={!effectiveNextUrl || isTransitioning}
-              onClick={() => effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')}
-              className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <span>Próximo</span>
-              <ChevronRight className="h-4 w-4" />
-            </button>
+            {activeUpcomingNext ? (() => {
+              const nextDate = formatEpisodeReleaseDate(
+                activeUpcomingNext.date,
+                activeUpcomingNext.airingAt,
+                activeUpcomingNext.hasExactAiringTime
+              );
+              const nextCountdown = formatEpisodeCountdown(
+                activeUpcomingNext.airingAt,
+                nowMs,
+                activeUpcomingNext.date
+              );
+              const nextEpLabel = formatUpcomingEpisodeShortLabel(activeUpcomingNext);
+              return (
+                <button
+                  type="button"
+                  data-upcoming-next-pill="true"
+                  onClick={() => onToast(formatUpcomingEpisodeNotice(activeUpcomingNext, nowMs))}
+                  title={`${formatUpcomingEpisodeNotice(activeUpcomingNext, nowMs)} (previsão oficial, não disponibilidade nos servidores)`}
+                  className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium tabular-nums transition-colors ${
+                    nextCountdown.state === 'future'
+                      ? 'border-[#f97316]/50 bg-[#1b0e05]/90 text-[#ffedd5] hover:border-[#f97316]/80'
+                      : nextCountdown.state === 'now'
+                        ? 'border-emerald-400/55 bg-[#052e22]/90 text-emerald-100'
+                        : 'border-white/15 bg-[#151921] text-slate-300 hover:border-white/25'
+                  }`}
+                >
+                  {nextCountdown.state === 'pending' ? (
+                    <CloudOff className="h-3.5 w-3.5 shrink-0 text-slate-400" />
+                  ) : (
+                    <Clock
+                      className={`h-3.5 w-3.5 shrink-0 ${
+                        nextCountdown.state === 'now'
+                          ? 'text-emerald-300'
+                          : nextCountdown.state === 'future'
+                            ? 'text-[#f97316]'
+                            : 'text-slate-400'
+                      }`}
+                    />
+                  )}
+                  <span className="truncate">
+                    Próx. {nextEpLabel}
+                    {nextDate ? ` · ${nextDate}` : ''}
+                    {` · ${nextCountdown.label}`}
+                  </span>
+                </button>
+              );
+            })() : (
+              <button
+                type="button"
+                disabled={!effectiveNextUrl || isTransitioning}
+                onClick={() => effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')}
+                className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <span>Próximo</span>
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -539,6 +794,7 @@ export function EpisodeWorkspace({
               hasNext={Boolean(effectiveNextUrl)}
               prevUrl={effectivePrevUrl}
               nextUrl={effectiveNextUrl}
+              upcomingNextEpisode={activeUpcomingNext}
               loadingEpisode={isTransitioning}
               hasUntriedFallbackServers={hasUntriedFallbackServers}
               resumeAfterFailover={resumeAfterFailover}
@@ -578,7 +834,7 @@ export function EpisodeWorkspace({
             <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
               <div className="h-10 w-10 animate-spin rounded-full border-3 border-white/15 border-t-[#f97316]" />
               <p className="mt-3 text-sm font-medium text-slate-300">
-                Consultando fontes e extraindo vídeo...
+                Consultando provedores e extraindo vídeo...
               </p>
             </div>
           ) : (
@@ -678,7 +934,7 @@ export function EpisodeWorkspace({
               <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-slate-400">
                 <span className="inline-flex items-center gap-2">
                   <Server className="h-3.5 w-3.5 text-[#f97316]" />
-                  <span>Servidores das Fontes ({playableOptions.length})</span>
+                  <span>Servidores dos Provedores ({playableOptions.length})</span>
                 </span>
                 {onRefreshSources && (
                   <button
@@ -740,7 +996,7 @@ export function EpisodeWorkspace({
 
               {playableOptions.length === 0 && !loadingExtraServers ? (
                 <p className="text-sm text-amber-300/90">
-                  Nenhum servidor encontrado nos servidores integrados para este título. Toque em Rebuscar para tentar novamente.
+                  Nenhum servidor de vídeo encontrado nos provedores integrados para este título. Toque em Rebuscar para tentar novamente.
                 </p>
               ) : (
                 <div className="flex flex-wrap gap-2">
@@ -809,11 +1065,60 @@ export function EpisodeWorkspace({
               <h2 className="mt-1 text-base font-semibold text-white">
                 {episode.seriesTitle}
               </h2>
-              {episode.synopsis && (
-                <p className="mt-3 text-xs leading-relaxed text-slate-400">
-                  {episode.synopsis}
-                </p>
-              )}
+              {(() => {
+                const scopedSynopsis =
+                  localizedSynopsisState.episodeUrl === episode.url
+                    ? localizedSynopsisState
+                    : { loading: false, result: null };
+                const tvdbSynopsis = scopedSynopsis.result;
+                const displaySynopsis = tvdbSynopsis?.synopsis || episode.synopsis;
+                const sourceCaption =
+                  tvdbSynopsis?.source === 'thetvdb-pt-br'
+                    ? 'TheTVDB · PT-BR'
+                    : tvdbSynopsis?.source === 'thetvdb-google-translate'
+                      ? 'TheTVDB · Traduzido via Google Tradutor'
+                      : tvdbSynopsis?.source === 'thetvdb-en'
+                        ? 'TheTVDB · Original (EN)'
+                        : null;
+
+                if (scopedSynopsis.loading && !tvdbSynopsis) {
+                  return (
+                    <div
+                      data-episode-synopsis-loading="true"
+                      className="mt-3 space-y-2"
+                      aria-label="Carregando sinopse do episódio"
+                    >
+                      <div className="h-3 w-2/3 animate-pulse rounded bg-white/10" />
+                      <div className="h-3 w-full animate-pulse rounded bg-white/8" />
+                      <div className="h-3 w-5/6 animate-pulse rounded bg-white/8" />
+                    </div>
+                  );
+                }
+
+                if (!displaySynopsis) return null;
+
+                return (
+                  <div
+                    data-episode-synopsis="true"
+                    data-synopsis-source={tvdbSynopsis?.source || 'fallback'}
+                    className="mt-3 space-y-2"
+                  >
+                    {tvdbSynopsis?.episodeTitle && (
+                      <p className="text-xs font-medium text-slate-200">
+                        {tvdbSynopsis.episodeTitle}
+                      </p>
+                    )}
+                    <p className="whitespace-pre-line text-xs leading-relaxed text-slate-300">
+                      {displaySynopsis}
+                    </p>
+                    {sourceCaption && (
+                      <p className="text-[10px] font-medium text-slate-500">
+                        {sourceCaption}
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
               {episode.seriesUrl && (
                 <button
                   type="button"

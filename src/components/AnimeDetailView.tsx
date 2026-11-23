@@ -362,7 +362,7 @@ export function AnimeDetailView({
                 )}
                 {anime.sourceServerName && (
                   <span className="rounded-md border border-white/10 bg-[#0d0f12]/70 px-2 py-0.5 text-[11px] text-slate-300">
-                    Servidor: {anime.sourceServerName}
+                    Provedor: {anime.sourceServerName}
                   </span>
                 )}
               </div>
@@ -613,7 +613,7 @@ export function AnimeDetailView({
 
         {anime.episodes.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
-            Nenhum episódio listado nos servidores ativos para este título ainda.
+            Nenhum episódio listado nos provedores ativos para este título ainda.
           </div>
         ) : visibleSeasonGroups.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center">
@@ -746,7 +746,7 @@ export function AnimeDetailView({
                               <span
                                 title={
                                   countdown.state === 'pending'
-                                    ? 'Episódio já exibido, mas ainda não publicado nos servidores.'
+                                    ? 'Episódio já exibido, mas ainda não publicado nos provedores.'
                                     : undefined
                                 }
                                 className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${

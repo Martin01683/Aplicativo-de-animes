@@ -1,4 +1,5 @@
 import { Capacitor, registerPlugin } from '@capacitor/core';
+import { isEpisodeAvailableOnServer } from './episodeAvailability';
 import { canonicalEpisodeKey as canonicalKey } from './favoriteAlerts';
 import type { VideoScaleMode } from './playbackProgress';
 import type { AnimeEpisodeLink, PlayerOption, StreamQuality, SubtitleTrack } from './types';
@@ -89,9 +90,29 @@ export function isSameEpisodeUrl(a?: string, b?: string): boolean {
   return canonicalKey(a) === canonicalKey(b);
 }
 
+function isSeriesEpisodeListAscending(episodes: AnimeEpisodeLink[]): boolean {
+  if (episodes.length < 2) return true;
+  const firstSeason = episodes[0].seasonNumber || 1;
+  const lastSeason = episodes[episodes.length - 1].seasonNumber || 1;
+  if (firstSeason !== lastSeason) {
+    return lastSeason > firstSeason;
+  }
+  const firstNum = episodes[0].episodeNumber;
+  const lastNum = episodes[episodes.length - 1].episodeNumber;
+  if (
+    typeof firstNum === 'number' &&
+    typeof lastNum === 'number' &&
+    firstNum !== lastNum
+  ) {
+    return lastNum > firstNum;
+  }
+  return true;
+}
+
 /**
- * Resolves adjacent previous/next episode URLs from a series episode list,
- * handling both ascending (Ep 1 -> Ep N) and descending (Ep N -> Ep 1) orders.
+ * Resolves adjacent previous/next PLAYABLE episode URLs from a series episode list,
+ * handling both ascending (Ep 1 -> Ep N) and descending (Ep N -> Ep 1) orders
+ * while never advancing into unreleased/unavailable episodes.
  */
 export function resolveSeriesPrevNext(
   episodes: AnimeEpisodeLink[],
@@ -105,28 +126,52 @@ export function resolveSeriesPrevNext(
     return { currentIndex: -1 };
   }
 
-  // Detect ordering when numeric episode numbers are present
-  let ascending = true;
-  if (episodes.length >= 2) {
-    const firstNum = episodes[0].episodeNumber;
-    const lastNum = episodes[episodes.length - 1].episodeNumber;
-    if (
-      typeof firstNum === 'number' &&
-      typeof lastNum === 'number' &&
-      firstNum !== lastNum
-    ) {
-      ascending = lastNum > firstNum;
+  const ascending = isSeriesEpisodeListAscending(episodes);
+  const prevStep = ascending ? -1 : 1;
+  const nextStep = ascending ? 1 : -1;
+
+  let prevUrl: string | undefined;
+  for (let i = currentIndex + prevStep; i >= 0 && i < episodes.length; i += prevStep) {
+    if (isEpisodeAvailableOnServer(episodes[i])) {
+      prevUrl = episodes[i].url;
+      break;
     }
   }
 
-  const prevIdx = ascending ? currentIndex - 1 : currentIndex + 1;
-  const nextIdx = ascending ? currentIndex + 1 : currentIndex - 1;
+  let nextUrl: string | undefined;
+  for (let i = currentIndex + nextStep; i >= 0 && i < episodes.length; i += nextStep) {
+    if (isEpisodeAvailableOnServer(episodes[i])) {
+      nextUrl = episodes[i].url;
+      break;
+    }
+  }
 
   return {
     currentIndex,
-    prevUrl: prevIdx >= 0 && prevIdx < episodes.length ? episodes[prevIdx].url : undefined,
-    nextUrl: nextIdx >= 0 && nextIdx < episodes.length ? episodes[nextIdx].url : undefined,
+    prevUrl,
+    nextUrl,
   };
+}
+
+/**
+ * Returns the immediately following episode in chronological order when it is NOT yet
+ * available on streaming servers (so the player can inform the user of its official release
+ * forecast instead of navigating to a dead page).
+ */
+export function findUpcomingNextEpisode(
+  episodes: AnimeEpisodeLink[],
+  currentUrl: string
+): AnimeEpisodeLink | undefined {
+  if (!episodes.length || !currentUrl) return undefined;
+  const currentIndex = episodes.findIndex((ep) => isSameEpisodeUrl(ep.url, currentUrl));
+  if (currentIndex < 0) return undefined;
+
+  const ascending = isSeriesEpisodeListAscending(episodes);
+  const nextIdx = ascending ? currentIndex + 1 : currentIndex - 1;
+  if (nextIdx < 0 || nextIdx >= episodes.length) return undefined;
+
+  const candidate = episodes[nextIdx];
+  return isEpisodeAvailableOnServer(candidate) ? undefined : candidate;
 }
 
 export async function playWithNativeVlc(

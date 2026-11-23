@@ -9,10 +9,13 @@ import {
 } from 'react';
 import Hls from 'hls.js';
 import {
+  Calendar,
   Camera,
   Check,
   ChevronLeft,
   ChevronRight,
+  Clock,
+  CloudOff,
   Download,
   FastForward,
   ListVideo,
@@ -40,6 +43,13 @@ import type {
   StreamQuality,
   SubtitleTrack,
 } from '../lib/types';
+import {
+  formatEpisodeCountdown,
+  formatEpisodeReleaseDate,
+  formatUpcomingEpisodeNotice,
+  formatUpcomingEpisodeShortLabel,
+  isEpisodeAvailableOnServer,
+} from '../lib/episodeAvailability';
 import { resolveBufferedEndSec } from '../lib/playerBuffer';
 import {
   decodeSubtitleBuffer,
@@ -101,6 +111,7 @@ interface AnimePlayerProps {
   hasNext?: boolean;
   prevUrl?: string;
   nextUrl?: string;
+  upcomingNextEpisode?: AnimeEpisodeLink;
   loadingEpisode?: boolean;
   errorMessage?: string;
   skipIntroSeconds?: number;
@@ -221,6 +232,7 @@ export function AnimePlayer({
   hasNext = false,
   prevUrl,
   nextUrl,
+  upcomingNextEpisode,
   loadingEpisode = false,
   errorMessage: externalErrorMessage = '',
   skipIntroSeconds = 85,
@@ -361,6 +373,53 @@ export function AnimePlayer({
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuTab, setMenuTab] = useState<SettingsTab>('main');
   const [episodesOpen, setEpisodesOpen] = useState(false);
+  const [upcomingBannerMode, setUpcomingBannerMode] = useState<'hidden' | 'click' | 'ended'>('hidden');
+  const upcomingBannerTimerRef = useRef<number | null>(null);
+  const [scheduleNowMs, setScheduleNowMs] = useState(() => Date.now());
+  const playableSeriesEpisodes = useMemo(
+    () => seriesEpisodes.filter(isEpisodeAvailableOnServer),
+    [seriesEpisodes]
+  );
+
+  const dismissUpcomingBanner = useCallback(() => {
+    if (upcomingBannerTimerRef.current) {
+      window.clearTimeout(upcomingBannerTimerRef.current);
+      upcomingBannerTimerRef.current = null;
+    }
+    setUpcomingBannerMode('hidden');
+  }, []);
+
+  const showUpcomingBanner = useCallback((mode: 'click' | 'ended') => {
+    if (upcomingBannerTimerRef.current) {
+      window.clearTimeout(upcomingBannerTimerRef.current);
+      upcomingBannerTimerRef.current = null;
+    }
+    setScheduleNowMs(Date.now());
+    setUpcomingBannerMode(mode);
+    if (mode === 'click') {
+      upcomingBannerTimerRef.current = window.setTimeout(() => {
+        upcomingBannerTimerRef.current = null;
+        setUpcomingBannerMode('hidden');
+      }, 7000);
+    }
+  }, []);
+
+  useEffect(() => {
+    dismissUpcomingBanner();
+    return () => {
+      if (upcomingBannerTimerRef.current) {
+        window.clearTimeout(upcomingBannerTimerRef.current);
+        upcomingBannerTimerRef.current = null;
+      }
+    };
+  }, [dismissUpcomingBanner, episodeUrl]);
+
+  useEffect(() => {
+    if (!episodesOpen && !upcomingNextEpisode && upcomingBannerMode === 'hidden') return;
+    setScheduleNowMs(Date.now());
+    const id = window.setInterval(() => setScheduleNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, [episodesOpen, upcomingBannerMode, upcomingNextEpisode]);
 
   // Video scale state (synced with prop and localStorage)
   const [localVideoScale, setLocalVideoScale] = useState<VideoScaleMode>(() =>
@@ -1057,7 +1116,7 @@ export function AnimePlayer({
           isMovie,
           streams: sortedStreams,
           subtitles,
-          episodes: seriesEpisodes,
+          episodes: playableSeriesEpisodes,
           watchedUrls: watchedUrls ? Array.from(watchedUrls) : [],
           options: playerOptions,
           selectedServerNume,
@@ -1148,7 +1207,7 @@ export function AnimePlayer({
       referer,
       selectedServerNume,
       selectedStreamIdx,
-      seriesEpisodes,
+      playableSeriesEpisodes,
       seriesTitle,
       seriesUrl,
       skipIntroSeconds,
@@ -1512,12 +1571,19 @@ export function AnimePlayer({
   }, [hasPrev, onPrevEpisode]);
 
   const triggerNextEpisode = useCallback(() => {
-    if (!hasNext || !onNextEpisode) return;
-    autoStartNextRef.current = true;
-    setEpisodesOpen(false);
-    setMenuOpen(false);
-    onNextEpisode();
-  }, [hasNext, onNextEpisode]);
+    if (hasNext && onNextEpisode) {
+      autoStartNextRef.current = true;
+      setEpisodesOpen(false);
+      setMenuOpen(false);
+      dismissUpcomingBanner();
+      onNextEpisode();
+      return;
+    }
+    if (!hasNext && upcomingNextEpisode) {
+      showUpcomingBanner('click');
+      onToast(formatUpcomingEpisodeNotice(upcomingNextEpisode));
+    }
+  }, [dismissUpcomingBanner, hasNext, onNextEpisode, onToast, showUpcomingBanner, upcomingNextEpisode]);
 
   const triggerSelectEpisode = useCallback(
     (url: string) => {
@@ -1828,6 +1894,16 @@ export function AnimePlayer({
                 autoNextTriggeredForUrlRef.current = episodeUrl || null;
                 onToast('Carregando próximo episódio...');
                 triggerNextEpisode();
+              } else if (
+                reachedGenuineEnd &&
+                !hasNext &&
+                upcomingNextEpisode &&
+                episodeUrl &&
+                autoNextTriggeredForUrlRef.current !== episodeUrl
+              ) {
+                autoNextTriggeredForUrlRef.current = episodeUrl;
+                showUpcomingBanner('ended');
+                onToast(formatUpcomingEpisodeNotice(upcomingNextEpisode));
               } else if (!reachedGenuineEnd && !loadingEpisode && !effectiveErrorMsg) {
                 advanceFallbackOrFail();
               }
@@ -1842,6 +1918,9 @@ export function AnimePlayer({
               setWaiting(false);
               setHasVideoFrame(true);
               setErrorMsg('');
+              if (upcomingBannerMode === 'ended') {
+                dismissUpcomingBanner();
+              }
             }}
             onLoadedMetadata={() => {
               const v = videoRef.current;
@@ -2107,6 +2186,98 @@ export function AnimePlayer({
         </div>
       )}
 
+      {/* In-Player Upcoming Next Episode Forecast Banner (works in normal & fullscreen modes) */}
+      {upcomingBannerMode !== 'hidden' && !hasNext && upcomingNextEpisode && !episodesOpen && (() => {
+        const epTag = formatUpcomingEpisodeShortLabel(upcomingNextEpisode);
+        const releaseDate = formatEpisodeReleaseDate(
+          upcomingNextEpisode.date,
+          upcomingNextEpisode.airingAt,
+          upcomingNextEpisode.hasExactAiringTime
+        );
+        const countdown = formatEpisodeCountdown(
+          upcomingNextEpisode.airingAt,
+          scheduleNowMs,
+          upcomingNextEpisode.date
+        );
+        const hasDistinctTitle =
+          Boolean(upcomingNextEpisode.title) &&
+          upcomingNextEpisode.title.trim().toLowerCase() !== epTag.toLowerCase();
+
+        return (
+          <div
+            data-player-upcoming-banner="true"
+            role="status"
+            aria-live="polite"
+            onClick={(e) => e.stopPropagation()}
+            className="pointer-events-auto absolute bottom-16 right-3 z-40 w-[min(360px,calc(100%-24px))] rounded-xl border border-[#f97316]/45 bg-[#0f131b]/95 p-3 shadow-2xl backdrop-blur-md sm:bottom-20 sm:right-4 sm:p-3.5"
+          >
+            <div className="flex items-start justify-between gap-2.5">
+              <div className="flex min-w-0 items-start gap-2.5">
+                <div
+                  className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border ${
+                    countdown.state === 'future'
+                      ? 'border-[#f97316]/40 bg-[#f97316]/15 text-[#fb923c]'
+                      : countdown.state === 'now'
+                        ? 'border-emerald-400/40 bg-emerald-500/15 text-emerald-300'
+                        : 'border-white/15 bg-white/5 text-slate-300'
+                  }`}
+                >
+                  {countdown.state === 'pending' ? (
+                    <CloudOff className="h-4 w-4" />
+                  ) : (
+                    <Clock className="h-4 w-4" />
+                  )}
+                </div>
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-xs font-semibold text-white">
+                      {upcomingBannerMode === 'ended'
+                        ? `Fim do episódio · ${epTag} ainda não lançado`
+                        : `${epTag} ainda não disponível`}
+                    </span>
+                  </div>
+                  {hasDistinctTitle && (
+                    <p className="mt-0.5 truncate text-[11px] text-slate-300">
+                      {upcomingNextEpisode.title}
+                    </p>
+                  )}
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] tabular-nums">
+                    {releaseDate && (
+                      <span className="inline-flex items-center gap-1 text-slate-200">
+                        <Calendar className="h-3 w-3 text-[#f97316]" />
+                        {releaseDate}
+                      </span>
+                    )}
+                    <span
+                      className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${
+                        countdown.state === 'future'
+                          ? 'border-[#f97316]/50 bg-[#1b0e05]/90 text-[#ffedd5]'
+                          : countdown.state === 'now'
+                            ? 'border-emerald-400/50 bg-[#052e22]/90 text-emerald-100'
+                            : 'border-white/15 bg-white/5 text-slate-300'
+                      }`}
+                    >
+                      {countdown.label}
+                    </span>
+                  </div>
+                  <p className="mt-1.5 text-[10px] leading-snug text-slate-400">
+                    Previsão do lançamento oficial; a disponibilidade nos servidores pode variar.
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={dismissUpcomingBanner}
+                aria-label="Fechar aviso de próximo episódio"
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-slate-400 transition-colors hover:bg-white/10 hover:text-white"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Bottom Controls HUD (outer gradient is pointer-events-none so it never blocks the center play button on mobile) */}
       <div
         className={`pointer-events-none absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/95 via-black/65 to-transparent px-3 pb-2 pt-8 transition-opacity duration-200 sm:px-4 sm:pb-3 sm:pt-10 ${
@@ -2321,11 +2492,22 @@ export function AnimePlayer({
                 {onNextEpisode && (
                   <button
                     type="button"
-                    disabled={!hasNext || loadingEpisode}
+                    disabled={(!hasNext && !upcomingNextEpisode) || loadingEpisode}
+                    aria-disabled={!hasNext || loadingEpisode}
                     onClick={triggerNextEpisode}
-                    aria-label="Próximo episódio"
-                    title="Próximo episódio"
-                    className="flex h-7 w-7 items-center justify-center rounded-lg text-white hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-35 sm:h-9 sm:w-9"
+                    aria-label={
+                      !hasNext && upcomingNextEpisode
+                        ? formatUpcomingEpisodeNotice(upcomingNextEpisode, scheduleNowMs)
+                        : 'Próximo episódio'
+                    }
+                    title={
+                      !hasNext && upcomingNextEpisode
+                        ? formatUpcomingEpisodeNotice(upcomingNextEpisode, scheduleNowMs)
+                        : 'Próximo episódio'
+                    }
+                    className={`flex h-7 w-7 items-center justify-center rounded-lg hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-35 sm:h-9 sm:w-9 ${
+                      !hasNext && upcomingNextEpisode ? 'text-slate-400 hover:text-slate-200' : 'text-white'
+                    }`}
                   >
                     <SkipForward className="h-4 w-4" />
                   </button>
@@ -2902,7 +3084,67 @@ export function AnimePlayer({
                 </div>
               ) : (
                 seriesEpisodes.map((ep) => {
+                  const available = isEpisodeAvailableOnServer(ep);
                   const isCurrent = isSameEpisodeUrl(ep.url, episodeUrl);
+                  if (!available) {
+                    const releaseDate = formatEpisodeReleaseDate(
+                      ep.date,
+                      ep.airingAt,
+                      ep.hasExactAiringTime
+                    );
+                    const countdown = formatEpisodeCountdown(
+                      ep.airingAt,
+                      scheduleNowMs,
+                      ep.date
+                    );
+                    return (
+                      <div
+                        key={`${ep.url}-${ep.seasonNumber || 1}-${ep.episodeNumber || ep.numberLabel}`}
+                        data-player-episode-unavailable="true"
+                        className="flex w-full items-center justify-between gap-2 rounded-lg border border-white/6 bg-[#0d0f12]/55 px-3 py-2 text-left"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-mono text-[11px] font-semibold tabular-nums text-slate-500">
+                              {ep.numberLabel || 'EP'}
+                            </span>
+                          </div>
+                          <div className="mt-0.5 truncate text-xs font-medium text-slate-400">
+                            {ep.title}
+                          </div>
+                          <div className="mt-0.5 inline-flex items-center gap-1 text-[10px] tabular-nums text-slate-500">
+                            <Calendar className="h-2.5 w-2.5 shrink-0" />
+                            <span>{releaseDate || 'Data ainda não confirmada'}</span>
+                          </div>
+                        </div>
+                        <span
+                          className={`inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${
+                            countdown.state === 'now'
+                              ? 'border-emerald-400/70 bg-[#052e22]/90 text-emerald-100'
+                              : countdown.state === 'future'
+                                ? 'border-[#f97316]/80 bg-[#1b0e05]/90 text-[#ffedd5]'
+                                : 'border-white/15 bg-[#0d0f12]/90 text-slate-300'
+                          }`}
+                        >
+                          {countdown.state === 'pending' ? (
+                            <CloudOff className="h-2.5 w-2.5 shrink-0 text-slate-400" />
+                          ) : (
+                            <Clock
+                              className={`h-2.5 w-2.5 shrink-0 ${
+                                countdown.state === 'now'
+                                  ? 'text-emerald-300'
+                                  : countdown.state === 'future'
+                                    ? 'text-[#f97316]'
+                                    : 'text-slate-400'
+                              }`}
+                            />
+                          )}
+                          <span>{countdown.label}</span>
+                        </span>
+                      </div>
+                    );
+                  }
+
                   const isWatched = isEpisodeMarkedWatched(ep.url, undefined, watchedUrls);
                   return (
                     <button

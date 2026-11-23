@@ -610,7 +610,7 @@ export function CatalogView({
                 id="catalog-search-input"
                 type="text"
                 autoComplete="off"
-                aria-label="Buscar nos servidores disponíveis"
+                aria-label="Buscar nos provedores disponíveis"
                 value={searchInput}
                 onFocus={() => {
                   if (searchInput.trim().length >= 2) setSuggestOpen(true);
@@ -624,7 +624,7 @@ export function CatalogView({
                     setSuggestOpen(false);
                   }
                 }}
-                placeholder="Buscar anime nos servidores..."
+                placeholder="Buscar anime nos provedores..."
                 className="w-full rounded-xl border border-white/12 bg-[#151921] py-2.5 pl-10 pr-9 text-sm text-white placeholder:text-slate-500 focus:border-[#f97316] focus:outline-none"
               />
               {(searchInput || searchResults !== null) && (
@@ -652,7 +652,7 @@ export function CatalogView({
                   {loadingSuggestions && suggestions.length === 0 ? (
                     <div className="flex items-center gap-2 px-3.5 py-3 text-xs text-slate-400">
                       <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
-                      <span>Buscando nos servidores...</span>
+                      <span>Buscando nos provedores...</span>
                     </div>
                   ) : (
                     <div className="max-h-80 divide-y divide-white/8 overflow-y-auto">
@@ -759,7 +759,7 @@ export function CatalogView({
               </h1>
               <p className="mt-0.5 text-xs tabular-nums text-slate-400">
                 {searching
-                  ? 'Consultando servidores disponíveis...'
+                  ? 'Consultando provedores disponíveis...'
                   : `${searchResults.length} título(s) disponível(is)${
                       searchTotalPages > 1
                         ? ` · Página ${searchPage} de ${searchTotalPages}`
@@ -791,7 +791,7 @@ export function CatalogView({
           ) : searchResults.length === 0 ? (
             <div className="rounded-xl border border-white/10 bg-[#151921] p-10 text-center">
               <p className="text-sm text-slate-300">
-                Nenhum título disponível nos servidores para &ldquo;{searchQuery}&rdquo;.
+                Nenhum título disponível nos provedores para &ldquo;{searchQuery}&rdquo;.
               </p>
               <button
                 type="button"
@@ -1273,7 +1273,7 @@ export function CatalogView({
                   <div>
                     <h1 className="text-xl font-bold text-white">Novos Lançamentos</h1>
                     <p className="mt-0.5 text-xs text-slate-400">
-                      Episódios disponíveis nos servidores — toque para assistir direto no player
+                      Episódios disponíveis nos provedores — toque para assistir direto no player
                     </p>
                   </div>
 
@@ -1390,7 +1390,7 @@ export function CatalogView({
                   <div className="mb-4 flex items-center justify-between gap-2 border-b border-white/10 pb-2.5">
                     <div className="flex items-center gap-2">
                       <Tv className="h-4 w-4 text-emerald-400" />
-                      <h2 className="text-lg font-bold text-white">Séries nos Servidores</h2>
+                      <h2 className="text-lg font-bold text-white">Séries nos Provedores</h2>
                     </div>
                     <button
                       type="button"
@@ -1433,8 +1433,8 @@ export function CatalogView({
                               : ''
                           }`
                         : displayedArchive.totalPages > 1
-                          ? `Disponíveis nos servidores · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
-                          : 'Animes disponíveis nos servidores integrados'}
+                          ? `Disponíveis nos provedores · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
+                          : 'Animes disponíveis nos provedores integrados'}
                     </p>
                   </div>
 

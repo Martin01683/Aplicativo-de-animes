@@ -8,6 +8,7 @@ import {
   classifyVerticalSwipeAction,
   computeSwipeBrightness,
   computeSwipeVolume,
+  findUpcomingNextEpisode,
   isSameEpisodeUrl,
   resolveSeriesPrevNext,
   shouldEnableDesktopShortcuts,
@@ -94,6 +95,54 @@ describe('nativeVlcPlayer & platform guards', () => {
       prevUrl: 'https://topanimes.net/episodio/a-ep-1/',
       nextUrl: 'https://topanimes.net/episodio/a-ep-3/',
     });
+  });
+
+  it('never advances into unreleased/unavailable episodes and surfaces upcomingNextEpisode instead', () => {
+    const mixed: AnimeEpisodeLink[] = [
+      {
+        numberLabel: 'EP 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        title: 'Ep 1',
+        url: 'https://topanimes.net/episodio/a-ep-1/',
+        availableOnServer: true,
+      },
+      {
+        numberLabel: 'EP 2',
+        episodeNumber: 2,
+        seasonNumber: 1,
+        title: 'Ep 2',
+        url: 'https://topanimes.net/episodio/a-ep-2/',
+        availableOnServer: true,
+      },
+      {
+        numberLabel: 'EP 3',
+        episodeNumber: 3,
+        seasonNumber: 1,
+        title: 'Ep 3',
+        url: 'anisync://episode/anime/thetvdb/100/s1/e3',
+        availableOnServer: false,
+        date: '2026-11-29',
+        airingAt: Math.floor(Date.parse('2026-11-29T19:00:00Z') / 1000),
+        hasExactAiringTime: true,
+      },
+    ];
+
+    // On the last available episode (EP 2), nextUrl must be undefined (never EP 3!)
+    assert.deepEqual(resolveSeriesPrevNext(mixed, 'https://topanimes.net/episodio/a-ep-2/'), {
+      currentIndex: 1,
+      prevUrl: 'https://topanimes.net/episodio/a-ep-1/',
+      nextUrl: undefined,
+    });
+
+    // findUpcomingNextEpisode identifies EP 3 so the player can show its release forecast
+    const upcoming = findUpcomingNextEpisode(mixed, 'https://topanimes.net/episodio/a-ep-2/');
+    assert.ok(upcoming);
+    assert.equal(upcoming.episodeNumber, 3);
+    assert.equal(upcoming.availableOnServer, false);
+
+    // On EP 1, EP 2 is available so there is no unavailable upcoming next episode
+    assert.equal(findUpcomingNextEpisode(mixed, 'https://topanimes.net/episodio/a-ep-1/'), undefined);
   });
 
   it('classifies left/center/right tap zones and vertical brightness vs volume sides', () => {

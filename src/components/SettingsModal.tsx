@@ -45,11 +45,7 @@ import {
   type DefaultAudioFilter,
   type EpisodeCheckIntervalMinutes,
 } from '../lib/settings';
-import {
-  EPISODE_SOURCE_KIND_META,
-  type EpisodeSourceConfig,
-  type SourceTestResult,
-} from '../lib/sources/types';
+import type { EpisodeSourceConfig, SourceTestResult } from '../lib/sources/types';
 import type { CatalogSourceCredentials } from '../lib/types';
 import type { NavSection } from './Header';
 
@@ -272,7 +268,7 @@ export function SettingsModal({
               Configurações do Anisync
             </h2>
             <p className="mt-0.5 text-xs text-slate-400">
-              Servidores de vídeo, metadados TheTVDB, calendário LiveChart.me e player
+              Provedores de episódios, metadados TheTVDB, calendário LiveChart.me e player
             </p>
           </div>
           <button
@@ -297,13 +293,13 @@ export function SettingsModal({
               <div className="flex items-center gap-2">
                 <Server className="h-4 w-4 text-[#f97316]" />
                 <h3 id="settings-episode-sources-heading" className="text-base font-semibold text-white">
-                  Servidores &amp; Fontes de Vídeo
+                  Provedores
                 </h3>
               </div>
             </div>
 
             <p className="text-xs leading-relaxed text-slate-400">
-              O Início, o Catálogo, a Busca e os Episódios consultam os servidores integrados abaixo.
+              O Início, o Catálogo, a Busca e os Episódios consultam os provedores integrados abaixo para localizar os servidores de vídeo.
             </p>
 
             {/* Configured Episode Sources List */}
@@ -318,9 +314,6 @@ export function SettingsModal({
                           <span className="inline-flex items-center gap-1 text-sm font-semibold text-white">
                             <Globe className="h-3.5 w-3.5 text-[#f97316]" />
                             {src.name}
-                          </span>
-                          <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] font-medium text-slate-300">
-                            {EPISODE_SOURCE_KIND_META[src.kind]?.label || src.kind}
                           </span>
                           {src.builtIn && (
                             <span className="rounded bg-[#f97316]/15 px-1.5 py-0.5 text-[10px] font-medium text-[#fb923c]">
@@ -1092,10 +1085,10 @@ export function SettingsModal({
               <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">
                 <div className="w-full min-w-0 sm:flex-1">
                   <span className="block text-sm font-medium text-slate-200">
-                    Preferência de áudio nas fontes
+                    Preferência de áudio nos provedores
                   </span>
                   <span className="mt-0.5 block text-xs text-slate-400">
-                    Prioriza servidores dublados ou legendados quando disponíveis nas fontes.
+                    Prioriza servidores de vídeo dublados ou legendados quando disponíveis nos provedores.
                   </span>
                 </div>
                 <div className="grid w-full shrink-0 grid-cols-3 gap-1 rounded-lg border border-white/10 bg-[#151921] p-1 sm:flex sm:w-auto sm:items-center">

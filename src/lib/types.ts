@@ -184,6 +184,7 @@ export interface AnimeEpisodeLink {
   availableOnServer?: boolean;
   airingAt?: number;
   hasExactAiringTime?: boolean;
+  tvdbEpisodeId?: number;
 }
 
 export interface ExternalDatabaseLinkItem {
@@ -320,6 +321,20 @@ export interface EpisodeDetails {
   sourceReports?: EpisodeSourceReportSummary[];
   isMovie: boolean;
   sourceMode?: 'live' | 'snapshot';
+}
+
+export type EpisodeSynopsisSource =
+  | 'thetvdb-pt-br'
+  | 'thetvdb-google-translate'
+  | 'thetvdb-en';
+
+export interface EpisodeSynopsisResult {
+  synopsis: string;
+  language: 'pt-BR' | 'en';
+  source: EpisodeSynopsisSource;
+  episodeTitle?: string;
+  tvdbEpisodeId?: number;
+  tvdbSeriesId?: number;
 }
 
 export interface VlcPlaylistEntry {

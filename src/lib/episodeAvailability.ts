@@ -258,6 +258,56 @@ export function formatEpisodeCountdown(
   return { label: `Em ${Math.max(1, mins)}m`, state: 'future' };
 }
 
+/**
+ * Normalizes an upcoming episode's short label so bare numeric strings like "3"
+ * render as "EP 3" instead of awkward "Próx. 3" or "3 ainda não disponível".
+ */
+export function formatUpcomingEpisodeShortLabel(
+  ep: Pick<AnimeEpisodeLink, 'numberLabel' | 'episodeNumber'>
+): string {
+  const raw = (ep.numberLabel || '').trim();
+  if (raw) {
+    if (/^\d+(?:\.\d+)?$/.test(raw)) {
+      return `EP ${raw}`;
+    }
+    return raw;
+  }
+  if (ep.episodeNumber !== null && ep.episodeNumber !== undefined) {
+    return `EP ${ep.episodeNumber}`;
+  }
+  return 'Próximo episódio';
+}
+
+/**
+ * Formats a concise PT-BR release forecast notice for an upcoming unavailable episode
+ * (used by the player Next button, auto-advance end notice, and EpisodeWorkspace header).
+ */
+export function formatUpcomingEpisodeNotice(
+  ep: Pick<AnimeEpisodeLink, 'numberLabel' | 'episodeNumber' | 'date' | 'airingAt' | 'hasExactAiringTime'>,
+  nowMs = Date.now()
+): string {
+  const epTag = formatUpcomingEpisodeShortLabel(ep);
+  const dateText = formatEpisodeReleaseDate(ep.date, ep.airingAt, ep.hasExactAiringTime);
+  const countdown = formatEpisodeCountdown(ep.airingAt, nowMs, ep.date);
+
+  if (countdown.state === 'future') {
+    return dateText
+      ? `${epTag} ainda não disponível · Previsão oficial: ${dateText} (${countdown.label})`
+      : `${epTag} ainda não disponível · Previsão oficial: ${countdown.label}`;
+  }
+  if (countdown.state === 'now') {
+    return dateText
+      ? `${epTag} acabou de estrear (${dateText}), mas ainda não está nos servidores.`
+      : `${epTag} acabou de estrear, mas ainda não está nos servidores.`;
+  }
+  if (countdown.state === 'pending') {
+    return dateText
+      ? `${epTag} (lançamento oficial em ${dateText}) ainda não está disponível nos servidores.`
+      : `${epTag} ainda não está disponível nos servidores.`;
+  }
+  return `${epTag} ainda não disponível nos servidores (data oficial não confirmada).`;
+}
+
 function isGenericEpisodeTitle(title: string): boolean {
   return /^(?:epis[oó]dio|episode|ep\.?)\s*\d+(?:\s*[-–—:]?\s*(?:final)?)?$/i.test(title.trim());
 }
@@ -544,6 +594,7 @@ export function mergeServerAndCatalogEpisodes(params: {
         durationMinutes: matchedServer.durationMinutes || catEp.durationMinutes,
         airingAt: matchedServer.airingAt ?? catEp.airingAt,
         hasExactAiringTime: matchedServer.hasExactAiringTime || catEp.hasExactAiringTime,
+        tvdbEpisodeId: matchedServer.tvdbEpisodeId ?? catEp.tvdbEpisodeId,
         availableOnServer: true,
       });
     } else {

@@ -905,7 +905,11 @@ export function parseTvdbAllSeasonsHtml(
     if (seen.has(key)) return;
     seen.add(key);
 
-    const rawTitle = cleanText($li.find('h4 a').first().text());
+    const titleAnchor = $li.find('h4 a').first();
+    const rawTitle = cleanText(titleAnchor.text());
+    const epHref = titleAnchor.attr('href') || '';
+    const epIdMatch = epHref.match(/\/episodes\/(\d+)/i);
+    const tvdbEpisodeId = epIdMatch ? Number.parseInt(epIdMatch[1], 10) : undefined;
     const date = cleanText($li.find('ul.list-inline li').first().text()) || undefined;
     const overview = cleanText($li.find('.list-group-item-text p').first().text()) || undefined;
     const imgEl = $li.find('img').first();
@@ -922,6 +926,7 @@ export function parseTvdbAllSeasonsHtml(
       date,
       thumb,
       overview,
+      tvdbEpisodeId: Number.isFinite(tvdbEpisodeId) ? tvdbEpisodeId : undefined,
     });
   });
 
@@ -1043,6 +1048,7 @@ export async function fetchTheTvdbDetails(
             const ePayload = JSON.parse(epsRes.body) as {
               data?: {
                 episodes?: Array<{
+                  id?: number;
                   number?: number;
                   seasonNumber?: number;
                   name?: string;
@@ -1067,6 +1073,7 @@ export async function fetchTheTvdbDetails(
                 thumb: isValidArtworkUrl(ep.image) || undefined,
                 overview: ep.overview || undefined,
                 durationMinutes: ep.runtime || undefined,
+                tvdbEpisodeId: ep.id && ep.id > 0 ? ep.id : undefined,
               });
             }
           }
@@ -1323,4 +1330,251 @@ export async function enrichServerDetailsWithTheTvdb(
     genres: tvdbGenres.length > 0 ? tvdbGenres : serverDetails.genres,
     episodes: mergedEpisodes,
   };
+}
+
+export interface TvdbEpisodeTranslations {
+  ptBrOverview?: string;
+  ptBrTitle?: string;
+  engOverview?: string;
+  engTitle?: string;
+  tvdbEpisodeId?: number;
+  tvdbSeriesId?: number;
+}
+
+/**
+ * Parses a public TheTVDB.com episode HTML page (`/series/{slug}/episodes/{id}`)
+ * and extracts strictly PT-BR (`pt`) and English (`eng`) overviews and episode titles.
+ */
+export function parseTvdbEpisodePageHtml(html: string): TvdbEpisodeTranslations {
+  const $ = cheerio.load(html);
+  const translations = new Map<string, { title: string; synopsis: string }>();
+
+  $('.change_translation_text[data-language]').each((_, el) => {
+    const lang = cleanText($(el).attr('data-language')).toLowerCase();
+    if (!lang) return;
+    const extracted = extractCleanTranslationText($, el);
+    translations.set(lang, { title: extracted.title, synopsis: extracted.synopsis });
+  });
+
+  // Strictly PT-BR on TheTVDB (`pt` = Portuguese - Brazil; `por` is European Portuguese)
+  const ptBrBlock =
+    translations.get('pt') || translations.get('pt-br') || translations.get('pt_br');
+  const engBlock = translations.get('eng') || translations.get('en');
+
+  return {
+    ptBrOverview: ptBrBlock?.synopsis || undefined,
+    ptBrTitle: ptBrBlock?.title || undefined,
+    engOverview: engBlock?.synopsis || undefined,
+    engTitle: engBlock?.title || undefined,
+  };
+}
+
+function matchTvdbEpisodeFromList(
+  episodes: AnimeEpisodeLink[],
+  seasonNumber: number,
+  episodeNumber: number
+): AnimeEpisodeLink | undefined {
+  if (!episodes.length || !Number.isFinite(episodeNumber) || episodeNumber <= 0) return undefined;
+
+  const targetSeason = Number.isFinite(seasonNumber) && seasonNumber > 0 ? seasonNumber : 1;
+  const exact = episodes.find(
+    (ep) => (ep.seasonNumber || 1) === targetSeason && ep.episodeNumber === episodeNumber
+  );
+  if (exact) return exact;
+
+  // Absolute episode numbering fallback (e.g. provider lists Episode 25 for Season 2 Ep 1)
+  if (targetSeason === 1 && episodeNumber <= episodes.length) {
+    return episodes[episodeNumber - 1];
+  }
+
+  return episodes.find((ep) => ep.episodeNumber === episodeNumber);
+}
+
+/**
+ * Fetches localized PT-BR and EN episode overview translations from TheTVDB.com
+ * for a given episode (by tvdbEpisodeId, tvdbId/tvdbSlug, or series title + season/episode).
+ */
+export async function fetchTheTvdbEpisodeTranslations(
+  fetchHttp: HttpFetcher,
+  options: {
+    title?: string;
+    originalTitle?: string;
+    alternativeTitles?: string[];
+    year?: string;
+    mediaType?: CanonicalMediaType;
+    seasonNumber?: number;
+    episodeNumber?: number;
+    tvdbId?: number;
+    tvdbSlug?: string;
+    tvdbEpisodeId?: number;
+    fallbackEnglishOverview?: string;
+    credentials?: CatalogSourceCredentials;
+  }
+): Promise<TvdbEpisodeTranslations | null> {
+  let tvdbEpisodeId =
+    options.tvdbEpisodeId && options.tvdbEpisodeId > 0 ? options.tvdbEpisodeId : undefined;
+  let tvdbSeriesId = options.tvdbId && options.tvdbId > 0 ? options.tvdbId : undefined;
+  let tvdbSlug = cleanText(options.tvdbSlug) || undefined;
+  let fallbackEngOverview = cleanText(options.fallbackEnglishOverview) || undefined;
+
+  // 1. Resolve tvdbEpisodeId via series episode guide if we don't already have it
+  if (!tvdbEpisodeId) {
+    const seasonNum =
+      options.seasonNumber && options.seasonNumber > 0 ? options.seasonNumber : 1;
+    const epNum = options.episodeNumber && options.episodeNumber > 0 ? options.episodeNumber : 0;
+    if (!epNum) {
+      return fallbackEngOverview ? { engOverview: fallbackEngOverview } : null;
+    }
+
+    if (!tvdbSeriesId && !tvdbSlug) {
+      const searchTerms = [
+        options.title,
+        options.originalTitle,
+        ...(options.alternativeTitles || []),
+      ].filter((x): x is string => Boolean(x && x.trim().length >= 2));
+
+      if (searchTerms.length > 0) {
+        const bestMatch = await findBestTheTvdbMatch(fetchHttp, searchTerms, {
+          mediaType: options.mediaType === 'series' ? 'series' : 'anime',
+          year: options.year,
+        }).catch(() => null);
+        if (bestMatch) {
+          tvdbSeriesId = bestMatch.tvdbId;
+          tvdbSlug = bestMatch.slug || undefined;
+        }
+      }
+    }
+
+    let seriesEpisodes: AnimeEpisodeLink[] = [];
+    if (tvdbSlug) {
+      try {
+        const epsRes = await fetchHttp(
+          `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(tvdbSlug)}/allseasons/official`,
+          {
+            referer: `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(tvdbSlug)}`,
+            timeoutMs: 9000,
+          }
+        );
+        if (epsRes.ok) {
+          seriesEpisodes = parseTvdbAllSeasonsHtml(
+            epsRes.body,
+            tvdbSeriesId || 0,
+            options.mediaType || 'anime'
+          );
+        }
+      } catch {
+        // fall through to fetchTheTvdbDetails below
+      }
+    }
+
+    if (seriesEpisodes.length === 0 && tvdbSeriesId) {
+      const details = await fetchTheTvdbDetails(fetchHttp, tvdbSeriesId, {
+        mediaType: options.mediaType || 'anime',
+        slugHint: tvdbSlug,
+        credentials: options.credentials,
+        includeEpisodes: true,
+      }).catch(() => null);
+      if (details) {
+        seriesEpisodes = details.episodes;
+        tvdbSlug = tvdbSlug || details.externalIds?.tvdbSlug;
+      }
+    }
+
+    const matched = matchTvdbEpisodeFromList(seriesEpisodes, seasonNum, epNum);
+    if (matched) {
+      tvdbEpisodeId = matched.tvdbEpisodeId;
+      if (!fallbackEngOverview && matched.overview) {
+        fallbackEngOverview = cleanText(matched.overview) || undefined;
+      }
+    }
+  }
+
+  if (!tvdbEpisodeId) {
+    return fallbackEngOverview
+      ? { engOverview: fallbackEngOverview, tvdbSeriesId }
+      : null;
+  }
+
+  // 2. Try official TheTVDB v4 API episode translations when API key is configured
+  const token = await getTvdbBearerToken(fetchHttp, options.credentials);
+  if (token) {
+    try {
+      const [ptRes, engRes] = await Promise.all([
+        fetchHttp(`${TVDB_V4_API_BASE}/episodes/${tvdbEpisodeId}/translations/pt`, {
+          accept: 'application/json',
+          headers: { Authorization: `Bearer ${token}` },
+          timeoutMs: 6500,
+        }).catch(() => null),
+        fetchHttp(`${TVDB_V4_API_BASE}/episodes/${tvdbEpisodeId}/translations/eng`, {
+          accept: 'application/json',
+          headers: { Authorization: `Bearer ${token}` },
+          timeoutMs: 6500,
+        }).catch(() => null),
+      ]);
+
+      let ptBrOverview: string | undefined;
+      let ptBrTitle: string | undefined;
+      let engOverview: string | undefined;
+      let engTitle: string | undefined;
+
+      if (ptRes?.ok) {
+        const parsed = JSON.parse(ptRes.body) as { data?: { name?: string; overview?: string } };
+        ptBrOverview = cleanText(parsed.data?.overview) || undefined;
+        ptBrTitle = cleanText(parsed.data?.name) || undefined;
+      }
+      if (engRes?.ok) {
+        const parsed = JSON.parse(engRes.body) as { data?: { name?: string; overview?: string } };
+        engOverview = cleanText(parsed.data?.overview) || undefined;
+        engTitle = cleanText(parsed.data?.name) || undefined;
+      }
+
+      if (ptBrOverview || engOverview) {
+        return {
+          ptBrOverview,
+          ptBrTitle,
+          engOverview: engOverview || fallbackEngOverview,
+          engTitle,
+          tvdbEpisodeId,
+          tvdbSeriesId,
+        };
+      }
+    } catch {
+      // Fall through to public TheTVDB.com episode HTML page
+    }
+  }
+
+  // 3. Public TheTVDB.com episode page (zero API key required)
+  const epPageUrl = tvdbSlug
+    ? `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(tvdbSlug)}/episodes/${tvdbEpisodeId}`
+    : `${TVDB_WEB_ORIGIN}/dereferrer/episode/${tvdbEpisodeId}`;
+
+  try {
+    const res = await fetchHttp(epPageUrl, {
+      referer: `${TVDB_WEB_ORIGIN}/`,
+      timeoutMs: 9000,
+    });
+    if (res.ok) {
+      const parsed = parseTvdbEpisodePageHtml(res.body);
+      return {
+        ptBrOverview: parsed.ptBrOverview,
+        ptBrTitle: parsed.ptBrTitle,
+        engOverview: parsed.engOverview || fallbackEngOverview,
+        engTitle: parsed.engTitle,
+        tvdbEpisodeId,
+        tvdbSeriesId,
+      };
+    }
+  } catch {
+    // Fall back to overview captured from /allseasons/official if available
+  }
+
+  if (fallbackEngOverview) {
+    return {
+      engOverview: fallbackEngOverview,
+      tvdbEpisodeId,
+      tvdbSeriesId,
+    };
+  }
+
+  return null;
 }

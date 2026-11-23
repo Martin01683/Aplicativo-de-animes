@@ -27,6 +27,7 @@ import {
   normalizeTopAnimesUrl,
   pickLatestAnimeEpisode,
 } from './favoriteAlerts.ts';
+import { resolveLocalizedEpisodeSynopsis } from './episodeSynopsis.ts';
 import {
   extractHinataSoulSeasonNumber,
   parseHinataSoulEpisodePageHtml,
@@ -232,8 +233,8 @@ async function resolveCanonicalEpisodeDetails(
     synopsis: matchedEp?.overview || details.synopsis,
     genres: details.genres,
     prevUrl:
-      prevEp?.url ||
-      (!isMovie && parsed.episodeNumber > 1
+      (prevEp && prevEp.availableOnServer !== false ? prevEp.url : undefined) ||
+      (!isMovie && !prevEp && parsed.episodeNumber > 1
         ? buildEpisodeUri(
             parsed.mediaType,
             parsed.source,
@@ -242,7 +243,7 @@ async function resolveCanonicalEpisodeDetails(
             parsed.episodeNumber - 1
           )
         : undefined),
-    nextUrl: nextEp?.url,
+    nextUrl: nextEp && nextEp.availableOnServer !== false ? nextEp.url : undefined,
     options: aggregated.options,
     sourceReports: aggregated.reports,
     isMovie,
@@ -670,6 +671,54 @@ export async function dispatchAnisyncApiRequest(
     }
 
     return { status: 200, body: { latestByUrl } };
+  }
+
+  if (pathname === '/api/episode-synopsis') {
+    const title = (url.searchParams.get('title') || '').trim();
+    const originalTitle = (url.searchParams.get('originalTitle') || '').trim() || undefined;
+    const year = (url.searchParams.get('year') || '').trim() || undefined;
+    const mediaTypeParam = (url.searchParams.get('mediaType') || '').trim();
+    const mediaType =
+      mediaTypeParam === 'series'
+        ? 'series'
+        : mediaTypeParam === 'movie'
+          ? 'movie'
+          : 'anime';
+    const seasonRaw = Number.parseInt(url.searchParams.get('season') || '', 10);
+    const episodeRaw = Number.parseInt(url.searchParams.get('episode') || '', 10);
+    const tvdbIdRaw = Number.parseInt(url.searchParams.get('tvdbId') || '', 10);
+    const tvdbEpisodeIdRaw = Number.parseInt(url.searchParams.get('tvdbEpisodeId') || '', 10);
+    const tvdbSlug = (url.searchParams.get('tvdbSlug') || '').trim() || undefined;
+    const fallbackEnglishOverview =
+      (url.searchParams.get('englishOverview') || '').trim().slice(0, 2000) || undefined;
+
+    if (!title && !originalTitle && !tvdbIdRaw && !tvdbSlug && !tvdbEpisodeIdRaw) {
+      return { status: 400, body: { error: 'Parâmetros insuficientes para buscar sinopse do episódio.' } };
+    }
+
+    try {
+      const result = await resolveLocalizedEpisodeSynopsis(fetchHttp, {
+        title: title || undefined,
+        originalTitle,
+        year,
+        mediaType,
+        seasonNumber: Number.isFinite(seasonRaw) && seasonRaw > 0 ? seasonRaw : 1,
+        episodeNumber: Number.isFinite(episodeRaw) && episodeRaw > 0 ? episodeRaw : undefined,
+        tvdbId: Number.isFinite(tvdbIdRaw) && tvdbIdRaw > 0 ? tvdbIdRaw : undefined,
+        tvdbSlug,
+        tvdbEpisodeId:
+          Number.isFinite(tvdbEpisodeIdRaw) && tvdbEpisodeIdRaw > 0
+            ? tvdbEpisodeIdRaw
+            : undefined,
+        fallbackEnglishOverview,
+        credentials: catalogPrefs?.credentials,
+        useCache,
+      });
+
+      return { status: 200, body: { result } };
+    } catch {
+      return { status: 200, body: { result: null } };
+    }
   }
 
   if (pathname === '/api/episode') {
