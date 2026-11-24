@@ -1,11 +1,13 @@
 import * as cheerio from 'cheerio';
 import {
+  isEpisodeAvailableOnServer,
   mergeServerAndCatalogEpisodes,
   parseEpisodeDateToTimestampSec,
 } from '../../episodeAvailability.ts';
 import { translateEnglishToPtBr } from '../../googleTranslate.ts';
 import type { HttpFetcher } from '../../httpTypes.ts';
 import type {
+  AnimeAudioTrackData,
   AnimeDetails,
   AnimeEpisodeLink,
   CatalogSourceCredentials,
@@ -28,6 +30,7 @@ import {
   extractSafeParentPrefixForTvdb,
   extractSeasonAndPartInfo,
   unifyServerSeasonsWithCatalog,
+  type UnifiedAudioTrackResult,
 } from '../seasonUnifier.ts';
 
 const TVDB_V4_API_BASE = 'https://api4.thetvdb.com/v4';
@@ -1315,6 +1318,54 @@ export async function fetchTheTvdbDetails(
   }
 }
 
+function buildDualAudioTracks(params: {
+  primaryAudio: 'DUB' | 'LEG';
+  primaryEpisodes: AnimeEpisodeLink[];
+  primarySourceUrl: string;
+  alternateTrack?: UnifiedAudioTrackResult;
+  mergeAlternateEpisodes: (
+    serverEpisodes: AnimeEpisodeLink[],
+    sourceUrl: string
+  ) => AnimeEpisodeLink[];
+}): Partial<Record<'DUB' | 'LEG', AnimeAudioTrackData>> | undefined {
+  const {
+    primaryAudio,
+    primaryEpisodes,
+    primarySourceUrl,
+    alternateTrack,
+    mergeAlternateEpisodes,
+  } = params;
+  if (!alternateTrack || alternateTrack.serverEpisodes.length === 0) {
+    return undefined;
+  }
+
+  const alternateSourceUrl = alternateTrack.sourceUrl || primarySourceUrl;
+  const mergedAlternate = mergeAlternateEpisodes(
+    alternateTrack.serverEpisodes,
+    alternateSourceUrl
+  );
+  const alternatePlayableCount = mergedAlternate.filter(isEpisodeAvailableOnServer).length;
+  if (alternatePlayableCount === 0) {
+    return undefined;
+  }
+
+  const primaryPlayableCount = primaryEpisodes.filter(isEpisodeAvailableOnServer).length;
+  return {
+    [primaryAudio]: {
+      audioType: primaryAudio,
+      episodes: primaryEpisodes,
+      playableCount: primaryPlayableCount,
+      sourceUrl: primarySourceUrl,
+    },
+    [alternateTrack.audioType]: {
+      audioType: alternateTrack.audioType,
+      episodes: mergedAlternate,
+      playableCount: alternatePlayableCount,
+      sourceUrl: alternateTrack.sourceUrl,
+    },
+  };
+}
+
 /**
  * Enriches media details coming from the streaming server (TopAnimes / Hinata Soul)
  * with complete metadata & official episode schedule from TheTVDB + LiveChart.me
@@ -1341,6 +1392,7 @@ export async function enrichServerDetailsWithTheTvdb(
     serverDetails.url,
     serverDetails.audioType
   );
+  const primaryAudio: 'DUB' | 'LEG' = primaryTitleInfo.audioType === 'DUB' ? 'DUB' : 'LEG';
   const isLikelyLaterSeasonOrArc =
     (primaryTitleInfo.seasonNumber !== null && primaryTitleInfo.seasonNumber > 1) ||
     primaryTitleInfo.isFinalSeason ||
@@ -1371,6 +1423,7 @@ export async function enrichServerDetailsWithTheTvdb(
       unifiedWithoutTvdb && unifiedWithoutTvdb.unifiedSeasonCount > 1
         ? String(unifiedWithoutTvdb.unifiedSeasonCount)
         : serverDetails.seasonsCount;
+    const cleanAltTitle = stripSeasonFromTitle(activeTitle) || activeTitle;
 
     if (!isMovie && liveChartHint) {
       const mergedWithSchedule = mergeServerAndCatalogEpisodes({
@@ -1383,19 +1436,52 @@ export async function enrichServerDetailsWithTheTvdb(
         mediaType: (serverDetails.kind as CanonicalMediaType) || 'anime',
         unifyAllSeasons: true,
       });
+      const audioTracks = buildDualAudioTracks({
+        primaryAudio: unifiedWithoutTvdb?.primaryAudioType || primaryAudio,
+        primaryEpisodes: mergedWithSchedule,
+        primarySourceUrl: serverDetails.url,
+        alternateTrack: unifiedWithoutTvdb?.alternateAudioTrack,
+        mergeAlternateEpisodes: (altEps, altUrl) =>
+          mergeServerAndCatalogEpisodes({
+            serverTitle: cleanAltTitle,
+            serverUrl: altUrl,
+            serverEpisodes: altEps,
+            catalogEpisodes: [],
+            liveChartHint,
+            serverMatched: altEps.length > 0,
+            mediaType: (serverDetails.kind as CanonicalMediaType) || 'anime',
+            unifyAllSeasons: true,
+          }),
+      });
       return {
         ...serverDetails,
         title: activeTitle,
         seasonsCount: activeSeasonsCount,
         episodes: mergedWithSchedule,
+        ...(audioTracks ? { audioTracks } : {}),
       };
     }
-    if (unifiedWithoutTvdb && unifiedWithoutTvdb.addedSeasonPages > 0) {
+
+    const fallbackAudioTracks = !isMovie
+      ? buildDualAudioTracks({
+          primaryAudio: unifiedWithoutTvdb?.primaryAudioType || primaryAudio,
+          primaryEpisodes: activeEpisodes,
+          primarySourceUrl: serverDetails.url,
+          alternateTrack: unifiedWithoutTvdb?.alternateAudioTrack,
+          mergeAlternateEpisodes: (altEps) => altEps,
+        })
+      : undefined;
+
+    if (
+      unifiedWithoutTvdb &&
+      (unifiedWithoutTvdb.addedSeasonPages > 0 || Boolean(fallbackAudioTracks))
+    ) {
       return {
         ...serverDetails,
         title: activeTitle,
         seasonsCount: activeSeasonsCount,
         episodes: activeEpisodes,
+        ...(fallbackAudioTracks ? { audioTracks: fallbackAudioTracks } : {}),
       };
     }
     return serverDetails;
@@ -1530,6 +1616,29 @@ export async function enrichServerDetailsWithTheTvdb(
           unifyAllSeasons: true,
         });
 
+  const cleanAlternateTitle = stripSeasonFromTitle(resolvedTitle) || resolvedTitle;
+  const audioTracks =
+    resolvedKind !== 'movie'
+      ? buildDualAudioTracks({
+          primaryAudio: unifiedSeasons?.primaryAudioType || primaryAudio,
+          primaryEpisodes: mergedEpisodes,
+          primarySourceUrl: serverDetails.url,
+          alternateTrack: unifiedSeasons?.alternateAudioTrack,
+          mergeAlternateEpisodes: (altEps, altUrl) =>
+            mergeServerAndCatalogEpisodes({
+              serverTitle: cleanAlternateTitle,
+              serverUrl: altUrl,
+              serverEpisodes: altEps,
+              catalogEpisodes: tvdb?.episodes || [],
+              liveChartHint: resolvedLiveChartHint,
+              serverMatched: altEps.length > 0,
+              tvdbId: bestMatch.tvdbId,
+              mediaType: resolvedKind,
+              unifyAllSeasons: true,
+            }),
+        })
+      : undefined;
+
   const mergedSeasonCount =
     resolvedKind !== 'movie' && mergedEpisodes.length > 0
       ? new Set(mergedEpisodes.map((ep) => ep.seasonNumber || 1)).size
@@ -1569,6 +1678,7 @@ export async function enrichServerDetailsWithTheTvdb(
     originalLanguage: tvdb?.originalLanguage || bestMatch.originalLanguage,
     genres: tvdbGenres.length > 0 ? tvdbGenres : serverDetails.genres,
     episodes: mergedEpisodes,
+    ...(audioTracks ? { audioTracks } : {}),
   };
 }
 

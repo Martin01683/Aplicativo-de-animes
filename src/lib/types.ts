@@ -176,6 +176,7 @@ export interface AnimeEpisodeLink {
   seasonLabel?: string;
   title: string;
   url: string;
+  audioType?: AudioType;
   date?: string;
   thumb?: string;
   overview?: string;
@@ -185,6 +186,13 @@ export interface AnimeEpisodeLink {
   airingAt?: number;
   hasExactAiringTime?: boolean;
   tvdbEpisodeId?: number;
+}
+
+export interface AnimeAudioTrackData {
+  audioType: 'DUB' | 'LEG';
+  episodes: AnimeEpisodeLink[];
+  playableCount: number;
+  sourceUrl?: string;
 }
 
 export interface ExternalDatabaseLinkItem {
@@ -229,6 +237,7 @@ export interface AnimeDetails {
   genres: string[];
   audioType: AudioType;
   episodes: AnimeEpisodeLink[];
+  audioTracks?: Partial<Record<'DUB' | 'LEG', AnimeAudioTrackData>>;
   relations?: CatalogMediaItem[];
 }
 

@@ -53,12 +53,20 @@ export interface MatchedSiblingSeason {
   fallbackCandidates?: MatchedSiblingSeason[];
 }
 
+export interface UnifiedAudioTrackResult {
+  audioType: 'DUB' | 'LEG';
+  serverEpisodes: AnimeEpisodeLink[];
+  sourceUrl?: string;
+}
+
 export interface UnifiedServerSeasonsResult {
   serverEpisodes: AnimeEpisodeLink[];
   unifiedTitle: string;
   unifiedSeasonCount: number;
   addedSeasonPages: number;
   primarySeasonNumber: number;
+  primaryAudioType?: 'DUB' | 'LEG';
+  alternateAudioTrack?: UnifiedAudioTrackResult;
 }
 
 interface TvdbSeasonMeta {
@@ -634,6 +642,7 @@ export function matchSiblingSeasonCandidates(params: {
   primaryUrl: string;
   primaryTitle: string;
   primaryAudioType?: AudioType;
+  requiredAudioType?: 'DUB' | 'LEG';
   primarySeasonNumber: number;
   referenceTitles: string[];
   tvdbSeasons: number[];
@@ -647,6 +656,7 @@ export function matchSiblingSeasonCandidates(params: {
     primaryUrl,
     primaryTitle,
     primaryAudioType,
+    requiredAudioType,
     primarySeasonNumber,
     referenceTitles,
     tvdbSeasons,
@@ -660,7 +670,8 @@ export function matchSiblingSeasonCandidates(params: {
   const primaryCanon = canonicalServerUrl(primaryUrl);
   const primaryIsHs = isHinataSoulUrl(primaryUrl);
   const primaryInfo = extractSeasonAndPartInfo(primaryTitle, primaryUrl, primaryAudioType);
-  const effectivePrimaryAudio = primaryInfo.audioType || 'LEG';
+  const effectivePrimaryAudio: 'DUB' | 'LEG' =
+    requiredAudioType || (primaryInfo.audioType === 'DUB' ? 'DUB' : 'LEG');
 
   const refNormalizedBases = buildReferenceNormalizedBases(primaryTitle, referenceTitles);
   if (!refNormalizedBases.length) return [];
@@ -697,6 +708,9 @@ export function matchSiblingSeasonCandidates(params: {
 
     const info = extractSeasonAndPartInfo(cand.title, cand.url, cand.audioType);
     if (info.isMovieOrSpecial) continue;
+
+    const candAudio: 'DUB' | 'LEG' = info.audioType === 'DUB' ? 'DUB' : 'LEG';
+    if (requiredAudioType && candAudio !== requiredAudioType) continue;
 
     let baseScore = 0;
     for (const ref of refNormalizedBases) {
@@ -821,19 +835,19 @@ export function matchSiblingSeasonCandidates(params: {
     const isContinuationPart = Boolean(resolvedPart && resolvedPart > 1);
 
     // Skip candidates that represent the exact same arc/season as the opened page
-    // (unless primary is missing episodes or empty and this is a continuation / cross-provider backup)
+    // (unless primary is missing episodes or empty and this is a continuation / cross-provider same-audio backup)
     if (primaryHasPlayableEpisodes && groupKey === primaryGroupKey) {
       if (!needMoreEpisodesInPrimarySeason) {
         continue;
       }
-      // If primary needs more episodes, only allow the OTHER provider with the same audio
-      if (isHinataSoulUrl(cand.url) === primaryIsHs) {
+      // If primary needs more episodes, only allow the OTHER provider with the SAME audio
+      if (isHinataSoulUrl(cand.url) === primaryIsHs || candAudio !== effectivePrimaryAudio) {
         continue;
       }
     }
 
     // For plain numbered seasons (no arc subtitle), skip already-covered seasons unless continuation Part 2+
-    // or cross-provider backup for an incomplete primary season. Account for provider-vs-TheTVDB season shifts.
+    // or cross-provider same-audio backup for an incomplete primary season. Account for provider-vs-TheTVDB season shifts.
     const primaryHasSeasonShift =
       primaryInfo.seasonNumber !== null && primaryInfo.seasonNumber !== primarySeasonNumber;
     const isAlreadyCoveredPlainSeason =
@@ -848,6 +862,7 @@ export function matchSiblingSeasonCandidates(params: {
       const allowSameSeasonFill =
         needMoreEpisodesInPrimarySeason &&
         resolvedSeason === (primaryHasSeasonShift ? primaryInfo.seasonNumber : primarySeasonNumber) &&
+        candAudio === effectivePrimaryAudio &&
         (isContinuationPart || isHinataSoulUrl(cand.url) !== primaryIsHs);
       if (!allowSameSeasonFill) {
         continue;
@@ -862,12 +877,15 @@ export function matchSiblingSeasonCandidates(params: {
       effectiveInfo.normalizedSubtitle === primaryInfo.normalizedSubtitle &&
       (resolvedPart || 1) === (primaryInfo.partNumber || 1)
     ) {
-      if (!needMoreEpisodesInPrimarySeason || isHinataSoulUrl(cand.url) === primaryIsHs) {
+      if (
+        !needMoreEpisodesInPrimarySeason ||
+        isHinataSoulUrl(cand.url) === primaryIsHs ||
+        candAudio !== effectivePrimaryAudio
+      ) {
         continue;
       }
     }
 
-    const candAudio = info.audioType || 'LEG';
     const candIsHs = isHinataSoulUrl(cand.url);
 
     let totalScore = baseScore;
@@ -960,9 +978,15 @@ function normalizeEpisodesForSeason(
     partOffset?: number;
     preserveMultiSeason?: boolean;
     rebaseStartFromOne?: boolean;
+    audioType?: AudioType;
   } = {}
 ): AnimeEpisodeLink[] {
-  const { partOffset = 0, preserveMultiSeason = false, rebaseStartFromOne = false } = options;
+  const {
+    partOffset = 0,
+    preserveMultiSeason = false,
+    rebaseStartFromOne = false,
+    audioType,
+  } = options;
   const distinctSeasons = new Set(episodes.map((e) => e.seasonNumber || 1));
   const keepOriginalSeasons = preserveMultiSeason && distinctSeasons.size > 1;
 
@@ -991,6 +1015,7 @@ function normalizeEpisodesForSeason(
         /^\s*\d+\s*[-·]\s*\d+\s*$/.test(ep.numberLabel) ||
         /^\s*T\d+\s*[-·]\s*EP\.?\s*\d+\s*$/i.test(ep.numberLabel) ||
         /^\s*(?:ep\.?\s*)?\d+\s*$/i.test(ep.numberLabel));
+    const resolvedAudio = audioType ?? ep.audioType;
 
     return {
       ...ep,
@@ -1000,6 +1025,7 @@ function normalizeEpisodesForSeason(
       numberLabel: needsRenumberedLabel
         ? buildEpisodeSeasonLabel(sNum, adjustedEpNum, ep.numberLabel)
         : ep.numberLabel || buildEpisodeSeasonLabel(sNum, adjustedEpNum),
+      ...(resolvedAudio ? { audioType: resolvedAudio } : {}),
       availableOnServer: true,
     };
   });
@@ -1032,14 +1058,22 @@ async function fetchSiblingServerDetails(
 async function fetchSiblingGroupDetails(
   fetchHttp: HttpFetcher,
   candidate: MatchedSiblingSeason,
-  tvdbMetas: readonly TvdbSeasonMeta[]
+  tvdbMetas: readonly TvdbSeasonMeta[],
+  requiredAudioType?: 'DUB' | 'LEG'
 ): Promise<{ cand: MatchedSiblingSeason; details: AnimeDetails } | null> {
   const currentYear = new Date().getUTCFullYear();
   const allTvdbSeasonsHaveMultipleAiredEps =
     tvdbMetas.length > 0 && tvdbMetas.every((m) => m.airedEpisodes >= 4);
 
   const attempts = [candidate, ...(candidate.fallbackCandidates || [])];
-  for (const attempt of attempts) {
+  let best: { cand: MatchedSiblingSeason; details: AnimeDetails } | null = null;
+
+  for (let idx = 0; idx < attempts.length; idx += 1) {
+    const attempt = attempts[idx];
+    if (best && attempt.isHinataSoul === best.cand.isHinataSoul) {
+      continue;
+    }
+
     const details = await fetchSiblingServerDetails(fetchHttp, attempt);
     if (!details) continue;
     if (details.kind === 'movie' || /\/filmes?\//i.test(details.url)) continue;
@@ -1053,6 +1087,9 @@ async function fetchSiblingGroupDetails(
       details.url,
       details.audioType ?? attempt.audioType
     );
+    const fetchedAudio: 'DUB' | 'LEG' = attemptInfo.audioType === 'DUB' ? 'DUB' : 'LEG';
+    if (requiredAudioType && fetchedAudio !== requiredAudioType) continue;
+
     const attemptTiming = extractPageYearAndEarliestTs(
       details,
       playable,
@@ -1068,9 +1105,56 @@ async function fetchSiblingGroupDetails(
       allTvdbSeasonsHaveMultipleAiredEps;
     if (looksLikeUnmarkedMovie) continue;
 
-    return { cand: attempt, details: { ...details, episodes: playable } };
+    if (!best) {
+      best = { cand: attempt, details: { ...details, episodes: playable } };
+      const expectedAired =
+        attempt.seasonNumber > 0
+          ? (tvdbMetas.find((m) => m.seasonNumber === attempt.seasonNumber)?.airedEpisodes ?? 0)
+          : tvdbMetas.length === 1
+            ? tvdbMetas[0].airedEpisodes
+            : 0;
+      const hasOtherProviderFallback = attempts
+        .slice(idx + 1)
+        .some((a) => a.isHinataSoul !== attempt.isHinataSoul);
+      if (!(expectedAired >= playable.length + 3 && hasOtherProviderFallback)) {
+        return best;
+      }
+      continue;
+    }
+
+    // Merge missing same-audio episodes from the alternate provider backup into `best`
+    const existingKeys = new Set<string>();
+    const existingUrls = new Set<string>();
+    for (const ep of best.details.episodes) {
+      const epNum = ep.episodeNumber ?? parseEpisodeNumberFromLabel(ep.numberLabel || ep.title);
+      if (epNum !== null) existingKeys.add(`${ep.seasonNumber || 1}:${epNum}`);
+      if (ep.url) existingUrls.add(canonicalServerUrl(ep.url));
+    }
+
+    const extraEpisodes: AnimeEpisodeLink[] = [];
+    for (const ep of playable) {
+      const uKey = canonicalServerUrl(ep.url);
+      if (uKey && existingUrls.has(uKey)) continue;
+      const epNum = ep.episodeNumber ?? parseEpisodeNumberFromLabel(ep.numberLabel || ep.title);
+      if (epNum !== null && existingKeys.has(`${ep.seasonNumber || 1}:${epNum}`)) continue;
+      if (uKey) existingUrls.add(uKey);
+      if (epNum !== null) existingKeys.add(`${ep.seasonNumber || 1}:${epNum}`);
+      extraEpisodes.push(ep);
+    }
+
+    if (extraEpisodes.length > 0) {
+      best = {
+        ...best,
+        details: {
+          ...best.details,
+          episodes: [...best.details.episodes, ...extraEpisodes],
+        },
+      };
+    }
+    return best;
   }
-  return null;
+
+  return best;
 }
 
 function extractPageYearAndEarliestTs(
@@ -1390,15 +1474,475 @@ function buildSearchQueries(
   return [...latin, ...other].slice(0, 3);
 }
 
+interface PrimaryTrackContext {
+  details: AnimeDetails;
+  info: ParsedSeasonTitleInfo;
+  playableEps: AnimeEpisodeLink[];
+  metaTiming: { year: number | null; earliestEpTs: number | null };
+  isExactBase: boolean;
+  isSingleFlatSeason: boolean;
+  usesContinuousAbsolute: boolean;
+  rawSeasons: ReadonlySet<number>;
+  coveredSeasons: ReadonlySet<number>;
+  initialSeasonNumber: number;
+  needMoreEpisodesInPrimarySeason: boolean;
+}
+
+interface AssembledTrackResult {
+  serverEpisodes: AnimeEpisodeLink[];
+  addedSeasonPages: number;
+  primarySeasonNumber: number;
+  sourceUrl?: string;
+}
+
+async function assembleTrackEpisodesFromSiblings(params: {
+  fetchHttp: HttpFetcher;
+  trackAudio: 'DUB' | 'LEG';
+  matchedSiblings: readonly MatchedSiblingSeason[];
+  primaryCtx: PrimaryTrackContext | null;
+  referencePrimaryInfo: ParsedSeasonTitleInfo;
+  referencePrimarySeasonNumber: number;
+  tvdbMetas: readonly TvdbSeasonMeta[];
+  tvdbMetaBySeason: ReadonlyMap<number, TvdbSeasonMeta>;
+  maxTvdbSeason: number;
+  externalRefNormalizedBases: readonly string[];
+}): Promise<AssembledTrackResult | null> {
+  const {
+    fetchHttp,
+    trackAudio,
+    matchedSiblings,
+    primaryCtx,
+    referencePrimaryInfo,
+    referencePrimarySeasonNumber,
+    tvdbMetas,
+    tvdbMetaBySeason,
+    maxTvdbSeason,
+    externalRefNormalizedBases,
+  } = params;
+
+  // Fetch full AnimeDetails for each sibling group (with automatic fallback inside the group if #1 fails/is empty)
+  const fetchedSiblings: Array<{
+    cand: MatchedSiblingSeason;
+    details: AnimeDetails;
+    info: ParsedSeasonTitleInfo;
+    year: number | null;
+    earliestEpTs: number | null;
+    isExactSeriesBase: boolean;
+    isMultiSeasonPage: boolean;
+  }> = [];
+
+  for (let i = 0; i < matchedSiblings.length; i += 4) {
+    const batch = matchedSiblings.slice(i, i + 4);
+    const settled = await Promise.all(
+      batch.map((cand) => fetchSiblingGroupDetails(fetchHttp, cand, tvdbMetas, trackAudio))
+    );
+    for (const entry of settled) {
+      if (!entry) continue;
+      const { cand, details } = entry;
+      const rawInfo = extractSeasonAndPartInfo(
+        details.title || cand.title,
+        details.url,
+        details.audioType ?? cand.audioType
+      );
+      const info: ParsedSeasonTitleInfo =
+        !rawInfo.normalizedSubtitle && cand.normalizedSubtitle
+          ? {
+              ...rawInfo,
+              hasColonSubtitle: true,
+              subtitle: rawInfo.subtitle || cand.subtitle || cand.normalizedSubtitle,
+              normalizedSubtitle: cand.normalizedSubtitle,
+              seasonNumber: rawInfo.seasonNumber ?? cand.explicitSeasonNumber ?? null,
+            }
+          : rawInfo;
+      const timing = extractPageYearAndEarliestTs(
+        details,
+        details.episodes,
+        cand.year || info.extractedYear
+      );
+      const distinctRawSeasons = new Set(details.episodes.map((e) => e.seasonNumber || 1));
+
+      fetchedSiblings.push({
+        cand,
+        details,
+        info,
+        year: timing.year,
+        earliestEpTs: timing.earliestEpTs,
+        isExactSeriesBase: isExactBaseMatchToRefs(info, externalRefNormalizedBases),
+        isMultiSeasonPage: distinctRawSeasons.size > 1,
+      });
+    }
+  }
+
+  if (!fetchedSiblings.length) {
+    return null;
+  }
+
+  // Separate main season pages vs continuation Part 2+ split-cour pages
+  const mainSiblings = fetchedSiblings.filter(
+    (s) => !(s.info.partNumber && s.info.partNumber > 1) && !(s.cand.partNumber && s.cand.partNumber > 1)
+  );
+  const continuationSiblings = fetchedSiblings.filter(
+    (s) => Boolean((s.info.partNumber && s.info.partNumber > 1) || (s.cand.partNumber && s.cand.partNumber > 1))
+  );
+
+  let resolvedPrimarySeasonNumber = primaryCtx
+    ? primaryCtx.initialSeasonNumber
+    : referencePrimarySeasonNumber;
+
+  // Resolve authoritative season numbers for primary + main sibling pages
+  const assignedSeasonById = new Map<string, number>();
+
+  if (tvdbMetas.length > 0) {
+    // Exclude seasons already covered by a multi-season primary page or continuous absolute numbering
+    const lockedSeasons = new Set<number>();
+    if (primaryCtx && (primaryCtx.usesContinuousAbsolute || !primaryCtx.isSingleFlatSeason)) {
+      for (const s of primaryCtx.coveredSeasons) lockedSeasons.add(s);
+    }
+
+    const alignablePages: AlignableServerPage[] = [];
+    if (
+      primaryCtx &&
+      primaryCtx.isSingleFlatSeason &&
+      !primaryCtx.usesContinuousAbsolute &&
+      primaryCtx.playableEps.length > 0
+    ) {
+      alignablePages.push({
+        id: '__primary__',
+        isPrimary: true,
+        details: primaryCtx.details,
+        info: primaryCtx.info,
+        episodes: primaryCtx.playableEps,
+        year: primaryCtx.metaTiming.year,
+        earliestEpTs: primaryCtx.metaTiming.earliestEpTs,
+        groupKey: computeCandidateGroupKey(
+          primaryCtx.info,
+          primaryCtx.isExactBase,
+          resolvedPrimarySeasonNumber
+        ),
+        audioBonus: 2,
+        isExactSeriesBase: primaryCtx.isExactBase,
+        isMultiSeasonPage: false,
+      });
+    }
+
+    const catalogS1Max = tvdbMetaBySeason.get(1)?.maxEpisodeNumber ?? 0;
+
+    mainSiblings.forEach((sib, idx) => {
+      if (sib.isMultiSeasonPage) return;
+      // Handle single continuous-absolute page on an alternate audio track (e.g. One Piece 1..1120)
+      if (
+        !primaryCtx &&
+        mainSiblings.length === 1 &&
+        sib.isExactSeriesBase &&
+        sib.info.seasonNumber === null &&
+        !sib.info.isFinalSeason &&
+        catalogS1Max > 0
+      ) {
+        const sibMaxEp = sib.details.episodes.reduce(
+          (m, e) =>
+            Math.max(m, e.episodeNumber ?? parseEpisodeNumberFromLabel(e.numberLabel || e.title) ?? 0),
+          0
+        );
+        if (sibMaxEp > catalogS1Max) {
+          assignedSeasonById.set(`sib:${idx}`, 1);
+          return;
+        }
+      }
+      alignablePages.push({
+        id: `sib:${idx}`,
+        isPrimary: false,
+        details: sib.details,
+        info: sib.info,
+        episodes: sib.details.episodes,
+        year: sib.year,
+        earliestEpTs: sib.earliestEpTs,
+        groupKey: sib.cand.groupKey || `sib:${idx}`,
+        audioBonus: Math.max(0, Math.min(2, sib.cand.score)),
+        isExactSeriesBase: sib.isExactSeriesBase,
+        isMultiSeasonPage: false,
+      });
+    });
+
+    const availableMetas = tvdbMetas.filter((m) => !lockedSeasons.has(m.seasonNumber));
+    const optimal = alignPagesToTvdbSeasons(alignablePages, availableMetas, tvdbMetas);
+
+    for (const [id, s] of optimal.entries()) {
+      assignedSeasonById.set(id, s);
+    }
+
+    // Update primarySeasonNumber from the joint global assignment (joint alignment is even more accurate than solo!)
+    const jointPrimarySeason = optimal.get('__primary__');
+    if (jointPrimarySeason !== undefined) {
+      resolvedPrimarySeasonNumber = jointPrimarySeason;
+    }
+
+    // For incomplete primary season where a cross-provider SAME-AUDIO backup fetched the SAME season, allow it to fill missing episodes
+    if (primaryCtx && primaryCtx.needMoreEpisodesInPrimarySeason) {
+      mainSiblings.forEach((sib, idx) => {
+        const id = `sib:${idx}`;
+        if (assignedSeasonById.has(id) || sib.isMultiSeasonPage) return;
+        const primaryKey = computeCandidateGroupKey(
+          primaryCtx.info,
+          primaryCtx.isExactBase,
+          resolvedPrimarySeasonNumber
+        );
+        if (sib.cand.groupKey === primaryKey && sib.details.episodes.length > primaryCtx.playableEps.length) {
+          assignedSeasonById.set(id, resolvedPrimarySeasonNumber);
+        }
+      });
+    }
+  } else {
+    // No TheTVDB metadata available -> assign deterministically by explicit season & chronological year with zero duplicates
+    const usedNoTvdbSeasons = new Set<number>();
+    if (primaryCtx) {
+      assignedSeasonById.set('__primary__', resolvedPrimarySeasonNumber);
+      if (primaryCtx.isSingleFlatSeason) {
+        usedNoTvdbSeasons.add(resolvedPrimarySeasonNumber);
+      } else {
+        for (const s of primaryCtx.rawSeasons) usedNoTvdbSeasons.add(s);
+      }
+    }
+
+    // First assign siblings with explicit seasonNumber or exact base (S1)
+    const unnumberedArcSiblings: Array<{ idx: number; year: number }> = [];
+    mainSiblings.forEach((sib, idx) => {
+      const id = `sib:${idx}`;
+      if (sib.isMultiSeasonPage) return;
+      if (sib.isExactSeriesBase && sib.info.seasonNumber === null && !sib.info.isFinalSeason) {
+        if (!usedNoTvdbSeasons.has(1)) {
+          assignedSeasonById.set(id, 1);
+          usedNoTvdbSeasons.add(1);
+        }
+      } else if (sib.info.seasonNumber !== null && !usedNoTvdbSeasons.has(sib.info.seasonNumber)) {
+        assignedSeasonById.set(id, sib.info.seasonNumber);
+        usedNoTvdbSeasons.add(sib.info.seasonNumber);
+      } else if (sib.info.isFinalSeason) {
+        const nextS =
+          usedNoTvdbSeasons.size > 0 ? Math.max(2, ...Array.from(usedNoTvdbSeasons)) + 1 : 2;
+        assignedSeasonById.set(id, nextS);
+        usedNoTvdbSeasons.add(nextS);
+      } else if (
+        !primaryCtx &&
+        sib.info.normalizedSubtitle &&
+        referencePrimaryInfo.normalizedSubtitle &&
+        sib.info.normalizedSubtitle === referencePrimaryInfo.normalizedSubtitle &&
+        !usedNoTvdbSeasons.has(referencePrimarySeasonNumber)
+      ) {
+        assignedSeasonById.set(id, referencePrimarySeasonNumber);
+        usedNoTvdbSeasons.add(referencePrimarySeasonNumber);
+      } else if (
+        !primaryCtx &&
+        mainSiblings.length === 1 &&
+        !usedNoTvdbSeasons.has(referencePrimarySeasonNumber) &&
+        scoreStrictBaseMatch(referencePrimaryInfo.normalizedBase, sib.info.normalizedBase) >= 0.85
+      ) {
+        assignedSeasonById.set(id, referencePrimarySeasonNumber);
+        usedNoTvdbSeasons.add(referencePrimarySeasonNumber);
+      } else if (sib.info.hasColonSubtitle && sib.info.seasonNumber === null) {
+        unnumberedArcSiblings.push({ idx, year: sib.year ?? 9999 });
+      }
+    });
+
+    // Then assign unnumbered subtitled arcs in chronological year order to free season numbers >= 2
+    unnumberedArcSiblings.sort((a, b) => a.year - b.year);
+    for (const item of unnumberedArcSiblings) {
+      let nextS = 2;
+      while (usedNoTvdbSeasons.has(nextS)) nextS += 1;
+      assignedSeasonById.set(`sib:${item.idx}`, nextS);
+      usedNoTvdbSeasons.add(nextS);
+    }
+  }
+
+  // Normalize primary episodes with their final authoritative season number
+  const normalizedPrimaryEps = primaryCtx
+    ? primaryCtx.isSingleFlatSeason
+      ? normalizeEpisodesForSeason(primaryCtx.playableEps, resolvedPrimarySeasonNumber, {
+          audioType: trackAudio,
+        })
+      : normalizeEpisodesForSeason(primaryCtx.playableEps, 1, {
+          preserveMultiSeason: true,
+          audioType: trackAudio,
+        })
+    : [];
+
+  // Merge primary + assigned sibling episodes, never overwriting any (season, episode) already present in primary
+  const mergedEpisodes: AnimeEpisodeLink[] = [...normalizedPrimaryEps];
+  const seenSeasonEp = new Set<string>();
+  const seenUrls = new Set<string>();
+  const maxEpBySeason = new Map<number, number>();
+  const assignedSeasonBySubtitle = new Map<string, number>();
+  const assignedSeasonByExplicitNum = new Map<number, number>();
+
+  if (primaryCtx && primaryCtx.info.normalizedSubtitle && primaryCtx.isSingleFlatSeason) {
+    assignedSeasonBySubtitle.set(primaryCtx.info.normalizedSubtitle, resolvedPrimarySeasonNumber);
+  }
+  if (primaryCtx && primaryCtx.info.seasonNumber !== null && primaryCtx.isSingleFlatSeason) {
+    assignedSeasonByExplicitNum.set(primaryCtx.info.seasonNumber, resolvedPrimarySeasonNumber);
+  }
+
+  for (const ep of normalizedPrimaryEps) {
+    const s = ep.seasonNumber || 1;
+    const n = ep.episodeNumber;
+    if (n !== null) {
+      seenSeasonEp.add(`${s}:${n}`);
+      maxEpBySeason.set(s, Math.max(maxEpBySeason.get(s) || 0, n));
+    }
+    if (ep.url) seenUrls.add(canonicalServerUrl(ep.url));
+  }
+
+  const appendNormalizedEpisodes = (eps: readonly AnimeEpisodeLink[]): number => {
+    let added = 0;
+    for (const ep of eps) {
+      const uKey = canonicalServerUrl(ep.url);
+      if (uKey && seenUrls.has(uKey)) continue;
+      const s = ep.seasonNumber || 1;
+      const n = ep.episodeNumber;
+      if (n !== null && seenSeasonEp.has(`${s}:${n}`)) continue;
+
+      if (uKey) seenUrls.add(uKey);
+      if (n !== null) {
+        seenSeasonEp.add(`${s}:${n}`);
+        maxEpBySeason.set(s, Math.max(maxEpBySeason.get(s) || 0, n));
+      }
+      mergedEpisodes.push(ep);
+      added += 1;
+    }
+    return added;
+  };
+
+  let addedSeasonPages = 0;
+  let bestSourceSeason = Number.POSITIVE_INFINITY;
+  let bestSourceUrl: string | undefined = primaryCtx?.details.url;
+
+  // 1. Append all assigned main sibling pages
+  mainSiblings.forEach((sib, idx) => {
+    const id = `sib:${idx}`;
+    if (sib.isMultiSeasonPage) {
+      const normalizedMulti = normalizeEpisodesForSeason(sib.details.episodes, 1, {
+        preserveMultiSeason: true,
+        audioType: trackAudio,
+      });
+      if (appendNormalizedEpisodes(normalizedMulti) > 0) {
+        addedSeasonPages += 1;
+        if (!primaryCtx && bestSourceSeason > 1) {
+          bestSourceSeason = 1;
+          bestSourceUrl = sib.details.url;
+        }
+      }
+      return;
+    }
+
+    const targetSeason = assignedSeasonById.get(id);
+    if (!targetSeason || targetSeason < 1) return;
+
+    if (sib.info.normalizedSubtitle) {
+      assignedSeasonBySubtitle.set(sib.info.normalizedSubtitle, targetSeason);
+    }
+    if (sib.info.seasonNumber !== null) {
+      assignedSeasonByExplicitNum.set(sib.info.seasonNumber, targetSeason);
+    }
+
+    // Detect disjoint continuous numbering on a Season 2+ page (e.g. eps 27..37 for a TheTVDB season numbered 1..11)
+    const targetMeta = tvdbMetaBySeason.get(targetSeason);
+    let rebaseStartFromOne = false;
+    if (targetSeason > 1 && targetMeta && targetMeta.minEpisodeNumber === 1 && targetMeta.maxEpisodeNumber > 0) {
+      const epNums = sib.details.episodes
+        .map((e) => e.episodeNumber ?? parseEpisodeNumberFromLabel(e.numberLabel || e.title))
+        .filter((n): n is number => n !== null && n > 0);
+      if (epNums.length >= 2 && Math.min(...epNums) > targetMeta.maxEpisodeNumber) {
+        rebaseStartFromOne = true;
+      }
+    }
+
+    const normalizedSibling = normalizeEpisodesForSeason(sib.details.episodes, targetSeason, {
+      preserveMultiSeason: false,
+      rebaseStartFromOne,
+      audioType: trackAudio,
+    });
+
+    if (appendNormalizedEpisodes(normalizedSibling) > 0) {
+      addedSeasonPages += 1;
+      if (!primaryCtx && targetSeason < bestSourceSeason) {
+        bestSourceSeason = targetSeason;
+        bestSourceUrl = sib.details.url;
+      }
+    }
+  });
+
+  // 2. Append split-cour continuation Part 2+ pages (e.g. "Spy x Family Part 2", "Dr. Stone: New World Part 2")
+  continuationSiblings.sort(
+    (a, b) =>
+      (a.info.partNumber || a.cand.partNumber || 2) - (b.info.partNumber || b.cand.partNumber || 2)
+  );
+
+  for (const sib of continuationSiblings) {
+    let targetSeason = resolvedPrimarySeasonNumber;
+    if (sib.info.normalizedSubtitle && assignedSeasonBySubtitle.has(sib.info.normalizedSubtitle)) {
+      targetSeason = assignedSeasonBySubtitle.get(sib.info.normalizedSubtitle)!;
+    } else if (sib.info.seasonNumber !== null) {
+      targetSeason = assignedSeasonByExplicitNum.get(sib.info.seasonNumber) ?? sib.info.seasonNumber;
+    } else if (sib.info.isFinalSeason && maxTvdbSeason > 1) {
+      targetSeason = maxTvdbSeason;
+    } else if (sib.cand.seasonNumber > 0) {
+      targetSeason = sib.cand.seasonNumber;
+    }
+
+    let partOffset = 0;
+    const epNums = sib.details.episodes
+      .map((e) => e.episodeNumber ?? parseEpisodeNumberFromLabel(e.numberLabel || e.title))
+      .filter((n): n is number => n !== null && n > 0);
+    const minEp = epNums.length > 0 ? Math.min(...epNums) : 1;
+    const existingMax = maxEpBySeason.get(targetSeason) || 0;
+
+    if (minEp <= existingMax && existingMax > 0) {
+      const catalogSeasonCount = tvdbMetaBySeason.get(targetSeason)?.totalEpisodes ?? 0;
+      const seasonTaken = new Set(mergedEpisodes.map((e) => e.seasonNumber || 1));
+      if (catalogSeasonCount >= existingMax + Math.min(sib.details.episodes.length, 4)) {
+        // TheTVDB groups Part 1 + Part 2 inside the same season -> offset Part 2 numbers after Part 1!
+        partOffset = existingMax;
+      } else if (!seasonTaken.has(targetSeason + 1)) {
+        // TheTVDB splits Part 2 into the next season
+        targetSeason = targetSeason + 1;
+      }
+    }
+
+    const normalizedPart = normalizeEpisodesForSeason(sib.details.episodes, targetSeason, {
+      partOffset,
+      preserveMultiSeason: false,
+      audioType: trackAudio,
+    });
+    if (appendNormalizedEpisodes(normalizedPart) > 0) {
+      addedSeasonPages += 1;
+      if (!primaryCtx && !bestSourceUrl) {
+        bestSourceUrl = sib.details.url;
+      }
+    }
+  }
+
+  mergedEpisodes.sort(
+    (a, b) =>
+      (a.seasonNumber || 1) - (b.seasonNumber || 1) ||
+      (a.episodeNumber || 0) - (b.episodeNumber || 0)
+  );
+
+  return {
+    serverEpisodes: mergedEpisodes,
+    addedSeasonPages,
+    primarySeasonNumber: resolvedPrimarySeasonNumber,
+    sourceUrl: bestSourceUrl,
+  };
+}
+
 /**
  * Discovers and merges sibling season/arc pages across integrated streaming providers (TopAnimes &
- * Hinata Soul) so every anime detail page displays ALL available seasons organized in one unified view.
+ * Hinata Soul) while keeping DUB and LEG audio tracks strictly separated and independently unified.
  */
 export async function unifyServerSeasonsWithCatalog(
   fetchHttp: HttpFetcher,
   serverDetails: AnimeDetails,
   catalogEpisodes: readonly AnimeEpisodeLink[],
-  extraReferenceTitles: string[] = []
+  extraReferenceTitles: string[] = [],
+  options: { discoverAlternateAudio?: boolean } = {}
 ): Promise<UnifiedServerSeasonsResult> {
   const isMovie = serverDetails.kind === 'movie' || /\/filmes?\//i.test(serverDetails.url);
   if (isMovie) {
@@ -1416,6 +1960,9 @@ export async function unifyServerSeasonsWithCatalog(
     serverDetails.url,
     serverDetails.audioType
   );
+  const primaryAudio: 'DUB' | 'LEG' = primaryInfo.audioType === 'DUB' ? 'DUB' : 'LEG';
+  const alternateAudio: 'DUB' | 'LEG' = primaryAudio === 'DUB' ? 'LEG' : 'DUB';
+
   const externalRefNormalizedBases = buildExternalReferenceNormalizedBases(extraReferenceTitles);
   const primaryIsExactBase = isExactBaseMatchToRefs(primaryInfo, externalRefNormalizedBases);
 
@@ -1517,7 +2064,7 @@ export async function unifyServerSeasonsWithCatalog(
     primarySeasonEpCount > 0 && airedInPrimarySeason >= primarySeasonEpCount + 3;
 
   const hasMissingTvdbSeasons = tvdbSeasons.some((s) => !coveredSeasons.has(s));
-  const shouldSearchSiblings =
+  const shouldSearchPrimarySiblings =
     hasMissingTvdbSeasons ||
     primarySeasonNumber > 1 ||
     primaryInfo.seasonNumber !== null ||
@@ -1527,19 +2074,26 @@ export async function unifyServerSeasonsWithCatalog(
     needMoreEpisodesInPrimarySeason ||
     catalogEpisodes.length === 0 ||
     playablePrimaryEps.length === 0;
+  const shouldDiscoverAlternateAudio = options.discoverAlternateAudio !== false;
 
   const buildFallbackNormalizedPrimary = (): AnimeEpisodeLink[] =>
     primaryIsSingleFlatSeason
-      ? normalizeEpisodesForSeason(playablePrimaryEps, primarySeasonNumber)
-      : normalizeEpisodesForSeason(playablePrimaryEps, 1, { preserveMultiSeason: true });
+      ? normalizeEpisodesForSeason(playablePrimaryEps, primarySeasonNumber, {
+          audioType: primaryAudio,
+        })
+      : normalizeEpisodesForSeason(playablePrimaryEps, 1, {
+          preserveMultiSeason: true,
+          audioType: primaryAudio,
+        });
 
-  if (!shouldSearchSiblings) {
+  if (!shouldSearchPrimarySiblings && !shouldDiscoverAlternateAudio) {
     return {
       serverEpisodes: buildFallbackNormalizedPrimary(),
       unifiedTitle: serverDetails.title,
       unifiedSeasonCount: Math.max(1, coveredSeasons.size, tvdbSeasons.length),
       addedSeasonPages: 0,
       primarySeasonNumber,
+      primaryAudioType: primaryAudio,
     };
   }
 
@@ -1551,6 +2105,7 @@ export async function unifyServerSeasonsWithCatalog(
       unifiedSeasonCount: Math.max(1, coveredSeasons.size, tvdbSeasons.length),
       addedSeasonPages: 0,
       primarySeasonNumber,
+      primaryAudioType: primaryAudio,
     };
   }
 
@@ -1582,20 +2137,41 @@ export async function unifyServerSeasonsWithCatalog(
     );
   }
 
-  const runCandidateMatch = () =>
-    matchSiblingSeasonCandidates({
-      primaryUrl: serverDetails.url,
-      primaryTitle: serverDetails.title,
-      primaryAudioType: serverDetails.audioType,
-      primarySeasonNumber,
-      referenceTitles: extraReferenceTitles,
-      tvdbSeasons,
-      catalogEpisodes,
-      alreadyCoveredSeasons: coveredSeasons,
-      needMoreEpisodesInPrimarySeason,
-      searchCandidates: searchPool,
-      primaryHasPlayableEpisodes: playablePrimaryEps.length > 0,
-    });
+  const runPrimaryCandidateMatch = () =>
+    shouldSearchPrimarySiblings
+      ? matchSiblingSeasonCandidates({
+          primaryUrl: serverDetails.url,
+          primaryTitle: serverDetails.title,
+          primaryAudioType: primaryAudio,
+          requiredAudioType: primaryAudio,
+          primarySeasonNumber,
+          referenceTitles: extraReferenceTitles,
+          tvdbSeasons,
+          catalogEpisodes,
+          alreadyCoveredSeasons: coveredSeasons,
+          needMoreEpisodesInPrimarySeason,
+          searchCandidates: searchPool,
+          primaryHasPlayableEpisodes: playablePrimaryEps.length > 0,
+        })
+      : [];
+
+  const runAlternateCandidateMatch = () =>
+    shouldDiscoverAlternateAudio
+      ? matchSiblingSeasonCandidates({
+          primaryUrl: serverDetails.url,
+          primaryTitle: serverDetails.title,
+          primaryAudioType: alternateAudio,
+          requiredAudioType: alternateAudio,
+          primarySeasonNumber,
+          referenceTitles: extraReferenceTitles,
+          tvdbSeasons,
+          catalogEpisodes,
+          alreadyCoveredSeasons: new Set<number>(),
+          needMoreEpisodesInPrimarySeason: true,
+          searchCandidates: searchPool,
+          primaryHasPlayableEpisodes: false,
+        })
+      : [];
 
   const primaryQuery = searchQueries[0];
   const [fullPrimary, suggestPrimary] = await Promise.all([
@@ -1605,26 +2181,38 @@ export async function unifyServerSeasonsWithCatalog(
   if (fullPrimary?.results?.length) addResults(fullPrimary.results);
   if (suggestPrimary?.results?.length) addResults(suggestPrimary.results);
 
-  let matchedSiblings = runCandidateMatch();
+  let matchedPrimarySiblings = runPrimaryCandidateMatch();
+  let matchedAlternateSiblings = runAlternateCandidateMatch();
 
-  const needsMoreCandidates = (matched: readonly MatchedSiblingSeason[]): boolean => {
-    if (tvdbSeasons.length > 0) {
-      const uncoveredCount = tvdbSeasons.filter((s) => !coveredSeasons.has(s)).length;
-      const nonPartMatched = matched.filter((m) => !m.partNumber || m.partNumber === 1).length;
-      if (nonPartMatched < uncoveredCount) return true;
+  const needsMoreCandidates = (
+    matchedPrimary: readonly MatchedSiblingSeason[],
+    matchedAlternate: readonly MatchedSiblingSeason[]
+  ): boolean => {
+    if (shouldSearchPrimarySiblings) {
+      if (tvdbSeasons.length > 0) {
+        const uncoveredCount = tvdbSeasons.filter((s) => !coveredSeasons.has(s)).length;
+        const nonPartMatched = matchedPrimary.filter((m) => !m.partNumber || m.partNumber === 1).length;
+        if (nonPartMatched < uncoveredCount) return true;
+      }
+      if (
+        (primarySeasonNumber > 1 || (primaryInfo.hasColonSubtitle && !primaryIsExactBase)) &&
+        !matchedPrimary.some((m) => m.seasonNumber === 1)
+      ) {
+        return true;
+      }
     }
-    if (
-      (primarySeasonNumber > 1 || (primaryInfo.hasColonSubtitle && !primaryIsExactBase)) &&
-      !matched.some((m) => m.seasonNumber === 1)
-    ) {
-      return true;
+    if (shouldDiscoverAlternateAudio && matchedAlternate.length > 0 && tvdbSeasons.length > 1) {
+      const altNonPartMatched = matchedAlternate.filter(
+        (m) => !m.partNumber || m.partNumber === 1
+      ).length;
+      if (altNonPartMatched < tvdbSeasons.length) return true;
     }
     return false;
   };
 
   // Fetch Page 2 (for large franchises with 10+ LEG/DUB/movie entries like Kimetsu no Yaiba)
   // and/or alternate title query (e.g. "Demon Slayer" vs "Kimetsu no Yaiba") in parallel if still missing seasons
-  if (needsMoreCandidates(matchedSiblings)) {
+  if (needsMoreCandidates(matchedPrimarySiblings, matchedAlternateSiblings)) {
     const extraTasks: Array<Promise<SearchResultItem[]>> = [];
 
     if (fullPrimary && fullPrimary.totalPages > 1) {
@@ -1661,12 +2249,16 @@ export async function unifyServerSeasonsWithCatalog(
       for (const batch of extraSettled) {
         if (batch.length) addResults(batch);
       }
-      matchedSiblings = runCandidateMatch();
+      matchedPrimarySiblings = runPrimaryCandidateMatch();
+      matchedAlternateSiblings = runAlternateCandidateMatch();
     }
   }
 
   // Third fallback query if still missing seasons (e.g. bilingual subtitle query)
-  if (needsMoreCandidates(matchedSiblings) && searchQueries.length > 2) {
+  if (
+    needsMoreCandidates(matchedPrimarySiblings, matchedAlternateSiblings) &&
+    searchQueries.length > 2
+  ) {
     const thirdQuery = searchQueries[2];
     const [fullThird, suggestThird] = await Promise.all([
       getServerSearch(fetchHttp, thirdQuery, 1).catch(() => null),
@@ -1674,352 +2266,75 @@ export async function unifyServerSeasonsWithCatalog(
     ]);
     if (fullThird?.results?.length) addResults(fullThird.results);
     if (suggestThird?.results?.length) addResults(suggestThird.results);
-    matchedSiblings = runCandidateMatch();
+    matchedPrimarySiblings = runPrimaryCandidateMatch();
+    matchedAlternateSiblings = runAlternateCandidateMatch();
   }
 
-  if (!matchedSiblings.length) {
-    return {
-      serverEpisodes: buildFallbackNormalizedPrimary(),
-      unifiedTitle: serverDetails.title,
-      unifiedSeasonCount: Math.max(1, coveredSeasons.size, tvdbSeasons.length),
-      addedSeasonPages: 0,
-      primarySeasonNumber,
-    };
-  }
-
-  // Fetch full AnimeDetails for each sibling group (with automatic fallback inside the group if #1 fails/is empty)
-  const fetchedSiblings: Array<{
-    cand: MatchedSiblingSeason;
-    details: AnimeDetails;
-    info: ParsedSeasonTitleInfo;
-    year: number | null;
-    earliestEpTs: number | null;
-    isExactSeriesBase: boolean;
-    isMultiSeasonPage: boolean;
-  }> = [];
-
-  for (let i = 0; i < matchedSiblings.length; i += 4) {
-    const batch = matchedSiblings.slice(i, i + 4);
-    const settled = await Promise.all(
-      batch.map((cand) => fetchSiblingGroupDetails(fetchHttp, cand, tvdbMetas))
-    );
-    for (const entry of settled) {
-      if (!entry) continue;
-      const { cand, details } = entry;
-      const rawInfo = extractSeasonAndPartInfo(
-        details.title || cand.title,
-        details.url,
-        details.audioType ?? cand.audioType
-      );
-      const info: ParsedSeasonTitleInfo =
-        !rawInfo.normalizedSubtitle && cand.normalizedSubtitle
-          ? {
-              ...rawInfo,
-              hasColonSubtitle: true,
-              subtitle: rawInfo.subtitle || cand.subtitle || cand.normalizedSubtitle,
-              normalizedSubtitle: cand.normalizedSubtitle,
-              seasonNumber: rawInfo.seasonNumber ?? cand.explicitSeasonNumber ?? null,
-            }
-          : rawInfo;
-      const timing = extractPageYearAndEarliestTs(
-        details,
-        details.episodes,
-        cand.year || info.extractedYear
-      );
-      const distinctRawSeasons = new Set(details.episodes.map((e) => e.seasonNumber || 1));
-
-      fetchedSiblings.push({
-        cand,
-        details,
-        info,
-        year: timing.year,
-        earliestEpTs: timing.earliestEpTs,
-        isExactSeriesBase: isExactBaseMatchToRefs(info, externalRefNormalizedBases),
-        isMultiSeasonPage: distinctRawSeasons.size > 1,
-      });
-    }
-  }
-
-  if (!fetchedSiblings.length) {
-    return {
-      serverEpisodes: buildFallbackNormalizedPrimary(),
-      unifiedTitle: serverDetails.title,
-      unifiedSeasonCount: Math.max(1, coveredSeasons.size, tvdbSeasons.length),
-      addedSeasonPages: 0,
-      primarySeasonNumber,
-    };
-  }
-
-  // Separate main season pages vs continuation Part 2+ split-cour pages
-  const mainSiblings = fetchedSiblings.filter(
-    (s) => !(s.info.partNumber && s.info.partNumber > 1) && !(s.cand.partNumber && s.cand.partNumber > 1)
-  );
-  const continuationSiblings = fetchedSiblings.filter(
-    (s) => Boolean((s.info.partNumber && s.info.partNumber > 1) || (s.cand.partNumber && s.cand.partNumber > 1))
-  );
-
-  // Resolve authoritative season numbers for primary + main sibling pages
-  const assignedSeasonById = new Map<string, number>();
-
-  if (tvdbMetas.length > 0) {
-    // Exclude seasons already covered by a multi-season primary page or continuous absolute numbering
-    const lockedSeasons = new Set<number>();
-    if (usesContinuousAbsolute || !primaryIsSingleFlatSeason) {
-      for (const s of coveredSeasons) lockedSeasons.add(s);
-    }
-
-    const alignablePages: AlignableServerPage[] = [];
-    if (primaryIsSingleFlatSeason && !usesContinuousAbsolute && playablePrimaryEps.length > 0) {
-      alignablePages.push({
-        id: '__primary__',
-        isPrimary: true,
-        details: serverDetails,
-        info: primaryInfo,
-        episodes: playablePrimaryEps,
-        year: primaryMetaTiming.year,
-        earliestEpTs: primaryMetaTiming.earliestEpTs,
-        groupKey: computeCandidateGroupKey(primaryInfo, primaryIsExactBase, primarySeasonNumber),
-        audioBonus: 2,
-        isExactSeriesBase: primaryIsExactBase,
-        isMultiSeasonPage: false,
-      });
-    }
-
-    mainSiblings.forEach((sib, idx) => {
-      if (sib.isMultiSeasonPage) return;
-      alignablePages.push({
-        id: `sib:${idx}`,
-        isPrimary: false,
-        details: sib.details,
-        info: sib.info,
-        episodes: sib.details.episodes,
-        year: sib.year,
-        earliestEpTs: sib.earliestEpTs,
-        groupKey: sib.cand.groupKey || `sib:${idx}`,
-        audioBonus: Math.max(0, Math.min(2, sib.cand.score)),
-        isExactSeriesBase: sib.isExactSeriesBase,
-        isMultiSeasonPage: false,
-      });
-    });
-
-    const availableMetas = tvdbMetas.filter((m) => !lockedSeasons.has(m.seasonNumber));
-    const optimal = alignPagesToTvdbSeasons(alignablePages, availableMetas, tvdbMetas);
-
-    for (const [id, s] of optimal.entries()) {
-      assignedSeasonById.set(id, s);
-    }
-
-    // Update primarySeasonNumber from the joint global assignment (joint alignment is even more accurate than solo!)
-    const jointPrimarySeason = optimal.get('__primary__');
-    if (jointPrimarySeason !== undefined) {
-      primarySeasonNumber = jointPrimarySeason;
-    }
-
-    // For incomplete primary season where a cross-provider backup fetched the SAME season, allow it to fill missing episodes
-    if (needMoreEpisodesInPrimarySeason) {
-      mainSiblings.forEach((sib, idx) => {
-        const id = `sib:${idx}`;
-        if (assignedSeasonById.has(id) || sib.isMultiSeasonPage) return;
-        const primaryKey = computeCandidateGroupKey(
-          primaryInfo,
-          primaryIsExactBase,
-          primarySeasonNumber
-        );
-        if (sib.cand.groupKey === primaryKey && sib.details.episodes.length > playablePrimaryEps.length) {
-          assignedSeasonById.set(id, primarySeasonNumber);
-        }
-      });
-    }
-  } else {
-    // No TheTVDB metadata available -> assign deterministically by explicit season & chronological year with zero duplicates
-    assignedSeasonById.set('__primary__', primarySeasonNumber);
-    const usedNoTvdbSeasons = new Set<number>(
-      primaryIsSingleFlatSeason ? [primarySeasonNumber] : Array.from(rawPrimarySeasons)
-    );
-
-    // First assign siblings with explicit seasonNumber or exact base (S1)
-    const unnumberedArcSiblings: Array<{ idx: number; year: number }> = [];
-    mainSiblings.forEach((sib, idx) => {
-      const id = `sib:${idx}`;
-      if (sib.isMultiSeasonPage) return;
-      if (sib.isExactSeriesBase && sib.info.seasonNumber === null && !sib.info.isFinalSeason) {
-        if (!usedNoTvdbSeasons.has(1)) {
-          assignedSeasonById.set(id, 1);
-          usedNoTvdbSeasons.add(1);
-        }
-      } else if (sib.info.seasonNumber !== null && !usedNoTvdbSeasons.has(sib.info.seasonNumber)) {
-        assignedSeasonById.set(id, sib.info.seasonNumber);
-        usedNoTvdbSeasons.add(sib.info.seasonNumber);
-      } else if (sib.info.isFinalSeason) {
-        const nextS = Math.max(2, ...Array.from(usedNoTvdbSeasons)) + 1;
-        assignedSeasonById.set(id, nextS);
-        usedNoTvdbSeasons.add(nextS);
-      } else if (sib.info.hasColonSubtitle && sib.info.seasonNumber === null) {
-        unnumberedArcSiblings.push({ idx, year: sib.year ?? 9999 });
-      }
-    });
-
-    // Then assign unnumbered subtitled arcs in chronological year order to free season numbers >= 2
-    unnumberedArcSiblings.sort((a, b) => a.year - b.year);
-    for (const item of unnumberedArcSiblings) {
-      let nextS = 2;
-      while (usedNoTvdbSeasons.has(nextS)) nextS += 1;
-      assignedSeasonById.set(`sib:${item.idx}`, nextS);
-      usedNoTvdbSeasons.add(nextS);
-    }
-  }
-
-  // Normalize primary episodes with their final authoritative season number
-  const normalizedPrimaryEps = primaryIsSingleFlatSeason
-    ? normalizeEpisodesForSeason(playablePrimaryEps, primarySeasonNumber)
-    : normalizeEpisodesForSeason(playablePrimaryEps, 1, { preserveMultiSeason: true });
-
-  // Merge primary + assigned sibling episodes, never overwriting any (season, episode) already present in primary
-  const mergedEpisodes: AnimeEpisodeLink[] = [...normalizedPrimaryEps];
-  const seenSeasonEp = new Set<string>();
-  const seenUrls = new Set<string>();
-  const maxEpBySeason = new Map<number, number>();
-  const assignedSeasonBySubtitle = new Map<string, number>();
-  const assignedSeasonByExplicitNum = new Map<number, number>();
-
-  if (primaryInfo.normalizedSubtitle && primaryIsSingleFlatSeason) {
-    assignedSeasonBySubtitle.set(primaryInfo.normalizedSubtitle, primarySeasonNumber);
-  }
-  if (primaryInfo.seasonNumber !== null && primaryIsSingleFlatSeason) {
-    assignedSeasonByExplicitNum.set(primaryInfo.seasonNumber, primarySeasonNumber);
-  }
-
-  for (const ep of normalizedPrimaryEps) {
-    const s = ep.seasonNumber || 1;
-    const n = ep.episodeNumber;
-    if (n !== null) {
-      seenSeasonEp.add(`${s}:${n}`);
-      maxEpBySeason.set(s, Math.max(maxEpBySeason.get(s) || 0, n));
-    }
-    if (ep.url) seenUrls.add(canonicalServerUrl(ep.url));
-  }
-
-  const appendNormalizedEpisodes = (eps: readonly AnimeEpisodeLink[]): number => {
-    let added = 0;
-    for (const ep of eps) {
-      const uKey = canonicalServerUrl(ep.url);
-      if (uKey && seenUrls.has(uKey)) continue;
-      const s = ep.seasonNumber || 1;
-      const n = ep.episodeNumber;
-      if (n !== null && seenSeasonEp.has(`${s}:${n}`)) continue;
-
-      if (uKey) seenUrls.add(uKey);
-      if (n !== null) {
-        seenSeasonEp.add(`${s}:${n}`);
-        maxEpBySeason.set(s, Math.max(maxEpBySeason.get(s) || 0, n));
-      }
-      mergedEpisodes.push(ep);
-      added += 1;
-    }
-    return added;
+  const primaryTrackContext: PrimaryTrackContext = {
+    details: serverDetails,
+    info: primaryInfo,
+    playableEps: playablePrimaryEps,
+    metaTiming: primaryMetaTiming,
+    isExactBase: primaryIsExactBase,
+    isSingleFlatSeason: primaryIsSingleFlatSeason,
+    usesContinuousAbsolute,
+    rawSeasons: rawPrimarySeasons,
+    coveredSeasons,
+    initialSeasonNumber: primarySeasonNumber,
+    needMoreEpisodesInPrimarySeason,
   };
 
-  let addedSeasonPages = 0;
+  // Assemble primary audio track and alternate audio track independently in parallel
+  const [assembledPrimary, assembledAlternate] = await Promise.all([
+    matchedPrimarySiblings.length > 0
+      ? assembleTrackEpisodesFromSiblings({
+          fetchHttp,
+          trackAudio: primaryAudio,
+          matchedSiblings: matchedPrimarySiblings,
+          primaryCtx: primaryTrackContext,
+          referencePrimaryInfo: primaryInfo,
+          referencePrimarySeasonNumber: primarySeasonNumber,
+          tvdbMetas,
+          tvdbMetaBySeason,
+          maxTvdbSeason,
+          externalRefNormalizedBases,
+        })
+      : Promise.resolve(null),
+    matchedAlternateSiblings.length > 0
+      ? assembleTrackEpisodesFromSiblings({
+          fetchHttp,
+          trackAudio: alternateAudio,
+          matchedSiblings: matchedAlternateSiblings,
+          primaryCtx: null,
+          referencePrimaryInfo: primaryInfo,
+          referencePrimarySeasonNumber: primarySeasonNumber,
+          tvdbMetas,
+          tvdbMetaBySeason,
+          maxTvdbSeason,
+          externalRefNormalizedBases,
+        })
+      : Promise.resolve(null),
+  ]);
 
-  // 1. Append all assigned main sibling pages
-  mainSiblings.forEach((sib, idx) => {
-    const id = `sib:${idx}`;
-    if (sib.isMultiSeasonPage) {
-      const normalizedMulti = normalizeEpisodesForSeason(sib.details.episodes, 1, {
-        preserveMultiSeason: true,
-      });
-      if (appendNormalizedEpisodes(normalizedMulti) > 0) {
-        addedSeasonPages += 1;
-      }
-      return;
-    }
+  const finalPrimaryEpisodes = assembledPrimary
+    ? assembledPrimary.serverEpisodes
+    : buildFallbackNormalizedPrimary();
+  const finalAddedSeasonPages = assembledPrimary ? assembledPrimary.addedSeasonPages : 0;
+  const finalPrimarySeasonNumber = assembledPrimary
+    ? assembledPrimary.primarySeasonNumber
+    : primarySeasonNumber;
 
-    const targetSeason = assignedSeasonById.get(id);
-    if (!targetSeason || targetSeason < 1) return;
+  const alternateAudioTrack: UnifiedAudioTrackResult | undefined =
+    assembledAlternate && assembledAlternate.serverEpisodes.length > 0
+      ? {
+          audioType: alternateAudio,
+          serverEpisodes: assembledAlternate.serverEpisodes,
+          sourceUrl: assembledAlternate.sourceUrl,
+        }
+      : undefined;
 
-    if (sib.info.normalizedSubtitle) {
-      assignedSeasonBySubtitle.set(sib.info.normalizedSubtitle, targetSeason);
-    }
-    if (sib.info.seasonNumber !== null) {
-      assignedSeasonByExplicitNum.set(sib.info.seasonNumber, targetSeason);
-    }
-
-    // Detect disjoint continuous numbering on a Season 2+ page (e.g. eps 27..37 for a TheTVDB season numbered 1..11)
-    const targetMeta = tvdbMetaBySeason.get(targetSeason);
-    let rebaseStartFromOne = false;
-    if (targetSeason > 1 && targetMeta && targetMeta.minEpisodeNumber === 1 && targetMeta.maxEpisodeNumber > 0) {
-      const epNums = sib.details.episodes
-        .map((e) => e.episodeNumber ?? parseEpisodeNumberFromLabel(e.numberLabel || e.title))
-        .filter((n): n is number => n !== null && n > 0);
-      if (epNums.length >= 2 && Math.min(...epNums) > targetMeta.maxEpisodeNumber) {
-        rebaseStartFromOne = true;
-      }
-    }
-
-    const normalizedSibling = normalizeEpisodesForSeason(sib.details.episodes, targetSeason, {
-      preserveMultiSeason: false,
-      rebaseStartFromOne,
-    });
-
-    if (appendNormalizedEpisodes(normalizedSibling) > 0) {
-      addedSeasonPages += 1;
-    }
-  });
-
-  // 2. Append split-cour continuation Part 2+ pages (e.g. "Spy x Family Part 2", "Dr. Stone: New World Part 2")
-  continuationSiblings.sort(
-    (a, b) =>
-      (a.info.partNumber || a.cand.partNumber || 2) - (b.info.partNumber || b.cand.partNumber || 2)
-  );
-
-  for (const sib of continuationSiblings) {
-    let targetSeason = primarySeasonNumber;
-    if (sib.info.normalizedSubtitle && assignedSeasonBySubtitle.has(sib.info.normalizedSubtitle)) {
-      targetSeason = assignedSeasonBySubtitle.get(sib.info.normalizedSubtitle)!;
-    } else if (sib.info.seasonNumber !== null) {
-      targetSeason = assignedSeasonByExplicitNum.get(sib.info.seasonNumber) ?? sib.info.seasonNumber;
-    } else if (sib.info.isFinalSeason && maxTvdbSeason > 1) {
-      targetSeason = maxTvdbSeason;
-    } else if (sib.cand.seasonNumber > 0) {
-      targetSeason = sib.cand.seasonNumber;
-    }
-
-    let partOffset = 0;
-    const epNums = sib.details.episodes
-      .map((e) => e.episodeNumber ?? parseEpisodeNumberFromLabel(e.numberLabel || e.title))
-      .filter((n): n is number => n !== null && n > 0);
-    const minEp = epNums.length > 0 ? Math.min(...epNums) : 1;
-    const existingMax = maxEpBySeason.get(targetSeason) || 0;
-
-    if (minEp <= existingMax && existingMax > 0) {
-      const catalogSeasonCount = tvdbMetaBySeason.get(targetSeason)?.totalEpisodes ?? 0;
-      const seasonTaken = new Set(mergedEpisodes.map((e) => e.seasonNumber || 1));
-      if (catalogSeasonCount >= existingMax + Math.min(sib.details.episodes.length, 4)) {
-        // TheTVDB groups Part 1 + Part 2 inside the same season -> offset Part 2 numbers after Part 1!
-        partOffset = existingMax;
-      } else if (!seasonTaken.has(targetSeason + 1)) {
-        // TheTVDB splits Part 2 into the next season
-        targetSeason = targetSeason + 1;
-      }
-    }
-
-    const normalizedPart = normalizeEpisodesForSeason(sib.details.episodes, targetSeason, {
-      partOffset,
-      preserveMultiSeason: false,
-    });
-    if (appendNormalizedEpisodes(normalizedPart) > 0) {
-      addedSeasonPages += 1;
-    }
-  }
-
-  mergedEpisodes.sort(
-    (a, b) =>
-      (a.seasonNumber || 1) - (b.seasonNumber || 1) ||
-      (a.episodeNumber || 0) - (b.episodeNumber || 0)
-  );
-
-  const distinctUnifiedSeasons = new Set(mergedEpisodes.map((e) => e.seasonNumber || 1));
-  const unifiedMultiple = distinctUnifiedSeasons.size > 1 || addedSeasonPages > 0;
+  const distinctUnifiedSeasons = new Set(finalPrimaryEpisodes.map((e) => e.seasonNumber || 1));
+  const unifiedMultiple = distinctUnifiedSeasons.size > 1 || finalAddedSeasonPages > 0;
   const shouldCleanSubtitledArc =
     unifiedMultiple &&
     primaryInfo.hasColonSubtitle &&
@@ -2032,7 +2347,7 @@ export async function unifyServerSeasonsWithCatalog(
       primaryInfo.partNumber !== null);
 
   return {
-    serverEpisodes: mergedEpisodes,
+    serverEpisodes: finalPrimaryEpisodes,
     unifiedTitle:
       shouldCleanSeasonSuffix || shouldCleanSubtitledArc
         ? buildUnifiedSeriesTitle(
@@ -2042,7 +2357,9 @@ export async function unifyServerSeasonsWithCatalog(
           )
         : serverDetails.title,
     unifiedSeasonCount: Math.max(distinctUnifiedSeasons.size, tvdbSeasons.length, 1),
-    addedSeasonPages,
-    primarySeasonNumber,
+    addedSeasonPages: finalAddedSeasonPages,
+    primarySeasonNumber: finalPrimarySeasonNumber,
+    primaryAudioType: primaryAudio,
+    alternateAudioTrack,
   };
 }

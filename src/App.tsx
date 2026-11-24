@@ -51,6 +51,7 @@ import {
 import {
   consumeNativeVlcPendingSession,
   isSameEpisodeUrl,
+  resolveSeriesEpisodesForEpisode,
   setNativeVlcVideoScale,
   type NativeVlcPlayResult,
 } from './lib/nativeVlcPlayer';
@@ -1481,14 +1482,25 @@ export default function App() {
 
     const currentAnime = animeDetailsRef.current;
     if (currentAnime) {
-      const matchedEp = currentAnime.episodes.find(
+      const candidateTrackEps = [
+        ...currentAnime.episodes,
+        ...(currentAnime.audioTracks?.DUB?.episodes || []),
+        ...(currentAnime.audioTracks?.LEG?.episodes || []),
+      ];
+      const matchedEp = candidateTrackEps.find(
         (ep) => canonicalEpisodeProgressKey(ep.url) === key || ep.url === targetUrl
       );
       if (matchedEp) {
+        const matchedTrack =
+          matchedEp.audioType === 'DUB'
+            ? currentAnime.audioTracks?.DUB
+            : matchedEp.audioType === 'LEG'
+              ? currentAnime.audioTracks?.LEG
+              : undefined;
         return {
           title: matchedEp.title || `${currentAnime.title} — ${matchedEp.numberLabel || 'Episódio'}`,
           seriesTitle: currentAnime.title,
-          seriesUrl: currentAnime.url,
+          seriesUrl: matchedTrack?.sourceUrl || currentAnime.url,
           poster: currentAnime.poster,
           isMovie: currentAnime.kind === 'movie',
         };
@@ -2700,14 +2712,12 @@ export default function App() {
                 }
               >
                 {(() => {
-                  const matchesLoadedAnime = Boolean(
-                    animeDetails &&
-                      ((episodeDetails.seriesUrl &&
-                        isSameEpisodeUrl(animeDetails.url, episodeDetails.seriesUrl)) ||
-                        animeDetails.episodes.some((ep) =>
-                          isSameEpisodeUrl(ep.url, episodeDetails.url)
-                        ))
+                  const matchedTrackEpisodes = resolveSeriesEpisodesForEpisode(
+                    animeDetails,
+                    episodeDetails.url,
+                    episodeDetails.seriesUrl
                   );
+                  const matchesLoadedAnime = Boolean(matchedTrackEpisodes);
                   return (
                     <EpisodeWorkspace
                       episode={episodeDetails}
@@ -2717,7 +2727,7 @@ export default function App() {
                       )}
                       watchedUrls={watchedUrls}
                       progressMap={progressMap}
-                      initialSeriesEpisodes={matchesLoadedAnime ? animeDetails?.episodes : undefined}
+                      initialSeriesEpisodes={matchedTrackEpisodes}
                       initialSeriesArtwork={
                         matchesLoadedAnime && animeDetails
                           ? {

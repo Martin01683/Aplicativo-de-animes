@@ -31,6 +31,7 @@ import {
   findUpcomingNextEpisode,
   isDesktopShortcutsEnabled,
   isSameEpisodeUrl,
+  resolveSeriesEpisodesForEpisode,
   resolveSeriesPrevNext,
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
@@ -149,7 +150,7 @@ export function EpisodeWorkspace({
   const activeEpisodeUrlRef = useRef(episode.url);
   activeEpisodeUrlRef.current = episode.url;
 
-  const seriesCacheRef = useRef<Map<string, AnimeEpisodeLink[]>>(new Map());
+  const seriesDetailsCacheRef = useRef<Map<string, AnimeDetails>>(new Map());
   const seriesExternalIdsCacheRef = useRef<Map<string, ExternalMediaIds>>(new Map());
   const seriesArtworkCacheRef = useRef<Map<string, { poster?: string; backdrop?: string }>>(
     new Map()
@@ -246,7 +247,6 @@ export function EpisodeWorkspace({
       seriesArtworkCacheRef.current.set(seriesKey, initialSeriesArtwork);
     }
     if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
-      seriesCacheRef.current.set(seriesKey, initialSeriesEpisodes);
       setSeriesEpisodes(initialSeriesEpisodes);
       const cachedIds = seriesExternalIdsCacheRef.current.get(seriesKey);
       setSeriesExternalIds(episode.externalIds || initialSeriesExternalIds || cachedIds);
@@ -257,17 +257,24 @@ export function EpisodeWorkspace({
       return;
     }
 
-    const cached = seriesCacheRef.current.get(seriesKey);
-    if (cached && cached.length > 0) {
-      setSeriesEpisodes(cached);
-      setSeriesExternalIds(
-        episode.externalIds || initialSeriesExternalIds || seriesExternalIdsCacheRef.current.get(seriesKey)
-      );
-      setSeriesArtwork(
-        initialSeriesArtwork || seriesArtworkCacheRef.current.get(seriesKey) || {}
-      );
-      setSeriesMediaReadyForUrl(seriesUrl);
-      return;
+    const cachedDetails = seriesDetailsCacheRef.current.get(seriesKey);
+    if (cachedDetails) {
+      const resolvedTrackEps =
+        resolveSeriesEpisodesForEpisode(cachedDetails, episode.url, seriesUrl) ||
+        cachedDetails.episodes;
+      if (resolvedTrackEps.length > 0) {
+        setSeriesEpisodes(resolvedTrackEps);
+        setSeriesExternalIds(
+          episode.externalIds ||
+            initialSeriesExternalIds ||
+            seriesExternalIdsCacheRef.current.get(seriesKey)
+        );
+        setSeriesArtwork(
+          initialSeriesArtwork || seriesArtworkCacheRef.current.get(seriesKey) || {}
+        );
+        setSeriesMediaReadyForUrl(seriesUrl);
+        return;
+      }
     }
 
     let cancelled = false;
@@ -276,8 +283,10 @@ export function EpisodeWorkspace({
       .then((data: AnimeDetails | null) => {
         if (cancelled) return;
         if (data && Array.isArray(data.episodes)) {
-          seriesCacheRef.current.set(seriesKey, data.episodes);
-          setSeriesEpisodes(data.episodes);
+          seriesDetailsCacheRef.current.set(seriesKey, data);
+          const resolvedTrackEps =
+            resolveSeriesEpisodesForEpisode(data, episode.url, seriesUrl) || data.episodes;
+          setSeriesEpisodes(resolvedTrackEps);
         }
         if (data?.externalIds) {
           seriesExternalIdsCacheRef.current.set(seriesKey, data.externalIds);
@@ -306,6 +315,7 @@ export function EpisodeWorkspace({
     episode.externalIds,
     episode.isMovie,
     episode.seriesUrl,
+    episode.url,
     initialSeriesArtwork,
     initialSeriesEpisodes,
     initialSeriesExternalIds,

@@ -2,7 +2,14 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import { isEpisodeAvailableOnServer } from './episodeAvailability';
 import { canonicalEpisodeKey as canonicalKey } from './favoriteAlerts';
 import type { VideoScaleMode } from './playbackProgress';
-import type { AnimeEpisodeLink, PlayerOption, StreamQuality, SubtitleTrack } from './types';
+import type {
+  AnimeAudioTrackData,
+  AnimeDetails,
+  AnimeEpisodeLink,
+  PlayerOption,
+  StreamQuality,
+  SubtitleTrack,
+} from './types';
 
 export interface NativeVlcPlayOptions {
   title: string;
@@ -172,6 +179,47 @@ export function findUpcomingNextEpisode(
 
   const candidate = episodes[nextIdx];
   return isEpisodeAvailableOnServer(candidate) ? undefined : candidate;
+}
+
+/**
+ * Resolves the episode list for the exact audio track (DUB or LEG) that owns `episodeUrl`
+ * (or `episodeSeriesUrl`), preventing Prev/Next episode navigation from silently crossing
+ * between dubbed and subbed tracks when both are available on the same anime page.
+ */
+export function resolveSeriesEpisodesForEpisode(
+  anime: AnimeDetails | null | undefined,
+  episodeUrl?: string,
+  episodeSeriesUrl?: string
+): AnimeEpisodeLink[] | undefined {
+  if (!anime) return undefined;
+
+  const tracks = [anime.audioTracks?.DUB, anime.audioTracks?.LEG].filter(
+    (t): t is AnimeAudioTrackData => Boolean(t && t.episodes.length > 0)
+  );
+
+  if (episodeUrl) {
+    for (const track of tracks) {
+      if (track.episodes.some((ep) => isSameEpisodeUrl(ep.url, episodeUrl))) {
+        return track.episodes;
+      }
+    }
+    if (anime.episodes.some((ep) => isSameEpisodeUrl(ep.url, episodeUrl))) {
+      return anime.episodes;
+    }
+  }
+
+  if (episodeSeriesUrl) {
+    for (const track of tracks) {
+      if (track.sourceUrl && isSameEpisodeUrl(track.sourceUrl, episodeSeriesUrl)) {
+        return track.episodes;
+      }
+    }
+    if (isSameEpisodeUrl(anime.url, episodeSeriesUrl)) {
+      return anime.episodes;
+    }
+  }
+
+  return undefined;
 }
 
 export async function playWithNativeVlc(

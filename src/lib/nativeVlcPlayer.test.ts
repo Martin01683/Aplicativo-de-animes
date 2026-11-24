@@ -10,10 +10,11 @@ import {
   computeSwipeVolume,
   findUpcomingNextEpisode,
   isSameEpisodeUrl,
+  resolveSeriesEpisodesForEpisode,
   resolveSeriesPrevNext,
   shouldEnableDesktopShortcuts,
 } from './nativeVlcPlayer.ts';
-import type { AnimeEpisodeLink } from './types.ts';
+import type { AnimeDetails, AnimeEpisodeLink } from './types.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
@@ -168,6 +169,122 @@ describe('nativeVlcPlayer & platform guards', () => {
       percent: 0,
       muted: true,
     });
+  });
+
+  it('scopes Prev/Next navigation strictly to the opened episode audio track (DUB vs LEG)', () => {
+    const dubEpisodes: AnimeEpisodeLink[] = [
+      {
+        numberLabel: 'EP 4',
+        episodeNumber: 4,
+        seasonNumber: 1,
+        title: 'Episódio 4',
+        url: 'https://topanimes.net/episodio/juukishi-dublado-ep-4/',
+        audioType: 'DUB',
+        availableOnServer: true,
+      },
+      {
+        numberLabel: 'EP 5',
+        episodeNumber: 5,
+        seasonNumber: 1,
+        title: 'Episódio 5',
+        url: 'https://topanimes.net/episodio/juukishi-dublado-ep-5/',
+        audioType: 'DUB',
+        availableOnServer: true,
+      },
+      {
+        numberLabel: 'EP 6',
+        episodeNumber: 6,
+        seasonNumber: 1,
+        title: 'Episódio 6',
+        url: 'anisync://episode/anime/thetvdb/999/s1/e6',
+        availableOnServer: false,
+      },
+    ];
+    const legEpisodes: AnimeEpisodeLink[] = [
+      {
+        numberLabel: 'EP 5',
+        episodeNumber: 5,
+        seasonNumber: 1,
+        title: 'Episódio 5',
+        url: 'https://www.hinatasoul.com/videos/juukishi-ep-5',
+        audioType: 'LEG',
+        availableOnServer: true,
+      },
+      {
+        numberLabel: 'EP 6',
+        episodeNumber: 6,
+        seasonNumber: 1,
+        title: 'Episódio 6',
+        url: 'https://www.hinatasoul.com/videos/juukishi-ep-6',
+        audioType: 'LEG',
+        availableOnServer: true,
+      },
+      {
+        numberLabel: 'EP 7',
+        episodeNumber: 7,
+        seasonNumber: 1,
+        title: 'Episódio 7',
+        url: 'https://www.hinatasoul.com/videos/juukishi-ep-7',
+        audioType: 'LEG',
+        availableOnServer: true,
+      },
+    ];
+
+    const dualAudioAnime: AnimeDetails = {
+      title: 'Tsuihou sareta Tensei Juukishi Dublado',
+      url: 'https://topanimes.net/animes/juukishi-dublado/',
+      kind: 'anime',
+      poster: '',
+      backdrop: '',
+      synopsis: '',
+      genres: [],
+      audioType: 'DUB',
+      episodes: dubEpisodes,
+      audioTracks: {
+        DUB: {
+          audioType: 'DUB',
+          episodes: dubEpisodes,
+          playableCount: 2,
+          sourceUrl: 'https://topanimes.net/animes/juukishi-dublado/',
+        },
+        LEG: {
+          audioType: 'LEG',
+          episodes: legEpisodes,
+          playableCount: 3,
+          sourceUrl: 'https://www.hinatasoul.com/animes/juukishi',
+        },
+      },
+    };
+
+    // Watching EP 5 DUB -> strictly stays in DUB track (never jumps to EP 6 LEG!)
+    const dubList = resolveSeriesEpisodesForEpisode(
+      dualAudioAnime,
+      'https://topanimes.net/episodio/juukishi-dublado-ep-5/',
+      'https://topanimes.net/animes/juukishi-dublado/'
+    );
+    assert.ok(dubList);
+    const dubNav = resolveSeriesPrevNext(
+      dubList,
+      'https://topanimes.net/episodio/juukishi-dublado-ep-5/'
+    );
+    assert.equal(dubNav.prevUrl, 'https://topanimes.net/episodio/juukishi-dublado-ep-4/');
+    assert.equal(dubNav.nextUrl, undefined);
+    assert.equal(
+      findUpcomingNextEpisode(dubList, 'https://topanimes.net/episodio/juukishi-dublado-ep-5/')
+        ?.episodeNumber,
+      6
+    );
+
+    // Watching EP 6 LEG (from Legendado tab) -> strictly stays in LEG track!
+    const legList = resolveSeriesEpisodesForEpisode(
+      dualAudioAnime,
+      'https://www.hinatasoul.com/videos/juukishi-ep-6',
+      'https://topanimes.net/animes/juukishi-dublado/'
+    );
+    assert.ok(legList);
+    const legNav = resolveSeriesPrevNext(legList, 'https://www.hinatasoul.com/videos/juukishi-ep-6');
+    assert.equal(legNav.prevUrl, 'https://www.hinatasoul.com/videos/juukishi-ep-5');
+    assert.equal(legNav.nextUrl, 'https://www.hinatasoul.com/videos/juukishi-ep-7');
   });
 });
 

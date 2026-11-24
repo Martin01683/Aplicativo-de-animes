@@ -517,10 +517,10 @@ test('unifyServerSeasonsWithCatalog offsets restarting split-cour Part 2 episode
   );
 });
 
-test('unifyServerSeasonsWithCatalog skips provider search completely when single-season anime is already complete', async () => {
-  let networkCalls = 0;
+test('unifyServerSeasonsWithCatalog skips provider search when discoverAlternateAudio is disabled and avoids extra fetches when single-season anime has no alternate audio', async () => {
+  const fetchedUrls: string[] = [];
   const mockFetcher: HttpFetcher = async (url) => {
-    networkCalls += 1;
+    fetchedUrls.push(url);
     return { ok: false, status: 404, finalUrl: url, body: '' };
   };
 
@@ -570,9 +570,23 @@ test('unifyServerSeasonsWithCatalog skips provider search completely when single
     },
   ];
 
-  const result = await unifyServerSeasonsWithCatalog(mockFetcher, completeDetails, catalogEps);
-  assert.equal(networkCalls, 0);
-  assert.equal(result.serverEpisodes.length, 2);
+  // With alternate audio discovery disabled: 0 network calls
+  const resultNoAlt = await unifyServerSeasonsWithCatalog(mockFetcher, completeDetails, catalogEps, [], {
+    discoverAlternateAudio: false,
+  });
+  assert.equal(fetchedUrls.length, 0);
+  assert.equal(resultNoAlt.serverEpisodes.length, 2);
+  assert.equal(resultNoAlt.alternateAudioTrack, undefined);
+
+  // With default alternate audio discovery: performs only Page 1 search (no Page 2 / no anime page fetches)
+  const resultDefault = await unifyServerSeasonsWithCatalog(mockFetcher, completeDetails, catalogEps);
+  assert.equal(resultDefault.serverEpisodes.length, 2);
+  assert.equal(resultDefault.alternateAudioTrack, undefined);
+  assert.equal(
+    fetchedUrls.some((u) => /\/page\/2|\/animes\//i.test(u)),
+    false,
+    'Should not paginate or fetch extra anime pages when no alternate audio exists'
+  );
 });
 
 test('extractSeasonAndPartInfo, stripSeasonFromTitle, and extractSafeParentPrefixForTvdb handle numbered-before-colon arcs safely', () => {
@@ -1243,6 +1257,457 @@ test('matchSiblingSeasonCandidates matches colon-free arc titles while still rej
   assert.equal(
     matched.some((m) => /vigilantes/i.test(m.title)),
     false
+  );
+});
+
+test('matchSiblingSeasonCandidates never mixes LEG episodes into an incomplete DUB season and strictly honors requiredAudioType', () => {
+  const candidates: SearchResultItem[] = [
+    {
+      id: 'top-dub',
+      title: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru Dublado',
+      url: 'https://topanimes.net/animes/tsuihou-sareta-tensei-juukishi-dublado/',
+      poster: '',
+      kind: 'anime',
+      audioType: 'DUB',
+    },
+    {
+      id: 'hs-leg',
+      title: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru',
+      url: 'https://www.hinatasoul.com/animes/tsuihou-sareta-tensei-juukishi',
+      poster: '',
+      kind: 'anime',
+      audioType: 'LEG',
+    },
+    {
+      id: 'top-leg',
+      title: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru',
+      url: 'https://topanimes.net/animes/tsuihou-sareta-tensei-juukishi/',
+      poster: '',
+      kind: 'anime',
+      audioType: 'LEG',
+    },
+    {
+      id: 'hs-dub',
+      title: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru Dublado',
+      url: 'https://www.hinatasoul.com/animes/tsuihou-sareta-tensei-juukishi-dublado',
+      poster: '',
+      kind: 'anime',
+      audioType: 'DUB',
+    },
+  ];
+
+  // Even without requiredAudioType, same-season cross-provider fill on an incomplete DUB page MUST skip LEG!
+  const sameSeasonFillOnlyDub = matchSiblingSeasonCandidates({
+    primaryUrl: 'https://topanimes.net/animes/tsuihou-sareta-tensei-juukishi-dublado/',
+    primaryTitle: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru Dublado',
+    primaryAudioType: 'DUB',
+    primarySeasonNumber: 1,
+    referenceTitles: ['Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru'],
+    tvdbSeasons: [1],
+    alreadyCoveredSeasons: new Set([1]),
+    needMoreEpisodesInPrimarySeason: true,
+    searchCandidates: candidates,
+  });
+  assert.equal(sameSeasonFillOnlyDub.length, 1);
+  assert.equal(sameSeasonFillOnlyDub[0].audioType, 'DUB');
+  assert.equal(
+    sameSeasonFillOnlyDub[0].url,
+    'https://www.hinatasoul.com/animes/tsuihou-sareta-tensei-juukishi-dublado'
+  );
+
+  // When only LEG exists on the other provider, incomplete DUB page receives ZERO mixed candidates
+  const noCrossAudioLeak = matchSiblingSeasonCandidates({
+    primaryUrl: 'https://topanimes.net/animes/tsuihou-sareta-tensei-juukishi-dublado/',
+    primaryTitle: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru Dublado',
+    primaryAudioType: 'DUB',
+    requiredAudioType: 'DUB',
+    primarySeasonNumber: 1,
+    referenceTitles: ['Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru'],
+    tvdbSeasons: [1],
+    alreadyCoveredSeasons: new Set([1]),
+    needMoreEpisodesInPrimarySeason: true,
+    searchCandidates: candidates.filter((c) => c.id !== 'hs-dub'),
+  });
+  assert.equal(noCrossAudioLeak.length, 0);
+
+  // Alternate LEG discovery with requiredAudioType: 'LEG' finds LEG cleanly (with cross-provider fallback)
+  const altLegMatch = matchSiblingSeasonCandidates({
+    primaryUrl: 'https://topanimes.net/animes/tsuihou-sareta-tensei-juukishi-dublado/',
+    primaryTitle: 'Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru Dublado',
+    primaryAudioType: 'LEG',
+    requiredAudioType: 'LEG',
+    primarySeasonNumber: 1,
+    referenceTitles: ['Tsuihou sareta Tensei Juukishi wa Game Chishiki de Musou suru'],
+    tvdbSeasons: [1],
+    alreadyCoveredSeasons: new Set(),
+    needMoreEpisodesInPrimarySeason: true,
+    primaryHasPlayableEpisodes: false,
+    searchCandidates: candidates,
+  });
+  assert.equal(altLegMatch.length, 1);
+  assert.equal(altLegMatch[0].audioType, 'LEG');
+  assert.equal(altLegMatch[0].url, 'https://topanimes.net/animes/tsuihou-sareta-tensei-juukishi/');
+  assert.equal(
+    altLegMatch[0].fallbackCandidates?.[0]?.url,
+    'https://www.hinatasoul.com/animes/tsuihou-sareta-tensei-juukishi'
+  );
+});
+
+test('enrichServerDetailsWithTheTvdb keeps partial DUB (5 eps) and LEG (21 eps) strictly separated in dual audioTracks from either entry point', async () => {
+  const topSearchHtml = `
+    <html><body>
+      <div class="search-page">
+        <div class="result-item">
+          <div class="thumbnail"><a href="https://topanimes.net/animes/tsuihou-juukishi-dublado/"><span class="tvshows">Anime</span></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/tsuihou-juukishi-dublado/">Tsuihou sareta Tensei Juukishi Dublado</a></div><div class="meta"><span class="year">2026</span></div></div>
+        </div>
+      </div>
+    </body></html>
+  `;
+
+  const hsSearchHtml = `
+    <html><body>
+      <div class="ultimosAnimesHomeItem">
+        <a href="https://www.hinatasoul.com/animes/tsuihou-juukishi">
+          <div class="ultimosAnimesHomeItemInfosNome">Tsuihou sareta Tensei Juukishi</div>
+        </a>
+      </div>
+    </body></html>
+  `;
+
+  const topDubHtml = buildTopAnimesAnimeHtml({
+    title: 'Tsuihou sareta Tensei Juukishi Dublado',
+    year: '2026',
+    slug: 'tsuihou-juukishi-dublado',
+    count: 5,
+    epDate: 'Jul. 10, 2026',
+  });
+
+  const hsLegHtml = buildHinataSoulAnimeHtml({
+    title: 'Tsuihou sareta Tensei Juukishi',
+    year: '2026',
+    videoBaseId: 80000,
+    count: 21,
+  });
+
+  const tvdbSeriesHtml = `
+    <html><body>
+      <h1>Tsuihou sareta Tensei Juukishi</h1>
+      <img class="img-responsive" src="https://artworks.thetvdb.com/banners/juukishi-poster.jpg" />
+      <div class="change_translation_text" data-language="pt" data-title="Tsuihou sareta Tensei Juukishi">
+        <p>Sinopse oficial em português.</p>
+      </div>
+      <ul id="series_basic_info">
+        <li><strong>TheTVDB.com Series ID</strong><span>551234</span></li>
+        <li><strong>Genres</strong><span><a>Anime</a><a>Fantasy</a></span></li>
+      </ul>
+    </body></html>
+  `;
+
+  const tvdbEpisodeRows = Array.from({ length: 26 }, (_, idx) => {
+    const epNum = idx + 1;
+    const isFuture = epNum > 21;
+    const airDate = isFuture ? `December ${epNum - 10}, 2028` : `July ${Math.min(epNum, 28)}, 2026`;
+    return `
+      <li class="list-group-item">
+        <h4><span class="episode-label">S01E${String(epNum).padStart(2, '0')}</span><a href="/series/tsuihou-juukishi/episodes/${5000 + epNum}">Episode ${epNum}</a></h4>
+        <ul class="list-inline"><li>${airDate}</li></ul>
+      </li>
+    `;
+  }).join('');
+
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url.includes('api4.thetvdb.com/web/search/queries')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: JSON.stringify({
+          results: [
+            {
+              hits: [
+                {
+                  id: 551234,
+                  name: 'Tsuihou sareta Tensei Juukishi',
+                  slug: 'tsuihou-juukishi',
+                  type: 'series',
+                  country: 'jpn',
+                  primary_language: 'jpn',
+                  year: '2026',
+                  genres: ['Anime', 'Fantasy'],
+                  poster: 'https://artworks.thetvdb.com/banners/juukishi-poster.jpg',
+                },
+              ],
+            },
+          ],
+        }),
+      };
+    }
+    if (url.includes('thetvdb.com/series/tsuihou-juukishi/allseasons/official')) {
+      return { ok: true, status: 200, finalUrl: url, body: `<ul>${tvdbEpisodeRows}</ul>` };
+    }
+    if (url.includes('thetvdb.com/series/tsuihou-juukishi')) {
+      return { ok: true, status: 200, finalUrl: url, body: tvdbSeriesHtml };
+    }
+    if (url.includes('topanimes.net/?s=')) {
+      return { ok: true, status: 200, finalUrl: url, body: topSearchHtml };
+    }
+    if (url.includes('hinatasoul.com/busca')) {
+      return { ok: true, status: 200, finalUrl: url, body: hsSearchHtml };
+    }
+    if (url.includes('topanimes.net/animes/tsuihou-juukishi-dublado')) {
+      return { ok: true, status: 200, finalUrl: url, body: topDubHtml };
+    }
+    if (url.includes('hinatasoul.com/animes/tsuihou-juukishi')) {
+      return { ok: true, status: 200, finalUrl: url, body: hsLegHtml };
+    }
+    return { ok: false, status: 404, finalUrl: url, body: '' };
+  };
+
+  // Entry Point 1: Opening the Dublado page (5 DUB eps)
+  const openedDub: AnimeDetails = {
+    title: 'Tsuihou sareta Tensei Juukishi Dublado',
+    url: 'https://topanimes.net/animes/tsuihou-juukishi-dublado/',
+    kind: 'anime',
+    year: '2026',
+    poster: '',
+    backdrop: '',
+    synopsis: '',
+    genres: [],
+    audioType: 'DUB',
+    episodes: Array.from({ length: 5 }, (_, idx) => ({
+      numberLabel: `1 - ${idx + 1}`,
+      episodeNumber: idx + 1,
+      seasonNumber: 1,
+      title: `Episódio ${idx + 1}`,
+      url: `https://topanimes.net/episodio/tsuihou-juukishi-dublado-ep-${idx + 1}/`,
+      date: 'Jul. 10, 2026',
+    })),
+  };
+
+  const enrichedFromDub = await enrichServerDetailsWithTheTvdb(mockFetcher, openedDub);
+  assert.equal(enrichedFromDub.episodes.length, 26);
+  const dubPlayable = enrichedFromDub.episodes.filter((e) => e.availableOnServer !== false);
+  assert.equal(dubPlayable.length, 5, 'Primary DUB track must NEVER mix in LEG episodes 6..21');
+  assert.equal(
+    dubPlayable.every((e) => e.url.includes('dublado') && e.audioType === 'DUB'),
+    true
+  );
+
+  // Dual audioTracks must contain BOTH DUB (5 playable) and LEG (21 playable)
+  assert.ok(enrichedFromDub.audioTracks?.DUB);
+  assert.ok(enrichedFromDub.audioTracks?.LEG);
+  assert.equal(enrichedFromDub.audioTracks.DUB.playableCount, 5);
+  assert.equal(enrichedFromDub.audioTracks.LEG.playableCount, 21);
+  assert.equal(enrichedFromDub.audioTracks.LEG.episodes.length, 26);
+  const legPlayableFromDub = enrichedFromDub.audioTracks.LEG.episodes.filter(
+    (e) => e.availableOnServer !== false
+  );
+  assert.equal(legPlayableFromDub.length, 21);
+  assert.equal(
+    legPlayableFromDub.every((e) => e.url.includes('hinatasoul.com/videos/') && e.audioType === 'LEG'),
+    true
+  );
+  assert.equal(enrichedFromDub.audioTracks.LEG.episodes[21].availableOnServer, false);
+
+  // Entry Point 2: Opening the Legendado page directly (21 LEG eps) also discovers Dublado (5 eps)
+  const openedLeg: AnimeDetails = {
+    title: 'Tsuihou sareta Tensei Juukishi',
+    url: 'https://www.hinatasoul.com/animes/tsuihou-juukishi',
+    kind: 'anime',
+    year: '2026',
+    poster: '',
+    backdrop: '',
+    synopsis: '',
+    genres: [],
+    audioType: 'LEG',
+    episodes: Array.from({ length: 21 }, (_, idx) => ({
+      numberLabel: `EP ${idx + 1}`,
+      episodeNumber: idx + 1,
+      seasonNumber: 1,
+      title: `Episódio ${idx + 1}`,
+      url: `https://www.hinatasoul.com/videos/${80001 + idx}`,
+    })),
+  };
+
+  const enrichedFromLeg = await enrichServerDetailsWithTheTvdb(mockFetcher, openedLeg);
+  assert.equal(
+    enrichedFromLeg.episodes.filter((e) => e.availableOnServer !== false).length,
+    21
+  );
+  assert.equal(enrichedFromLeg.audioTracks?.LEG?.playableCount, 21);
+  assert.equal(enrichedFromLeg.audioTracks?.DUB?.playableCount, 5);
+});
+
+test('unifyServerSeasonsWithCatalog keeps multi-season DUB (S1+S2) and LEG (S1+S2+S3) tracks cleanly separated', async () => {
+  const topSearchHtml = `
+    <html><body>
+      <div class="search-page">
+        <div class="result-item">
+          <div class="thumbnail"><a href="https://topanimes.net/animes/jujutsu-kaisen-dublado/"><span class="tvshows">Anime</span></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/jujutsu-kaisen-dublado/">Jujutsu Kaisen Dublado</a></div><div class="meta"><span class="year">2020</span></div></div>
+        </div>
+        <div class="result-item">
+          <div class="thumbnail"><a href="https://topanimes.net/animes/jujutsu-kaisen-2-dublado/"><span class="tvshows">Anime</span></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/jujutsu-kaisen-2-dublado/">Jujutsu Kaisen 2nd Season Dublado</a></div><div class="meta"><span class="year">2023</span></div></div>
+        </div>
+        <div class="result-item">
+          <div class="thumbnail"><a href="https://topanimes.net/animes/jujutsu-kaisen/"><span class="tvshows">Anime</span></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/jujutsu-kaisen/">Jujutsu Kaisen</a></div><div class="meta"><span class="year">2020</span></div></div>
+        </div>
+        <div class="result-item">
+          <div class="thumbnail"><a href="https://topanimes.net/animes/jujutsu-kaisen-2/"><span class="tvshows">Anime</span></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/jujutsu-kaisen-2/">Jujutsu Kaisen 2nd Season</a></div><div class="meta"><span class="year">2023</span></div></div>
+        </div>
+        <div class="result-item">
+          <div class="thumbnail"><a href="https://topanimes.net/animes/jujutsu-kaisen-3/"><span class="tvshows">Anime</span></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/jujutsu-kaisen-3/">Jujutsu Kaisen 3rd Season</a></div><div class="meta"><span class="year">2026</span></div></div>
+        </div>
+      </div>
+    </body></html>
+  `;
+
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url.includes('topanimes.net/?s=')) {
+      return { ok: true, status: 200, finalUrl: url, body: topSearchHtml };
+    }
+    if (url.includes('animes/jujutsu-kaisen-2-dublado')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: buildTopAnimesAnimeHtml({
+          title: 'Jujutsu Kaisen 2nd Season Dublado',
+          year: '2023',
+          slug: 'jjk-s2-dub',
+          count: 3,
+          epDate: 'Jul. 06, 2023',
+        }),
+      };
+    }
+    if (url.includes('animes/jujutsu-kaisen/')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: buildTopAnimesAnimeHtml({
+          title: 'Jujutsu Kaisen',
+          year: '2020',
+          slug: 'jjk-s1-leg',
+          count: 3,
+          epDate: 'Oct. 03, 2020',
+        }),
+      };
+    }
+    if (url.includes('animes/jujutsu-kaisen-2/')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: buildTopAnimesAnimeHtml({
+          title: 'Jujutsu Kaisen 2nd Season',
+          year: '2023',
+          slug: 'jjk-s2-leg',
+          count: 3,
+          epDate: 'Jul. 06, 2023',
+        }),
+      };
+    }
+    if (url.includes('animes/jujutsu-kaisen-3/')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: buildTopAnimesAnimeHtml({
+          title: 'Jujutsu Kaisen 3rd Season',
+          year: '2026',
+          slug: 'jjk-s3-leg',
+          count: 2,
+          epDate: 'Jan. 10, 2026',
+        }),
+      };
+    }
+    return { ok: false, status: 404, finalUrl: url, body: '' };
+  };
+
+  const catalogEps: AnimeEpisodeLink[] = [
+    ...[1, 2, 3].map((n) => ({
+      numberLabel: `EP ${n}`,
+      episodeNumber: n,
+      seasonNumber: 1,
+      title: `S1 Ep ${n}`,
+      url: `anisync://episode/anime/thetvdb/377543/s1/e${n}`,
+      date: '2020-10-03',
+    })),
+    ...[1, 2, 3].map((n) => ({
+      numberLabel: `T2 · EP ${n}`,
+      episodeNumber: n,
+      seasonNumber: 2,
+      title: `S2 Ep ${n}`,
+      url: `anisync://episode/anime/thetvdb/377543/s2/e${n}`,
+      date: '2023-07-06',
+    })),
+    ...[1, 2].map((n) => ({
+      numberLabel: `T3 · EP ${n}`,
+      episodeNumber: n,
+      seasonNumber: 3,
+      title: `S3 Ep ${n}`,
+      url: `anisync://episode/anime/thetvdb/377543/s3/e${n}`,
+      date: '2026-01-10',
+    })),
+  ];
+
+  const openedDubS1: AnimeDetails = {
+    title: 'Jujutsu Kaisen Dublado',
+    url: 'https://topanimes.net/animes/jujutsu-kaisen-dublado/',
+    kind: 'anime',
+    year: '2020',
+    poster: '',
+    backdrop: '',
+    synopsis: '',
+    genres: [],
+    audioType: 'DUB',
+    episodes: [1, 2, 3].map((n) => ({
+      numberLabel: `1 - ${n}`,
+      episodeNumber: n,
+      seasonNumber: 1,
+      title: `Episódio ${n}`,
+      url: `https://topanimes.net/episodio/jjk-s1-dub-ep-${n}/`,
+      date: 'Oct. 03, 2020',
+    })),
+  };
+
+  const unified = await unifyServerSeasonsWithCatalog(mockFetcher, openedDubS1, catalogEps, [
+    'Jujutsu Kaisen',
+  ]);
+
+  // Primary DUB track has ONLY S1 + S2 DUB (6 eps) — NEVER leaks S3 LEG into DUB!
+  assert.equal(unified.primaryAudioType, 'DUB');
+  assert.equal(unified.serverEpisodes.length, 6);
+  assert.deepEqual(
+    Array.from(new Set(unified.serverEpisodes.map((e) => e.seasonNumber))).sort(),
+    [1, 2]
+  );
+  assert.equal(
+    unified.serverEpisodes.every((e) => e.url.includes('-dub-') && e.audioType === 'DUB'),
+    true
+  );
+
+  // Alternate LEG track has ALL 3 seasons LEG (8 eps)
+  assert.ok(unified.alternateAudioTrack);
+  assert.equal(unified.alternateAudioTrack.audioType, 'LEG');
+  assert.equal(unified.alternateAudioTrack.serverEpisodes.length, 8);
+  assert.deepEqual(
+    Array.from(
+      new Set(unified.alternateAudioTrack.serverEpisodes.map((e) => e.seasonNumber))
+    ).sort(),
+    [1, 2, 3]
+  );
+  assert.equal(
+    unified.alternateAudioTrack.serverEpisodes.every(
+      (e) => e.url.includes('-leg-') && e.audioType === 'LEG'
+    ),
+    true
   );
 });
 

@@ -92,6 +92,10 @@ export function AnimeDetailView({
 }: AnimeDetailViewProps) {
   const [episodeFilter, setEpisodeFilter] = useState('');
   const [sortDesc, setSortDesc] = useState(false);
+  const [selectedAudioState, setSelectedAudioState] = useState<{
+    animeUrl: string;
+    audio: 'DUB' | 'LEG';
+  }>({ animeUrl: '', audio: 'LEG' });
   const [selectedSeasonState, setSelectedSeasonState] = useState<{
     animeUrl: string;
     season: number | 'all';
@@ -216,9 +220,57 @@ export function AnimeDetailView({
   const effectivePoster = tvdbAnimeSynopsis?.poster || anime.poster;
   const effectiveBackdrop = tvdbAnimeSynopsis?.backdrop || anime.backdrop || effectivePoster;
 
+  const isMovie = anime.kind === 'movie';
+  const isSeries = anime.kind === 'series';
+
+  const defaultAudioTrack: 'DUB' | 'LEG' = anime.audioType === 'DUB' ? 'DUB' : 'LEG';
+  const dubTrack = anime.audioTracks?.DUB;
+  const legTrack = anime.audioTracks?.LEG;
+  const hasBothAudioTracks = Boolean(
+    !isMovie &&
+      dubTrack &&
+      legTrack &&
+      dubTrack.episodes.length > 0 &&
+      legTrack.episodes.length > 0 &&
+      (dubTrack.playableCount > 0 || legTrack.playableCount > 0)
+  );
+  const activeAudioTab: 'DUB' | 'LEG' =
+    hasBothAudioTracks && selectedAudioState.animeUrl === anime.url
+      ? selectedAudioState.audio
+      : defaultAudioTrack;
+  const effectiveAudioType = hasBothAudioTracks ? activeAudioTab : anime.audioType;
+  const activeEpisodes = useMemo(
+    () =>
+      hasBothAudioTracks
+        ? activeAudioTab === 'DUB'
+          ? dubTrack!.episodes
+          : legTrack!.episodes
+        : anime.episodes,
+    [activeAudioTab, anime.episodes, dubTrack, hasBothAudioTracks, legTrack]
+  );
+
+  const displayTitle = useMemo(() => {
+    if (!hasBothAudioTracks) return anime.title;
+    const stripped = anime.title
+      .replace(/(?:[\s\-–—]+(?:\(?\s*(?:dublado|legendado|dub|leg)\s*\)?))+$/i, '')
+      .trim();
+    return stripped.length >= 2 ? stripped : anime.title;
+  }, [anime.title, hasBothAudioTracks]);
+
+  const legPlayableKeys = useMemo(() => {
+    const keys = new Set<string>();
+    if (!legTrack) return keys;
+    for (const ep of legTrack.episodes) {
+      if (isEpisodeAvailableOnServer(ep) && ep.episodeNumber !== null) {
+        keys.add(`${ep.seasonNumber || 1}:${ep.episodeNumber}`);
+      }
+    }
+    return keys;
+  }, [legTrack]);
+
   const hasScheduledEpisodes = useMemo(
-    () => anime.episodes.some((ep) => !isEpisodeAvailableOnServer(ep)),
-    [anime.episodes]
+    () => activeEpisodes.some((ep) => !isEpisodeAvailableOnServer(ep)),
+    [activeEpisodes]
   );
 
   useEffect(() => {
@@ -227,16 +279,23 @@ export function AnimeDetailView({
     return () => window.clearInterval(id);
   }, [hasScheduledEpisodes]);
 
-  const isMovie = anime.kind === 'movie';
-  const isSeries = anime.kind === 'series';
-
   const playableEpisodes = useMemo(
-    () => anime.episodes.filter(isEpisodeAvailableOnServer),
-    [anime.episodes]
+    () => activeEpisodes.filter(isEpisodeAvailableOnServer),
+    [activeEpisodes]
   );
-  const unavailableCount = anime.episodes.length - playableEpisodes.length;
+  const unavailableCount = activeEpisodes.length - playableEpisodes.length;
 
-  const latestEpisode = pickLatestAnimeEpisode(playableEpisodes, anime.title, effectivePoster);
+  const primaryLatestEpisode = useMemo(
+    () =>
+      pickLatestAnimeEpisode(
+        anime.episodes.filter(isEpisodeAvailableOnServer),
+        anime.title,
+        effectivePoster
+      ),
+    [anime.episodes, anime.title, effectivePoster]
+  );
+
+  const latestEpisode = pickLatestAnimeEpisode(playableEpisodes, displayTitle, effectivePoster);
   const firstEpisode = playableEpisodes[0];
   const lastEpisodeItem =
     playableEpisodes.length > 1 ? playableEpisodes[playableEpisodes.length - 1] : null;
@@ -253,7 +312,7 @@ export function AnimeDetailView({
           }
         : null;
 
-  const baseSeasonGroups = useMemo(() => groupEpisodesBySeason(anime.episodes), [anime.episodes]);
+  const baseSeasonGroups = useMemo(() => groupEpisodesBySeason(activeEpisodes), [activeEpisodes]);
 
   const activeSeasonTab: number | 'all' = useMemo(() => {
     if (selectedSeasonState.animeUrl !== anime.url) return 'all';
@@ -353,10 +412,16 @@ export function AnimeDetailView({
     playableEpisodes.length > 0 && totalWatchedCount === playableEpisodes.length;
 
   const subtitleParts: string[] = [];
-  if (anime.alternativeTitle) subtitleParts.push(anime.alternativeTitle);
+  if (
+    anime.alternativeTitle &&
+    anime.alternativeTitle.toLowerCase() !== displayTitle.toLowerCase()
+  ) {
+    subtitleParts.push(anime.alternativeTitle);
+  }
   if (
     anime.originalTitle &&
     anime.originalTitle.toLowerCase() !== anime.title.toLowerCase() &&
+    anime.originalTitle.toLowerCase() !== displayTitle.toLowerCase() &&
     anime.originalTitle.toLowerCase() !== (anime.alternativeTitle || '').toLowerCase()
   ) {
     subtitleParts.push(anime.originalTitle);
@@ -422,7 +487,7 @@ export function AnimeDetailView({
         catalogSource: anime.catalogSource,
         externalIds: anime.externalIds,
       },
-      latestEpisode
+      primaryLatestEpisode
     );
   };
 
@@ -459,7 +524,7 @@ export function AnimeDetailView({
         <div className="relative grid gap-6 p-5 sm:p-7 lg:grid-cols-[220px_1fr] lg:gap-8">
           <MediaPoster
             src={effectivePoster}
-            alt={anime.title}
+            alt={displayTitle}
             aspect="portrait"
             className="mx-auto w-full max-w-[220px] rounded-xl border border-white/10 shadow-xl lg:mx-0"
           />
@@ -471,15 +536,16 @@ export function AnimeDetailView({
                   {isMovie ? <Film className="h-3 w-3" /> : <Tv className="h-3 w-3" />}
                   <span>{isMovie ? 'Filme' : isSeries ? 'Série' : 'Anime'}</span>
                 </span>
-                {anime.audioType && (
+                {effectiveAudioType && (
                   <span
+                    data-hero-audio-badge={effectiveAudioType}
                     className={`rounded-md border px-2 py-0.5 font-semibold ${
-                      anime.audioType === 'DUB'
+                      effectiveAudioType === 'DUB'
                         ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
                         : 'border-sky-500/35 bg-sky-500/12 text-sky-300'
                     }`}
                   >
-                    {anime.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
+                    {effectiveAudioType === 'DUB' ? 'Dublado' : 'Legendado'}
                   </span>
                 )}
                 {anime.year && <span className="tabular-nums text-slate-300">{anime.year}</span>}
@@ -489,9 +555,9 @@ export function AnimeDetailView({
                     {anime.rating}
                   </span>
                 )}
-                {!isMovie && anime.episodes.length > 0 && (
+                {!isMovie && activeEpisodes.length > 0 && (
                   <span className="tabular-nums text-slate-300">
-                    {anime.episodes.length} episódio{anime.episodes.length === 1 ? '' : 's'}
+                    {activeEpisodes.length} episódio{activeEpisodes.length === 1 ? '' : 's'}
                   </span>
                 )}
                 {anime.sourceServerName && (
@@ -502,7 +568,7 @@ export function AnimeDetailView({
               </div>
 
               <h1 className="mt-3 text-2xl font-bold tracking-tight text-white sm:text-3xl">
-                {anime.title}
+                {displayTitle}
               </h1>
 
               {subtitleParts.length > 0 && (
@@ -688,11 +754,11 @@ export function AnimeDetailView({
             <h2 className="text-lg font-semibold text-white">
               {isMovie ? 'Reprodução' : 'Episódios'}
             </h2>
-            {!isMovie && anime.episodes.length > 0 && (
+            {!isMovie && activeEpisodes.length > 0 && (
               <span className="font-mono text-xs tabular-nums text-slate-400">
                 {playableEpisodes.length > 0
                   ? `${totalWatchedCount}/${playableEpisodes.length} vistos`
-                  : `${anime.episodes.length} episódio${anime.episodes.length === 1 ? '' : 's'}`}
+                  : `${activeEpisodes.length} episódio${activeEpisodes.length === 1 ? '' : 's'}`}
                 {unavailableCount > 0 && (
                   <span className="text-[#fb923c]">
                     {' '}
@@ -704,7 +770,7 @@ export function AnimeDetailView({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            {anime.episodes.length > 1 && (
+            {activeEpisodes.length > 1 && (
               <>
                 <div className="relative">
                   <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-500" />
@@ -795,6 +861,65 @@ export function AnimeDetailView({
           </div>
         </div>
 
+        {hasBothAudioTracks && dubTrack && legTrack && (
+          <div
+            data-audio-track-tabs="true"
+            className="mb-4 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-white/10 bg-[#151921] p-2"
+          >
+            <div
+              role="tablist"
+              aria-label="Áudio dos episódios"
+              className="inline-flex w-full items-center gap-1.5 rounded-lg bg-[#0d0f12] p-1 sm:w-auto"
+            >
+              {(['DUB', 'LEG'] as const).map((audioKey) => {
+                const track = audioKey === 'DUB' ? dubTrack : legTrack;
+                const isSelected = activeAudioTab === audioKey;
+                const label = audioKey === 'DUB' ? 'Dublado' : 'Legendado';
+                const activeStyle =
+                  audioKey === 'DUB'
+                    ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 shadow-sm'
+                    : 'border-sky-500/45 bg-sky-500/15 text-sky-300 shadow-sm';
+                const countStyle = isSelected
+                  ? audioKey === 'DUB'
+                    ? 'bg-emerald-500/20 text-emerald-200'
+                    : 'bg-sky-500/20 text-sky-200'
+                  : 'bg-white/6 text-slate-400';
+
+                return (
+                  <button
+                    key={audioKey}
+                    type="button"
+                    role="tab"
+                    data-audio-track-tab={audioKey}
+                    aria-selected={isSelected}
+                    onClick={() =>
+                      setSelectedAudioState({ animeUrl: anime.url, audio: audioKey })
+                    }
+                    className={`inline-flex flex-1 items-center justify-center gap-2 rounded-md border px-3.5 py-2 text-xs font-semibold transition-colors sm:flex-none ${
+                      isSelected
+                        ? activeStyle
+                        : 'border-transparent text-slate-400 hover:bg-white/[0.04] hover:text-slate-200'
+                    }`}
+                  >
+                    <span>{label}</span>
+                    <span
+                      className={`rounded px-1.5 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${countStyle}`}
+                    >
+                      {track.playableCount}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <p className="px-1.5 text-[11px] text-slate-400">
+              {activeAudioTab === 'DUB'
+                ? `${dubTrack.playableCount} ${dubTrack.playableCount === 1 ? 'episódio dublado disponível' : 'episódios dublados disponíveis'}`
+                : `${legTrack.playableCount} ${legTrack.playableCount === 1 ? 'episódio legendado disponível' : 'episódios legendados disponíveis'}`}
+            </p>
+          </div>
+        )}
+
         {!isMovie && baseSeasonGroups.length > 1 && (
           <div
             data-season-tabs="true"
@@ -817,7 +942,7 @@ export function AnimeDetailView({
             >
               <span>Todas ({baseSeasonGroups.length})</span>
               <span className="font-mono text-[11px] font-normal tabular-nums text-slate-400">
-                {anime.episodes.length} eps
+                {activeEpisodes.length} eps
               </span>
             </button>
 
@@ -874,7 +999,7 @@ export function AnimeDetailView({
           </div>
         )}
 
-        {anime.episodes.length === 0 ? (
+        {activeEpisodes.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
             Nenhum episódio listado nos provedores ativos para este título ainda.
           </div>
@@ -1085,6 +1210,19 @@ export function AnimeDetailView({
 
                       if (!available) {
                         const countdown = formatEpisodeCountdown(ep.airingAt, nowMs, ep.date);
+                        const isMissingDubOnly =
+                          hasBothAudioTracks &&
+                          activeAudioTab === 'DUB' &&
+                          countdown.state === 'pending' &&
+                          ep.episodeNumber !== null &&
+                          legPlayableKeys.has(`${ep.seasonNumber || 1}:${ep.episodeNumber}`);
+                        const badgeLabel = isMissingDubOnly ? 'Sem dublagem' : countdown.label;
+                        const badgeTitle = isMissingDubOnly
+                          ? 'Ainda sem dublagem; disponível na aba Legendado.'
+                          : countdown.state === 'pending'
+                            ? 'Episódio já exibido, mas ainda não publicado nos provedores.'
+                            : undefined;
+
                         return (
                           <div
                             key={`${ep.url}-${ep.seasonNumber || 1}-${ep.episodeNumber || ep.numberLabel}`}
@@ -1128,11 +1266,7 @@ export function AnimeDetailView({
 
                             <div className="flex shrink-0 items-center">
                               <span
-                                title={
-                                  countdown.state === 'pending'
-                                    ? 'Episódio já exibido, mas ainda não publicado nos provedores.'
-                                    : undefined
-                                }
+                                title={badgeTitle}
                                 className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${
                                   countdown.state === 'now'
                                     ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
@@ -1156,7 +1290,7 @@ export function AnimeDetailView({
                                     }`}
                                   />
                                 )}
-                                <span>{countdown.label}</span>
+                                <span>{badgeLabel}</span>
                               </span>
                             </div>
                           </div>

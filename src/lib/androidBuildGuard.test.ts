@@ -654,7 +654,7 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(detailTsx, /Recolher tudo/);
 
     const appTsx = readRepoFile('src/App.tsx');
-    assert.match(appTsx, /animeDetails\.episodes\.some\(\(ep\) =>/);
+    assert.match(appTsx, /resolveSeriesEpisodesForEpisode\(/);
   });
 
   it('omits redundant top Avisos/Favoritos buttons in AnimeDetailView and avoids duplicate bottom toast for unavailable upcoming episodes', () => {
@@ -793,5 +793,22 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
       'Unplayed episode unmounts must not persist progress or history',
     );
     assert.match(playerTsx, /recordHistoryOnPlaybackStart\(episodeUrl\);/);
+  });
+
+  it('renders Dublado/Legendado audio track tabs in AnimeDetailView and scopes playback lists per audio track', () => {
+    const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
+    assert.match(detailTsx, /data-audio-track-tabs="true"/);
+    assert.match(detailTsx, /data-audio-track-tab=\{audioKey\}/);
+    assert.match(detailTsx, /data-hero-audio-badge=\{effectiveAudioType\}/);
+    assert.match(detailTsx, /Sem dublagem/);
+    assert.match(detailTsx, /primaryLatestEpisode/);
+
+    const appTsx = readRepoFile('src/App.tsx');
+    assert.match(appTsx, /resolveSeriesEpisodesForEpisode\(\s*animeDetails,/);
+    assert.match(appTsx, /currentAnime\.audioTracks\?\.DUB\?\.episodes/);
+    assert.match(appTsx, /currentAnime\.audioTracks\?\.LEG\?\.episodes/);
+
+    const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
+    assert.match(workspaceTsx, /resolveSeriesEpisodesForEpisode\(/);
   });
 });
