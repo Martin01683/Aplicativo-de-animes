@@ -238,14 +238,14 @@ function main() {
 
   const gradlew = getGradleWrapperCommand();
   console.log(
-    `🔨 Validando compilação Android Release (${gradlew} :app:checkReleaseAarMetadata :app:compileReleaseJavaWithJavac :app:testReleaseUnitTest --no-daemon)...`,
+    `🔨 Validando compilação Android Release (${gradlew} :app:checkReleaseAarMetadata :app:compileReleaseJavaWithJavac :app:testDebugUnitTest --no-daemon)...`,
   );
   runCommandOrExit(
     gradlew,
     [
       ':app:checkReleaseAarMetadata',
       ':app:compileReleaseJavaWithJavac',
-      ':app:testReleaseUnitTest',
+      ':app:testDebugUnitTest',
       '--no-daemon',
     ],
     { cwd: ANDROID_DIR, env: childEnv },

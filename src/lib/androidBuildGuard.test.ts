@@ -353,6 +353,10 @@ describe('Pre-push build checks and Android Gradle gate', () => {
     assert.match(pkg.scripts['prepush:check'], /scripts\/check-android-build\.mjs --pre-push/);
     assert.match(scriptSource, /:app:checkReleaseAarMetadata/);
     assert.match(scriptSource, /:app:compileReleaseJavaWithJavac/);
+    assert.match(scriptSource, /:app:testDebugUnitTest/);
+
+    const wrapperProps = readRepoFile('android/gradle/wrapper/gradle-wrapper.properties');
+    assert.match(wrapperProps, /gradle-9\.\d+\.\d+-/);
   });
 
   it('detects Android-related file changes accurately', () => {
