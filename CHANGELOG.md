@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.30] — 2026-11-24
+
+### Correções
+- Match notification small icon silhouette exactly to the Anisync app logo (`8538d5e`)
+
 ## [v1.0.29] — 2026-11-24
 
 ### Correções
