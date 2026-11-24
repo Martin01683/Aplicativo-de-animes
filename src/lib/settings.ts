@@ -11,7 +11,7 @@ import {
 } from './sources/types.ts';
 import type { CatalogSourceCredentials, LiveChartScheduleMode } from './types.ts';
 
-export type EpisodeCheckIntervalMinutes = 0 | 1 | 5 | 15 | 30 | 60;
+export type EpisodeCheckIntervalMinutes = 0 | 15 | 30 | 60;
 export type AppUpdateIntervalHours = 6 | 24 | 168;
 export type DefaultAudioFilter = 'ALL' | 'DUB' | 'LEG';
 export type SkipIntroSeconds = 30 | 60 | 85 | 90;
@@ -82,8 +82,6 @@ export const EPISODE_CHECK_INTERVAL_OPTIONS: Array<{
   label: string;
   shortLabel: string;
 }> = [
-  { value: 1, label: 'A cada 1 minuto', shortLabel: '1 min' },
-  { value: 5, label: 'A cada 5 minutos', shortLabel: '5 min' },
   { value: 15, label: 'A cada 15 minutos (Padrão)', shortLabel: '15 min' },
   { value: 30, label: 'A cada 30 minutos', shortLabel: '30 min' },
   { value: 60, label: 'A cada 1 hora', shortLabel: '1 hora' },
@@ -101,7 +99,7 @@ export const APP_UPDATE_INTERVAL_OPTIONS: Array<{
 
 export const SKIP_INTRO_OPTIONS: SkipIntroSeconds[] = [30, 60, 85, 90];
 
-const VALID_EPISODE_INTERVALS = new Set<number>([0, 1, 5, 15, 30, 60]);
+const VALID_EPISODE_INTERVALS = new Set<number>([0, 15, 30, 60]);
 const VALID_UPDATE_INTERVALS = new Set<number>([6, 24, 168]);
 const VALID_SECTIONS = new Set<NavSection>(['releases', 'calendar', 'catalog', 'library']);
 const VALID_AUDIO_FILTERS = new Set<DefaultAudioFilter>(['ALL', 'DUB', 'LEG']);
@@ -202,14 +200,8 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
       typeof input.showInAppEpisodeToasts === 'boolean'
         ? input.showInAppEpisodeToasts
         : DEFAULT_APP_SETTINGS.showInAppEpisodeToasts,
-    notificationSound:
-      typeof input.notificationSound === 'boolean'
-        ? input.notificationSound
-        : DEFAULT_APP_SETTINGS.notificationSound,
-    quietHoursEnabled:
-      typeof input.quietHoursEnabled === 'boolean'
-        ? input.quietHoursEnabled
-        : DEFAULT_APP_SETTINGS.quietHoursEnabled,
+    notificationSound: false,
+    quietHoursEnabled: false,
     quietHoursStart: sanitizeHour(input.quietHoursStart, DEFAULT_APP_SETTINGS.quietHoursStart),
     quietHoursEnd: sanitizeHour(input.quietHoursEnd, DEFAULT_APP_SETTINGS.quietHoursEnd),
     notifyAudioFilter,

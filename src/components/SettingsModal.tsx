@@ -10,13 +10,11 @@ import {
   Globe,
   KeyRound,
   Loader2,
-  Moon,
   RefreshCw,
   RotateCcw,
   Send,
   Server,
   Trash2,
-  Volume2,
   X,
 } from 'lucide-react';
 import { apiFetch, type ApkDownloadProgressEvent } from '../lib/apiClient';
@@ -27,10 +25,7 @@ import {
   type AppBuildInfo,
   type AppUpdateCheckResult,
 } from '../lib/appUpdater';
-import {
-  formatHourLabel,
-  type NotificationPermissionStatus,
-} from '../lib/notifications';
+import type { NotificationPermissionStatus } from '../lib/notifications';
 import {
   VIDEO_SCALE_OPTIONS,
   type VideoScaleMode,
@@ -48,8 +43,6 @@ import {
 import type { EpisodeSourceConfig, SourceTestResult } from '../lib/sources/types';
 import type { CatalogSourceCredentials } from '../lib/types';
 import type { NavSection } from './Header';
-
-const HOUR_OPTIONS = Array.from({ length: 24 }, (_, idx) => idx);
 
 interface SettingsModalProps {
   open: boolean;
@@ -474,7 +467,7 @@ export function SettingsModal({
               <p className="text-xs text-slate-400">
                 Define de quanto em quanto tempo o Anisync consulta o catálogo e seus favoritos (até 30 títulos) para detectar novos lançamentos.
               </p>
-              <div className="grid grid-cols-3 gap-2 pt-1 sm:grid-cols-6">
+              <div className="grid grid-cols-2 gap-2 pt-1 sm:grid-cols-4">
                 {EPISODE_CHECK_INTERVAL_OPTIONS.map((opt) => {
                   const active = settings.episodeCheckIntervalMinutes === opt.value;
                   return (
@@ -569,93 +562,6 @@ export function SettingsModal({
                   onChange={(val) => onUpdateSettings({ showInAppEpisodeToasts: val })}
                   label="Avisos flutuantes de novos episódios"
                 />
-              </div>
-
-              <div className="flex items-center justify-between gap-4 px-4 py-3.5">
-                <label htmlFor="toggle-notification-sound" className="min-w-0 flex-1 cursor-pointer">
-                  <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-200">
-                    <Volume2 className="h-3.5 w-3.5 text-[#f97316]" />
-                    <span>Som discreto ao chegar episódio novo</span>
-                  </span>
-                  <span className="mt-0.5 block text-xs text-slate-400">
-                    Toca um alerta suave dentro do app fora do horário silencioso.
-                  </span>
-                </label>
-                <ToggleSwitch
-                  id="toggle-notification-sound"
-                  checked={settings.notificationSound}
-                  onChange={(val) => onUpdateSettings({ notificationSound: val })}
-                  label="Som discreto ao chegar episódio novo"
-                />
-              </div>
-
-              <div className="space-y-3 px-4 py-3.5">
-                <div className="flex items-center justify-between gap-4">
-                  <label htmlFor="toggle-quiet-hours" className="min-w-0 flex-1 cursor-pointer">
-                    <span className="inline-flex items-center gap-1.5 text-sm font-medium text-slate-200">
-                      <Moon className="h-3.5 w-3.5 text-indigo-300" />
-                      <span>Horário silencioso (Não perturbe)</span>
-                    </span>
-                    <span className="mt-0.5 block text-xs text-slate-400">
-                      Guarda novos episódios no sininho sem enviar alertas barulhentos no dispositivo durante o intervalo escolhido.
-                    </span>
-                  </label>
-                  <ToggleSwitch
-                    id="toggle-quiet-hours"
-                    checked={settings.quietHoursEnabled}
-                    onChange={(val) => onUpdateSettings({ quietHoursEnabled: val })}
-                    label="Horário silencioso (Não perturbe)"
-                  />
-                </div>
-
-                {settings.quietHoursEnabled && (
-                  <div className="grid grid-cols-2 gap-3 rounded-lg border border-white/8 bg-[#151921]/70 p-3">
-                    <div>
-                      <label
-                        htmlFor="quiet-hours-start"
-                        className="mb-1 block text-[11px] font-medium text-slate-400"
-                      >
-                        Início do silêncio
-                      </label>
-                      <select
-                        id="quiet-hours-start"
-                        value={settings.quietHoursStart}
-                        onChange={(e) =>
-                          onUpdateSettings({ quietHoursStart: Number(e.target.value) })
-                        }
-                        className="min-h-[38px] w-full rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1.5 text-xs font-medium tabular-nums text-slate-200 focus:border-[#f97316] focus:outline-none"
-                      >
-                        {HOUR_OPTIONS.map((h) => (
-                          <option key={h} value={h}>
-                            {formatHourLabel(h)}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label
-                        htmlFor="quiet-hours-end"
-                        className="mb-1 block text-[11px] font-medium text-slate-400"
-                      >
-                        Fim do silêncio
-                      </label>
-                      <select
-                        id="quiet-hours-end"
-                        value={settings.quietHoursEnd}
-                        onChange={(e) =>
-                          onUpdateSettings({ quietHoursEnd: Number(e.target.value) })
-                        }
-                        className="min-h-[38px] w-full rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1.5 text-xs font-medium tabular-nums text-slate-200 focus:border-[#f97316] focus:outline-none"
-                      >
-                        {HOUR_OPTIONS.map((h) => (
-                          <option key={h} value={h}>
-                            {formatHourLabel(h)}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                )}
               </div>
 
               <div className="flex flex-col items-start gap-3 px-4 py-3.5 sm:flex-row sm:items-center sm:justify-between">

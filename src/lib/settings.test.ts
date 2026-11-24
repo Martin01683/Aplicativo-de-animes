@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   APP_UPDATE_INTERVAL_OPTIONS,
   DEFAULT_APP_SETTINGS,
+  EPISODE_CHECK_INTERVAL_OPTIONS,
   formatRelativeTimestamp,
   getEpisodeCheckIntervalMs,
   sanitizeAppSettings,
@@ -38,7 +39,7 @@ test('sanitizeAppSettings falls back cleanly on invalid or partial input', () =>
   );
 });
 
-test('sanitizeAppSettings preserves valid user values and migrates legacy startup interval', () => {
+test('sanitizeAppSettings preserves valid user values and migrates legacy removed notification options safely', () => {
   const result = sanitizeAppSettings({
     episodeCheckIntervalMinutes: 15,
     checkEpisodesOnStartup: false,
@@ -64,8 +65,9 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy startu
   assert.equal(result.checkEpisodesOnStartup, false);
   assert.equal(result.notifyNewEpisodes, false);
   assert.equal(result.showInAppEpisodeToasts, false);
-  assert.equal(result.notificationSound, true);
-  assert.equal(result.quietHoursEnabled, true);
+  // Removed options always migrate cleanly to disabled so users aren't stuck with hidden toggles
+  assert.equal(result.notificationSound, false);
+  assert.equal(result.quietHoursEnabled, false);
   assert.equal(result.quietHoursStart, 22);
   assert.equal(result.quietHoursEnd, 7);
   assert.equal(result.notifyAudioFilter, 'LEG');
@@ -77,6 +79,14 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy startu
   assert.equal(result.skipIntroSeconds, 90);
   assert.equal(result.autoPlayNextEpisode, true);
   assert.equal(result.videoScale, 'fill');
+
+  // Legacy 1 min and 5 min intervals migrate safely to 15 min
+  assert.equal(sanitizeAppSettings({ episodeCheckIntervalMinutes: 1 }).episodeCheckIntervalMinutes, 15);
+  assert.equal(sanitizeAppSettings({ episodeCheckIntervalMinutes: 5 }).episodeCheckIntervalMinutes, 15);
+  assert.deepEqual(
+    EPISODE_CHECK_INTERVAL_OPTIONS.map((opt) => opt.value),
+    [15, 30, 60, 0]
+  );
 
   // Invalid quiet hours and audio filter fall back cleanly
   const badNotificationOpts = sanitizeAppSettings({
@@ -98,12 +108,17 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy startu
     APP_UPDATE_INTERVAL_OPTIONS.map((opt) => opt.value),
     [6, 24, 168]
   );
+
+  // SettingsModal omits removed options
+  const modalTsx = readFileSync(resolve(ROOT, 'src/components/SettingsModal.tsx'), 'utf8');
+  assert.doesNotMatch(modalTsx, /Som discreto ao chegar episódio novo/);
+  assert.doesNotMatch(modalTsx, /Horário silencioso \(Não perturbe\)/);
 });
 
 test('getEpisodeCheckIntervalMs returns null for manual mode and ms otherwise', () => {
   assert.equal(getEpisodeCheckIntervalMs(0), null);
-  assert.equal(getEpisodeCheckIntervalMs(1), 60_000);
   assert.equal(getEpisodeCheckIntervalMs(15), 900_000);
+  assert.equal(getEpisodeCheckIntervalMs(30), 1_800_000);
   assert.equal(getEpisodeCheckIntervalMs(60), 3_600_000);
 });
 
