@@ -192,11 +192,20 @@ test('Android native notification bridge declares POST_NOTIFICATIONS, channels, 
     'utf-8'
   );
 
+  const statIcon = readFileSync(
+    resolve(ROOT, 'android/app/src/main/res/drawable/ic_stat_anisync.xml'),
+    'utf-8'
+  );
+
   assert.match(manifest, /android\.permission\.POST_NOTIFICATIONS/);
   assert.match(plugin, /public void getNotificationPermission\(/);
   assert.match(plugin, /public void requestNotificationPermission\(/);
   assert.match(plugin, /public void showLocalNotification\(/);
   assert.match(plugin, /public void consumePendingNotificationTarget\(/);
+  assert.match(plugin, /\.setSmallIcon\(R\.drawable\.ic_stat_anisync\)/);
+  assert.match(plugin, /\.setColor\(0xFFF97316\)/);
+  assert.doesNotMatch(plugin, /\.setSmallIcon\(R\.mipmap\.ic_launcher\)/);
+  assert.match(statIcon, /#FFFFFFFF/);
   assert.match(plugin, /anisync_episodes/);
   assert.match(plugin, /anisync_updates/);
   assert.match(mainActivity, /EXTRA_NOTIFICATION_URL/);

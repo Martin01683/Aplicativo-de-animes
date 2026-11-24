@@ -494,7 +494,8 @@ public class LocalProxyPlugin extends Plugin {
             );
 
             NotificationCompat.Builder builder = new NotificationCompat.Builder(ctx, channelId)
-                .setSmallIcon(R.mipmap.ic_launcher)
+                .setSmallIcon(R.drawable.ic_stat_anisync)
+                .setColor(0xFFF97316)
                 .setContentTitle(title)
                 .setContentText(body)
                 .setStyle(new NotificationCompat.BigTextStyle().bigText(body))

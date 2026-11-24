@@ -1,0 +1,37 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="340"
+    android:viewportHeight="340">
+    <!-- Monochrome Anisync orbital arcs + hollow play symbol for Android status bar & notification icon -->
+    <group
+        android:translateX="-86"
+        android:translateY="-86">
+        <path
+            android:pathData="M 122,256 A 134,134 0 0,1 356,166"
+            android:strokeWidth="22"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M 390,256 A 134,134 0 0,1 156,346"
+            android:strokeWidth="22"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M 152,192 A 122,122 0 0,1 374,286"
+            android:strokeWidth="22"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M 360,320 A 122,122 0 0,1 138,226"
+            android:strokeWidth="22"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round" />
+        <path
+            android:pathData="M 218,194 L 314,256 L 218,318 Z"
+            android:strokeWidth="34"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round"
+            android:strokeLineJoin="round" />
+    </group>
+</vector>
