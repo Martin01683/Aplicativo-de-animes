@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Calendar,
   Clock,
@@ -13,6 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { isItemFavorited } from '../lib/favoriteAlerts';
+import type { MediaNavigationSeed } from '../lib/prefetchCache';
 import type {
   CalendarDaySection,
   CatalogMediaItem,
@@ -27,11 +28,14 @@ interface LiveChartCalendarProps {
   scheduleMode: LiveChartScheduleMode;
   loading: boolean;
   error?: string;
+  isHidden?: boolean;
   favorites: CatalogMediaItem[];
   onSelectDay: (dayId: string) => void;
   onChangeScheduleMode: (mode: LiveChartScheduleMode) => void;
+  onPrefetchScheduleMode?: (mode: LiveChartScheduleMode) => void;
   onRefresh: () => void;
-  onOpenItem: (url: string, kind: MediaKind) => void;
+  onOpenItem: (url: string, kind: MediaKind, seed?: MediaNavigationSeed) => void;
+  onPrefetchItem?: (url: string, kind: MediaKind, seed?: MediaNavigationSeed) => void;
   onToggleFavorite: (item: CatalogMediaItem) => void;
 }
 
@@ -143,17 +147,34 @@ const MODE_OPTIONS: Array<{ id: LiveChartScheduleMode; label: string; title: str
   { id: 'jp', label: 'Japão (TV)', title: 'Horário de exibição original no Japão' },
 ];
 
+function toCalendarSeed(item: CatalogMediaItem): MediaNavigationSeed {
+  return {
+    title: item.title,
+    poster: item.poster,
+    kind: 'anime',
+    audioType: item.audioType,
+    year: item.year,
+    rating: item.rating,
+    episodeLabel: item.episodeLabel,
+    catalogSource: item.catalogSource,
+    externalIds: item.externalIds,
+  };
+}
+
 export function LiveChartCalendar({
   days,
   selectedDayId,
   scheduleMode,
   loading,
   error,
+  isHidden = false,
   favorites,
   onSelectDay,
   onChangeScheduleMode,
+  onPrefetchScheduleMode,
   onRefresh,
   onOpenItem,
+  onPrefetchItem,
   onToggleFavorite,
 }: LiveChartCalendarProps) {
   const [layout, setLayout] = useState<CalendarLayout>('grid');
@@ -161,10 +182,47 @@ export function LiveChartCalendar({
   const [serviceFilter, setServiceFilter] = useState<string>('ALL');
   const [searchFilter, setSearchFilter] = useState('');
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const hoverTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (isHidden) return;
+    setNowMs(Date.now());
     const id = window.setInterval(() => setNowMs(Date.now()), 30_000);
     return () => window.clearInterval(id);
+  }, [isHidden]);
+
+  useEffect(() => {
+    return () => {
+      if (hoverTimerRef.current !== null) {
+        window.clearTimeout(hoverTimerRef.current);
+      }
+    };
+  }, []);
+
+  const scheduleCardPrefetch = useCallback(
+    (item: CatalogMediaItem, immediate = false) => {
+      if (!onPrefetchItem) return;
+      if (hoverTimerRef.current !== null) {
+        window.clearTimeout(hoverTimerRef.current);
+        hoverTimerRef.current = null;
+      }
+      if (immediate) {
+        onPrefetchItem(item.url, 'anime', toCalendarSeed(item));
+        return;
+      }
+      hoverTimerRef.current = window.setTimeout(() => {
+        hoverTimerRef.current = null;
+        onPrefetchItem(item.url, 'anime', toCalendarSeed(item));
+      }, 90);
+    },
+    [onPrefetchItem]
+  );
+
+  const cancelCardPrefetch = useCallback(() => {
+    if (hoverTimerRef.current !== null) {
+      window.clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
   }, []);
 
   // Reset service filter if selected service disappears after changing mode
@@ -344,7 +402,11 @@ export function LiveChartCalendar({
       >
         <button
           type="button"
-          onClick={() => onOpenItem(item.url, 'anime')}
+          onClick={() => onOpenItem(item.url, 'anime', toCalendarSeed(item))}
+          onMouseEnter={() => scheduleCardPrefetch(item)}
+          onMouseLeave={cancelCardPrefetch}
+          onFocus={() => scheduleCardPrefetch(item)}
+          onTouchStart={() => scheduleCardPrefetch(item, true)}
           className="flex flex-1 flex-col text-left"
         >
           {/* Poster with top time/countdown overlay & bottom gradient title */}
@@ -483,7 +545,11 @@ export function LiveChartCalendar({
                     >
                       <button
                         type="button"
-                        onClick={() => onOpenItem(item.url, 'anime')}
+                        onClick={() => onOpenItem(item.url, 'anime', toCalendarSeed(item))}
+                        onMouseEnter={() => scheduleCardPrefetch(item)}
+                        onMouseLeave={cancelCardPrefetch}
+                        onFocus={() => scheduleCardPrefetch(item)}
+                        onTouchStart={() => scheduleCardPrefetch(item, true)}
                         className="flex min-w-0 flex-1 items-center gap-3 text-left"
                       >
                         <MediaPoster
@@ -583,6 +649,9 @@ export function LiveChartCalendar({
                   type="button"
                   title={m.title}
                   onClick={() => onChangeScheduleMode(m.id)}
+                  onMouseEnter={() => onPrefetchScheduleMode?.(m.id)}
+                  onFocus={() => onPrefetchScheduleMode?.(m.id)}
+                  onTouchStart={() => onPrefetchScheduleMode?.(m.id)}
                   className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors ${
                     scheduleMode === m.id
                       ? 'bg-[#f97316] text-[#0d0f12] font-semibold'
@@ -813,7 +882,7 @@ export function LiveChartCalendar({
           {Array.from({ length: 10 }).map((_, i) => (
             <div
               key={i}
-              className="aspect-[2/3] animate-pulse rounded-xl border border-white/8 bg-[#151921]"
+              className="anisync-shimmer aspect-[2/3] rounded-xl border border-white/8"
             />
           ))}
         </div>
@@ -849,7 +918,11 @@ export function LiveChartCalendar({
           )}
         </div>
       ) : (
-        <div className="space-y-8">
+        <div
+          className={`space-y-8 transition-opacity duration-150 ${
+            loading ? 'opacity-65' : 'opacity-100'
+          }`}
+        >
           {visibleDays
             .filter((d) => d.items.length > 0)
             .map((day) => (

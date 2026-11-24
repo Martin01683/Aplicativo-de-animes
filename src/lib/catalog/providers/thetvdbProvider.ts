@@ -441,6 +441,13 @@ async function getTvdbBearerToken(
   }
 }
 
+const TVDB_WEB_SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+type TvdbWebSearchHitPair = Array<{ hit: TvdbWebSearchHit; parsed: TvdbRichMatch }>;
+const tvdbWebSearchCacheByFetcher = new WeakMap<
+  HttpFetcher,
+  Map<string, { value?: TvdbWebSearchHitPair; expiresAt: number; inFlight?: Promise<TvdbWebSearchHitPair> }>
+>();
+
 /**
  * Queries TheTVDB's public web search API (no API key required) for series, anime, and movies.
  */
@@ -451,9 +458,27 @@ export async function searchTheTvdbWebHits(
     mediaType?: 'all' | 'anime' | 'series' | 'movie';
     limit?: number;
   } = {}
-): Promise<Array<{ hit: TvdbWebSearchHit; parsed: TvdbRichMatch }>> {
+): Promise<TvdbWebSearchHitPair> {
   const cleanQuery = query.trim();
   if (!cleanQuery) return [];
+
+  const limit = Math.min(20, Math.max(5, options.limit || 12));
+  const cacheKey = `${options.mediaType || 'all'}::${limit}::${cleanQuery.toLowerCase()}`;
+  let map = tvdbWebSearchCacheByFetcher.get(fetchHttp);
+  if (!map) {
+    map = new Map();
+    tvdbWebSearchCacheByFetcher.set(fetchHttp, map);
+  }
+  const now = Date.now();
+  const existing = map.get(cacheKey);
+  if (existing) {
+    if (existing.expiresAt > now && existing.value !== undefined) {
+      return existing.value;
+    }
+    if (existing.inFlight) {
+      return existing.inFlight;
+    }
+  }
 
   const facetFilters =
     options.mediaType === 'movie'
@@ -462,41 +487,62 @@ export async function searchTheTvdbWebHits(
         ? [['type:series']]
         : [['type:series', 'type:movie']];
 
-  try {
-    const res = await fetchHttp(TVDB_WEB_SEARCH_URL, {
-      method: 'POST',
-      accept: 'application/json',
-      contentType: 'application/json',
-      referer: `${TVDB_WEB_ORIGIN}/search`,
-      headers: { Origin: TVDB_WEB_ORIGIN },
-      body: JSON.stringify({
-        requests: [
-          {
-            indexName: 'TVDB',
-            params: {
-              query: cleanQuery,
-              hitsPerPage: Math.min(20, Math.max(5, options.limit || 12)),
-              facetFilters,
+  const req = (async (): Promise<TvdbWebSearchHitPair> => {
+    try {
+      const res = await fetchHttp(TVDB_WEB_SEARCH_URL, {
+        method: 'POST',
+        accept: 'application/json',
+        contentType: 'application/json',
+        referer: `${TVDB_WEB_ORIGIN}/search`,
+        headers: { Origin: TVDB_WEB_ORIGIN },
+        body: JSON.stringify({
+          requests: [
+            {
+              indexName: 'TVDB',
+              params: {
+                query: cleanQuery,
+                hitsPerPage: limit,
+                facetFilters,
+              },
             },
-          },
-        ],
-      }),
-      timeoutMs: 9000,
-    });
+          ],
+        }),
+        timeoutMs: 9000,
+      });
 
-    if (!res.ok) return [];
-    const payload = JSON.parse(res.body) as {
-      results?: Array<{ hits?: TvdbWebSearchHit[] }>;
-    };
-    const hits = payload?.results?.[0]?.hits || [];
-    const out: Array<{ hit: TvdbWebSearchHit; parsed: TvdbRichMatch }> = [];
-    for (const hit of hits) {
-      const parsed = parseTvdbWebSearchHit(hit);
-      if (parsed) out.push({ hit, parsed });
+      if (!res.ok) return [];
+      const payload = JSON.parse(res.body) as {
+        results?: Array<{ hits?: TvdbWebSearchHit[] }>;
+      };
+      const hits = payload?.results?.[0]?.hits || [];
+      const out: TvdbWebSearchHitPair = [];
+      for (const hit of hits) {
+        const parsed = parseTvdbWebSearchHit(hit);
+        if (parsed) out.push({ hit, parsed });
+      }
+      return out;
+    } catch {
+      return [];
     }
-    return out;
-  } catch {
-    return [];
+  })();
+
+  if (map.size > 80) {
+    const oldest = map.keys().next().value;
+    if (oldest) map.delete(oldest);
+  }
+  const slot: { value?: TvdbWebSearchHitPair; expiresAt: number; inFlight?: Promise<TvdbWebSearchHitPair> } = {
+    expiresAt: 0,
+    inFlight: req,
+  };
+  map.set(cacheKey, slot);
+
+  try {
+    const value = await req;
+    slot.value = value;
+    slot.expiresAt = Date.now() + TVDB_WEB_SEARCH_CACHE_TTL_MS;
+    return value;
+  } finally {
+    slot.inFlight = undefined;
   }
 }
 
@@ -1219,6 +1265,7 @@ export async function localizeTvdbEpisodeListTitles(
     onlyCjk?: boolean;
     useCache?: boolean;
     skipDirectEpisodePages?: boolean;
+    skipTranslateForHydratableIds?: boolean;
     maxDirectEpisodePages?: number;
   } = {}
 ): Promise<AnimeEpisodeLink[]> {
@@ -1228,13 +1275,32 @@ export async function localizeTvdbEpisodeListTitles(
 
   // 1. Directly fetch individual TheTVDB episode pages for native PT-BR titles on standard-sized series
   const pageByEpisodeId = new Map<number, TvdbEpisodeTranslations>();
+
+  // Always pick up zero-cost in-memory cache hits even when deferring network fetches
+  if (useCache) {
+    for (const ep of episodes) {
+      if (ep.tvdbEpisodeId && ep.tvdbEpisodeId > 0 && !pageByEpisodeId.has(ep.tvdbEpisodeId)) {
+        const cached = readTvdbEpisodePageCache(ep.tvdbEpisodeId);
+        if (cached) {
+          pageByEpisodeId.set(ep.tvdbEpisodeId, cached);
+        }
+      }
+    }
+  }
+
   const eligibleIds =
     !options.skipDirectEpisodePages && !options.onlyCjk
       ? Array.from(
           new Set(
             episodes
               .map((ep) => ep.tvdbEpisodeId)
-              .filter((id): id is number => typeof id === 'number' && Number.isFinite(id) && id > 0)
+              .filter(
+                (id): id is number =>
+                  typeof id === 'number' &&
+                  Number.isFinite(id) &&
+                  id > 0 &&
+                  !pageByEpisodeId.has(id)
+              )
           )
         )
       : [];
@@ -1267,6 +1333,14 @@ export async function localizeTvdbEpisodeListTitles(
     const pageTrans = ep.tvdbEpisodeId ? pageByEpisodeId.get(ep.tvdbEpisodeId) : undefined;
     if (pageTrans?.ptBrTitle) {
       return; // Official native TheTVDB PT-BR title — no machine translation needed
+    }
+    if (
+      options.skipTranslateForHydratableIds &&
+      !pageTrans &&
+      ep.tvdbEpisodeId &&
+      ep.tvdbEpisodeId > 0
+    ) {
+      return; // AnimeDetailView will hydrate official PT-BR titles asynchronously via /api/episode-titles
     }
 
     const m = ep.title.match(EPISODE_PREFIX_SUBTITLE_RE);
@@ -1632,6 +1706,7 @@ export async function fetchTheTvdbDetails(
           tvdbSlug: details.externalIds?.tvdbSlug,
           tvdbSeriesId: details.externalIds?.tvdbId || tvdbId,
           skipDirectEpisodePages: options.skipEpisodePageHydration,
+          skipTranslateForHydratableIds: options.skipEpisodePageHydration,
         });
         const seasons = new Set(details.episodes.map((e) => e.seasonNumber || 1));
         details.seasonsCount = String(seasons.size);
@@ -1702,7 +1777,7 @@ export async function enrichServerDetailsWithTheTvdb(
   fetchHttp: HttpFetcher,
   serverDetails: AnimeDetails,
   credentials?: CatalogSourceCredentials,
-  extra?: { livechartId?: number }
+  extra?: { livechartId?: number; skipEpisodePageHydration?: boolean }
 ): Promise<AnimeDetails> {
   const queryTerms = [
     serverDetails.title,
@@ -1820,6 +1895,7 @@ export async function enrichServerDetailsWithTheTvdb(
     credentials,
     slugHint: bestMatch.slug,
     includeEpisodes: !isMovie && bestMatch.mediaType !== 'movie',
+    skipEpisodePageHydration: extra?.skipEpisodePageHydration,
   }).catch(() => null);
 
   const tvdb = fullTvdb || null;

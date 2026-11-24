@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
   Search,
   X,
@@ -22,7 +22,6 @@ import {
   ArrowRight,
   SlidersHorizontal,
 } from 'lucide-react';
-import { apiFetch } from '../lib/apiClient';
 import { isItemFavorited } from '../lib/favoriteAlerts';
 import {
   filterFavoriteAlerts,
@@ -36,6 +35,10 @@ import {
   getHistoryEntrySeriesName,
   isEpisodeCompleted,
 } from '../lib/playbackProgress';
+import {
+  fetchSearchSuggestCached,
+  type MediaNavigationSeed,
+} from '../lib/prefetchCache';
 import { formatRelativeTimestamp } from '../lib/settings';
 import type {
   AudioType,
@@ -48,7 +51,6 @@ import type {
   LiveChartScheduleMode,
   MediaKind,
   SearchResultItem,
-  SearchSuggestResponse,
   SliderMovieItem,
   WatchHistoryEntry,
 } from '../lib/types';
@@ -147,7 +149,15 @@ interface CatalogViewProps {
   onSelectCalendarDay: (dayId: string) => void;
   onChangeCalendarScheduleMode: (mode: LiveChartScheduleMode) => void;
   onRefreshCalendar: () => void;
-  onOpenItem: (url: string, kind: MediaKind) => void;
+  onOpenItem: (url: string, kind: MediaKind, seed?: MediaNavigationSeed) => void;
+  onPrefetchItem?: (url: string, kind: MediaKind, seed?: MediaNavigationSeed) => void;
+  onPrefetchArchiveCategory?: (category: CatalogArchiveCategory) => void;
+  onPrefetchCalendarMode?: (mode: LiveChartScheduleMode) => void;
+  onPrefetchMoreReleases?: () => void;
+  onPrefetchMoreArchive?: (category: CatalogArchiveCategory) => void;
+  onPrefetchMoreFiltered?: () => void;
+  onPrefetchMoreSearch?: () => void;
+  isHidden?: boolean;
   onToggleFavorite: (item: CatalogMediaItem) => void;
   onToggleMuteFavorite: (animeUrl: string) => void;
   onCheckFavoriteUpdates: () => void;
@@ -165,6 +175,36 @@ interface CatalogViewProps {
   onSelectSection: (section: NavSection) => void;
   defaultAudioFilter: 'ALL' | 'DUB' | 'LEG';
   watchedEpisodeKeys?: Set<string>;
+}
+
+function buildSeedFromCatalogItem(item: CatalogMediaItem): MediaNavigationSeed {
+  return {
+    title: item.title,
+    poster: item.poster,
+    backdrop: item.kind === 'episode' ? item.poster : undefined,
+    kind: item.kind,
+    audioType: item.audioType,
+    year: item.year,
+    rating: item.rating,
+    episodeLabel: item.episodeLabel,
+    sourceServerName: item.sourceServerName,
+    catalogSource: item.catalogSource,
+    externalIds: item.externalIds,
+    isMovie: item.kind === 'movie',
+  };
+}
+
+function buildSeedFromSearchItem(item: SearchResultItem): MediaNavigationSeed {
+  return {
+    title: item.title,
+    poster: item.poster,
+    kind: item.kind,
+    audioType: item.audioType,
+    year: item.year,
+    rating: item.rating,
+    sourceServerName: item.sourceServerName,
+    isMovie: item.kind === 'movie',
+  };
 }
 
 const BASE_ARCHIVE_TABS: Array<{ id: CatalogArchiveCategory; label: string }> = [
@@ -244,6 +284,14 @@ export function CatalogView({
   onChangeCalendarScheduleMode,
   onRefreshCalendar,
   onOpenItem,
+  onPrefetchItem,
+  onPrefetchArchiveCategory,
+  onPrefetchCalendarMode,
+  onPrefetchMoreReleases,
+  onPrefetchMoreArchive,
+  onPrefetchMoreFiltered,
+  onPrefetchMoreSearch,
+  isHidden = false,
   onToggleFavorite,
   onToggleMuteFavorite,
   onCheckFavoriteUpdates,
@@ -272,6 +320,49 @@ export function CatalogView({
   const [openHistoryMenuKey, setOpenHistoryMenuKey] = useState<string | null>(null);
   const searchBoxRef = useRef<HTMLDivElement>(null);
   const suggestReqGenRef = useRef(0);
+  const hoverPrefetchTimerRef = useRef<number | null>(null);
+  const releasesLoadMoreRef = useRef<HTMLDivElement>(null);
+  const catalogLoadMoreRef = useRef<HTMLDivElement>(null);
+  const searchLoadMoreRef = useRef<HTMLDivElement>(null);
+
+  const scheduleHoverPrefetch = useCallback(
+    (url: string, kind: MediaKind, seed?: MediaNavigationSeed) => {
+      if (!onPrefetchItem || !url) return;
+      if (hoverPrefetchTimerRef.current !== null) {
+        window.clearTimeout(hoverPrefetchTimerRef.current);
+      }
+      hoverPrefetchTimerRef.current = window.setTimeout(() => {
+        hoverPrefetchTimerRef.current = null;
+        onPrefetchItem(url, kind, seed);
+      }, 85);
+    },
+    [onPrefetchItem]
+  );
+
+  const cancelHoverPrefetch = useCallback(() => {
+    if (hoverPrefetchTimerRef.current !== null) {
+      window.clearTimeout(hoverPrefetchTimerRef.current);
+      hoverPrefetchTimerRef.current = null;
+    }
+  }, []);
+
+  const triggerImmediatePrefetch = useCallback(
+    (url: string, kind: MediaKind, seed?: MediaNavigationSeed) => {
+      cancelHoverPrefetch();
+      if (onPrefetchItem && url) {
+        onPrefetchItem(url, kind, seed);
+      }
+    },
+    [cancelHoverPrefetch, onPrefetchItem]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (hoverPrefetchTimerRef.current !== null) {
+        window.clearTimeout(hoverPrefetchTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setAudioFilter(defaultAudioFilter);
@@ -324,9 +415,8 @@ export function CatalogView({
     const reqId = ++suggestReqGenRef.current;
     const timer = window.setTimeout(() => {
       setLoadingSuggestions(true);
-      apiFetch(`/api/search-suggest?q=${encodeURIComponent(trimmed)}`)
-        .then((res) => (res.ok ? res.json() : null))
-        .then((data: SearchSuggestResponse | null) => {
+      fetchSearchSuggestCached(trimmed)
+        .then((data) => {
           if (suggestReqGenRef.current !== reqId) return;
           setSuggestions(Array.isArray(data?.results) ? data.results.slice(0, 8) : []);
         })
@@ -339,10 +429,88 @@ export function CatalogView({
             setLoadingSuggestions(false);
           }
         });
-    }, 280);
+    }, 190);
 
     return () => window.clearTimeout(timer);
   }, [searchInput, suggestOpen]);
+
+  // Proactively prefetch the next pagination page when the user scrolls near the bottom
+  useEffect(() => {
+    if (isHidden || typeof IntersectionObserver === 'undefined') return;
+    const target = releasesLoadMoreRef.current;
+    if (!target || activeSection !== 'releases' || searchResults !== null || !onPrefetchMoreReleases) {
+      return;
+    }
+    if (releasesPage >= releasesTotalPages) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          onPrefetchMoreReleases();
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '480px 0px' }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [activeSection, isHidden, onPrefetchMoreReleases, releasesPage, releasesTotalPages, searchResults]);
+
+  const hasActiveFilterForObserver = Boolean(selectedGenre || selectedYear || selectedGlossary);
+  const displayedArchiveForObserver = hasActiveFilterForObserver
+    ? filteredCatalog
+    : archiveState[archiveCategory];
+
+  useEffect(() => {
+    if (isHidden || typeof IntersectionObserver === 'undefined') return;
+    const target = catalogLoadMoreRef.current;
+    if (!target || activeSection !== 'catalog' || searchResults !== null) return;
+    if (displayedArchiveForObserver.currentPage >= displayedArchiveForObserver.totalPages) return;
+    const prefetchFn = hasActiveFilterForObserver
+      ? onPrefetchMoreFiltered
+      : onPrefetchMoreArchive
+        ? () => onPrefetchMoreArchive(archiveCategory)
+        : undefined;
+    if (!prefetchFn) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          prefetchFn();
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '480px 0px' }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [
+    activeSection,
+    archiveCategory,
+    displayedArchiveForObserver.currentPage,
+    displayedArchiveForObserver.totalPages,
+    hasActiveFilterForObserver,
+    isHidden,
+    onPrefetchMoreArchive,
+    onPrefetchMoreFiltered,
+    searchResults,
+  ]);
+
+  useEffect(() => {
+    if (isHidden || typeof IntersectionObserver === 'undefined') return;
+    const target = searchLoadMoreRef.current;
+    if (!target || searchResults === null || !onPrefetchMoreSearch) return;
+    if (searchPage >= searchTotalPages) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          onPrefetchMoreSearch();
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '480px 0px' }
+    );
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [isHidden, onPrefetchMoreSearch, searchPage, searchResults, searchTotalPages]);
 
   const handleSearchSubmit = (e: FormEvent) => {
     e.preventDefault();
@@ -393,10 +561,16 @@ export function CatalogView({
       animeEpisodeCount: number;
       animeName: string;
     },
-    showMuteButton = false
+    showMuteButton = false,
+    priority = false,
+    seedOverride?: Partial<MediaNavigationSeed>
   ) => {
     const favActive = isItemFavorited(item.url, favorites);
     const favMuted = showMuteButton && favActive && isFavoriteMuted(item.url, mutedFavoriteUrls);
+    const navSeed: MediaNavigationSeed = {
+      ...buildSeedFromCatalogItem(item),
+      ...seedOverride,
+    };
     const metaParts: string[] = [];
     if (favMuted) {
       metaParts.push('Silenciado');
@@ -429,7 +603,11 @@ export function CatalogView({
       >
         <button
           type="button"
-          onClick={() => onOpenItem(item.url, item.kind)}
+          onMouseEnter={() => scheduleHoverPrefetch(item.url, item.kind, navSeed)}
+          onMouseLeave={cancelHoverPrefetch}
+          onFocus={() => triggerImmediatePrefetch(item.url, item.kind, navSeed)}
+          onTouchStart={() => triggerImmediatePrefetch(item.url, item.kind, navSeed)}
+          onClick={() => onOpenItem(item.url, item.kind, navSeed)}
           className="flex flex-1 flex-col text-left"
         >
           <div className="relative w-full overflow-hidden rounded-t-xl border-b border-white/8">
@@ -437,6 +615,7 @@ export function CatalogView({
               src={item.poster}
               alt={item.title}
               aspect={aspect}
+              priority={priority}
               className="w-full"
             />
             {item.audioType && (
@@ -656,56 +835,69 @@ export function CatalogView({
                     </div>
                   ) : (
                     <div className="max-h-80 divide-y divide-white/8 overflow-y-auto">
-                      {suggestions.map((item) => (
-                        <button
-                          key={item.url}
-                          type="button"
-                          role="option"
-                          onClick={() => {
-                            setSuggestOpen(false);
-                            onOpenItem(item.url, item.kind);
-                          }}
-                          className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-white/5"
-                        >
-                          <MediaPoster
-                            src={item.poster}
-                            alt={item.title}
-                            aspect="portrait"
-                            className="h-12 w-9 shrink-0 rounded border border-white/10"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-sm font-medium text-white">
-                              {item.title}
-                            </p>
-                            <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
-                              <span>{kindDisplayLabel(item.kind)}</span>
-                              {item.audioType && (
-                                <span
-                                  className={
-                                    item.audioType === 'DUB'
-                                      ? 'font-semibold text-emerald-400'
-                                      : 'text-slate-300'
-                                  }
-                                >
-                                  {item.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
-                                </span>
-                              )}
-                              {item.year && <span className="tabular-nums">{item.year}</span>}
-                              {item.rating && (
-                                <span className="inline-flex items-center gap-0.5 tabular-nums text-amber-400">
-                                  <Star className="h-3 w-3 fill-amber-400" />
-                                  {item.rating}
-                                </span>
-                              )}
-                              {item.sourceServerName && (
-                                <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-slate-300">
-                                  {item.sourceServerName}
-                                </span>
-                              )}
+                      {suggestions.map((item) => {
+                        const suggestSeed = buildSeedFromSearchItem(item);
+                        return (
+                          <button
+                            key={item.url}
+                            type="button"
+                            role="option"
+                            onMouseEnter={() =>
+                              scheduleHoverPrefetch(item.url, item.kind, suggestSeed)
+                            }
+                            onMouseLeave={cancelHoverPrefetch}
+                            onFocus={() =>
+                              triggerImmediatePrefetch(item.url, item.kind, suggestSeed)
+                            }
+                            onTouchStart={() =>
+                              triggerImmediatePrefetch(item.url, item.kind, suggestSeed)
+                            }
+                            onClick={() => {
+                              setSuggestOpen(false);
+                              onOpenItem(item.url, item.kind, suggestSeed);
+                            }}
+                            className="flex w-full items-center gap-3 px-3.5 py-2.5 text-left transition-colors hover:bg-white/5"
+                          >
+                            <MediaPoster
+                              src={item.poster}
+                              alt={item.title}
+                              aspect="portrait"
+                              className="h-12 w-9 shrink-0 rounded border border-white/10"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-sm font-medium text-white">
+                                {item.title}
+                              </p>
+                              <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                                <span>{kindDisplayLabel(item.kind)}</span>
+                                {item.audioType && (
+                                  <span
+                                    className={
+                                      item.audioType === 'DUB'
+                                        ? 'font-semibold text-emerald-400'
+                                        : 'text-slate-300'
+                                    }
+                                  >
+                                    {item.audioType === 'DUB' ? 'Dublado' : 'Legendado'}
+                                  </span>
+                                )}
+                                {item.year && <span className="tabular-nums">{item.year}</span>}
+                                {item.rating && (
+                                  <span className="inline-flex items-center gap-0.5 tabular-nums text-amber-400">
+                                    <Star className="h-3 w-3 fill-amber-400" />
+                                    {item.rating}
+                                  </span>
+                                )}
+                                {item.sourceServerName && (
+                                  <span className="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-slate-300">
+                                    {item.sourceServerName}
+                                  </span>
+                                )}
+                              </div>
                             </div>
-                          </div>
-                        </button>
-                      ))}
+                          </button>
+                        );
+                      })}
                       <button
                         type="button"
                         onClick={() => {
@@ -779,12 +971,12 @@ export function CatalogView({
             </button>
           </div>
 
-          {searching ? (
+          {searching && searchResults.length === 0 ? (
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
               {Array.from({ length: 10 }).map((_, i) => (
                 <div
                   key={i}
-                  className="aspect-[2/3] animate-pulse rounded-xl border border-white/8 bg-[#151921]"
+                  className="anisync-shimmer aspect-[2/3] rounded-xl border border-white/8"
                 />
               ))}
             </div>
@@ -806,8 +998,12 @@ export function CatalogView({
             </div>
           ) : (
             <>
-              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                {searchResults.map((item) =>
+              <div
+                className={`grid grid-cols-2 gap-4 transition-opacity duration-200 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 ${
+                  searching ? 'opacity-60' : 'opacity-100'
+                }`}
+              >
+                {searchResults.map((item, idx) =>
                   renderCard(
                     {
                       id: item.id,
@@ -820,16 +1016,23 @@ export function CatalogView({
                       rating: item.rating,
                       sourceServerName: item.sourceServerName,
                     },
-                    'portrait'
+                    'portrait',
+                    undefined,
+                    undefined,
+                    false,
+                    idx < 5
                   )
                 )}
               </div>
 
               {searchPage < searchTotalPages && (
-                <div className="mt-7 flex justify-center">
+                <div ref={searchLoadMoreRef} className="mt-7 flex justify-center">
                   <button
                     type="button"
                     disabled={loadingMoreSearch}
+                    onMouseEnter={() => onPrefetchMoreSearch?.()}
+                    onFocus={() => onPrefetchMoreSearch?.()}
+                    onTouchStart={() => onPrefetchMoreSearch?.()}
                     onClick={onLoadMoreSearch}
                     className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-[#151921] px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-[#f97316]/60 disabled:opacity-50"
                   >
@@ -858,10 +1061,13 @@ export function CatalogView({
           loading={loadingWeeklyCalendar}
           error={calendarError}
           favorites={favorites}
+          isHidden={isHidden}
           onSelectDay={onSelectCalendarDay}
           onChangeScheduleMode={onChangeCalendarScheduleMode}
+          onPrefetchScheduleMode={onPrefetchCalendarMode}
           onRefresh={onRefreshCalendar}
           onOpenItem={onOpenItem}
+          onPrefetchItem={onPrefetchItem}
           onToggleFavorite={onToggleFavorite}
         />
       ) : activeSection === 'library' ? (
@@ -1030,6 +1236,40 @@ export function CatalogView({
                         >
                           <button
                             type="button"
+                            onMouseEnter={() =>
+                              scheduleHoverPrefetch(alert.episodeUrl, 'episode', {
+                                title: alert.episodeTitle || `${alert.animeTitle} — ${alert.episodeLabel}`,
+                                seriesTitle: alert.animeTitle,
+                                seriesUrl: alert.animeUrl,
+                                poster: alert.poster,
+                                backdrop: alert.poster,
+                                episodeLabel: alert.episodeLabel,
+                                kind: 'episode',
+                              })
+                            }
+                            onMouseLeave={cancelHoverPrefetch}
+                            onFocus={() =>
+                              triggerImmediatePrefetch(alert.episodeUrl, 'episode', {
+                                title: alert.episodeTitle || `${alert.animeTitle} — ${alert.episodeLabel}`,
+                                seriesTitle: alert.animeTitle,
+                                seriesUrl: alert.animeUrl,
+                                poster: alert.poster,
+                                backdrop: alert.poster,
+                                episodeLabel: alert.episodeLabel,
+                                kind: 'episode',
+                              })
+                            }
+                            onTouchStart={() =>
+                              triggerImmediatePrefetch(alert.episodeUrl, 'episode', {
+                                title: alert.episodeTitle || `${alert.animeTitle} — ${alert.episodeLabel}`,
+                                seriesTitle: alert.animeTitle,
+                                seriesUrl: alert.animeUrl,
+                                poster: alert.poster,
+                                backdrop: alert.poster,
+                                episodeLabel: alert.episodeLabel,
+                                kind: 'episode',
+                              })
+                            }
                             onClick={() => onOpenAlert(alert)}
                             className="flex min-w-0 flex-1 items-start gap-3 text-left"
                           >
@@ -1075,7 +1315,28 @@ export function CatalogView({
                             {alert.animeUrl && (
                               <button
                                 type="button"
-                                onClick={() => onOpenItem(alert.animeUrl, 'anime')}
+                                onMouseEnter={() =>
+                                  scheduleHoverPrefetch(alert.animeUrl, 'anime', {
+                                    title: alert.animeTitle,
+                                    poster: alert.poster,
+                                    kind: 'anime',
+                                  })
+                                }
+                                onMouseLeave={cancelHoverPrefetch}
+                                onTouchStart={() =>
+                                  triggerImmediatePrefetch(alert.animeUrl, 'anime', {
+                                    title: alert.animeTitle,
+                                    poster: alert.poster,
+                                    kind: 'anime',
+                                  })
+                                }
+                                onClick={() =>
+                                  onOpenItem(alert.animeUrl, 'anime', {
+                                    title: alert.animeTitle,
+                                    poster: alert.poster,
+                                    kind: 'anime',
+                                  })
+                                }
                                 aria-label={`Abrir página de ${alert.animeTitle}`}
                                 title="Abrir página do anime"
                                 className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-[#0d0f12] text-slate-300 transition-colors hover:border-[#f97316]/50 hover:text-white"
@@ -1121,7 +1382,9 @@ export function CatalogView({
               </div>
             ) : (
               <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                {favorites.map((fav) => renderCard(fav, 'portrait', undefined, undefined, true))}
+                {favorites.map((fav, idx) =>
+                  renderCard(fav, 'portrait', undefined, undefined, true, idx < 5)
+                )}
               </div>
             )}
           </section>
@@ -1189,6 +1452,14 @@ export function CatalogView({
                       entry,
                       animeEpisodeCount: countAnimeEpisodesInHistory(history, entry),
                       animeName: getHistoryEntrySeriesName(entry),
+                    },
+                    false,
+                    false,
+                    {
+                      seriesTitle: entry.seriesTitle,
+                      seriesUrl: entry.seriesUrl,
+                      backdrop: entry.poster,
+                      isMovie: entry.kind === 'movie',
                     }
                   );
                 })}
@@ -1201,7 +1472,7 @@ export function CatalogView({
           {Array.from({ length: 8 }).map((_, i) => (
             <div
               key={i}
-              className="aspect-video animate-pulse rounded-xl border border-white/8 bg-[#151921]"
+              className="anisync-shimmer aspect-video rounded-xl border border-white/8"
             />
           ))}
         </div>
@@ -1240,7 +1511,7 @@ export function CatalogView({
                     </button>
                   </div>
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                    {continueWatchingItems.map((entry) => {
+                    {continueWatchingItems.map((entry, idx) => {
                       const pos = entry.positionSec ?? 0;
                       const dur = entry.durationSec ?? 0;
                       const pct = dur > 0 ? Math.min(99, (pos / dur) * 100) : 15;
@@ -1260,6 +1531,14 @@ export function CatalogView({
                           entry,
                           animeEpisodeCount: countAnimeEpisodesInHistory(history, entry),
                           animeName: getHistoryEntrySeriesName(entry),
+                        },
+                        false,
+                        idx < 4,
+                        {
+                          seriesTitle: entry.seriesTitle,
+                          seriesUrl: entry.seriesUrl,
+                          backdrop: entry.poster,
+                          isMovie: entry.kind === 'movie',
                         }
                       );
                     })}
@@ -1305,15 +1584,27 @@ export function CatalogView({
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                    {filterByAudio(releases).map((item) => renderCard(item, 'landscape'))}
+                    {filterByAudio(releases).map((item, idx) =>
+                      renderCard(
+                        item,
+                        'landscape',
+                        undefined,
+                        undefined,
+                        false,
+                        idx < 4 && continueWatchingItems.length === 0
+                      )
+                    )}
                   </div>
                 )}
 
                 {releasesPage < releasesTotalPages && (
-                  <div className="mt-7 flex justify-center">
+                  <div ref={releasesLoadMoreRef} className="mt-7 flex justify-center">
                     <button
                       type="button"
                       disabled={loadingMoreReleases}
+                      onMouseEnter={() => onPrefetchMoreReleases?.()}
+                      onFocus={() => onPrefetchMoreReleases?.()}
+                      onTouchStart={() => onPrefetchMoreReleases?.()}
                       onClick={onLoadMoreReleases}
                       className="inline-flex items-center gap-2 rounded-xl border border-white/12 bg-[#151921] px-5 py-2.5 text-sm font-medium text-white transition-colors hover:border-[#f97316]/60 disabled:opacity-50"
                     >
@@ -1342,6 +1633,9 @@ export function CatalogView({
                     </div>
                     <button
                       type="button"
+                      onMouseEnter={() => onPrefetchArchiveCategory?.('animes')}
+                      onFocus={() => onPrefetchArchiveCategory?.('animes')}
+                      onTouchStart={() => onPrefetchArchiveCategory?.('animes')}
                       onClick={() => {
                         onSelectArchiveCategory('animes');
                         onSelectSection('catalog');
@@ -1368,6 +1662,9 @@ export function CatalogView({
                     </div>
                     <button
                       type="button"
+                      onMouseEnter={() => onPrefetchArchiveCategory?.('movies')}
+                      onFocus={() => onPrefetchArchiveCategory?.('movies')}
+                      onTouchStart={() => onPrefetchArchiveCategory?.('movies')}
                       onClick={() => {
                         onSelectArchiveCategory('movies');
                         onSelectSection('catalog');
@@ -1394,6 +1691,9 @@ export function CatalogView({
                     </div>
                     <button
                       type="button"
+                      onMouseEnter={() => onPrefetchArchiveCategory?.('series')}
+                      onFocus={() => onPrefetchArchiveCategory?.('series')}
+                      onTouchStart={() => onPrefetchArchiveCategory?.('series')}
                       onClick={() => {
                         onSelectArchiveCategory('series');
                         onSelectSection('catalog');
@@ -1446,6 +1746,9 @@ export function CatalogView({
                         <button
                           key={tab.id}
                           type="button"
+                          onMouseEnter={() => onPrefetchArchiveCategory?.(tab.id)}
+                          onFocus={() => onPrefetchArchiveCategory?.(tab.id)}
+                          onTouchStart={() => onPrefetchArchiveCategory?.(tab.id)}
                           onClick={() => onSelectArchiveCategory(tab.id)}
                           className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
                             active
@@ -1557,7 +1860,9 @@ export function CatalogView({
                       <h2 className="text-base font-semibold text-white">Em Destaque</h2>
                     </div>
                     <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-                      {featuredAnimes.slice(0, 8).map((item) => renderCard(item, 'portrait'))}
+                      {featuredAnimes.slice(0, 8).map((item, idx) =>
+                        renderCard(item, 'portrait', undefined, undefined, false, idx < 4)
+                      )}
                     </div>
                   </div>
                 )}
@@ -1572,7 +1877,7 @@ export function CatalogView({
                       <h2 className="text-base font-semibold text-white">Filmes em Destaque</h2>
                     </div>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                      {sliderMovies.slice(0, 6).map((movie) => {
+                      {sliderMovies.slice(0, 6).map((movie, idx) => {
                         const favItem: CatalogMediaItem = {
                           id: movie.id,
                           title: movie.title,
@@ -1582,6 +1887,14 @@ export function CatalogView({
                           audioType: null,
                           year: movie.year,
                         };
+                        const movieSeed: MediaNavigationSeed = {
+                          title: movie.title,
+                          poster: movie.backdrop,
+                          backdrop: movie.backdrop,
+                          kind: 'movie',
+                          year: movie.year,
+                          isMovie: true,
+                        };
                         const favActive = isItemFavorited(movie.url, favorites);
                         return (
                           <div
@@ -1590,13 +1903,24 @@ export function CatalogView({
                           >
                             <button
                               type="button"
-                              onClick={() => onOpenItem(movie.url, 'movie')}
+                              onMouseEnter={() =>
+                                scheduleHoverPrefetch(movie.url, 'movie', movieSeed)
+                              }
+                              onMouseLeave={cancelHoverPrefetch}
+                              onFocus={() =>
+                                triggerImmediatePrefetch(movie.url, 'movie', movieSeed)
+                              }
+                              onTouchStart={() =>
+                                triggerImmediatePrefetch(movie.url, 'movie', movieSeed)
+                              }
+                              onClick={() => onOpenItem(movie.url, 'movie', movieSeed)}
                               className="flex flex-1 flex-col text-left"
                             >
                               <MediaPoster
                                 src={movie.backdrop}
                                 alt={movie.title}
                                 aspect="landscape"
+                                priority={idx < 3}
                                 className="w-full border-b border-white/8"
                               />
                               <div className="p-3">
@@ -1642,7 +1966,7 @@ export function CatalogView({
                   {Array.from({ length: 10 }).map((_, i) => (
                     <div
                       key={i}
-                      className="aspect-[2/3] animate-pulse rounded-xl border border-white/8 bg-[#151921]"
+                      className="anisync-shimmer aspect-[2/3] rounded-xl border border-white/8"
                     />
                   ))}
                 </div>
@@ -1661,15 +1985,38 @@ export function CatalogView({
                           : `Lançamentos de ${selectedYear}`
                       : archiveTabs.find((t) => t.id === archiveCategory)?.label || 'Catálogo'}
                   </h2>
-                  <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
-                    {displayedArchive.items.map((item) => renderCard(item, 'portrait'))}
+                  <div
+                    className={`grid grid-cols-2 gap-4 transition-opacity duration-200 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 ${
+                      displayedArchive.loading && displayedArchive.currentPage === 1
+                        ? 'opacity-60'
+                        : 'opacity-100'
+                    }`}
+                  >
+                    {displayedArchive.items.map((item, idx) =>
+                      renderCard(item, 'portrait', undefined, undefined, false, idx < 5)
+                    )}
                   </div>
 
                   {displayedArchive.currentPage < displayedArchive.totalPages && (
-                    <div className="mt-7 flex justify-center">
+                    <div ref={catalogLoadMoreRef} className="mt-7 flex justify-center">
                       <button
                         type="button"
                         disabled={displayedArchive.loading}
+                        onMouseEnter={() =>
+                          hasActiveFilter
+                            ? onPrefetchMoreFiltered?.()
+                            : onPrefetchMoreArchive?.(archiveCategory)
+                        }
+                        onFocus={() =>
+                          hasActiveFilter
+                            ? onPrefetchMoreFiltered?.()
+                            : onPrefetchMoreArchive?.(archiveCategory)
+                        }
+                        onTouchStart={() =>
+                          hasActiveFilter
+                            ? onPrefetchMoreFiltered?.()
+                            : onPrefetchMoreArchive?.(archiveCategory)
+                        }
                         onClick={() =>
                           hasActiveFilter
                             ? onLoadMoreFiltered()

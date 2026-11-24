@@ -2,7 +2,7 @@ import {createRoot} from 'react-dom/client';
 import {registerSW} from 'virtual:pwa-register';
 import App from './App.tsx';
 import './index.css';
-import {initApiClient, isNativeAndroidApp} from './lib/apiClient';
+import {initApiClient, isNativeAndroidApp, preloadApiRouter} from './lib/apiClient';
 
 if (!isNativeAndroidApp()) {
   registerSW({immediate: true});
@@ -32,6 +32,9 @@ if (typeof document !== 'undefined') {
   });
 }
 
-void initApiClient().finally(() => {
-  createRoot(document.getElementById('root')!).render(<App />);
-});
+// Warm native proxy URL and Android API router in parallel without blocking First Contentful Paint
+void initApiClient();
+preloadApiRouter();
+
+createRoot(document.getElementById('root')!).render(<App />);
+

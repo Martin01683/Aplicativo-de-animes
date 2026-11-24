@@ -353,6 +353,22 @@ function loadAnisyncApiRouter(): Promise<typeof import('./anisyncApiRouter.ts')>
   return routerModulePromise;
 }
 
+export function preloadApiRouter(): void {
+  if (!isNativeAndroidApp()) return;
+  void loadAnisyncApiRouter().catch(() => {
+    // Best-effort startup warmup on Android
+  });
+}
+
+export function clearNativeApiCaches(): void {
+  if (!routerModulePromise) return;
+  void routerModulePromise
+    .then((mod) => mod.clearAnisyncRouterCaches())
+    .catch(() => {
+      // Ignore
+    });
+}
+
 export async function routeNativeApiRequest(
   pathWithQuery: string,
   init: RequestInit | undefined,

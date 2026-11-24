@@ -20,6 +20,9 @@ import type {
 } from './types.ts';
 import { isSafeExternalHttpUrl, normalizeTopAnimesUrl, unwrapAvisoUrl } from './urlSafety.ts';
 import { isUncensoredEpisodeTitle } from './episodeAvailability.ts';
+import { formatServerLabel } from './serverLabel.ts';
+
+export { formatServerLabel };
 
 const NAMED_HEIGHTS: Record<string, number> = {
   uhd: 2160,
@@ -58,12 +61,6 @@ const AD_HOST_RE =
 
 function cleanText(val: string | undefined): string {
   return String(val || '').replace(/\s+/g, ' ').trim();
-}
-
-export function formatServerLabel(raw: string | undefined, fallback = 'Servidor'): string {
-  const cleaned = cleanText(raw);
-  if (!cleaned) return fallback;
-  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
 export function inferAudioType(text: string): AudioType {

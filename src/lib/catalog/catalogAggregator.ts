@@ -158,7 +158,8 @@ export async function getAggregatedRandomMedia(
 export async function getAggregatedMediaDetails(
   fetchHttp: HttpFetcher,
   targetUri: string,
-  prefs?: CatalogPreferences
+  prefs?: CatalogPreferences,
+  options?: { skipEpisodePageHydration?: boolean }
 ): Promise<AnimeDetails | null> {
   const parsed = parseAnisyncUri(targetUri);
   if (parsed.kind !== 'media') return null;
@@ -173,6 +174,7 @@ export async function getAggregatedMediaDetails(
       mediaType,
       credentials: prefs?.credentials,
       includeEpisodes: true,
+      skipEpisodePageHydration: options?.skipEpisodePageHydration,
     });
   }
 
@@ -214,7 +216,10 @@ export async function getAggregatedMediaDetails(
         fetchHttp,
         resolvedServerMatch.details,
         prefs?.credentials,
-        { livechartId: lc.livechartId || undefined }
+        {
+          livechartId: lc.livechartId || undefined,
+          skipEpisodePageHydration: options?.skipEpisodePageHydration,
+        }
       ).catch(() => resolvedServerMatch.details);
 
       const mergedIds = {
@@ -236,6 +241,7 @@ export async function getAggregatedMediaDetails(
         credentials: prefs?.credentials,
         slugHint: tvdbMatch.slug,
         includeEpisodes: true,
+        skipEpisodePageHydration: options?.skipEpisodePageHydration,
       }).catch(() => null);
 
       const base = fullTvdb || {

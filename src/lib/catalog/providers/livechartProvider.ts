@@ -533,6 +533,7 @@ export function parseLiveChartScheduleHtml(
 
 const LIVECHART_HINT_CACHE_TTL_MS = 15 * 60 * 1000;
 let cachedLiveChartScheduleItems: { items: CatalogMediaItem[]; expiresAt: number } | null = null;
+const inFlightLiveChartScheduleByFetcher = new WeakMap<HttpFetcher, Promise<CatalogMediaItem[]>>();
 
 function rememberLiveChartItems(response: WeeklyCalendarResponse): void {
   const flat: CatalogMediaItem[] = [];
@@ -600,12 +601,19 @@ export async function findLiveChartScheduleHint(
       : null;
 
   if (!items) {
-    try {
-      const fetched = await fetchLiveChartWeeklySchedule(fetchHttp, { mode: 'streams' });
-      items = fetched.days.flatMap((d) => d.items);
-    } catch {
-      return null;
+    let pending = inFlightLiveChartScheduleByFetcher.get(fetchHttp);
+    if (!pending) {
+      pending = fetchLiveChartWeeklySchedule(fetchHttp, { mode: 'streams' })
+        .then((fetched) => fetched.days.flatMap((d) => d.items))
+        .catch(() => [] as CatalogMediaItem[])
+        .finally(() => {
+          if (inFlightLiveChartScheduleByFetcher.get(fetchHttp) === pending) {
+            inFlightLiveChartScheduleByFetcher.delete(fetchHttp);
+          }
+        });
+      inFlightLiveChartScheduleByFetcher.set(fetchHttp, pending);
     }
+    items = await pending;
   }
 
   if (!items || items.length === 0) return null;

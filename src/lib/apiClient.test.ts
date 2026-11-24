@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import {
+  clearAnisyncRouterCaches,
+  dispatchAnisyncApiRequest,
+} from './anisyncApiRouter';
 import { routeNativeApiRequest } from './apiClient';
 
 test('routeNativeApiRequest validates /api/media, /api/anime, /api/episode and /api/resolve-embed', async () => {
@@ -653,3 +657,252 @@ test('POST /api/episode with deferCrossSources returns immediately without block
   );
   assert.equal(videoPageFetches.length, 1, 'must not re-download Hinata Soul episode HTML');
 });
+
+test('dispatchAnisyncApiRequest coalesces parallel stage=quick and fast=1 /api/media requests and skips synchronous episode page scrapes', async () => {
+  clearAnisyncRouterCaches();
+  const fetchedUrls: string[] = [];
+  const animeHtml = `
+    <html><body>
+      <div class="sheader">
+        <div class="poster"><img src="https://img.example.org/demo.jpg" /></div>
+        <div class="data"><h1>Solo Demo</h1><div class="extra"><span class="date">2025</span></div></div>
+      </div>
+      <div id="info"><div class="wp-content"><p>Sinopse base do servidor.</p></div></div>
+      <div id="seasons">
+        <div class="se-c">
+          <div class="se-q"><span class="se-t">1</span></div>
+          <ul class="episodios">
+            <li>
+              <div class="numerando">1 - 1</div>
+              <div class="episodiotitle"><a href="https://topanimes.net/episodio/solo-demo-episodio-1/">Episódio 1</a></div>
+            </li>
+          </ul>
+        </div>
+      </div>
+    </body></html>`;
+
+  const fetchHttp = async (targetUrl: string) => {
+    fetchedUrls.push(targetUrl);
+    if (targetUrl === 'https://topanimes.net/animes/solo-demo/') {
+      await new Promise((r) => setTimeout(r, 15));
+      return { status: 200, ok: true, finalUrl: targetUrl, body: animeHtml };
+    }
+    if (targetUrl.includes('api4.thetvdb.com/web/search/queries')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: targetUrl,
+        body: JSON.stringify({
+          results: [
+            {
+              hits: [
+                {
+                  id: '555123',
+                  objectID: 'series-555123',
+                  type: 'series',
+                  slug: 'solo-demo',
+                  name: 'Solo Demo',
+                  year: '2025',
+                  country: 'jpn',
+                  primary_language: 'jpn',
+                  translations: { pt: 'Solo Demo', eng: 'Solo Demo' },
+                  overviews: { pt: 'Sinopse oficial em PT-BR' },
+                },
+              ],
+            },
+          ],
+        }),
+      };
+    }
+    if (targetUrl.includes('thetvdb.com/series/solo-demo/allseasons/official')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: targetUrl,
+        body: `
+          <ul class="list-group">
+            <li class="list-group-item">
+              <h4>
+                <span class="episode-label">S01E01</span>
+                <a href="/series/solo-demo/episodes/777111">First Episode EN</a>
+              </h4>
+            </li>
+          </ul>`,
+      };
+    }
+    if (targetUrl.includes('thetvdb.com/series/solo-demo') || targetUrl.includes('thetvdb.com/dereferrer/series/555123')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: 'https://www.thetvdb.com/series/solo-demo',
+        body: `
+          <html>
+            <head><title>Solo Demo - TheTVDB.com</title></head>
+            <body>
+              <h1>Solo Demo</h1>
+              <div class="change_translation_text" data-language="pt" data-title="Solo Demo"><p>Sinopse oficial em PT-BR</p></div>
+              <ul id="series_basic_info">
+                <li><strong>TheTVDB.com Series ID</strong><span>555123</span></li>
+              </ul>
+            </body>
+          </html>`,
+      };
+    }
+    return { status: 404, ok: false, finalUrl: targetUrl, body: '' };
+  };
+
+  try {
+    const encoded = encodeURIComponent('https://topanimes.net/animes/solo-demo/');
+    const [quickRes, fullRes] = await Promise.all([
+      dispatchAnisyncApiRequest(
+        `/api/media?url=${encoded}&stage=quick`,
+        { method: 'GET' },
+        { fetchHttp, serviceName: 'test', useCache: true }
+      ),
+      dispatchAnisyncApiRequest(
+        `/api/media?url=${encoded}&fast=1`,
+        { method: 'GET' },
+        { fetchHttp, serviceName: 'test', useCache: true }
+      ),
+    ]);
+
+    assert.equal(quickRes.status, 200);
+    assert.equal(fullRes.status, 200);
+
+    const quickBody = quickRes.body as { title: string; episodes: Array<{ url: string }> };
+    const fullBody = fullRes.body as {
+      title: string;
+      synopsis: string;
+      episodes: Array<{ tvdbEpisodeId?: number }>;
+    };
+    assert.equal(quickBody.title, 'Solo Demo');
+    assert.equal(quickBody.episodes.length, 1);
+    assert.equal(fullBody.synopsis, 'Sinopse oficial em PT-BR');
+    assert.equal(fullBody.episodes[0].tvdbEpisodeId, 777111);
+
+    // Parallel quick + full must coalesce into a single TopAnimes anime HTML request
+    const animePageHits = fetchedUrls.filter(
+      (u) => u === 'https://topanimes.net/animes/solo-demo/'
+    );
+    assert.equal(animePageHits.length, 1, 'stage=quick and fast=1 must coalesce raw server HTML fetch');
+
+    // fast=1 must NOT scrape individual TheTVDB episode pages synchronously
+    assert.equal(
+      fetchedUrls.some((u) => u.includes('/episodes/777111')),
+      false,
+      'fast=1 must defer individual TheTVDB episode page fetches to client /api/episode-titles'
+    );
+
+    // Subsequent stage=quick should immediately return the already-cached enriched result
+    const warmQuick = await dispatchAnisyncApiRequest(
+      `/api/media?url=${encoded}&stage=quick`,
+      { method: 'GET' },
+      { fetchHttp, serviceName: 'test', useCache: true }
+    );
+    assert.equal((warmQuick.body as { synopsis: string }).synopsis, 'Sinopse oficial em PT-BR');
+  } finally {
+    clearAnisyncRouterCaches();
+  }
+});
+
+test('dispatchAnisyncApiRequest coalesces Hinata Soul homepage between /api/home and /api/episodes and caches /api/catalog', async () => {
+  clearAnisyncRouterCaches();
+  const fetchedUrls: string[] = [];
+  const topHomeHtml = `
+    <html><body>
+      <div id="dt-tvshows">
+        <article class="item"><div class="poster"><img src="https://img.example.org/a.jpg" /></div>
+          <div class="data"><h3><a href="https://topanimes.net/animes/alpha/">Alpha</a></h3></div>
+        </article>
+      </div>
+      <article class="item se episodes">
+        <div class="poster"><img src="https://img.example.org/e.jpg" alt="Alpha" /></div>
+        <div class="data"><a href="https://topanimes.net/episodio/alpha-episodio-1/"><h3>Episódio 1</h3><span class="serie">Alpha</span></a></div>
+      </article>
+    </body></html>`;
+
+  const topArchiveHtml = `
+    <html><body>
+      <div class="items normal">
+        <article class="item tvshows"><div class="poster"><img src="https://img.example.org/a.jpg" /></div>
+          <div class="data"><h3><a href="https://topanimes.net/animes/alpha/">Alpha</a></h3></div>
+        </article>
+      </div>
+      <div class="pagination"><span>Página 1 de 3</span></div>
+    </body></html>`;
+
+  const hinataHomeHtml = `
+    <html><body>
+      <div class="ultimosEpisodiosHomeItem">
+        <a href="https://www.hinatasoul.com/videos/1001" title="Beta Episódio 1">
+          <img src="https://img.example.org/beta.jpg" />
+          <div class="ultimosEpisodiosHomeItemInfosNome">Beta</div>
+          <div class="ultimosEpisodiosHomeItemInfosNum">Episódio 1</div>
+        </a>
+      </div>
+    </body></html>`;
+
+  const fetchHttp = async (targetUrl: string) => {
+    fetchedUrls.push(targetUrl);
+    if (targetUrl === 'https://www.hinatasoul.com/' || targetUrl === 'https://www.hinatasoul.com') {
+      await new Promise((r) => setTimeout(r, 15));
+      return { status: 200, ok: true, finalUrl: targetUrl, body: hinataHomeHtml };
+    }
+    if (targetUrl === 'https://topanimes.net/' || targetUrl === 'https://topanimes.net') {
+      return { status: 200, ok: true, finalUrl: targetUrl, body: topHomeHtml };
+    }
+    if (targetUrl.startsWith('https://topanimes.net/episodio/')) {
+      return { status: 200, ok: true, finalUrl: targetUrl, body: topHomeHtml };
+    }
+    if (targetUrl.startsWith('https://topanimes.net/animes/')) {
+      return { status: 200, ok: true, finalUrl: targetUrl, body: topArchiveHtml };
+    }
+    return { status: 404, ok: false, finalUrl: targetUrl, body: '' };
+  };
+
+  try {
+    const [homeRes, epsRes] = await Promise.all([
+      dispatchAnisyncApiRequest(
+        '/api/home',
+        { method: 'GET' },
+        { fetchHttp, serviceName: 'test', useCache: true }
+      ),
+      dispatchAnisyncApiRequest(
+        '/api/episodes?page=1',
+        { method: 'GET' },
+        { fetchHttp, serviceName: 'test', useCache: true }
+      ),
+    ]);
+    assert.equal(homeRes.status, 200);
+    assert.equal(epsRes.status, 200);
+
+    const hinataHomeHits = fetchedUrls.filter((u) => u.startsWith('https://www.hinatasoul.com'));
+    assert.equal(
+      hinataHomeHits.length,
+      1,
+      'parallel /api/home and /api/episodes?page=1 must share a single Hinata Soul home request'
+    );
+
+    // First /api/catalog hits upstream; second hits router TTL cache cleanly
+    const cat1 = await dispatchAnisyncApiRequest(
+      '/api/catalog?category=animes&page=1',
+      { method: 'GET' },
+      { fetchHttp, serviceName: 'test', useCache: true }
+    );
+    const hitsAfterFirst = fetchedUrls.filter((u) => u.startsWith('https://topanimes.net/animes/')).length;
+    const cat2 = await dispatchAnisyncApiRequest(
+      '/api/catalog?category=animes&page=1',
+      { method: 'GET' },
+      { fetchHttp, serviceName: 'test', useCache: true }
+    );
+    const hitsAfterSecond = fetchedUrls.filter((u) => u.startsWith('https://topanimes.net/animes/')).length;
+
+    assert.equal(cat1.status, 200);
+    assert.equal(cat2.status, 200);
+    assert.equal(hitsAfterFirst, 1);
+    assert.equal(hitsAfterSecond, 1, 'second /api/catalog request must be served from router cache');
+  } finally {
+    clearAnisyncRouterCaches();
+  }
+});
+
