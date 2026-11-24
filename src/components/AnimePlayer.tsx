@@ -112,6 +112,7 @@ interface AnimePlayerProps {
   prevUrl?: string;
   nextUrl?: string;
   upcomingNextEpisode?: AnimeEpisodeLink;
+  upcomingBannerTrigger?: number;
   loadingEpisode?: boolean;
   errorMessage?: string;
   skipIntroSeconds?: number;
@@ -233,6 +234,7 @@ export function AnimePlayer({
   prevUrl,
   nextUrl,
   upcomingNextEpisode,
+  upcomingBannerTrigger = 0,
   loadingEpisode = false,
   errorMessage: externalErrorMessage = '',
   skipIntroSeconds = 85,
@@ -403,6 +405,21 @@ export function AnimePlayer({
       }, 7000);
     }
   }, []);
+
+  const lastUpcomingTriggerRef = useRef(upcomingBannerTrigger);
+  useEffect(() => {
+    if (
+      upcomingBannerTrigger > 0 &&
+      upcomingBannerTrigger !== lastUpcomingTriggerRef.current &&
+      !hasNext &&
+      upcomingNextEpisode
+    ) {
+      lastUpcomingTriggerRef.current = upcomingBannerTrigger;
+      showUpcomingBanner('click');
+    } else {
+      lastUpcomingTriggerRef.current = upcomingBannerTrigger;
+    }
+  }, [hasNext, showUpcomingBanner, upcomingBannerTrigger, upcomingNextEpisode]);
 
   useEffect(() => {
     dismissUpcomingBanner();
@@ -1190,6 +1207,9 @@ export function AnimePlayer({
             setNativeResumeMs(
               Math.round(getEpisodeResumeSeconds(activeResultUrl) * 1000)
             );
+            if (completedFlag && res?.action === 'closed' && !hasNext && upcomingNextEpisode) {
+              showUpcomingBanner('ended');
+            }
           }
         }
 
@@ -1233,10 +1253,12 @@ export function AnimePlayer({
       playableSeriesEpisodes,
       seriesTitle,
       seriesUrl,
+      showUpcomingBanner,
       skipIntroSeconds,
       sortedStreams,
       subtitles,
       title,
+      upcomingNextEpisode,
       watchedUrls,
     ]
   );
@@ -1334,6 +1356,29 @@ export function AnimePlayer({
     });
     showControlsTemporarily();
   }, [volume, showControlsTemporarily]);
+
+  const exitFullscreenIfActive = useCallback(() => {
+    try {
+      if (document.fullscreenElement && document.exitFullscreen) {
+        void document.exitFullscreen().catch(() => {
+          // ignore
+        });
+      }
+      const video = videoRef.current as
+        | (HTMLVideoElement & {
+            webkitExitFullscreen?: () => void;
+            webkitDisplayingFullscreen?: boolean;
+          })
+        | null;
+      if (video?.webkitDisplayingFullscreen && video.webkitExitFullscreen) {
+        video.webkitExitFullscreen();
+      }
+      const orientation = screen.orientation as ScreenOrientation & { unlock?: () => void };
+      orientation?.unlock?.();
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const toggleFullscreen = useCallback(async () => {
     if (useNativeVlc) {
@@ -1604,9 +1649,8 @@ export function AnimePlayer({
     }
     if (!hasNext && upcomingNextEpisode) {
       showUpcomingBanner('click');
-      onToast(formatUpcomingEpisodeNotice(upcomingNextEpisode));
     }
-  }, [dismissUpcomingBanner, hasNext, onNextEpisode, onToast, showUpcomingBanner, upcomingNextEpisode]);
+  }, [dismissUpcomingBanner, hasNext, onNextEpisode, showUpcomingBanner, upcomingNextEpisode]);
 
   const triggerSelectEpisode = useCallback(
     (url: string) => {
@@ -1917,16 +1961,16 @@ export function AnimePlayer({
                 autoNextTriggeredForUrlRef.current = episodeUrl || null;
                 onToast('Carregando próximo episódio...');
                 triggerNextEpisode();
-              } else if (
-                reachedGenuineEnd &&
-                !hasNext &&
-                upcomingNextEpisode &&
-                episodeUrl &&
-                autoNextTriggeredForUrlRef.current !== episodeUrl
-              ) {
-                autoNextTriggeredForUrlRef.current = episodeUrl;
-                showUpcomingBanner('ended');
-                onToast(formatUpcomingEpisodeNotice(upcomingNextEpisode));
+              } else if (reachedGenuineEnd && !hasNext) {
+                exitFullscreenIfActive();
+                if (
+                  upcomingNextEpisode &&
+                  episodeUrl &&
+                  autoNextTriggeredForUrlRef.current !== episodeUrl
+                ) {
+                  autoNextTriggeredForUrlRef.current = episodeUrl;
+                  showUpcomingBanner('ended');
+                }
               } else if (!reachedGenuineEnd && !loadingEpisode && !effectiveErrorMsg) {
                 advanceFallbackOrFail();
               }
@@ -2615,7 +2659,7 @@ export function AnimePlayer({
                       <button
                         type="button"
                         onClick={() => setMenuTab('quality')}
-                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10 sm:hidden"
                       >
                         <span>Qualidade</span>
                         <span className="inline-flex items-center gap-1 font-mono text-slate-400">
@@ -2658,7 +2702,7 @@ export function AnimePlayer({
                       <button
                         type="button"
                         onClick={() => setMenuTab('subs')}
-                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10 sm:hidden"
                       >
                         <span>Legendas</span>
                         <span className="inline-flex max-w-[130px] items-center gap-1 truncate text-slate-400">

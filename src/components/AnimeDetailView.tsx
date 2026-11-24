@@ -439,44 +439,6 @@ export function AnimeDetailView({
           <ArrowLeft className="h-4 w-4" />
           <span>Voltar</span>
         </button>
-
-        <div className="flex items-center gap-2 md:hidden">
-          {isFavorite && onToggleMuteFavorite && (
-            <button
-              type="button"
-              onClick={() => onToggleMuteFavorite(anime.url)}
-              aria-pressed={isMuted}
-              aria-label={
-                isMuted
-                  ? `Ativar avisos de ${anime.title}`
-                  : `Silenciar avisos de ${anime.title}`
-              }
-              className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-semibold transition-colors ${
-                isMuted
-                  ? 'border-white/15 bg-[#151921] text-slate-400 hover:text-white'
-                  : 'border-[#f97316]/40 bg-[#f97316]/12 text-[#fb923c] hover:bg-[#f97316]/20'
-              }`}
-            >
-              {isMuted ? <BellOff className="h-3.5 w-3.5" /> : <Bell className="h-3.5 w-3.5" />}
-              <span>{isMuted ? 'Silenciado' : 'Avisos'}</span>
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={handleToggleFav}
-            aria-pressed={isFavorite}
-            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
-              isFavorite
-                ? 'border-rose-500/50 bg-rose-500/15 text-rose-200 hover:bg-rose-500/20'
-                : 'border-white/15 bg-[#151921] text-white hover:border-rose-400/60 hover:text-rose-200'
-            }`}
-          >
-            <Heart
-              className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : 'text-rose-400'}`}
-            />
-            <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
-          </button>
-        </div>
       </div>
 
       {/* Hero Info Card enriched by TheTVDB */}
@@ -941,6 +903,14 @@ export function AnimeDetailView({
               const seasonAllWatched =
                 seasonPlayableEpisodes.length > 0 &&
                 seasonWatchedCount === seasonPlayableEpisodes.length;
+              const totalSeasonEpisodes = fullGroup.episodes.length;
+              const seasonBadgeLabel =
+                seasonPlayableEpisodes.length > 0
+                  ? `${seasonWatchedCount}/${seasonPlayableEpisodes.length}`
+                  : `0/${totalSeasonEpisodes}`;
+              const seasonBadgeClass = seasonAllWatched
+                ? 'border-emerald-500/45 bg-emerald-500/20 text-emerald-300'
+                : 'border-[#f97316]/35 bg-[#f97316]/15 text-[#fb923c]';
               const seasonExpanded = isSeasonExpanded(group.seasonNumber);
               const seasonPanelId = `season-panel-${group.seasonNumber}`;
               const canCollapseSeason =
@@ -954,7 +924,8 @@ export function AnimeDetailView({
                   className="overflow-hidden rounded-xl border border-white/10 bg-[#151921]"
                 >
                   <div
-                    className={`flex flex-wrap items-center justify-between gap-2 bg-[#0d0f12]/55 px-4 py-2.5 transition-colors ${
+                    data-season-header={group.seasonNumber}
+                    className={`flex items-center justify-between gap-2 bg-[#0d0f12]/55 px-4 py-2.5 transition-colors ${
                       seasonExpanded ? 'border-b border-white/10' : ''
                     } ${canCollapseSeason ? 'hover:bg-white/[0.04]' : ''}`}
                   >
@@ -965,64 +936,37 @@ export function AnimeDetailView({
                         aria-expanded={seasonExpanded}
                         aria-controls={seasonPanelId}
                         onClick={() => toggleSeasonExpanded(group.seasonNumber)}
-                        className="flex min-w-0 flex-1 items-center justify-between gap-3 py-0.5 text-left"
+                        className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
                       >
-                        <div className="flex min-w-0 flex-wrap items-center gap-2">
-                          <span className="text-xs font-semibold uppercase tracking-wide text-white sm:text-sm sm:normal-case sm:tracking-normal">
-                            {group.label}
-                          </span>
-                          <span
-                            className={`inline-flex items-center rounded-md border px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${
-                              seasonAllWatched
-                                ? 'border-emerald-500/45 bg-emerald-500/20 text-emerald-300'
-                                : seasonPlayableEpisodes.length > 0
-                                  ? 'border-[#f97316]/35 bg-[#f97316]/15 text-[#fb923c]'
-                                  : 'border-white/15 bg-white/8 text-slate-300'
-                            }`}
-                          >
-                            {seasonPlayableEpisodes.length > 0
-                              ? `${seasonWatchedCount}/${seasonPlayableEpisodes.length}`
-                              : `${fullGroup.episodes.length} eps`}
-                          </span>
-                          {seasonUnavailableCount > 0 && (
-                            <span className="font-mono text-[11px] tabular-nums text-[#fb923c]">
-                              · {seasonUnavailableCount}{' '}
-                              {seasonUnavailableCount === 1 ? 'indisponível' : 'indisponíveis'}
-                            </span>
-                          )}
-                        </div>
-
-                        <span
-                          aria-hidden="true"
-                          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-white/10 text-slate-200 transition-colors"
-                        >
-                          <ChevronDown
-                            className={`h-4 w-4 transition-transform duration-200 ${
-                              seasonExpanded ? 'rotate-180' : ''
-                            }`}
-                          />
-                        </span>
-                      </button>
-                    ) : (
-                      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-                        <span className="text-xs font-semibold uppercase tracking-wide text-white sm:text-sm sm:normal-case sm:tracking-normal">
+                        <span className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-white sm:text-sm sm:normal-case sm:tracking-normal">
                           {group.label}
                         </span>
                         <span
-                          className={`inline-flex items-center rounded-md border px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${
-                            seasonAllWatched
-                              ? 'border-emerald-500/45 bg-emerald-500/20 text-emerald-300'
-                              : seasonPlayableEpisodes.length > 0
-                                ? 'border-[#f97316]/35 bg-[#f97316]/15 text-[#fb923c]'
-                                : 'border-white/15 bg-white/8 text-slate-300'
-                          }`}
+                          data-season-badge={group.seasonNumber}
+                          className={`inline-flex shrink-0 items-center rounded-md border px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${seasonBadgeClass}`}
                         >
-                          {seasonPlayableEpisodes.length > 0
-                            ? `${seasonWatchedCount}/${seasonPlayableEpisodes.length}`
-                            : `${fullGroup.episodes.length} eps`}
+                          {seasonBadgeLabel}
                         </span>
                         {seasonUnavailableCount > 0 && (
-                          <span className="font-mono text-[11px] tabular-nums text-[#fb923c]">
+                          <span className="truncate font-mono text-[11px] tabular-nums text-[#fb923c]">
+                            · {seasonUnavailableCount}{' '}
+                            {seasonUnavailableCount === 1 ? 'indisponível' : 'indisponíveis'}
+                          </span>
+                        )}
+                      </button>
+                    ) : (
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <span className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-white sm:text-sm sm:normal-case sm:tracking-normal">
+                          {group.label}
+                        </span>
+                        <span
+                          data-season-badge={group.seasonNumber}
+                          className={`inline-flex shrink-0 items-center rounded-md border px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${seasonBadgeClass}`}
+                        >
+                          {seasonBadgeLabel}
+                        </span>
+                        {seasonUnavailableCount > 0 && (
+                          <span className="truncate font-mono text-[11px] tabular-nums text-[#fb923c]">
                             · {seasonUnavailableCount}{' '}
                             {seasonUnavailableCount === 1 ? 'indisponível' : 'indisponíveis'}
                           </span>
@@ -1030,37 +974,63 @@ export function AnimeDetailView({
                       </div>
                     )}
 
-                    {seasonPlayableEpisodes.length > 0 && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          onToggleEpisodesWatched(
-                            seasonPlayableEpisodes,
-                            !seasonAllWatched,
+                    <div className="flex shrink-0 items-center gap-2">
+                      {seasonPlayableEpisodes.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onToggleEpisodesWatched(
+                              seasonPlayableEpisodes,
+                              !seasonAllWatched,
+                              seasonAllWatched
+                                ? `${group.label} desmarcada`
+                                : `${group.label} marcada como vista`
+                            )
+                          }
+                          aria-pressed={seasonAllWatched}
+                          className={`${
+                            canCollapseSeason ? 'hidden sm:inline-flex' : 'inline-flex'
+                          } shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
                             seasonAllWatched
-                              ? `${group.label} desmarcada`
-                              : `${group.label} marcada como vista`
-                          )
-                        }
-                        aria-pressed={seasonAllWatched}
-                        className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
-                          seasonAllWatched
-                            ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                            : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
-                        }`}
-                      >
-                        <CheckCheck className="h-3.5 w-3.5" />
-                        <span>
-                          {seasonAllWatched
-                            ? isMovie
-                              ? 'Visto'
-                              : 'Temporada vista'
-                            : isMovie
-                              ? 'Marcar como visto'
-                              : 'Marcar temporada como vista'}
-                        </span>
-                      </button>
-                    )}
+                              ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                              : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
+                          }`}
+                        >
+                          <CheckCheck className="h-3.5 w-3.5" />
+                          <span>
+                            {seasonAllWatched
+                              ? isMovie
+                                ? 'Visto'
+                                : 'Temporada vista'
+                              : isMovie
+                                ? 'Marcar como visto'
+                                : 'Marcar temporada como vista'}
+                          </span>
+                        </button>
+                      )}
+
+                      {canCollapseSeason && (
+                        <button
+                          type="button"
+                          data-season-chevron={group.seasonNumber}
+                          aria-expanded={seasonExpanded}
+                          aria-controls={seasonPanelId}
+                          aria-label={
+                            seasonExpanded
+                              ? `Recolher ${group.label}`
+                              : `Expandir ${group.label}`
+                          }
+                          onClick={() => toggleSeasonExpanded(group.seasonNumber)}
+                          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/10 text-slate-200 transition-colors hover:bg-white/15 hover:text-white"
+                        >
+                          <ChevronDown
+                            className={`h-4 w-4 transition-transform duration-200 ${
+                              seasonExpanded ? 'rotate-180' : ''
+                            }`}
+                          />
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {seasonExpanded && (
@@ -1069,6 +1039,33 @@ export function AnimeDetailView({
                       data-season-episodes={group.seasonNumber}
                       className="divide-y divide-white/8"
                     >
+                    {canCollapseSeason && seasonPlayableEpisodes.length > 0 && (
+                      <div className="flex items-center justify-end bg-[#0d0f12]/30 px-4 py-2 sm:hidden">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            onToggleEpisodesWatched(
+                              seasonPlayableEpisodes,
+                              !seasonAllWatched,
+                              seasonAllWatched
+                                ? `${group.label} desmarcada`
+                                : `${group.label} marcada como vista`
+                            )
+                          }
+                          aria-pressed={seasonAllWatched}
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
+                            seasonAllWatched
+                              ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                              : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
+                          }`}
+                        >
+                          <CheckCheck className="h-3.5 w-3.5" />
+                          <span>
+                            {seasonAllWatched ? 'Temporada vista' : 'Marcar temporada como vista'}
+                          </span>
+                        </button>
+                      </div>
+                    )}
                     {group.episodes.map((ep) => {
                       const available = isEpisodeAvailableOnServer(ep);
                       const formattedDate = formatEpisodeReleaseDate(

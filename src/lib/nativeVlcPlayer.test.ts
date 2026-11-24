@@ -270,12 +270,12 @@ describe('VlcPlayerActivity - Android focus & LibVLC surface lifecycle', () => {
     assert.match(loadEpMatch[0], /streamPreparedWallMs = 0L;/);
   });
 
-  it('separates Legendas and Áudio into distinct menus in VlcPlayerActivity', () => {
+  it('keeps Legendas and Qualidade on dedicated bottom-bar buttons without duplicating them inside the gear menu', () => {
     assert.doesNotMatch(activityJava, /Legendas & Áudio/);
-    assert.match(
-      activityJava,
-      /addSettingsRow\("Legendas",\s*getActiveSubtitleSummary\(\),\s*false,\s*v\s*->\s*renderSettingsTab\("subs"\)\)/
-    );
+    assert.match(activityJava, /btnQuality\.setOnClickListener\(v -> openSettingsMenu\("quality"\)\)/);
+    assert.match(activityJava, /btnTracks\.setOnClickListener\(v -> openSettingsMenu\("subs"\)\)/);
+    assert.doesNotMatch(activityJava, /addSettingsRow\("Qualidade"/);
+    assert.doesNotMatch(activityJava, /addSettingsRow\("Legendas"/);
     assert.match(
       activityJava,
       /addSettingsRow\("Áudio",\s*getActiveAudioSummary\(\),\s*false,\s*v\s*->\s*renderSettingsTab\("audio"\)\)/

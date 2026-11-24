@@ -1319,6 +1319,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         lastKnownPositionMs = Math.max(posMs, durMs);
                         lastKnownDurationMs = durMs;
                         saveCurrentEpisodeProgress(true);
+                        boolean hasNextAvailable =
+                            (!nextUrl.isEmpty() && !isSameEpisodeUrl(episodeUrl, nextUrl)) || hasNextFlag;
                         if (autoPlayNextEpisode && !nextUrl.isEmpty() && !isSameEpisodeUrl(episodeUrl, nextUrl)) {
                             Toast.makeText(VlcPlayerActivity.this, "Carregando próximo episódio...", Toast.LENGTH_SHORT).show();
                             loadEpisodeInFullscreen(nextUrl, false);
@@ -1333,6 +1335,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             restoreFrameTargetMs = 0L;
                             uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
                             uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+                            if (!hasNextAvailable) {
+                                updateMediaSessionPlaybackState(PlaybackState.STATE_STOPPED);
+                                finishWithAction("closed", false);
+                                return;
+                            }
                             setControlsVisible(true);
                             updateMediaSessionPlaybackState(PlaybackState.STATE_PAUSED);
                         }
@@ -2106,7 +2113,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
         findViewById(R.id.vlc_settings_card).setOnClickListener(v -> {
             // Consume clicks inside card
         });
-        settingsHeader.setOnClickListener(v -> renderSettingsTab("main"));
+        settingsHeader.setOnClickListener(v -> {
+            if ("quality".equals(settingsTab) || "subs".equals(settingsTab)) {
+                closeSettingsMenu();
+            } else {
+                renderSettingsTab("main");
+            }
+        });
 
         seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override
@@ -3049,11 +3062,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
             settingsHeader.setVisibility(View.GONE);
             settingsHeaderDivider.setVisibility(View.GONE);
 
-            String qualityVal = (!streams.isEmpty() && currentStreamIdx < streams.size())
-                ? streams.get(currentStreamIdx).label
-                : "Auto";
-            addSettingsRow("Qualidade", qualityVal, false, v -> renderSettingsTab("quality"));
-
             if (!serverOptions.isEmpty()) {
                 String srvLabel = "Automático";
                 for (TopAnimesEpisodeResolver.ServerOption o : serverOptions) {
@@ -3068,7 +3076,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
             String speedLabel = currentSpeed == 1.0f ? "Normal" : (currentSpeed + "×");
             addSettingsRow("Velocidade", speedLabel, false, v -> renderSettingsTab("speed"));
 
-            addSettingsRow("Legendas", getActiveSubtitleSummary(), false, v -> renderSettingsTab("subs"));
             addSettingsRow("Áudio", getActiveAudioSummary(), false, v -> renderSettingsTab("audio"));
             addSettingsRow("Escala de Tela", SCALE_LABELS[currentScaleIdx], false, v -> renderSettingsTab("scale"));
 
@@ -3275,15 +3282,6 @@ public class VlcPlayerActivity extends AppCompatActivity {
             }
         }
         Toast.makeText(this, "Saída de áudio: " + modeLabel, Toast.LENGTH_SHORT).show();
-    }
-
-    private String getActiveSubtitleSummary() {
-        if (mediaPlayer == null) return "Desativada";
-        int activeSpu = mediaPlayer.getSpuTrack();
-        if (activeSpu == -1) return "Desativada";
-        MediaPlayer.TrackDescription[] tracks = mediaPlayer.getSpuTracks();
-        String name = buildTrackLabels(tracks, false).get(activeSpu);
-        return name != null && !name.isEmpty() ? name : "Desativada";
     }
 
     private String getActiveAudioSummary() {

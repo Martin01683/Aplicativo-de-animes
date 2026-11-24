@@ -741,6 +741,7 @@ export function EpisodeWorkspace({
   const activeUpcomingNext = !effectiveNextUrl ? upcomingNextEpisode : undefined;
 
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [upcomingBannerTrigger, setUpcomingBannerTrigger] = useState(0);
   useEffect(() => {
     if (!activeUpcomingNext) return;
     setNowMs(Date.now());
@@ -848,7 +849,7 @@ export function EpisodeWorkspace({
                 <button
                   type="button"
                   data-upcoming-next-pill="true"
-                  onClick={() => onToast(formatUpcomingEpisodeNotice(activeUpcomingNext, nowMs))}
+                  onClick={() => setUpcomingBannerTrigger((prev) => prev + 1)}
                   title={`${formatUpcomingEpisodeNotice(activeUpcomingNext, nowMs)} (previsão oficial, não disponibilidade nos servidores)`}
                   className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium tabular-nums transition-colors ${
                     nextCountdown.state === 'future'
@@ -916,6 +917,7 @@ export function EpisodeWorkspace({
             prevUrl={effectivePrevUrl}
             nextUrl={effectiveNextUrl}
             upcomingNextEpisode={activeUpcomingNext}
+            upcomingBannerTrigger={upcomingBannerTrigger}
             loadingEpisode={isTransitioning}
             hasUntriedFallbackServers={hasUntriedFallbackServers}
             resumeAfterFailover={resumeAfterFailover}

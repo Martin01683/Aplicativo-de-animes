@@ -645,5 +645,82 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     const appTsx = readRepoFile('src/App.tsx');
     assert.match(appTsx, /animeDetails\.episodes\.some\(\(ep\) =>/);
   });
+
+  it('omits redundant top Avisos/Favoritos buttons in AnimeDetailView and avoids duplicate bottom toast for unavailable upcoming episodes', () => {
+    const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
+    const returnIdx = detailTsx.lastIndexOf('  return (\n    <div className="mx-auto max-w-7xl');
+    const heroCardIdx = detailTsx.indexOf('{/* Hero Info Card enriched by TheTVDB */}');
+    assert.ok(returnIdx > 0 && heroCardIdx > returnIdx, 'Top bar and Hero Info Card markers must exist in AnimeDetailView');
+    const topBarSection = detailTsx.slice(returnIdx, heroCardIdx);
+    assert.doesNotMatch(
+      topBarSection,
+      /Nos Favoritos|Favoritar/,
+      'Top navigation bar above the hero card should not duplicate the Favoritar button',
+    );
+    assert.doesNotMatch(
+      topBarSection,
+      /onToggleMuteFavorite/,
+      'Top navigation bar above the hero card should not duplicate the Avisos button',
+    );
+
+    // Action row inside hero card must still keep both buttons
+    const heroSection = detailTsx.slice(heroCardIdx);
+    assert.match(heroSection, /Nos Favoritos/);
+    assert.match(heroSection, /Avisos ativos/);
+
+    const playerTsx = readRepoFile('src/components/AnimePlayer.tsx');
+    const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
+    assert.doesNotMatch(
+      playerTsx,
+      /onToast\(formatUpcomingEpisodeNotice/,
+      'AnimePlayer must not show a redundant bottom toast alongside the in-player upcoming notice',
+    );
+    assert.doesNotMatch(
+      workspaceTsx,
+      /onToast\(formatUpcomingEpisodeNotice/,
+      'EpisodeWorkspace top upcoming pill must not show a redundant bottom toast',
+    );
+    assert.match(workspaceTsx, /data-upcoming-next-pill="true"/);
+    assert.match(playerTsx, /data-player-upcoming-banner="true"/);
+  });
+
+  it('keeps season card headers uniformly aligned with consistent badges, far-right chevron, and auto-exits fullscreen on end without next episode', () => {
+    const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
+    assert.match(detailTsx, /data-season-header=/);
+    assert.match(detailTsx, /data-season-badge=/);
+    assert.match(detailTsx, /data-season-chevron=/);
+    assert.match(detailTsx, /shrink-0 whitespace-nowrap text-xs font-semibold uppercase/);
+    assert.doesNotMatch(
+      detailTsx,
+      /\$\{fullGroup\.episodes\.length\} eps/,
+      'Unavailable seasons should use the same 0/N orange badge style instead of a gray "N eps" badge',
+    );
+    assert.doesNotMatch(
+      detailTsx,
+      /border-white\/15 bg-white\/8 text-slate-300/,
+      'Season counter badges should stay consistent across seasons',
+    );
+
+    const playerTsx = readRepoFile('src/components/AnimePlayer.tsx');
+    assert.match(playerTsx, /const exitFullscreenIfActive = useCallback/);
+    assert.match(playerTsx, /else if \(reachedGenuineEnd && !hasNext\) \{\s*exitFullscreenIfActive\(\);/);
+
+    const vlcJava = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java',
+    );
+    assert.match(
+      vlcJava,
+      /if \(!hasNextAvailable\) \{\s*updateMediaSessionPlaybackState\(PlaybackState\.STATE_STOPPED\);\s*finishWithAction\("closed", false\);\s*return;\s*\}/,
+    );
+
+    const calendarTsx = readRepoFile('src/components/LiveChartCalendar.tsx');
+    assert.match(calendarTsx, /data-calendar-card-footer="true"/);
+    assert.match(calendarTsx, /data-calendar-badges-compact="true"/);
+    assert.match(calendarTsx, /renderReleaseBadges\(item, true\)/);
+    assert.match(playerTsx, /onClick=\{\(\) => setMenuTab\('quality'\)\}\s*className="[^"]*sm:hidden"/);
+    assert.match(playerTsx, /onClick=\{\(\) => setMenuTab\('subs'\)\}\s*className="[^"]*sm:hidden"/);
+  });
 });
+
+
 
