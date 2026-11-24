@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.27] — 2026-11-24
+
+### Correções
+- Disable long-press haptic vibration, text selection, and drag/contextmenu callouts on cards (`e805494`)
+
 ## [v1.0.26] — 2026-11-24
 
 ### Correções
