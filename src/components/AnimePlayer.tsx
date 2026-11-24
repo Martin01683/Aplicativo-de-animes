@@ -77,6 +77,7 @@ import {
 import {
   getEpisodeProgress,
   getEpisodeResumeSeconds,
+  pushHistoryEntry,
   saveEpisodeProgress,
 } from '../lib/storage';
 import { SubtitleCanvasRenderer } from '../lib/subtitleCanvas';
@@ -299,6 +300,7 @@ export function AnimePlayer({
   const preHoldSpeedRef = useRef(1);
   const autoStartNextRef = useRef(false);
   const hasPlaybackStartedRef = useRef(false);
+  const historyRecordedEpisodeUrlRef = useRef<string | null>(null);
   const loadedMediaEpisodeUrlRef = useRef<string | null>(null);
   const firstTimeUpdateSecRef = useRef<number | null>(null);
   const userSeekedInStreamRef = useRef(false);
@@ -463,6 +465,25 @@ export function AnimePlayer({
     savePrefs({ volume, muted, capScale, capColor, videoScale: effectiveVideoScale });
   }, [volume, muted, capScale, capColor, effectiveVideoScale]);
 
+  const recordHistoryOnPlaybackStart = useCallback((targetUrl?: string) => {
+    const resolvedUrl = targetUrl || latestPlaybackRef.current.url;
+    if (!resolvedUrl) return;
+    if (isSameEpisodeUrl(historyRecordedEpisodeUrlRef.current || undefined, resolvedUrl)) return;
+    const metaSnap = latestMetaRef.current;
+    if (!isSameEpisodeUrl(resolvedUrl, metaSnap.episodeUrl) || !metaSnap.title) return;
+    historyRecordedEpisodeUrlRef.current = resolvedUrl;
+    pushHistoryEntry({
+      url: resolvedUrl,
+      title: metaSnap.title,
+      seriesTitle: metaSnap.seriesTitle,
+      seriesUrl: metaSnap.seriesUrl,
+      poster: metaSnap.poster || '',
+      kind: metaSnap.isMovie ? 'movie' : 'episode',
+      watchedAt: new Date().toISOString(),
+    });
+    onPlaybackProgressRef.current?.();
+  }, []);
+
   const persistEpisodeProgressNow = useCallback(
     (opts?: {
       url?: string;
@@ -476,12 +497,7 @@ export function AnimePlayer({
       const positionSec = opts?.positionSec ?? latestPlaybackRef.current.currentTime;
       const durationSec = opts?.durationSec ?? latestPlaybackRef.current.duration;
       const ended = opts?.ended ?? latestPlaybackRef.current.ended;
-      if (
-        !opts?.forceReset &&
-        !ended &&
-        !latestPlaybackRef.current.hasStarted &&
-        positionSec < 2
-      ) {
+      if (!opts?.forceReset && !ended && !latestPlaybackRef.current.hasStarted) {
         return;
       }
       if (!opts?.forceReset && !ended && pendingSeekSecRef.current > 1 && positionSec < 2) {
@@ -502,6 +518,8 @@ export function AnimePlayer({
               seriesUrl: metaSnap.seriesUrl,
               poster: metaSnap.poster,
               kind: metaSnap.isMovie ? 'movie' : 'episode',
+              watchedAt: new Date().toISOString(),
+              promoteInHistory: true,
             }
           : undefined,
       });
@@ -557,6 +575,7 @@ export function AnimePlayer({
     autoNextTriggeredForUrlRef.current = null;
     serverRetryCountRef.current = 0;
     hasPlaybackStartedRef.current = false;
+    historyRecordedEpisodeUrlRef.current = null;
     loadedMediaEpisodeUrlRef.current = null;
     firstTimeUpdateSecRef.current = null;
     userSeekedInStreamRef.current = false;
@@ -578,7 +597,7 @@ export function AnimePlayer({
       currentTime: savedResumeSec > 1 ? savedResumeSec : 0,
       duration: savedEntry?.durationSec || 0,
       hasStarted: false,
-      ended: Boolean(savedEntry?.completed),
+      ended: false,
     };
     setCurrentTime(savedResumeSec > 1 ? savedResumeSec : 0);
     setDuration(savedEntry?.durationSec || 0);
@@ -2026,6 +2045,7 @@ export function AnimePlayer({
               if (v.currentTime >= 2) {
                 hasPlaybackStartedRef.current = true;
                 latestPlaybackRef.current.hasStarted = true;
+                recordHistoryOnPlaybackStart(episodeUrl);
               }
               persistEpisodeProgressNow({
                 url: episodeUrl,
@@ -2059,6 +2079,7 @@ export function AnimePlayer({
                 clearLoadWatchdog();
                 hasPlaybackStartedRef.current = true;
                 latestPlaybackRef.current.hasStarted = true;
+                recordHistoryOnPlaybackStart(episodeUrl);
               }
               setCurrentTime(v.currentTime);
               const dur = Number.isFinite(v.duration) ? v.duration : duration;

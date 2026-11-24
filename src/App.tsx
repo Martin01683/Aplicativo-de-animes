@@ -1562,33 +1562,10 @@ export default function App() {
           setEpisodeDetails(cachedEp);
           setLoadingDetail(false);
           setDetailError('');
-          const updatedHistory = pushHistoryEntry({
-            url: cachedEp.url,
-            title: cachedEp.title,
-            seriesTitle: cachedEp.seriesTitle || knownMeta?.seriesTitle,
-            seriesUrl: cachedEp.seriesUrl || knownMeta?.seriesUrl,
-            poster: cachedEp.backdrop || cachedEp.poster || knownMeta?.poster || '',
-            kind: cachedEp.isMovie ? 'movie' : 'episode',
-            watchedAt: new Date().toISOString(),
-          });
-          setHistory(updatedHistory);
           return;
         }
       } else {
         episodeDetailsCacheRef.current.delete(epCacheKey);
-      }
-
-      if (knownMeta?.title) {
-        const optimisticHistory = pushHistoryEntry({
-          url,
-          title: knownMeta.title,
-          seriesTitle: knownMeta.seriesTitle,
-          seriesUrl: knownMeta.seriesUrl,
-          poster: knownMeta.poster || '',
-          kind: knownMeta.isMovie ? 'movie' : 'episode',
-          watchedAt: new Date().toISOString(),
-        });
-        setHistory(optimisticHistory);
       }
 
       setDetailError('');
@@ -1621,16 +1598,6 @@ export default function App() {
         };
         episodeDetailsCacheRef.current.set(epCacheKey, ep);
         setEpisodeDetails(ep);
-        const updatedHistory = pushHistoryEntry({
-          url: ep.url,
-          title: ep.title,
-          seriesTitle: ep.seriesTitle,
-          seriesUrl: ep.seriesUrl,
-          poster: ep.backdrop || ep.poster,
-          kind: ep.isMovie ? 'movie' : 'episode',
-          watchedAt: new Date().toISOString(),
-        });
-        setHistory(updatedHistory);
 
         // Augment with secondary integrated servers (e.g. Hinata Soul) in the background
         // while showing an explicit loading indicator next to the server list.

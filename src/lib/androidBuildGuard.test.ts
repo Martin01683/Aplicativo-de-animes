@@ -700,6 +700,17 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
       /border-white\/15 bg-white\/8 text-slate-300/,
       'Season counter badges should stay consistent across seasons',
     );
+    assert.match(
+      detailTsx,
+      /data-season-mark-desktop=\{group\.seasonNumber\}[\s\S]{0,600}hidden sm:inline-flex/,
+      'Header mark-season button must always stay hidden on mobile so it never overlaps the episode badge',
+    );
+    assert.doesNotMatch(
+      detailTsx,
+      /canCollapseSeason \? 'hidden sm:inline-flex' : 'inline-flex'/,
+      'Non-collapsible single-season tabs must not force the mark-season button inline into the narrow mobile header',
+    );
+    assert.match(detailTsx, /data-season-mobile-actions=\{group\.seasonNumber\}/);
 
     const playerTsx = readRepoFile('src/components/AnimePlayer.tsx');
     assert.match(playerTsx, /const exitFullscreenIfActive = useCallback/);
@@ -746,5 +757,30 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(mainTsx, /addEventListener\('contextmenu'/);
     assert.match(mainTsx, /addEventListener\('dragstart'/);
     assert.match(mainTsx, /isEditableTouchTarget/);
+  });
+
+  it('does not add episodes to watch history on page open before actual video playback starts', () => {
+    const appTsx = readRepoFile('src/App.tsx');
+    const loadEpStart = appTsx.indexOf('const loadEpisodeDetailsForRoute = useCallback(');
+    const syncNativeStart = appTsx.indexOf('const syncNativeSessionResult = useCallback(');
+    assert.ok(
+      loadEpStart > 0 && syncNativeStart > loadEpStart,
+      'loadEpisodeDetailsForRoute and syncNativeSessionResult markers must exist in App.tsx',
+    );
+    const loadEpBody = appTsx.slice(loadEpStart, syncNativeStart);
+    assert.doesNotMatch(
+      loadEpBody,
+      /pushHistoryEntry\(/,
+      'Opening an episode page must not push it into watch history before the user presses play',
+    );
+
+    const playerTsx = readRepoFile('src/components/AnimePlayer.tsx');
+    assert.match(playerTsx, /const recordHistoryOnPlaybackStart = useCallback/);
+    assert.match(
+      playerTsx,
+      /if \(!opts\?\.forceReset && !ended && !latestPlaybackRef\.current\.hasStarted\) \{/,
+      'Unplayed episode unmounts must not persist progress or history',
+    );
+    assert.match(playerTsx, /recordHistoryOnPlaybackStart\(episodeUrl\);/);
   });
 });
