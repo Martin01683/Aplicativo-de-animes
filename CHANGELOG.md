@@ -2,6 +2,17 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.25] — 2026-11-24
+
+### Correções
+- Add monochrome Anisync small icon for system notifications (`66e8a5c`)
+- Standardize season cards, deduplicate player menu and episode notices, and auto-exit fullscreen at series end (`e15c5a5`)
+- Compact card footer tags onto a single balanced row (`ab18843`)
+- Unify multi-season arc entries and improve TheTVDB season alignment (`35df0cf`)
+
+### Melhorias e Manutenção
+- Remove 1/5 min intervals, notification sound, and quiet hours options (`8966a04`)
+
 ## [v1.0.24] — 2026-11-23
 
 ### Novidades
