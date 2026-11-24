@@ -217,9 +217,50 @@ export function LiveChartCalendar({
 
   const hasActiveFilters = audioFilter !== 'ALL' || serviceFilter !== 'ALL' || Boolean(searchFilter.trim());
 
-  const renderReleaseBadges = (item: CatalogMediaItem) => {
+  const renderReleaseBadges = (item: CatalogMediaItem, compact = false) => {
     const meta = item.scheduleMeta;
     const svcStyle = getServiceBadgeStyle(meta?.serviceName);
+    if (compact) {
+      return (
+        <div
+          data-calendar-badges-compact="true"
+          className="flex w-full min-w-0 items-center justify-between gap-1"
+        >
+          <div className="flex shrink-0 items-center gap-1">
+            {item.episodeLabel && (
+              <span className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] font-bold leading-none tabular-nums text-white">
+                {item.episodeLabel}
+              </span>
+            )}
+            {meta?.hasDub && (
+              <span className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-[9.5px] font-bold leading-none tracking-wide text-emerald-300">
+                DUB
+              </span>
+            )}
+            {meta?.hasSub && (
+              <span className="rounded border border-sky-500/40 bg-sky-500/15 px-1 py-0.5 text-[9.5px] font-bold leading-none tracking-wide text-sky-300">
+                SUB
+              </span>
+            )}
+            {!meta?.hasDub && !meta?.hasSub && meta?.isJapaneseBroadcast && (
+              <span className="rounded border border-white/12 bg-white/6 px-1 py-0.5 text-[9.5px] font-semibold leading-none text-slate-300">
+                JP
+              </span>
+            )}
+          </div>
+          {meta?.serviceName && (
+            <span
+              title={meta.serviceName}
+              className={`inline-flex min-w-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold leading-none ${svcStyle.badge}`}
+            >
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${svcStyle.dot}`} />
+              <span className="truncate">{meta.serviceName}</span>
+            </span>
+          )}
+        </div>
+      );
+    }
+
     return (
       <div className="flex flex-wrap items-center gap-1.5">
         {item.episodeLabel && (
@@ -322,8 +363,11 @@ export function LiveChartCalendar({
           </div>
 
           {/* Bottom Release Strip (EP + Dub/Sub + Streaming Service) */}
-          <div className="flex flex-1 items-center border-t border-white/8 bg-[#12161e] px-3 py-2.5">
-            {renderReleaseBadges(item)}
+          <div
+            data-calendar-card-footer="true"
+            className="flex min-h-[30px] shrink-0 items-center border-t border-white/8 bg-[#12161e] px-2 py-1.5 sm:px-2.5 sm:py-2"
+          >
+            {renderReleaseBadges(item, true)}
           </div>
         </button>
 
