@@ -324,6 +324,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private boolean useProxyForAttempt = false;
     private int currentStreamIdx = 0;
     private long pendingSeekMs = 0L;
+    private long activeSeekOriginMs = -1L;
     private long activeSeekTargetMs = -1L;
     private long activeSeekIssuedElapsedMs = 0L;
     private long pendingInteractiveSeekMs = -1L;
@@ -336,7 +337,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private static final int MAX_RETRIES_PER_SERVER = 1;
     private static final long LOAD_WATCHDOG_TIMEOUT_MS = 12000L;
-    private static final long INTERACTIVE_SEEK_COALESCE_MS = 140L;
+    private static final long INTERACTIVE_SEEK_COALESCE_MS = 280L;
 
     private volatile long activePlaybackSessionGen = 0L;
     private long sessionCounter = 0L;
@@ -1051,11 +1052,32 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     private void commitPlayerSeek(long prevPos, long target) {
         if (mediaPlayer == null) return;
+        activeSeekOriginMs = Math.max(0L, prevPos);
         activeSeekTargetMs = target;
         activeSeekIssuedElapsedMs = SystemClock.elapsedRealtime();
         lastKnownPositionMs = target;
-        mediaPlayer.setTime(target, true);
+        // Exact seek (fast=false) ensures short +5s/-5s steps land at the requested
+        // timestamp instead of snapping backward to a preceding keyframe on 5-10s GOP streams.
+        mediaPlayer.setTime(target, false);
         onSeekCommitted(prevPos, target);
+    }
+
+    static boolean hasActiveSeekArrived(long timeMs, long originMs, long targetMs, long elapsedMs) {
+        if (targetMs < 0L) return true;
+        if (elapsedMs > 2500L) return true;
+        if (originMs < 0L) {
+            return Math.abs(timeMs - targetMs) <= 1500L;
+        }
+        long seekDelta = targetMs - originMs;
+        long seekDist = Math.abs(seekDelta);
+        long arrivalToleranceMs = Math.min(1500L, Math.max(400L, seekDist / 2L));
+        if (seekDelta > 0L) {
+            return timeMs >= (targetMs - arrivalToleranceMs);
+        }
+        if (seekDelta < 0L) {
+            return timeMs <= (targetMs + arrivalToleranceMs);
+        }
+        return Math.abs(timeMs - targetMs) <= 1500L;
     }
 
     private void initLibVlc() {
@@ -1231,8 +1253,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         }
                         if (activeSeekTargetMs >= 0L) {
                             long seekElapsed = SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs;
-                            if (Math.abs(timeMs - activeSeekTargetMs) <= 8000L || seekElapsed > 2500L) {
+                            if (hasActiveSeekArrived(timeMs, activeSeekOriginMs, activeSeekTargetMs, seekElapsed)) {
                                 activeSeekTargetMs = -1L;
+                                activeSeekOriginMs = -1L;
                             } else {
                                 return;
                             }
@@ -1556,6 +1579,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
         clearPendingInteractiveSeek();
         activeSeekTargetMs = -1L;
+        activeSeekOriginMs = -1L;
         pauseAfterRestoreFrame = pauseAfterFirstFrame;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -1782,6 +1806,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
         clearPendingInteractiveSeek();
         activeSeekTargetMs = -1L;
+        activeSeekOriginMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -2552,14 +2577,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
         long total = Math.max(lastKnownDurationMs, mediaPlayer.getLength());
         boolean hasRecentSeekAnchor =
-            pendingInteractiveSeekMs >= 0L
-                || (activeSeekTargetMs >= 0L
-                    && (SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs) <= 2500L);
+            activeSeekTargetMs >= 0L
+                && (SystemClock.elapsedRealtime() - activeSeekIssuedElapsedMs) <= 2500L;
         long current;
         if (pendingInteractiveSeekMs >= 0L) {
             current = pendingInteractiveSeekMs;
         } else if (hasRecentSeekAnchor) {
-            current = Math.max(0L, lastKnownPositionMs);
+            current = Math.max(0L, activeSeekTargetMs);
         } else {
             long rawCurrent = mediaPlayer.getTime();
             current = rawCurrent >= 0L ? rawCurrent : Math.max(0L, lastKnownPositionMs);
@@ -2573,7 +2597,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
         if (seekOnlyHud) {
             if (pendingInteractiveSeekMs < 0L) {
-                pendingInteractiveSeekPrevPosMs = lastKnownPositionMs;
+                pendingInteractiveSeekPrevPosMs = current;
             }
             pendingInteractiveSeekMs = target;
             lastKnownPositionMs = target;
@@ -2584,7 +2608,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         } else {
             long prevPos = pendingInteractiveSeekMs >= 0L
                 ? pendingInteractiveSeekPrevPosMs
-                : lastKnownPositionMs;
+                : current;
             clearPendingInteractiveSeek();
             timeCurrentView.setText(formatMs(target));
             seekBar.setProgress((int) Math.min(Integer.MAX_VALUE, target));
@@ -2875,6 +2899,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
         clearPendingInteractiveSeek();
         activeSeekTargetMs = -1L;
+        activeSeekOriginMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -3486,6 +3511,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
         clearPendingInteractiveSeek();
         activeSeekTargetMs = -1L;
+        activeSeekOriginMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;
@@ -4052,6 +4078,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
         clearPendingInteractiveSeek();
         activeSeekTargetMs = -1L;
+        activeSeekOriginMs = -1L;
         pauseAfterRestoreFrame = false;
         pauseAfterRestoreScheduled = false;
         restoreFrameTimeReached = false;

@@ -593,7 +593,18 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(activityJava, /private boolean hasAudioFocus = false/);
     assert.match(activityJava, /AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK/);
     assert.match(activityJava, /commitInteractiveSeekRunnable/);
-    assert.match(activityJava, /mediaPlayer\.setTime\(target, true\)/);
+    assert.match(
+      activityJava,
+      /mediaPlayer\.setTime\(target, false\)/,
+      'LibVLC seeks must use exact mode (fast=false) so +5s forward seeks never snap backward to a previous keyframe',
+    );
+    assert.doesNotMatch(
+      activityJava,
+      /mediaPlayer\.setTime\(target, true\)/,
+      'fast=true snaps short forward seeks backward on 5-10s GOP anime encodes',
+    );
+    assert.match(activityJava, /hasActiveSeekArrived\(/);
+    assert.match(activityJava, /activeSeekOriginMs/);
     assert.match(activityJava, /syncPlayerPlaybackParametersIfNeeded\(\)/);
     assert.match(activityJava, /mediaPlayer\.getRate\(\)/);
     assert.match(activityJava, /mediaPlayer\.getVolume\(\)/);
