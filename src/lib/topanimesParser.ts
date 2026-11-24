@@ -100,7 +100,7 @@ function parsePaginationMeta($: cheerio.CheerioAPI): {
   totalPages: number;
 } {
   const pagText = cleanText($('.pagination span').first().text());
-  const match = pagText.match(/Page\s+(\d+)\s+of\s+(\d+)/i);
+  const match = pagText.match(/(?:Page|P[aá]gina)\s+(\d+)\s+(?:of|de)\s+(\d+)/i);
   if (match) {
     return {
       currentPage: Math.max(1, Number.parseInt(match[1], 10)),

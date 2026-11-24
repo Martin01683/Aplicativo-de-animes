@@ -221,10 +221,24 @@ export function normalizeTitleForMatch(raw: string): string {
 
 export function stripSeasonFromTitle(raw: string): string {
   return (raw || '')
+    .replace(
+      /\s*\((?:dublado|legendado|dub|leg|pt[\s-]?br|dual[\s-]?audio|hd|full\s*hd|tv)\)\s*/gi,
+      ' '
+    )
+    .replace(
+      /\s*[-–—:]?\s*\b(?:(?:the\s+)?final\s+season|temporada\s+final|[uú]ltima\s+temporada)\b.*$/i,
+      ''
+    )
     .replace(/\s*[-–—:]?\s*\b(?:season|temporada|part|parte|cour)\s*\d+\b.*$/i, '')
-    .replace(/\s+\b\d+(?:st|nd|rd|th|a|ª)\s*(?:season|temporada)\b.*$/i, '')
+    .replace(/\s*[-–—:]?\s*\b\d+(?:st|nd|rd|th|a|ª)\s*(?:season|temporada)\b.*$/i, '')
+    .replace(/\s*[-–—]\s*(?:dublado|legendado|dub|leg)\s*$/i, '')
     .replace(/\s+\b(?:dublado|legendado|dub|leg|online|hd|full\s*hd)\b/gi, '')
-    .replace(/\s+\b([2-9]|1\d)\s*$/i, '')
+    .replace(/\s+(?:II|III|IV|V|VI|VII|VIII|IX|X)(?:\s*[-–—:].*|\s*$)/, '')
+    .replace(
+      /^(.{3,}?[^\d/])\s+([2-9]|1[0-5])(?:\s*(?::|–|—|\s-\s)(?!\s*(?:the\s+animation|the\s+series|animation)\b).*|\s*$)/i,
+      '$1'
+    )
+    .replace(/[-–—:]+\s*$/, '')
     .replace(/\s+/g, ' ')
     .trim();
 }

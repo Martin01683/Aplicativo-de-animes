@@ -24,7 +24,11 @@ import {
   type CanonicalMediaType,
 } from '../idCodec.ts';
 import { findLiveChartScheduleHint } from './livechartProvider.ts';
-import { unifyServerSeasonsWithCatalog } from '../seasonUnifier.ts';
+import {
+  extractSafeParentPrefixForTvdb,
+  extractSeasonAndPartInfo,
+  unifyServerSeasonsWithCatalog,
+} from '../seasonUnifier.ts';
 
 const TVDB_V4_API_BASE = 'https://api4.thetvdb.com/v4';
 const TVDB_WEB_SEARCH_URL = 'https://api4.thetvdb.com/web/search/queries';
@@ -583,21 +587,26 @@ export async function findBestTheTvdbMatch(
   } = {}
 ): Promise<TvdbRichMatch | null> {
   const uniqueTerms: string[] = [];
+  const pushTerm = (rawCandidate: string | null | undefined) => {
+    const clean = cleanText(rawCandidate);
+    if (clean.length < 2) return;
+    if (!uniqueTerms.some((x) => x.toLowerCase() === clean.toLowerCase())) {
+      uniqueTerms.push(clean);
+    }
+  };
   for (const raw of terms) {
     const t = cleanText(raw);
     if (t.length < 2) continue;
-    if (!uniqueTerms.some((x) => x.toLowerCase() === t.toLowerCase())) {
-      uniqueTerms.push(t);
-    }
+    pushTerm(t);
     const stripped = stripSeasonFromTitle(t);
-    if (
-      stripped.length >= 2 &&
-      stripped.toLowerCase() !== t.toLowerCase() &&
-      !uniqueTerms.some((x) => x.toLowerCase() === stripped.toLowerCase())
-    ) {
-      uniqueTerms.push(stripped);
+    if (stripped.length >= 2 && stripped.toLowerCase() !== t.toLowerCase()) {
+      pushTerm(stripped);
     }
-    if (uniqueTerms.length >= 4) break;
+    const parentPrefix = extractSafeParentPrefixForTvdb(t);
+    if (parentPrefix && parentPrefix.toLowerCase() !== t.toLowerCase()) {
+      pushTerm(parentPrefix);
+    }
+    if (uniqueTerms.length >= 6) break;
   }
   if (!uniqueTerms.length) return null;
 
@@ -610,7 +619,7 @@ export async function findBestTheTvdbMatch(
 
   let best: { match: TvdbRichMatch; rank: number; sim: number } | null = null;
 
-  for (const term of uniqueTerms.slice(0, 2)) {
+  for (const term of uniqueTerms.slice(0, 3)) {
     const webHits = await searchTheTvdbWebHits(fetchHttp, term, {
       mediaType: searchType,
       limit: 10,
@@ -1327,10 +1336,20 @@ export async function enrichServerDetailsWithTheTvdb(
   if (!queryTerms.length) return serverDetails;
 
   const isMovie = serverDetails.kind === 'movie' || /\/filmes\//i.test(serverDetails.url);
+  const primaryTitleInfo = extractSeasonAndPartInfo(
+    serverDetails.title,
+    serverDetails.url,
+    serverDetails.audioType
+  );
+  const isLikelyLaterSeasonOrArc =
+    (primaryTitleInfo.seasonNumber !== null && primaryTitleInfo.seasonNumber > 1) ||
+    primaryTitleInfo.isFinalSeason ||
+    primaryTitleInfo.hasColonSubtitle;
+
   const [bestMatch, liveChartHint] = await Promise.all([
     findBestTheTvdbMatch(fetchHttp, queryTerms, {
       mediaType: serverDetails.kind || (isMovie ? 'movie' : 'anime'),
-      year: serverDetails.year,
+      year: isLikelyLaterSeasonOrArc ? undefined : serverDetails.year,
     }),
     !isMovie
       ? findLiveChartScheduleHint(fetchHttp, {
@@ -1399,7 +1418,9 @@ export async function enrichServerDetailsWithTheTvdb(
         : bestMatch.mediaType;
 
   const extraReferenceTitles = [
-    ...queryTerms,
+    serverDetails.originalTitle || '',
+    serverDetails.alternativeTitle || '',
+    ...(serverDetails.alternativeTitles || []),
     tvdb?.title || '',
     tvdb?.originalTitle || '',
     tvdb?.alternativeTitle || '',
@@ -1498,7 +1519,7 @@ export async function enrichServerDetailsWithTheTvdb(
           thumb: tvdb?.backdrop || bestMatch.backdrop || tvdb?.poster || bestMatch.poster || ep.thumb,
         }))
       : mergeServerAndCatalogEpisodes({
-          serverTitle: serverDetails.title,
+          serverTitle: resolvedTitle,
           serverUrl: serverDetails.url,
           serverEpisodes: unifiedServerEps,
           catalogEpisodes: tvdb?.episodes || [],

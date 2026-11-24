@@ -382,10 +382,10 @@ export function mergeServerAndCatalogEpisodes(params: {
       ? Array.from(serverSeasons)[0]
       : null;
   const targetSingleSeason =
-    explicitSeason && explicitSeason > 1
-      ? explicitSeason
-      : singleServerSeason && singleServerSeason > 1
-        ? singleServerSeason
+    singleServerSeason && singleServerSeason > 1
+      ? singleServerSeason
+      : explicitSeason && explicitSeason > 1
+        ? explicitSeason
         : null;
 
   if (targetSingleSeason && serverIsSingleFlatSeason) {
@@ -403,6 +403,7 @@ export function mergeServerAndCatalogEpisodes(params: {
   // Upgrade catalog timestamps with LiveChart exact airing time (and project exact weekly time to subsequent episodes in the same season)
   const targetLiveChartSeason = (() => {
     if (!liveChartHint) return mappedServerSeason;
+    if (singleServerSeason && singleServerSeason > 1) return singleServerSeason;
     if (explicitSeason && explicitSeason > 1) return explicitSeason;
     // If catalog has multiple seasons, prefer the highest/latest season that contains or precedes liveChartHint.episodeNumber
     const distinctSeasons = Array.from(new Set(scopedCatalog.map((e) => e.seasonNumber || 1))).sort(
@@ -455,9 +456,11 @@ export function mergeServerAndCatalogEpisodes(params: {
     );
     const maxServerEpInTargetSeason = serverEpisodes.reduce((max, ep) => {
       const s =
-        explicitSeason && explicitSeason > 1 && serverIsSingleFlatSeason
-          ? mappedServerSeason
-          : ep.seasonNumber || 1;
+        singleServerSeason && singleServerSeason > 1
+          ? singleServerSeason
+          : explicitSeason && explicitSeason > 1 && serverIsSingleFlatSeason
+            ? mappedServerSeason
+            : ep.seasonNumber || 1;
       if (s !== targetLiveChartSeason) return max;
       const n = ep.episodeNumber ?? parseEpisodeNumberFromLabel(ep.numberLabel || ep.title) ?? 0;
       return Math.max(max, n);
@@ -530,9 +533,11 @@ export function mergeServerAndCatalogEpisodes(params: {
   const normalizedServerEps = serverEpisodes.map((ep) => {
     const epNum = ep.episodeNumber ?? parseEpisodeNumberFromLabel(ep.numberLabel || ep.title);
     const sNum =
-      explicitSeason && explicitSeason > 1 && serverIsSingleFlatSeason
-        ? mappedServerSeason
-        : ep.seasonNumber || 1;
+      singleServerSeason && singleServerSeason > 1
+        ? singleServerSeason
+        : explicitSeason && explicitSeason > 1 && serverIsSingleFlatSeason
+          ? mappedServerSeason
+          : ep.seasonNumber || 1;
     const item: AnimeEpisodeLink = {
       ...ep,
       episodeNumber: epNum,
