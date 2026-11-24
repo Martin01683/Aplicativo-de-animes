@@ -2,6 +2,14 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.34] — 2026-11-24
+
+### Correções
+- Eliminate +5s seek jump-back by blocking VLC 3.0 TimeCallback echo and stale mid-seek updates (`6e308cc`)
+
+### Melhorias e Manutenção
+- Upgrade Gradle wrapper to 9.9.2 and AGP to 9.5.2 (`e666d5d`)
+
 ## [v1.0.33] — 2026-11-24
 
 ### Correções
