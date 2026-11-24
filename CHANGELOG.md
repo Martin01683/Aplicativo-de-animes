@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.32] — 2026-11-24
+
+### Novidades
+- Option 2 Crunchyroll-style episode cards, Sem censura badge, and PT-BR episode title translation (`52f800e`)
+
 ## [v1.0.31] — 2026-11-24
 
 ### Novidades
