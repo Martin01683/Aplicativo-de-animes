@@ -41,6 +41,7 @@ public class MainActivity extends BridgeActivity {
         super.onCreate(savedInstanceState);
 
         captureNotificationIntent(getIntent(), false);
+        configureWebViewTouchBehavior();
 
         getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
             @Override
@@ -63,6 +64,17 @@ public class MainActivity extends BridgeActivity {
                 );
             }
         });
+    }
+
+    private void configureWebViewTouchBehavior() {
+        WebView webView = getBridge() != null ? getBridge().getWebView() : null;
+        if (webView == null) return;
+        webView.setHapticFeedbackEnabled(false);
+        webView.setOnLongClickListener(v -> {
+            WebView.HitTestResult hit = webView.getHitTestResult();
+            return hit == null || hit.getType() != WebView.HitTestResult.EDIT_TEXT_TYPE;
+        });
+        webView.setLongClickable(false);
     }
 
     @Override

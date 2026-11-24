@@ -724,4 +724,27 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(playerTsx, /onClick=\{\(\) => setMenuTab\('quality'\)\}\s*className="[^"]*sm:hidden"/);
     assert.match(playerTsx, /onClick=\{\(\) => setMenuTab\('subs'\)\}\s*className="[^"]*sm:hidden"/);
   });
+
+  it('prevents long-press haptic vibration and drag/contextmenu callouts on cards while preserving editable inputs', () => {
+    const mainActivity = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/MainActivity.java',
+    );
+    assert.match(mainActivity, /webView\.setHapticFeedbackEnabled\(false\);/);
+    assert.match(mainActivity, /webView\.setLongClickable\(false\);/);
+    assert.match(mainActivity, /WebView\.HitTestResult\.EDIT_TEXT_TYPE/);
+
+    const indexCss = readRepoFile('src/index.css');
+    assert.match(indexCss, /user-select:\s*none;/);
+    assert.match(indexCss, /-webkit-touch-callout:\s*none;/);
+    assert.match(indexCss, /input,\s*textarea,/);
+    assert.match(indexCss, /user-select:\s*text;/);
+
+    const mediaPoster = readRepoFile('src/components/MediaPoster.tsx');
+    assert.match(mediaPoster, /draggable=\{false\}/);
+
+    const mainTsx = readRepoFile('src/main.tsx');
+    assert.match(mainTsx, /addEventListener\('contextmenu'/);
+    assert.match(mainTsx, /addEventListener\('dragstart'/);
+    assert.match(mainTsx, /isEditableTouchTarget/);
+  });
 });

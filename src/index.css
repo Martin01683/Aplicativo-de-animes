@@ -7,10 +7,34 @@
 }
 
 @layer base {
+  html,
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+
   body {
     font-family: var(--font-sans);
     background-color: #0d0f12;
     color: #f1f5f9;
+  }
+
+  input,
+  textarea,
+  [contenteditable="true"],
+  .select-text {
+    -webkit-user-select: text;
+    user-select: text;
+    -webkit-touch-callout: default;
+  }
+
+  img,
+  a,
+  button {
+    -webkit-user-drag: none;
+    -webkit-touch-callout: none;
   }
 
   h1, h2, h3, h4 {
