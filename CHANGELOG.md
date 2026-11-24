@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.31] — 2026-11-24
+
+### Novidades
+- Separate DUB and LEG audio tracks with switcher tabs and audio-scoped playback (`8515d6d`)
+
 ## [v1.0.30] — 2026-11-24
 
 ### Correções
