@@ -2,6 +2,12 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.28] — 2026-11-24
+
+### Correções
+- Only record episodes in watch history after video playback actually starts (`17d655d`)
+- Keep 'Marcar temporada como vista' below season header on mobile single-season tabs (`8c9c800`)
+
 ## [v1.0.27] — 2026-11-24
 
 ### Correções
