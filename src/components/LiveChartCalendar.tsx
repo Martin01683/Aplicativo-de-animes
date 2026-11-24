@@ -40,53 +40,62 @@ type CalendarLayout = 'grid' | 'timeline';
 
 function getServiceBadgeStyle(serviceName: string | undefined): {
   badge: string;
+  row: string;
   dot: string;
 } {
   const key = (serviceName || '').toLowerCase();
   if (key.includes('crunchyroll')) {
     return {
       badge: 'border-[#f47521]/40 bg-[#f47521]/15 text-[#ff9b54]',
+      row: 'bg-[#f47521]/[0.11] text-[#ff9b54]',
       dot: 'bg-[#f47521]',
     };
   }
   if (key.includes('netflix')) {
     return {
       badge: 'border-[#e50914]/40 bg-[#e50914]/15 text-[#ff6b72]',
+      row: 'bg-[#e50914]/[0.12] text-[#ff6b72]',
       dot: 'bg-[#e50914]',
     };
   }
   if (key.includes('prime')) {
     return {
       badge: 'border-[#00a8e1]/40 bg-[#00a8e1]/15 text-[#5cd3ff]',
+      row: 'bg-[#00a8e1]/[0.11] text-[#5cd3ff]',
       dot: 'bg-[#00a8e1]',
     };
   }
   if (key.includes('disney')) {
     return {
       badge: 'border-[#3b82f6]/40 bg-[#3b82f6]/15 text-[#93c5fd]',
+      row: 'bg-[#3b82f6]/[0.12] text-[#93c5fd]',
       dot: 'bg-[#3b82f6]',
     };
   }
   if (key.includes('youtube') || key === 'yt') {
     return {
       badge: 'border-red-500/35 bg-red-500/15 text-red-300',
+      row: 'bg-red-500/[0.11] text-red-300',
       dot: 'bg-red-500',
     };
   }
   if (key.includes('hidive')) {
     return {
       badge: 'border-cyan-400/35 bg-cyan-500/15 text-cyan-300',
+      row: 'bg-cyan-500/[0.11] text-cyan-300',
       dot: 'bg-cyan-400',
     };
   }
   if (key.includes('wetv') || key.includes('bilibili') || key.includes('iqiyi')) {
     return {
       badge: 'border-amber-400/35 bg-amber-500/15 text-amber-300',
+      row: 'bg-amber-500/[0.11] text-amber-300',
       dot: 'bg-amber-400',
     };
   }
   return {
     badge: 'border-white/12 bg-white/6 text-slate-300',
+    row: 'bg-white/[0.03] text-slate-300',
     dot: 'bg-slate-400',
   };
 }
@@ -221,42 +230,69 @@ export function LiveChartCalendar({
     const meta = item.scheduleMeta;
     const svcStyle = getServiceBadgeStyle(meta?.serviceName);
     if (compact) {
+      const platformLabel =
+        meta?.serviceName || (meta?.isJapaneseBroadcast ? 'TV (JP)' : 'Oficial');
       return (
         <div
           data-calendar-badges-compact="true"
-          className="flex w-full min-w-0 items-center justify-between gap-1"
+          className="flex w-full min-w-0 flex-col"
         >
-          <div className="flex shrink-0 items-center gap-1">
-            {item.episodeLabel && (
-              <span className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] font-bold leading-none tabular-nums text-white">
+          <div
+            data-calendar-meta-row="true"
+            className="flex min-h-[26px] w-full min-w-0 items-center justify-between gap-1 px-2 py-1 sm:px-2.5"
+          >
+            {item.episodeLabel ? (
+              <span
+                data-calendar-episode-tag="true"
+                className="min-w-0 truncate text-[10.5px] font-bold leading-none tabular-nums text-white"
+              >
                 {item.episodeLabel}
               </span>
-            )}
-            {meta?.hasDub && (
-              <span className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-[9.5px] font-bold leading-none tracking-wide text-emerald-300">
-                DUB
+            ) : (
+              <span
+                data-calendar-episode-tag="true"
+                className="text-[10.5px] font-semibold leading-none text-slate-400"
+              >
+                Novo
               </span>
             )}
-            {meta?.hasSub && (
-              <span className="rounded border border-sky-500/40 bg-sky-500/15 px-1 py-0.5 text-[9.5px] font-bold leading-none tracking-wide text-sky-300">
-                SUB
-              </span>
-            )}
-            {!meta?.hasDub && !meta?.hasSub && meta?.isJapaneseBroadcast && (
-              <span className="rounded border border-white/12 bg-white/6 px-1 py-0.5 text-[9.5px] font-semibold leading-none text-slate-300">
-                JP
-              </span>
-            )}
+            <div className="flex shrink-0 items-center gap-1">
+              {meta?.hasDub && (
+                <span
+                  data-calendar-audio-tag="DUB"
+                  className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-[9.5px] font-bold leading-none tracking-wide text-emerald-300"
+                >
+                  DUB
+                </span>
+              )}
+              {meta?.hasSub && (
+                <span
+                  data-calendar-audio-tag="SUB"
+                  className="rounded border border-sky-500/40 bg-sky-500/15 px-1 py-0.5 text-[9.5px] font-bold leading-none tracking-wide text-sky-300"
+                >
+                  SUB
+                </span>
+              )}
+              {!meta?.hasDub && !meta?.hasSub && meta?.isJapaneseBroadcast && (
+                <span
+                  data-calendar-audio-tag="JP"
+                  className="rounded border border-white/12 bg-white/6 px-1 py-0.5 text-[9.5px] font-semibold leading-none text-slate-300"
+                >
+                  JP
+                </span>
+              )}
+            </div>
           </div>
-          {meta?.serviceName && (
-            <span
-              title={meta.serviceName}
-              className={`inline-flex min-w-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold leading-none ${svcStyle.badge}`}
-            >
-              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${svcStyle.dot}`} />
-              <span className="truncate">{meta.serviceName}</span>
+          <div
+            data-calendar-service-row="true"
+            title={platformLabel}
+            className={`flex min-h-[24px] w-full min-w-0 items-center gap-1.5 border-t border-white/6 px-2 py-1 text-[10.5px] font-semibold leading-none sm:px-2.5 ${svcStyle.row}`}
+          >
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${svcStyle.dot}`} />
+            <span data-calendar-service-name="true" className="truncate">
+              {platformLabel}
             </span>
-          )}
+          </div>
         </div>
       );
     }
@@ -362,10 +398,10 @@ export function LiveChartCalendar({
             </div>
           </div>
 
-          {/* Bottom Release Strip (EP + Dub/Sub + Streaming Service) */}
+          {/* Bottom Release Strip (Row 1: EP + Dub/Sub/JP, Row 2: Full-width Platform bar) */}
           <div
             data-calendar-card-footer="true"
-            className="flex min-h-[30px] shrink-0 items-center border-t border-white/8 bg-[#12161e] px-2 py-1.5 sm:px-2.5 sm:py-2"
+            className="flex w-full shrink-0 flex-col border-t border-white/8 bg-[#12161e]"
           >
             {renderReleaseBadges(item, true)}
           </div>

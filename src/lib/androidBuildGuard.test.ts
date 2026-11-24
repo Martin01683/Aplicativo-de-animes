@@ -716,11 +716,12 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     const calendarTsx = readRepoFile('src/components/LiveChartCalendar.tsx');
     assert.match(calendarTsx, /data-calendar-card-footer="true"/);
     assert.match(calendarTsx, /data-calendar-badges-compact="true"/);
+    assert.match(calendarTsx, /data-calendar-meta-row="true"/);
+    assert.match(calendarTsx, /data-calendar-service-row="true"/);
+    assert.match(calendarTsx, /data-calendar-episode-tag="true"/);
+    assert.match(calendarTsx, /data-calendar-service-name="true"/);
     assert.match(calendarTsx, /renderReleaseBadges\(item, true\)/);
     assert.match(playerTsx, /onClick=\{\(\) => setMenuTab\('quality'\)\}\s*className="[^"]*sm:hidden"/);
     assert.match(playerTsx, /onClick=\{\(\) => setMenuTab\('subs'\)\}\s*className="[^"]*sm:hidden"/);
   });
 });
-
-
-
