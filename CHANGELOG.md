@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.29] — 2026-11-24
+
+### Correções
+- Use exact LibVLC seek and directional TimeChanged guard so +5s forward skips never jump backward (`63dbf87`)
+
 ## [v1.0.28] — 2026-11-24
 
 ### Correções
