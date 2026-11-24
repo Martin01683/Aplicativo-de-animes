@@ -52,6 +52,11 @@ import {
 } from '../lib/episodeAvailability';
 import { resolveBufferedEndSec } from '../lib/playerBuffer';
 import {
+  resolveSeekBaseTimeSec,
+  shouldAcceptWebTimeUpdate,
+  type WebActiveSeekGuard,
+} from '../lib/playerSeekGuard';
+import {
   decodeSubtitleBuffer,
   hexToRgb,
   parseSubtitleContent,
@@ -309,6 +314,7 @@ export function AnimePlayer({
   const autoNextTriggeredForUrlRef = useRef<string | null>(null);
   const serverRetryCountRef = useRef(0);
   const pendingSeekSecRef = useRef(0);
+  const activeSeekGuardRef = useRef<WebActiveSeekGuard | null>(null);
   const loadWatchdogTimerRef = useRef<number | null>(null);
   const latestPlaybackRef = useRef<{
     url: string;
@@ -580,6 +586,7 @@ export function AnimePlayer({
     firstTimeUpdateSecRef.current = null;
     userSeekedInStreamRef.current = false;
     applyingPendingSeekRef.current = false;
+    activeSeekGuardRef.current = null;
     streamPreparedWallRef.current = 0;
 
     const savedEntry = episodeUrl ? getEpisodeProgress(episodeUrl) : null;
@@ -633,6 +640,7 @@ export function AnimePlayer({
     firstTimeUpdateSecRef.current = null;
     userSeekedInStreamRef.current = false;
     applyingPendingSeekRef.current = false;
+    activeSeekGuardRef.current = null;
     setSpeed(1);
     setHasVideoFrame(false);
     setErrorMsg('');
@@ -1312,7 +1320,20 @@ export function AnimePlayer({
         Number.isFinite(video.duration) && video.duration > 0
           ? video.duration
           : Number.MAX_SAFE_INTEGER;
-      const next = Math.max(0, Math.min(cap, video.currentTime + deltaSeconds));
+      const nowMs = Date.now();
+      const baseTime = resolveSeekBaseTimeSec(
+        video.currentTime,
+        activeSeekGuardRef.current,
+        nowMs,
+        video.seeking,
+      );
+      const next = Math.max(0, Math.min(cap, baseTime + deltaSeconds));
+      const originSec = activeSeekGuardRef.current?.originSec ?? baseTime;
+      activeSeekGuardRef.current = {
+        originSec,
+        targetSec: next,
+        issuedAtMs: nowMs,
+      };
       pendingSeekSecRef.current = 0;
       applyingPendingSeekRef.current = false;
       userSeekedInStreamRef.current = true;
@@ -2024,8 +2045,9 @@ export function AnimePlayer({
             onLoadedData={() => setHasVideoFrame(true)}
             onSeeked={() => {
               const v = videoRef.current;
-              if (!v || !episodeUrl) return;
+              if (!v) return;
               if (
+                episodeUrl &&
                 loadedMediaEpisodeUrlRef.current &&
                 !isSameEpisodeUrl(loadedMediaEpisodeUrlRef.current, episodeUrl)
               ) {
@@ -2033,9 +2055,25 @@ export function AnimePlayer({
               }
               const wasAutoResumeSeek = applyingPendingSeekRef.current;
               applyingPendingSeekRef.current = false;
+              if (activeSeekGuardRef.current) {
+                const seekDecision = shouldAcceptWebTimeUpdate(
+                  v.currentTime,
+                  v.seeking,
+                  activeSeekGuardRef.current,
+                  Date.now(),
+                );
+                if (!seekDecision.accept) {
+                  return;
+                }
+                if (seekDecision.clearGuard) {
+                  activeSeekGuardRef.current = null;
+                }
+              }
+              setCurrentTime(v.currentTime);
               const dur = Number.isFinite(v.duration) ? v.duration : duration;
               latestPlaybackRef.current.currentTime = v.currentTime;
               latestPlaybackRef.current.duration = dur;
+              if (!episodeUrl) return;
               if (wasAutoResumeSeek) {
                 firstTimeUpdateSecRef.current = v.currentTime;
                 return;
@@ -2067,6 +2105,18 @@ export function AnimePlayer({
               if (pendingSeekSecRef.current > 1) {
                 applyPendingSeek(v);
                 if (pendingSeekSecRef.current > 1) return;
+              }
+              const seekDecision = shouldAcceptWebTimeUpdate(
+                v.currentTime,
+                v.seeking,
+                activeSeekGuardRef.current,
+                Date.now(),
+              );
+              if (!seekDecision.accept) {
+                return;
+              }
+              if (seekDecision.clearGuard) {
+                activeSeekGuardRef.current = null;
               }
               if (
                 firstTimeUpdateSecRef.current === null ||
@@ -2428,6 +2478,14 @@ export function AnimePlayer({
               userSeekedInStreamRef.current = true;
               firstTimeUpdateSecRef.current = target;
               const v = videoRef.current;
+              const originSec =
+                activeSeekGuardRef.current?.originSec ??
+                (v && Number.isFinite(v.currentTime) ? v.currentTime : currentTime);
+              activeSeekGuardRef.current = {
+                originSec,
+                targetSec: target,
+                issuedAtMs: Date.now(),
+              };
               if (v) v.currentTime = target;
               setCurrentTime(target);
               const dur = v && Number.isFinite(v.duration) ? v.duration : duration;

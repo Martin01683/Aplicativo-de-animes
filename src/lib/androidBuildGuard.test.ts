@@ -609,10 +609,22 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     );
     assert.match(activityJava, /hasActiveSeekArrived\(/);
     assert.match(activityJava, /activeSeekOriginMs/);
+    assert.match(
+      activityJava,
+      /activeSeekEchoBarrierPending\s*=\s*true/,
+      'commitPlayerSeek must arm activeSeekEchoBarrierPending before mediaPlayer.setTime() to drop VLC 3.0 TimeCallback synchronous echoes',
+    );
+    assert.match(activityJava, /if\s*\(activeSeekEchoBarrierPending\)/);
+    assert.match(activityJava, /if\s*\(capturedSeekGen\s*!=\s*activeSeekGen\)/);
+    assert.match(activityJava, /clearActiveSeekGuard\(\)/);
     assert.match(activityJava, /syncPlayerPlaybackParametersIfNeeded\(\)/);
     assert.match(activityJava, /mediaPlayer\.getRate\(\)/);
     assert.match(activityJava, /mediaPlayer\.getVolume\(\)/);
     assert.match(activityJava, /mediaPlayer\.getAudioTrack\(\)/);
+
+    const animePlayerTsx = readRepoFile('src/components/AnimePlayer.tsx');
+    assert.match(animePlayerTsx, /shouldAcceptWebTimeUpdate\(/);
+    assert.match(animePlayerTsx, /resolveSeekBaseTimeSec\(/);
   });
 
   it('places episode synopsis and "Ver todos os episódios" button above "Marcar como visto" and "Favoritar" in EpisodeWorkspace', () => {
