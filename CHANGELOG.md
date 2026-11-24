@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.33] — 2026-11-24
+
+### Correções
+- Load official TheTVDB PT-BR episode titles directly with shared cache and clean Japanese brackets (`c740e15`)
+
 ## [v1.0.32] — 2026-11-24
 
 ### Novidades
