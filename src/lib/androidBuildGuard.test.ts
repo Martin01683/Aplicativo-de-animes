@@ -840,4 +840,43 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
     assert.match(workspaceTsx, /data-episode-uncensored="true"[\s\S]*?Sem censura/);
   });
+
+  it('orders AnimeDetailView hero as Style A (Poster+Backdrop -> Clean Badges -> Title -> Subtitle -> Genres -> Synopsis -> Info Panel -> Actions) and eagerly hydrates episode titles with loading skeleton', () => {
+    const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
+    const heroStart = detailTsx.indexOf('{/* Hero Info Card enriched by TheTVDB */}');
+    const episodesStart = detailTsx.indexOf('{/* Episodes / Movie Playback Section */}');
+    assert.ok(heroStart > 0 && episodesStart > heroStart);
+
+    const hero = detailTsx.slice(heroStart, episodesStart);
+    const badgesIdx = hero.indexOf('data-hero-badges="true"');
+    const titleIdx = hero.indexOf('<h1');
+    const subtitleIdx = hero.indexOf('{subtitleParts.join');
+    const genresIdx = hero.indexOf('{visibleGenres.map');
+    const synopsisIdx = hero.indexOf('data-anime-synopsis="true"');
+    const infoPanelIdx = hero.indexOf('data-anime-info-panel="true"');
+    const actionsIdx = hero.indexOf('data-anime-actions="true"');
+
+    assert.ok(
+      badgesIdx > 0 &&
+        titleIdx > badgesIdx &&
+        subtitleIdx > titleIdx &&
+        genresIdx > subtitleIdx &&
+        synopsisIdx > genresIdx &&
+        infoPanelIdx > synopsisIdx &&
+        actionsIdx > infoPanelIdx,
+      'Hero sections must follow: Badges -> Title -> Subtitle -> Genres -> Synopsis -> Info Panel -> Actions',
+    );
+
+    const badgesBlock = hero.slice(badgesIdx, titleIdx);
+    assert.doesNotMatch(
+      badgesBlock,
+      /anime\.year|activeEpisodes\.length|Provedor:/,
+      'Top hero badges must omit redundant year, episode count, and provider text',
+    );
+
+    assert.match(detailTsx, /allUnlocalizedEpisodeIds/);
+    assert.match(detailTsx, /data-episode-titles-loading="true"/);
+    assert.match(detailTsx, /data-episode-title-loading="true"/);
+    assert.match(detailTsx, /Buscando títulos dos episódios no TheTVDB\.\.\./);
+  });
 });
