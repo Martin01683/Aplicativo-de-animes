@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.26] — 2026-11-24
+
+### Correções
+- Standardize card footer into two fixed rows to prevent tag truncation (`0331399`)
+
 ## [v1.0.25] — 2026-11-24
 
 ### Correções
