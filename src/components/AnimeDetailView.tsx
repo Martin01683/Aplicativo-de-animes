@@ -978,6 +978,7 @@ export function AnimeDetailView({
                       {seasonPlayableEpisodes.length > 0 && (
                         <button
                           type="button"
+                          data-season-mark-desktop={group.seasonNumber}
                           onClick={() =>
                             onToggleEpisodesWatched(
                               seasonPlayableEpisodes,
@@ -988,9 +989,7 @@ export function AnimeDetailView({
                             )
                           }
                           aria-pressed={seasonAllWatched}
-                          className={`${
-                            canCollapseSeason ? 'hidden sm:inline-flex' : 'inline-flex'
-                          } shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
+                          className={`hidden sm:inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors ${
                             seasonAllWatched
                               ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
                               : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white'
@@ -1039,10 +1038,14 @@ export function AnimeDetailView({
                       data-season-episodes={group.seasonNumber}
                       className="divide-y divide-white/8"
                     >
-                    {canCollapseSeason && seasonPlayableEpisodes.length > 0 && (
-                      <div className="flex items-center justify-end bg-[#0d0f12]/30 px-4 py-2 sm:hidden">
+                    {seasonPlayableEpisodes.length > 0 && (
+                      <div
+                        data-season-mobile-actions={group.seasonNumber}
+                        className="flex items-center justify-end bg-[#0d0f12]/30 px-4 py-2 sm:hidden"
+                      >
                         <button
                           type="button"
+                          data-season-mark-mobile={group.seasonNumber}
                           onClick={() =>
                             onToggleEpisodesWatched(
                               seasonPlayableEpisodes,
@@ -1061,7 +1064,13 @@ export function AnimeDetailView({
                         >
                           <CheckCheck className="h-3.5 w-3.5" />
                           <span>
-                            {seasonAllWatched ? 'Temporada vista' : 'Marcar temporada como vista'}
+                            {seasonAllWatched
+                              ? isMovie
+                                ? 'Visto'
+                                : 'Temporada vista'
+                              : isMovie
+                                ? 'Marcar como visto'
+                                : 'Marcar temporada como vista'}
                           </span>
                         </button>
                       </div>
