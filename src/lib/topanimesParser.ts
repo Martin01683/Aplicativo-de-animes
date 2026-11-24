@@ -19,6 +19,7 @@ import type {
   WeeklyCalendarResponse,
 } from './types.ts';
 import { isSafeExternalHttpUrl, normalizeTopAnimesUrl, unwrapAvisoUrl } from './urlSafety.ts';
+import { isUncensoredEpisodeTitle } from './episodeAvailability.ts';
 
 const NAMED_HEIGHTS: Record<string, number> = {
   uhd: 2160,
@@ -965,6 +966,8 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
         ? containerSeasonTitle
         : `Temporada ${seasonNumber}`;
 
+    const uncensored = isUncensoredEpisodeTitle(epTitle) || isUncensoredEpisodeTitle(numberLabel);
+
     episodes.push({
       numberLabel: numberLabel || (Number.isFinite(parsedNum) ? String(parsedNum) : ''),
       episodeNumber: Number.isFinite(parsedNum) ? parsedNum : null,
@@ -974,6 +977,7 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
       url: href,
       date: date || undefined,
       thumb: thumb || undefined,
+      ...(uncensored ? { uncensored: true } : {}),
     });
   };
 

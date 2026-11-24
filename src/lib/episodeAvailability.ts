@@ -307,8 +307,126 @@ export function formatUpcomingEpisodeNotice(
   return `${epTag} ainda não disponível nos servidores (data oficial não confirmada).`;
 }
 
+const UNCENSORED_TAG_RE =
+  /\b(?:vers[aã]o\s+)?(?:sem[\s-]+censura|uncensored|des?censurad[oa])\b/i;
+
+export function isUncensoredEpisodeTitle(text?: string): boolean {
+  if (!text) return false;
+  return UNCENSORED_TAG_RE.test(text);
+}
+
+export function stripUncensoredTag(title?: string): string {
+  if (!title) return '';
+  return title
+    .replace(
+      /\s*[([]\s*(?:vers[aã]o\s+)?(?:sem[\s-]+censura|uncensored|des?censurad[oa])\s*[)\]]/gi,
+      ''
+    )
+    .replace(
+      /\s*(?:[-–—|/·:]\s*)?\b(?:vers[aã]o\s+)?(?:sem[\s-]+censura|uncensored|des?censurad[oa])\b/gi,
+      ''
+    )
+    .replace(/\s*[-–—|/·:]\s*$/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+export function isEpisodeUncensored(
+  ep: Pick<AnimeEpisodeLink, 'uncensored' | 'title' | 'numberLabel'> | null | undefined
+): boolean {
+  if (!ep) return false;
+  return Boolean(
+    ep.uncensored ||
+      isUncensoredEpisodeTitle(ep.title) ||
+      isUncensoredEpisodeTitle(ep.numberLabel)
+  );
+}
+
+/**
+ * Formats a concise episode badge (`EP 3` or `T2 · EP 3`) for the Option 2 card header,
+ * avoiding raw provider strings like `"1 - 3"`.
+ */
+export function formatEpisodeCardBadge(
+  ep: Pick<AnimeEpisodeLink, 'episodeNumber' | 'seasonNumber' | 'numberLabel'>,
+  isMovie = false
+): string {
+  if (isMovie) return 'Filme';
+  if (
+    ep.episodeNumber !== null &&
+    ep.episodeNumber !== undefined &&
+    Number.isFinite(ep.episodeNumber) &&
+    ep.episodeNumber > 0
+  ) {
+    const sNum = ep.seasonNumber && ep.seasonNumber > 1 ? ep.seasonNumber : 1;
+    return sNum > 1 ? `T${sNum} · EP ${ep.episodeNumber}` : `EP ${ep.episodeNumber}`;
+  }
+  const cleanedLabel = stripUncensoredTag(ep.numberLabel || '');
+  if (cleanedLabel) {
+    if (/^\d+(?:\.\d+)?$/.test(cleanedLabel)) {
+      return `EP ${cleanedLabel}`;
+    }
+    return cleanedLabel;
+  }
+  return 'EP';
+}
+
+/**
+ * Formats the display title inside an Option 2 episode card:
+ * removes redundant `"Episódio N — "` prefixes (since `EP N` is already shown as a badge)
+ * and strips `(Sem Censura)` tags (rendered as a dedicated pill badge).
+ */
+export function formatEpisodeCardTitle(
+  ep: Pick<AnimeEpisodeLink, 'title' | 'episodeNumber'>,
+  isMovie = false
+): string {
+  const cleaned = stripUncensoredTag(ep.title || '');
+  if (isMovie) {
+    return cleaned || 'Filme Completo';
+  }
+  const withoutPrefix = cleaned
+    .replace(
+      /^(?:(?:T\d+\s*[·-]\s*)?(?:epis[oó]dio|episode|ep\.?)\s*\d+)\s*[—–:-]\s*/i,
+      ''
+    )
+    .trim();
+  if (withoutPrefix && !/^[-–—·:|/]+$/.test(withoutPrefix)) {
+    return withoutPrefix;
+  }
+  if (cleaned) {
+    return cleaned;
+  }
+  return ep.episodeNumber && ep.episodeNumber > 0
+    ? `Episódio ${ep.episodeNumber}`
+    : 'Episódio';
+}
+
+/**
+ * Formats a concise label for the Hero primary play CTA button so long episode titles
+ * never wrap the main button into multiple lines.
+ */
+export function formatEpisodePlayCtaLabel(
+  ep: Pick<AnimeEpisodeLink, 'title' | 'episodeNumber' | 'seasonNumber'>,
+  isMovie = false
+): string {
+  if (isMovie) return 'Assistir Filme';
+  if (
+    ep.episodeNumber !== null &&
+    ep.episodeNumber !== undefined &&
+    Number.isFinite(ep.episodeNumber) &&
+    ep.episodeNumber > 0
+  ) {
+    const sNum = ep.seasonNumber && ep.seasonNumber > 1 ? ep.seasonNumber : 1;
+    return sNum > 1
+      ? `Assistir T${sNum} · EP ${ep.episodeNumber}`
+      : `Assistir Episódio ${ep.episodeNumber}`;
+  }
+  const fallback = stripUncensoredTag(ep.title || '');
+  return fallback ? `Assistir ${fallback}` : 'Assistir Episódio';
+}
+
 function isGenericEpisodeTitle(title: string): boolean {
-  return /^(?:epis[oó]dio|episode|ep\.?)\s*\d+(?:\s*[-–—:]?\s*(?:final)?)?$/i.test(title.trim());
+  const cleaned = stripUncensoredTag(title);
+  return /^(?:epis[oó]dio|episode|ep\.?)\s*\d+(?:\s*[-–—:]?\s*(?:final)?)?$/i.test(cleaned);
 }
 
 function formatIsoDateFromSec(sec: number): string {
@@ -522,6 +640,7 @@ export function mergeServerAndCatalogEpisodes(params: {
   if (scopedCatalog.length === 0) {
     return serverEpisodes.map((ep) => ({
       ...ep,
+      ...(isEpisodeUncensored(ep) ? { uncensored: true } : {}),
       availableOnServer: true,
       airingAt: ep.airingAt ?? parseEpisodeDateToTimestampSec(ep.date),
     }));
@@ -540,6 +659,7 @@ export function mergeServerAndCatalogEpisodes(params: {
           : ep.seasonNumber || 1;
     const item: AnimeEpisodeLink = {
       ...ep,
+      ...(isEpisodeUncensored(ep) ? { uncensored: true } : {}),
       episodeNumber: epNum,
       seasonNumber: sNum,
       seasonLabel: ep.seasonLabel || `Temporada ${sNum}`,
@@ -590,11 +710,13 @@ export function mergeServerAndCatalogEpisodes(params: {
         Boolean(catEp.title) &&
         !isGenericEpisodeTitle(catEp.title) &&
         isGenericEpisodeTitle(matchedServer.title);
+      const uncensored = isEpisodeUncensored(matchedServer) || isEpisodeUncensored(catEp);
       const hasMisleadingSeason1Label =
         sNum > 1 && /^\s*1\s*[-·]\s*\d+\s*$/.test(matchedServer.numberLabel || '');
       merged.push({
         ...matchedServer,
         title: preferCatalogTitle ? catEp.title : matchedServer.title,
+        ...(uncensored ? { uncensored: true } : {}),
         seasonNumber: sNum,
         seasonLabel: catEp.seasonLabel || matchedServer.seasonLabel || `Temporada ${sNum}`,
         numberLabel: hasMisleadingSeason1Label

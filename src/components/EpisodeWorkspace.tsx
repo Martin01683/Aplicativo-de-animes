@@ -25,6 +25,8 @@ import {
   formatUpcomingEpisodeNotice,
   formatUpcomingEpisodeShortLabel,
   isEpisodeAvailableOnServer,
+  isEpisodeUncensored,
+  isUncensoredEpisodeTitle,
 } from '../lib/episodeAvailability';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
 import {
@@ -985,9 +987,21 @@ export function EpisodeWorkspace({
         <section className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
           <div className="space-y-3.5 border-b border-white/8 pb-4">
             <div className="min-w-0">
-              <h1 className="text-lg font-bold text-white sm:text-2xl">
-                {episode.title}
-              </h1>
+              <div className="flex flex-wrap items-center gap-2">
+                <h1 className="text-lg font-bold text-white sm:text-2xl">
+                  {episode.title}
+                </h1>
+                {(isEpisodeUncensored(matchedSeriesEpisode) ||
+                  isUncensoredEpisodeTitle(episode.title) ||
+                  isUncensoredEpisodeTitle(episode.episodeLabel)) && (
+                  <span
+                    data-episode-uncensored="true"
+                    className="inline-flex shrink-0 items-center rounded border border-rose-500/40 bg-rose-500/15 px-2 py-0.5 text-[11px] font-semibold leading-tight text-rose-300"
+                  >
+                    Sem censura
+                  </span>
+                )}
+              </div>
               {episode.genres.length > 0 && (
                 <p className="mt-1 text-xs text-slate-400">
                   {episode.genres.join(' · ')}

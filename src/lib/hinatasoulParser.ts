@@ -14,6 +14,7 @@ import {
   isSafeExternalHttpUrl,
   normalizeHinataSoulUrl,
 } from './urlSafety.ts';
+import { isUncensoredEpisodeTitle } from './episodeAvailability.ts';
 
 export const HINATASOUL_ORIGIN = 'https://www.hinatasoul.com';
 export const HINATASOUL_R2_ORIGIN =
@@ -593,6 +594,8 @@ export function parseHinataSoulAnimePageHtml(
         : rawNumText || `EP ${idx + 1}`;
     const epTitle = rawNumText || (epNum !== null ? `Episódio ${epNum}` : rawName || `Episódio ${idx + 1}`);
 
+    const uncensored = isUncensoredEpisodeTitle(rawNumText) || isUncensoredEpisodeTitle(rawName);
+
     episodes.push({
       numberLabel,
       episodeNumber: epNum,
@@ -602,6 +605,7 @@ export function parseHinataSoulAnimePageHtml(
       url: epUrl,
       date: date || undefined,
       thumb: thumb || undefined,
+      ...(uncensored ? { uncensored: true } : {}),
     });
   });
 

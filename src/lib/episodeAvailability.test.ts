@@ -2,12 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   extractExplicitSeasonNumber,
+  formatEpisodeCardBadge,
+  formatEpisodeCardTitle,
   formatEpisodeCountdown,
+  formatEpisodePlayCtaLabel,
   formatEpisodeReleaseDate,
   formatUpcomingEpisodeNotice,
   isEpisodeAvailableOnServer,
+  isEpisodeUncensored,
+  isUncensoredEpisodeTitle,
   mergeServerAndCatalogEpisodes,
   parseEpisodeDateToTimestampSec,
+  stripUncensoredTag,
 } from './episodeAvailability';
 import { pickLatestAnimeEpisode } from './favoriteAlerts';
 import type { AnimeEpisodeLink } from './types';
@@ -497,6 +503,113 @@ test('mergeServerAndCatalogEpisodes keeps all seasons when unifyAllSeasons is tr
   assert.equal(latest.episodeUrl, 'https://topanimes.net/episodio/frieren-2-ep-3/');
   assert.equal(latest.episodeLabel, 'T2 · EP 3');
 });
+
+test('uncensored detection, tag stripping, and Option 2 episode card formatters handle Sem Censura and long titles cleanly', () => {
+  assert.equal(isUncensoredEpisodeTitle('Episódio 3 (Sem Censura)'), true);
+  assert.equal(isUncensoredEpisodeTitle('Episódio 5 - Uncensored'), true);
+  assert.equal(isUncensoredEpisodeTitle('Episódio 1'), false);
+
+  assert.equal(stripUncensoredTag('Episódio 3 (Sem Censura)'), 'Episódio 3');
+  assert.equal(stripUncensoredTag('Episódio 5 [Uncensored]'), 'Episódio 5');
+  assert.equal(stripUncensoredTag('Episódio 6 — Sem Censura'), 'Episódio 6');
+
+  assert.equal(
+    formatEpisodeCardBadge({ numberLabel: '1 - 3', episodeNumber: 3, seasonNumber: 1 }),
+    'EP 3'
+  );
+  assert.equal(
+    formatEpisodeCardBadge({ numberLabel: '2 - 4', episodeNumber: 4, seasonNumber: 2 }),
+    'T2 · EP 4'
+  );
+  assert.equal(
+    formatEpisodeCardBadge({ numberLabel: '1 - 1', episodeNumber: 1, seasonNumber: 1 }, true),
+    'Filme'
+  );
+
+  assert.equal(
+    formatEpisodeCardTitle({
+      title: 'Episódio 3 — Dia de piscina no Conselho Estudantil',
+      episodeNumber: 3,
+    }),
+    'Dia de piscina no Conselho Estudantil'
+  );
+  assert.equal(
+    formatEpisodeCardTitle({
+      title: 'Episódio 3 (Sem Censura)',
+      episodeNumber: 3,
+    }),
+    'Episódio 3'
+  );
+
+  assert.equal(
+    formatEpisodePlayCtaLabel({
+      title: 'Episódio 1 — Até o pirralho tem seus furos / A presidente foi levada pelo Ume-kun',
+      episodeNumber: 1,
+      seasonNumber: 1,
+    }),
+    'Assistir Episódio 1'
+  );
+  assert.equal(
+    formatEpisodePlayCtaLabel(
+      { title: 'Filme Completo', episodeNumber: 1, seasonNumber: 1 },
+      true
+    ),
+    'Assistir Filme'
+  );
+});
+
+test('mergeServerAndCatalogEpisodes preserves uncensored flag while replacing generic Sem Censura server titles with TheTVDB episode titles', () => {
+  const merged = mergeServerAndCatalogEpisodes({
+    serverTitle: 'Seitokai ni mo Ana wa Aru!',
+    serverUrl: 'https://topanimes.net/animes/seitokai/',
+    serverEpisodes: [
+      {
+        numberLabel: '1 - 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        title: 'Episódio 1',
+        url: 'https://topanimes.net/episodio/seitokai-ep-1/',
+      },
+      {
+        numberLabel: '1 - 3',
+        episodeNumber: 3,
+        seasonNumber: 1,
+        title: 'Episódio 3 (Sem Censura)',
+        url: 'https://topanimes.net/episodio/seitokai-ep-3/',
+      },
+    ],
+    catalogEpisodes: [
+      {
+        numberLabel: 'EP 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 1 — Até o pirralho tem seus furos',
+        url: 'anisync://episode/anime/thetvdb/463051/s1/e1',
+      },
+      {
+        numberLabel: 'EP 3',
+        episodeNumber: 3,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 3 — Dia de piscina no Conselho Estudantil',
+        url: 'anisync://episode/anime/thetvdb/463051/s1/e3',
+      },
+    ],
+    serverMatched: true,
+    tvdbId: 463051,
+  });
+
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].title, 'Episódio 1 — Até o pirralho tem seus furos');
+  assert.equal(isEpisodeUncensored(merged[0]), false);
+
+  assert.equal(merged[1].title, 'Episódio 3 — Dia de piscina no Conselho Estudantil');
+  assert.equal(merged[1].uncensored, true);
+  assert.equal(isEpisodeUncensored(merged[1]), true);
+  assert.equal(formatEpisodeCardTitle(merged[1]), 'Dia de piscina no Conselho Estudantil');
+});
+
 
 
 

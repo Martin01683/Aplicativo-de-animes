@@ -30,9 +30,13 @@ import {
 } from 'lucide-react';
 import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
 import {
+  formatEpisodeCardBadge,
+  formatEpisodeCardTitle,
   formatEpisodeCountdown,
+  formatEpisodePlayCtaLabel,
   formatEpisodeReleaseDate,
   isEpisodeAvailableOnServer,
+  isEpisodeUncensored,
 } from '../lib/episodeAvailability';
 import { normalizeTopAnimesUrl, pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
 import {
@@ -308,7 +312,7 @@ export function AnimeDetailView({
       : !isMovie && lastEpisodeItem && firstEpisode && lastEpisodeItem.url !== firstEpisode.url
         ? {
             url: lastEpisodeItem.url,
-            label: lastEpisodeItem.title,
+            label: formatEpisodeCardBadge(lastEpisodeItem, isMovie),
           }
         : null;
 
@@ -354,7 +358,8 @@ export function AnimeDetailView({
               return (
                 ep.title.toLowerCase().includes(query) ||
                 ep.numberLabel.toLowerCase().includes(query) ||
-                (ep.date && ep.date.toLowerCase().includes(query))
+                (ep.date && ep.date.toLowerCase().includes(query)) ||
+                (isEpisodeUncensored(ep) && 'sem censura uncensored'.includes(query))
               );
             });
         const ordered = sortDesc ? [...filtered].reverse() : filtered;
@@ -598,7 +603,7 @@ export function AnimeDetailView({
                     className="inline-flex items-center gap-2 rounded-lg bg-[#f97316] px-4 py-2.5 text-sm font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c]"
                   >
                     <Play className="h-4 w-4 fill-current" />
-                    <span>{isMovie ? 'Assistir Filme' : `Assistir ${firstEpisode.title}`}</span>
+                    <span>{formatEpisodePlayCtaLabel(firstEpisode, isMovie)}</span>
                   </button>
                 )}
 
@@ -1207,6 +1212,9 @@ export function AnimeDetailView({
                         ep.airingAt,
                         ep.hasExactAiringTime
                       );
+                      const epBadge = formatEpisodeCardBadge(ep, isMovie);
+                      const epDisplayTitle = formatEpisodeCardTitle(ep, isMovie);
+                      const uncensored = isEpisodeUncensored(ep);
 
                       if (!available) {
                         const countdown = formatEpisodeCountdown(ep.airingAt, nowMs, ep.date);
@@ -1227,32 +1235,71 @@ export function AnimeDetailView({
                           <div
                             key={`${ep.url}-${ep.seasonNumber || 1}-${ep.episodeNumber || ep.numberLabel}`}
                             data-episode-unavailable="true"
-                            className="flex items-center justify-between gap-2.5 bg-[#0d0f12]/35 px-4 py-3 sm:gap-4"
+                            className="bg-[#0d0f12]/35 px-3.5 py-3 sm:px-4"
                           >
-                            <div className="flex min-w-0 flex-1 items-center gap-2.5 sm:gap-4">
+                            <div className="flex items-start gap-3 sm:gap-4">
                               {ep.thumb ? (
                                 <MediaPoster
                                   src={ep.thumb}
-                                  alt={ep.title}
+                                  alt={epDisplayTitle}
                                   aspect="landscape"
-                                  className="h-11 w-[72px] shrink-0 rounded-md border border-white/10 opacity-60 sm:h-12 sm:w-20"
+                                  className="mt-0.5 h-[54px] w-[96px] shrink-0 rounded-md border border-white/10 opacity-60 sm:h-16 sm:w-28"
                                 />
                               ) : null}
-                              <span
-                                className={`${ep.thumb ? 'hidden sm:inline-block' : ''} w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-500 sm:w-20`}
-                              >
-                                {ep.numberLabel || 'EP'}
-                              </span>
+
                               <div className="min-w-0 flex-1">
-                                {ep.thumb && (
-                                  <div className="font-mono text-[10px] font-medium tabular-nums text-slate-500 sm:hidden">
-                                    {ep.numberLabel || 'EP'}
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                                    <span className="font-mono text-[11px] font-semibold tabular-nums text-slate-400 sm:text-xs">
+                                      {epBadge}
+                                    </span>
+                                    {uncensored && (
+                                      <span
+                                        data-episode-uncensored="true"
+                                        className="inline-flex shrink-0 items-center rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-rose-300"
+                                      >
+                                        Sem censura
+                                      </span>
+                                    )}
                                   </div>
-                                )}
-                                <div className="truncate text-sm font-medium text-slate-300">
-                                  {ep.title}
+
+                                  <span
+                                    title={badgeTitle}
+                                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${
+                                      countdown.state === 'now'
+                                        ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
+                                        : countdown.state === 'future'
+                                          ? 'border-[#f97316]/85 bg-[#1b0e05]/92 text-[#ffedd5]'
+                                          : countdown.state === 'pending'
+                                            ? 'border-white/20 bg-[#0d0f12]/92 text-slate-300'
+                                            : 'border-white/20 bg-[#0d0f12]/90 text-slate-300'
+                                    }`}
+                                  >
+                                    {countdown.state === 'pending' ? (
+                                      <CloudOff className="h-3 w-3 shrink-0 text-slate-400" />
+                                    ) : (
+                                      <Clock
+                                        className={`h-3 w-3 shrink-0 ${
+                                          countdown.state === 'now'
+                                            ? 'text-emerald-300'
+                                            : countdown.state === 'future'
+                                              ? 'text-[#f97316]'
+                                              : 'text-slate-400'
+                                        }`}
+                                      />
+                                    )}
+                                    <span>{badgeLabel}</span>
+                                  </span>
                                 </div>
-                                <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs tabular-nums text-slate-400">
+
+                                <div
+                                  data-episode-title="true"
+                                  className="mt-1 line-clamp-2 text-[13.5px] font-medium leading-snug text-slate-300 sm:text-sm"
+                                >
+                                  {epDisplayTitle}
+                                </div>
+
+                                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] tabular-nums text-slate-400 sm:text-xs">
                                   <span className="inline-flex items-center gap-1">
                                     <Calendar className="h-3 w-3 shrink-0 text-slate-500" />
                                     <span>{formattedDate || 'Data ainda não confirmada'}</span>
@@ -1263,36 +1310,6 @@ export function AnimeDetailView({
                                 </div>
                               </div>
                             </div>
-
-                            <div className="flex shrink-0 items-center">
-                              <span
-                                title={badgeTitle}
-                                className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${
-                                  countdown.state === 'now'
-                                    ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
-                                    : countdown.state === 'future'
-                                      ? 'border-[#f97316]/85 bg-[#1b0e05]/92 text-[#ffedd5]'
-                                      : countdown.state === 'pending'
-                                        ? 'border-white/20 bg-[#0d0f12]/92 text-slate-300'
-                                        : 'border-white/20 bg-[#0d0f12]/90 text-slate-300'
-                                }`}
-                              >
-                                {countdown.state === 'pending' ? (
-                                  <CloudOff className="h-3 w-3 shrink-0 text-slate-400" />
-                                ) : (
-                                  <Clock
-                                    className={`h-3 w-3 shrink-0 ${
-                                      countdown.state === 'now'
-                                        ? 'text-emerald-300'
-                                        : countdown.state === 'future'
-                                          ? 'text-[#f97316]'
-                                          : 'text-slate-400'
-                                    }`}
-                                  />
-                                )}
-                                <span>{badgeLabel}</span>
-                              </span>
-                            </div>
                           </div>
                         );
                       }
@@ -1300,90 +1317,122 @@ export function AnimeDetailView({
                       const epKey = canonicalEpisodeProgressKey(ep.url);
                       const epProgress = epKey ? progressMap?.[epKey] : undefined;
                       const resumeSec = getResumePositionSec(epProgress);
+                      const progressPct =
+                        resumeSec >= 2 && epProgress && epProgress.durationSec > 0
+                          ? Math.min(
+                              96,
+                              Math.max(4, Math.round((resumeSec / epProgress.durationSec) * 100))
+                            )
+                          : 0;
                       const watched = isWatchedEpisode(ep);
                       return (
                         <div
                           key={ep.url}
-                          className="group flex items-center justify-between gap-2 px-4 py-3 transition-colors hover:bg-white/5 sm:gap-4"
+                          data-episode-card="true"
+                          className="group px-3.5 py-3 transition-colors hover:bg-white/5 sm:px-4"
                         >
-                          <button
-                            type="button"
-                            onClick={() => onOpenEpisode(ep.url)}
-                            className="flex min-w-0 flex-1 items-center justify-between gap-2.5 text-left sm:gap-3"
-                          >
-                            <div className="flex min-w-0 flex-1 items-center gap-2.5 sm:gap-4">
-                              {ep.thumb ? (
+                          <div className="flex items-start gap-3 sm:gap-4">
+                            {ep.thumb ? (
+                              <button
+                                type="button"
+                                onClick={() => onOpenEpisode(ep.url)}
+                                aria-label={`Assistir ${epBadge}: ${epDisplayTitle}`}
+                                className="relative mt-0.5 h-[54px] w-[96px] shrink-0 overflow-hidden rounded-md border border-white/10 sm:h-16 sm:w-28"
+                              >
                                 <MediaPoster
                                   src={ep.thumb}
-                                  alt={ep.title}
+                                  alt={epDisplayTitle}
                                   aspect="landscape"
-                                  className="h-11 w-[72px] shrink-0 rounded-md border border-white/10 sm:h-12 sm:w-20"
+                                  className="h-full w-full"
                                 />
-                              ) : null}
-                              <span
-                                className={`${ep.thumb ? 'hidden sm:inline-block' : ''} w-12 shrink-0 font-mono text-xs font-medium tabular-nums text-slate-400 sm:w-20`}
+                                <span
+                                  aria-hidden="true"
+                                  className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/20 transition-colors group-hover:bg-black/35"
+                                >
+                                  <span className="flex h-6 w-6 items-center justify-center rounded-full bg-black/65 text-[#f97316] ring-1 ring-white/20 transition-transform group-hover:scale-110 sm:h-7 sm:w-7">
+                                    <Play className="h-3 w-3 translate-x-[0.5px] fill-current sm:h-3.5 sm:w-3.5" />
+                                  </span>
+                                </span>
+                                {progressPct > 0 && (
+                                  <span
+                                    aria-hidden="true"
+                                    className="pointer-events-none absolute inset-x-0 bottom-0 h-1 bg-black/60"
+                                  >
+                                    <span
+                                      className="block h-full bg-[#f97316]"
+                                      style={{ width: `${progressPct}%` }}
+                                    />
+                                  </span>
+                                )}
+                              </button>
+                            ) : null}
+
+                            <div className="min-w-0 flex-1">
+                              <button
+                                type="button"
+                                onClick={() => onOpenEpisode(ep.url)}
+                                className="block w-full text-left"
                               >
-                                {ep.numberLabel || 'EP'}
-                              </span>
-                              <div className="min-w-0 flex-1">
-                                {ep.thumb && (
-                                  <div className="font-mono text-[10px] font-medium tabular-nums text-slate-400 sm:hidden">
-                                    {ep.numberLabel || 'EP'}
-                                  </div>
-                                )}
-                                <div className="truncate text-sm font-medium text-white group-hover:text-[#f97316]">
-                                  {ep.title}
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  {!ep.thumb && (
+                                    <Play className="h-3 w-3 shrink-0 fill-current text-[#f97316]" />
+                                  )}
+                                  <span className="font-mono text-[11px] font-semibold tabular-nums text-[#fb923c] sm:text-xs">
+                                    {epBadge}
+                                  </span>
+                                  {uncensored && (
+                                    <span
+                                      data-episode-uncensored="true"
+                                      className="inline-flex shrink-0 items-center rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-rose-300"
+                                    >
+                                      Sem censura
+                                    </span>
+                                  )}
                                 </div>
-                                {(formattedDate || ep.durationMinutes || ep.rating || resumeSec >= 2) && (
-                                  <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs tabular-nums text-slate-500">
-                                    {formattedDate && <span>{formattedDate}</span>}
-                                    {ep.durationMinutes && <span>{ep.durationMinutes} min</span>}
-                                    {ep.rating && (
-                                      <span className="text-amber-400/90">★ {ep.rating}</span>
-                                    )}
-                                    {resumeSec >= 2 && (
-                                      <span className="font-medium text-[#fb923c] sm:hidden">
-                                        Parou em {formatPlaybackTimestamp(resumeSec)}
-                                      </span>
-                                    )}
-                                  </div>
-                                )}
+
+                                <div
+                                  data-episode-title="true"
+                                  className="mt-0.5 line-clamp-2 text-[13.5px] font-medium leading-snug text-white transition-colors group-hover:text-[#f97316] sm:text-sm"
+                                >
+                                  {epDisplayTitle}
+                                </div>
+                              </button>
+
+                              <div className="mt-1.5 flex items-center justify-between gap-2">
+                                <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] tabular-nums text-slate-500 sm:text-xs">
+                                  {formattedDate && <span>{formattedDate}</span>}
+                                  {ep.durationMinutes && <span>{ep.durationMinutes} min</span>}
+                                  {ep.rating && (
+                                    <span className="text-amber-400/90">★ {ep.rating}</span>
+                                  )}
+                                  {resumeSec >= 2 && (
+                                    <span className="font-medium text-[#fb923c]">
+                                      Parou em {formatPlaybackTimestamp(resumeSec)}
+                                    </span>
+                                  )}
+                                </div>
+
+                                <button
+                                  type="button"
+                                  onClick={() => onToggleEpisodesWatched([ep], !watched)}
+                                  aria-pressed={watched}
+                                  aria-label={
+                                    watched
+                                      ? `Desmarcar ${epBadge} como visto`
+                                      : `Marcar ${epBadge} como visto`
+                                  }
+                                  className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors sm:px-2.5 sm:py-1 sm:text-xs ${
+                                    watched
+                                      ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                                      : 'border-white/12 bg-[#0d0f12] text-slate-400 hover:border-emerald-500/50 hover:text-white'
+                                  }`}
+                                >
+                                  <Check className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
+                                  <span>Visto</span>
+                                </button>
                               </div>
                             </div>
-
-                            <div className="flex shrink-0 items-center gap-2.5">
-                              {resumeSec >= 2 && (
-                                <span className="hidden text-xs font-medium tabular-nums text-[#fb923c] sm:inline">
-                                  Parou em {formatPlaybackTimestamp(resumeSec)}
-                                </span>
-                              )}
-                              <span className="inline-flex items-center gap-1 text-xs font-medium text-slate-300 group-hover:text-white">
-                                <Play className="h-3.5 w-3.5 text-[#f97316]" />
-                                <span className="hidden sm:inline">
-                                  {resumeSec >= 2 ? 'Retomar' : 'Abrir'}
-                                </span>
-                              </span>
-                            </div>
-                          </button>
-
-                          <button
-                            type="button"
-                            onClick={() => onToggleEpisodesWatched([ep], !watched)}
-                            aria-pressed={watched}
-                            aria-label={
-                              watched
-                                ? `Desmarcar ${ep.title} como visto`
-                                : `Marcar ${ep.title} como visto`
-                            }
-                            className={`inline-flex shrink-0 items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                              watched
-                                ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                                : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
-                            }`}
-                          >
-                            <Check className="h-3.5 w-3.5" />
-                            <span>{watched ? 'Visto' : 'Visto'}</span>
-                          </button>
+                          </div>
                         </div>
                       );
                     })}

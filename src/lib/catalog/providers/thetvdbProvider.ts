@@ -4,7 +4,11 @@ import {
   mergeServerAndCatalogEpisodes,
   parseEpisodeDateToTimestampSec,
 } from '../../episodeAvailability.ts';
-import { translateEnglishToPtBr } from '../../googleTranslate.ts';
+import {
+  hasCjkOrJapaneseScript,
+  translateEnglishToPtBr,
+  translateTitlesBatchToPtBr,
+} from '../../googleTranslate.ts';
 import type { HttpFetcher } from '../../httpTypes.ts';
 import type {
   AnimeAudioTrackData,
@@ -989,7 +993,15 @@ export function parseTvdbAllSeasonsHtml(
     seen.add(key);
 
     const titleAnchor = $li.find('h4 a').first();
-    const rawTitle = cleanText(titleAnchor.text());
+    const inlinePtTitle = cleanText(
+      $li
+        .find(
+          '.change_translation_text[data-language="pt"], .change_translation_text[data-language="pt-br"]'
+        )
+        .first()
+        .attr('data-title') || ''
+    );
+    const rawTitle = inlinePtTitle || cleanText(titleAnchor.text());
     const cleanEpTitle = rawTitle && !/^(?:tba|tbd)$/i.test(rawTitle) ? rawTitle : '';
     const epHref = titleAnchor.attr('href') || '';
     const epIdMatch = epHref.match(/\/episodes\/(\d+)/i);
@@ -1034,6 +1046,50 @@ export function parseTvdbAllSeasonsHtml(
   return episodes;
 }
 
+const EPISODE_PREFIX_SUBTITLE_RE = /^Episódio\s+(\d+)\s+—\s+(.+)$/;
+
+/**
+ * Translates episode subtitles parsed from TheTVDB episode guides (which on public
+ * `/allseasons/official` pages often return English or raw Japanese titles) to PT-BR
+ * in fast batched requests, keeping original titles intact if translation fails.
+ */
+export async function localizeTvdbEpisodeListTitles(
+  fetchHttp: HttpFetcher,
+  episodes: AnimeEpisodeLink[],
+  options: { onlyCjk?: boolean; useCache?: boolean } = {}
+): Promise<AnimeEpisodeLink[]> {
+  if (episodes.length === 0) return episodes;
+
+  const subtitlesToTranslate: string[] = [];
+  for (const ep of episodes) {
+    const m = ep.title.match(EPISODE_PREFIX_SUBTITLE_RE);
+    const sub = m?.[2]?.trim();
+    if (!sub) continue;
+    if (options.onlyCjk && !hasCjkOrJapaneseScript(sub)) continue;
+    subtitlesToTranslate.push(sub);
+  }
+
+  if (subtitlesToTranslate.length === 0) return episodes;
+
+  const translatedMap = await translateTitlesBatchToPtBr(fetchHttp, subtitlesToTranslate, {
+    useCache: options.useCache,
+  });
+  if (translatedMap.size === 0) return episodes;
+
+  return episodes.map((ep) => {
+    const m = ep.title.match(EPISODE_PREFIX_SUBTITLE_RE);
+    const epNum = m?.[1];
+    const sub = m?.[2]?.trim();
+    if (!epNum || !sub) return ep;
+    const translated = translatedMap.get(sub);
+    if (!translated) return ep;
+    return {
+      ...ep,
+      title: `Episódio ${epNum} — ${translated}`,
+    };
+  });
+}
+
 export async function fetchTheTvdbDetails(
   fetchHttp: HttpFetcher,
   tvdbId: number,
@@ -1053,6 +1109,7 @@ export async function fetchTheTvdbDetails(
   if (token) {
     try {
       const endpoint = mediaType === 'movie' ? 'movies' : 'series';
+      let epsCameFromPt = false;
       const [mainRes, ptTransRes, epsRes] = await Promise.all([
         fetchHttp(`${TVDB_V4_API_BASE}/${endpoint}/${tvdbId}/extended`, {
           accept: 'application/json',
@@ -1065,17 +1122,29 @@ export async function fetchTheTvdbDetails(
           timeoutMs: 7000,
         }).catch(() => null),
         mediaType !== 'movie' && includeEpisodes
-          ? fetchHttp(`${TVDB_V4_API_BASE}/series/${tvdbId}/episodes/default/pt?page=0`, {
-              accept: 'application/json',
-              headers: { Authorization: `Bearer ${token}` },
-              timeoutMs: 9000,
-            }).catch(() =>
-              fetchHttp(`${TVDB_V4_API_BASE}/series/${tvdbId}/episodes/default?page=0`, {
+          ? (async () => {
+              try {
+                const ptEps = await fetchHttp(
+                  `${TVDB_V4_API_BASE}/series/${tvdbId}/episodes/default/pt?page=0`,
+                  {
+                    accept: 'application/json',
+                    headers: { Authorization: `Bearer ${token}` },
+                    timeoutMs: 9000,
+                  }
+                );
+                if (ptEps.ok) {
+                  epsCameFromPt = true;
+                  return ptEps;
+                }
+              } catch {
+                // Fall back to default episodes endpoint below
+              }
+              return fetchHttp(`${TVDB_V4_API_BASE}/series/${tvdbId}/episodes/default?page=0`, {
                 accept: 'application/json',
                 headers: { Authorization: `Bearer ${token}` },
                 timeoutMs: 9000,
-              })
-            )
+              }).catch(() => null);
+            })()
           : Promise.resolve(null),
       ]);
 
@@ -1190,6 +1259,13 @@ export async function fetchTheTvdbDetails(
             }
           }
 
+          const localizedV4Episodes =
+            resolvedType !== 'movie' && episodes.length > 0
+              ? await localizeTvdbEpisodeListTitles(fetchHttp, episodes, {
+                  onlyCjk: epsCameFromPt,
+                })
+              : episodes;
+
           const title = ptName || d.name;
           const studio = d.companies?.find((c) => /studio|production/i.test(c.companyType?.companyTypeName || ''))?.name;
           const network = d.companies?.find((c) => /network/i.test(c.companyType?.companyTypeName || ''))?.name;
@@ -1248,7 +1324,7 @@ export async function fetchTheTvdbDetails(
               new Set((d.genres || []).map((g) => translateGenre(g.name || '')).filter(Boolean))
             ),
             audioType: null,
-            episodes,
+            episodes: localizedV4Episodes,
           };
         }
       }
@@ -1305,10 +1381,10 @@ export async function fetchTheTvdbDetails(
         (details.kind as CanonicalMediaType) || 'anime'
       );
       if (parsedEps.length > 0) {
-        details.episodes = parsedEps;
-        const seasons = new Set(parsedEps.map((e) => e.seasonNumber || 1));
+        details.episodes = await localizeTvdbEpisodeListTitles(fetchHttp, parsedEps);
+        const seasons = new Set(details.episodes.map((e) => e.seasonNumber || 1));
         details.seasonsCount = String(seasons.size);
-        details.episodesTotalCount = String(parsedEps.length);
+        details.episodesTotalCount = String(details.episodes.length);
       }
     }
 
@@ -1687,6 +1763,7 @@ export interface TvdbEpisodeTranslations {
   ptBrTitle?: string;
   engOverview?: string;
   engTitle?: string;
+  originalTitle?: string;
   episodeImage?: string;
   tvdbEpisodeId?: number;
   tvdbSeriesId?: number;
@@ -1711,6 +1788,11 @@ export function parseTvdbEpisodePageHtml(html: string): TvdbEpisodeTranslations 
   const ptBrBlock =
     translations.get('pt') || translations.get('pt-br') || translations.get('pt_br');
   const engBlock = translations.get('eng') || translations.get('en');
+  const jpnBlock = translations.get('jpn') || translations.get('ja');
+  const rawH1 = cleanText($('h1#episode_title, h1.translated_title, h1').first().text());
+  const candidateOriginalTitle =
+    jpnBlock?.title ||
+    (rawH1 && !/^(?:tba|tbd)$/i.test(rawH1) ? rawH1 : '');
 
   let episodeImage = '';
   $('img').each((_, img) => {
@@ -1731,6 +1813,11 @@ export function parseTvdbEpisodePageHtml(html: string): TvdbEpisodeTranslations 
     ptBrTitle: ptBrBlock?.title || undefined,
     engOverview: engBlock?.synopsis || undefined,
     engTitle: engBlock?.title || undefined,
+    ...(candidateOriginalTitle &&
+    candidateOriginalTitle !== ptBrBlock?.title &&
+    candidateOriginalTitle !== engBlock?.title
+      ? { originalTitle: candidateOriginalTitle }
+      : {}),
     ...(episodeImage ? { episodeImage } : {}),
   };
 }

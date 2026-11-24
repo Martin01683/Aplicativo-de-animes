@@ -535,14 +535,10 @@ describe('Android TopAnimesEpisodeResolver & LocalProxyPlugin improvements', () 
     assert.match(activityJava, /KeyEvent\.KEYCODE_MEDIA_PAUSE/);
     assert.match(activityJava, /KeyEvent\.KEYCODE_HEADSETHOOK/);
 
-    // Episode list shows "Parou em" below the title on mobile instead of crowding the title row
+    // Episode list shows "Parou em" below the title (Option 2 layout) instead of crowding the title row
     assert.match(
       animeDetailTsx,
-      /font-medium text-\[#fb923c\] sm:hidden[\s\S]*?Parou em \{formatPlaybackTimestamp\(resumeSec\)\}/
-    );
-    assert.match(
-      animeDetailTsx,
-      /hidden text-xs font-medium tabular-nums text-\[#fb923c\] sm:inline[\s\S]*?Parou em \{formatPlaybackTimestamp\(resumeSec\)\}/
+      /data-episode-title="true"[\s\S]*?font-medium text-\[#fb923c\][\s\S]*?Parou em \{formatPlaybackTimestamp\(resumeSec\)\}/
     );
   });
 

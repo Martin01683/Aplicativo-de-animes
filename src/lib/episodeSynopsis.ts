@@ -14,9 +14,10 @@ import {
   parseGoogleTranslateResponse,
   splitTextForTranslation,
   translateEnglishToPtBr,
+  translateTextToPtBr,
 } from './googleTranslate.ts';
 
-export { parseGoogleTranslateResponse, splitTextForTranslation, translateEnglishToPtBr };
+export { parseGoogleTranslateResponse, splitTextForTranslation, translateEnglishToPtBr, translateTextToPtBr };
 
 const SYNOPSIS_CACHE_TTL_MS = 30 * 60 * 1000;
 const SYNOPSIS_CACHE_MAX_ENTRIES = 250;
@@ -124,14 +125,32 @@ export async function resolveLocalizedEpisodeSynopsis(
 
   const imageFields = translations.episodeImage ? { episodeImage: translations.episodeImage } : {};
 
+  const resolveEpisodeTitle = async (): Promise<string | undefined> => {
+    if (translations.ptBrTitle) return translations.ptBrTitle;
+    if (translations.engTitle) {
+      const translatedTitle = await translateTextToPtBr(fetchHttp, translations.engTitle, 'en');
+      return translatedTitle || translations.engTitle;
+    }
+    if (translations.originalTitle) {
+      const translatedTitle = await translateTextToPtBr(
+        fetchHttp,
+        translations.originalTitle,
+        'auto'
+      );
+      return translatedTitle || translations.originalTitle;
+    }
+    return undefined;
+  };
+
   // 1. Native PT-BR synopsis from TheTVDB.com
   const ptBr = cleanSynopsisWhitespace(translations.ptBrOverview || '');
   if (ptBr) {
+    const episodeTitle = await resolveEpisodeTitle();
     const result: EpisodeSynopsisResult = {
       synopsis: ptBr,
       language: 'pt-BR',
       source: 'thetvdb-pt-br',
-      episodeTitle: translations.ptBrTitle || translations.engTitle,
+      episodeTitle,
       ...imageFields,
       tvdbEpisodeId: translations.tvdbEpisodeId,
       tvdbSeriesId: translations.tvdbSeriesId,
@@ -147,13 +166,16 @@ export async function resolveLocalizedEpisodeSynopsis(
     return null;
   }
 
-  const translatedPtBr = await translateEnglishToPtBr(fetchHttp, eng);
+  const [translatedPtBr, episodeTitle] = await Promise.all([
+    translateEnglishToPtBr(fetchHttp, eng),
+    resolveEpisodeTitle(),
+  ]);
   if (translatedPtBr) {
     const result: EpisodeSynopsisResult = {
       synopsis: translatedPtBr,
       language: 'pt-BR',
       source: 'thetvdb-google-translate',
-      episodeTitle: translations.ptBrTitle || translations.engTitle,
+      episodeTitle,
       ...imageFields,
       tvdbEpisodeId: translations.tvdbEpisodeId,
       tvdbSeriesId: translations.tvdbSeriesId,
@@ -167,7 +189,7 @@ export async function resolveLocalizedEpisodeSynopsis(
     synopsis: eng,
     language: 'en',
     source: 'thetvdb-en',
-    episodeTitle: translations.ptBrTitle || translations.engTitle,
+    episodeTitle,
     ...imageFields,
     tvdbEpisodeId: translations.tvdbEpisodeId,
     tvdbSeriesId: translations.tvdbSeriesId,

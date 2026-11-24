@@ -2,10 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { HttpFetcher } from './httpTypes.ts';
 import {
+  localizeTvdbEpisodeListTitles,
   parseTvdbAllSeasonsHtml,
   parseTvdbEpisodePageHtml,
   parseTvdbMediaPageTranslations,
 } from './catalog/providers/thetvdbProvider.ts';
+import {
+  clearTitleTranslationCache,
+  normalizeTitleForTranslation,
+  translateTitlesBatchToPtBr,
+} from './googleTranslate.ts';
 import {
   clearAnimeSynopsisCache,
   clearEpisodeSynopsisCache,
@@ -153,7 +159,7 @@ test('resolveLocalizedEpisodeSynopsis prefers native TheTVDB PT-BR without calli
 
 test('resolveLocalizedEpisodeSynopsis translates TheTVDB English via Google Translate when PT-BR is missing', async () => {
   clearEpisodeSynopsisCache();
-  let translateUrl = '';
+  const translateUrls: string[] = [];
 
   const mockFetch: HttpFetcher = async (url) => {
     if (url.includes('/episodes/777001')) {
@@ -169,7 +175,15 @@ test('resolveLocalizedEpisodeSynopsis translates TheTVDB English via Google Tran
       };
     }
     if (url.includes('translate.googleapis.com')) {
-      translateUrl = url;
+      translateUrls.push(url);
+      if (url.includes('A%20New%20Dawn')) {
+        return {
+          ok: true,
+          status: 200,
+          finalUrl: url,
+          body: JSON.stringify([[['Um Novo Amanhecer', 'A New Dawn']], null, 'en']),
+        };
+      }
       return {
         ok: true,
         status: 200,
@@ -195,12 +209,12 @@ test('resolveLocalizedEpisodeSynopsis translates TheTVDB English via Google Tran
     useCache: false,
   });
 
-  assert.match(translateUrl, /sl=en&tl=pt-BR/);
+  assert.ok(translateUrls.some((u) => /sl=en&tl=pt-BR/.test(u)));
   assert.deepEqual(result, {
     synopsis: 'Os heróis partem ao nascer do sol para atravessar as montanhas do norte.',
     language: 'pt-BR',
     source: 'thetvdb-google-translate',
-    episodeTitle: 'A New Dawn',
+    episodeTitle: 'Um Novo Amanhecer',
     tvdbEpisodeId: 777001,
     tvdbSeriesId: undefined,
   });
@@ -465,3 +479,111 @@ test('resolveLocalizedAnimeSynopsis prefers native PT-BR, translates EN via Goog
     'https://artworks.thetvdb.com/banners/v4/movie/2001/posters/pm.jpg'
   );
 });
+
+test('normalizeTitleForTranslation cleans Japanese segment quotes and translateTitlesBatchToPtBr separates JA vs Latin scripts', async () => {
+  clearTitleTranslationCache();
+
+  assert.equal(
+    normalizeTitleForTranslation('「オスガキにも穴はあるんだよな…」「かいちょーは梅くんに貰われました」'),
+    'オスガキにも穴はあるんだよな… / かいちょーは梅くんに貰われました'
+  );
+  assert.equal(normalizeTitleForTranslation('「こまろと不思議な箱」'), 'こまろと不思議な箱');
+
+  const requestedUrls: string[] = [];
+  const mockFetch: HttpFetcher = async (url) => {
+    requestedUrls.push(url);
+    const parsedUrl = new URL(url);
+    const sl = parsedUrl.searchParams.get('sl');
+    const q = parsedUrl.searchParams.get('q') || '';
+    if (sl === 'ja') {
+      const translated = q
+        .split('\n')
+        .map((line) =>
+          line.includes('オスガキ')
+            ? 'Até o pirralho tem seus furos... / A presidente foi levada pelo Ume-kun'
+            : 'Komaro e a caixa misteriosa'
+        )
+        .join('\n');
+      return { ok: true, status: 200, finalUrl: url, body: JSON.stringify([[[translated, q]], null, 'ja']) };
+    }
+    const translated = q
+      .split('\n')
+      .map((line) => (line === "The Journey's End" ? 'O Fim da Jornada' : line))
+      .join('\n');
+    return { ok: true, status: 200, finalUrl: url, body: JSON.stringify([[[translated, q]], null, 'en']) };
+  };
+
+  const map = await translateTitlesBatchToPtBr(
+    mockFetch,
+    [
+      '「オスガキにも穴はあるんだよな…」「かいちょーは梅くんに貰われました」',
+      '「こまろと不思議な箱」',
+      "The Journey's End",
+    ],
+    { useCache: false }
+  );
+
+  // Must issue separate requests for Japanese (sl=ja) and Latin (sl=auto) scripts
+  assert.equal(requestedUrls.length, 2);
+  assert.ok(requestedUrls.some((u) => u.includes('sl=ja&tl=pt-BR')));
+  assert.ok(requestedUrls.some((u) => u.includes('sl=auto&tl=pt-BR')));
+  assert.equal(
+    map.get('「オスガキにも穴はあるんだよな…」「かいちょーは梅くんに貰われました」'),
+    'Até o pirralho tem seus furos... / A presidente foi levada pelo Ume-kun'
+  );
+  assert.equal(map.get('「こまろと不思議な箱」'), 'Komaro e a caixa misteriosa');
+  assert.equal(map.get("The Journey's End"), 'O Fim da Jornada');
+});
+
+test('localizeTvdbEpisodeListTitles translates public /allseasons/official Japanese episode titles and falls back cleanly on line mismatch', async () => {
+  clearTitleTranslationCache();
+
+  const html = `
+    <ul>
+      <li class="list-group-item">
+        <span class="episode-label">S01E01</span>
+        <h4><a href="/series/seitokai/episodes/101">「オスガキにも穴はあるんだよな…」</a></h4>
+      </li>
+      <li class="list-group-item">
+        <span class="episode-label">S01E02</span>
+        <h4><a href="/series/seitokai/episodes/102">「メシにも穴はあるんだよな…」</a></h4>
+      </li>
+    </ul>
+  `;
+  const parsed = parseTvdbAllSeasonsHtml(html, 463051, 'anime');
+
+  // Simulate batch returning wrong line count -> must safely fall back to per-item translation
+  let batchAttempted = false;
+  const mockFetch: HttpFetcher = async (url) => {
+    const q = new URL(url).searchParams.get('q') || '';
+    if (q.includes('\n')) {
+      batchAttempted = true;
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: JSON.stringify([[['Linha única quebrada', q]], null, 'ja']),
+      };
+    }
+    if (q.includes('オスガキ')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: JSON.stringify([[['Até o pirralho tem seus furos...', q]], null, 'ja']),
+      };
+    }
+    return {
+      ok: true,
+      status: 200,
+      finalUrl: url,
+      body: JSON.stringify([[['A hora do rango também tem seus furos...', q]], null, 'ja']),
+    };
+  };
+
+  const localized = await localizeTvdbEpisodeListTitles(mockFetch, parsed, { useCache: false });
+  assert.equal(batchAttempted, true);
+  assert.equal(localized[0].title, 'Episódio 1 — Até o pirralho tem seus furos...');
+  assert.equal(localized[1].title, 'Episódio 2 — A hora do rango também tem seus furos...');
+});
+

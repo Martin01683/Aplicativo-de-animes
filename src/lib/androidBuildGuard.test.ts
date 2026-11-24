@@ -811,4 +811,17 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
     assert.match(workspaceTsx, /resolveSeriesEpisodesForEpisode\(/);
   });
+
+  it('renders Option 2 episode cards with 2-line readable titles, dedicated Sem censura badge, and concise hero CTA', () => {
+    const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
+    assert.match(detailTsx, /formatEpisodePlayCtaLabel\(firstEpisode, isMovie\)/);
+    assert.match(detailTsx, /formatEpisodeCardBadge\(ep, isMovie\)/);
+    assert.match(detailTsx, /formatEpisodeCardTitle\(ep, isMovie\)/);
+    assert.match(detailTsx, /data-episode-card="true"/);
+    assert.match(detailTsx, /data-episode-title="true"[\s\S]*?line-clamp-2/);
+    assert.match(detailTsx, /data-episode-uncensored="true"[\s\S]*?Sem censura/);
+
+    const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
+    assert.match(workspaceTsx, /data-episode-uncensored="true"[\s\S]*?Sem censura/);
+  });
 });
