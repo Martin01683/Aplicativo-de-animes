@@ -315,6 +315,7 @@ async function createAppServer(): Promise<void> {
   app.get('/api/episode', handleAggregatedRoute);
   app.post('/api/episode', handleAggregatedRoute);
   app.get('/api/episode-synopsis', handleAggregatedRoute);
+  app.get('/api/episode-titles', handleAggregatedRoute);
   app.get('/api/anime-synopsis', handleAggregatedRoute);
   app.post('/api/sources/resolve', handleAggregatedRoute);
   app.post('/api/sources/test', handleAggregatedRoute);

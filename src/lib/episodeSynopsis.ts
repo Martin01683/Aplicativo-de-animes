@@ -6,6 +6,7 @@ import type {
 import type { CanonicalMediaType } from './catalog/idCodec.ts';
 import type { HttpFetcher } from './httpTypes.ts';
 import {
+  clearTvdbEpisodePageCache,
   fetchTheTvdbEpisodeTranslations,
   fetchTheTvdbMediaTranslations,
 } from './catalog/providers/thetvdbProvider.ts';
@@ -32,6 +33,7 @@ const animeSynopsisCache = new Map<string, CachedSynopsisEntry<AnimeSynopsisResu
 
 export function clearEpisodeSynopsisCache(): void {
   synopsisCache.clear();
+  clearTvdbEpisodePageCache();
 }
 
 export function clearAnimeSynopsisCache(): void {
@@ -116,6 +118,7 @@ export async function resolveLocalizedEpisodeSynopsis(
     tvdbEpisodeId: input.tvdbEpisodeId,
     fallbackEnglishOverview: input.fallbackEnglishOverview,
     credentials: input.credentials,
+    useCache,
   });
 
   if (!translations) {
@@ -128,14 +131,22 @@ export async function resolveLocalizedEpisodeSynopsis(
   const resolveEpisodeTitle = async (): Promise<string | undefined> => {
     if (translations.ptBrTitle) return translations.ptBrTitle;
     if (translations.engTitle) {
-      const translatedTitle = await translateTextToPtBr(fetchHttp, translations.engTitle, 'en');
+      const translatedTitle = await translateTextToPtBr(
+        fetchHttp,
+        translations.engTitle,
+        'en',
+        5000,
+        useCache
+      );
       return translatedTitle || translations.engTitle;
     }
     if (translations.originalTitle) {
       const translatedTitle = await translateTextToPtBr(
         fetchHttp,
         translations.originalTitle,
-        'auto'
+        'auto',
+        5000,
+        useCache
       );
       return translatedTitle || translations.originalTitle;
     }

@@ -118,8 +118,8 @@ export function hasCjkOrJapaneseScript(text: string): boolean {
 }
 
 /**
- * Cleans Japanese quotation wrappers (e.g. `「Seg 1」「Seg 2」`) and internal newlines
- * so Google Translate produces natural, readable single-line titles.
+ * Cleans Japanese quotation/bracket wrappers (e.g. `「Seg 1」「Seg 2」`, `【逸脱】`)
+ * and internal newlines so Google Translate produces natural, readable single-line titles.
  */
 export function normalizeTitleForTranslation(raw: string): string {
   let text = raw
@@ -128,14 +128,29 @@ export function normalizeTitleForTranslation(raw: string): string {
     .trim();
   if (!text) return '';
 
-  // Convert adjacent Japanese segment quotes into a clean slash separator
+  // Convert adjacent Japanese segment quotes/brackets into a clean slash separator
   text = text
     .replace(/」\s*「/g, ' / ')
-    .replace(/』\s*『/g, ' / ');
+    .replace(/』\s*『/g, ' / ')
+    .replace(/】\s*【/g, ' / ')
+    .replace(/〕\s*〔/g, ' / ')
+    .replace(/》\s*《/g, ' / ');
 
-  // Strip wrapping Japanese corner brackets when they enclose the full string
-  if ((text.startsWith('「') && text.endsWith('」')) || (text.startsWith('『') && text.endsWith('』'))) {
-    text = text.slice(1, -1).trim();
+  const wrapperPairs: Array<[string, string]> = [
+    ['「', '」'],
+    ['『', '』'],
+    ['【', '】'],
+    ['〔', '〕'],
+    ['《', '》'],
+    ['[', ']'],
+  ];
+  for (const [open, close] of wrapperPairs) {
+    if (text.startsWith(open) && text.endsWith(close) && text.length > 2) {
+      const inner = text.slice(1, -1).trim();
+      if (inner && !inner.includes(open) && !inner.includes(close)) {
+        text = inner;
+      }
+    }
   }
 
   return text
@@ -151,22 +166,35 @@ export function cleanTranslatedTitle(raw: string): string {
     .trim();
   if (!text) return '';
 
-  // Remove redundant outer double-quotes only when wrapping the whole title with no inner quotes
-  if (
-    ((text.startsWith('"') && text.endsWith('"')) ||
-      (text.startsWith('“') && text.endsWith('”'))) &&
-    text.length > 2
-  ) {
-    const inner = text.slice(1, -1).trim();
-    if (inner && !/[“”"]/.test(inner)) {
-      text = inner;
+  // Remove redundant outer quotes or brackets when wrapping the full title
+  const wrapperPairs: Array<[string, string]> = [
+    ['"', '"'],
+    ['“', '”'],
+    ['[', ']'],
+    ['【', '】'],
+    ['「', '」'],
+    ['『', '』'],
+  ];
+  for (const [open, close] of wrapperPairs) {
+    if (text.startsWith(open) && text.endsWith(close) && text.length > 2) {
+      const inner = text.slice(1, -1).trim();
+      if (inner && !inner.includes(open) && !inner.includes(close)) {
+        text = inner;
+      }
     }
   }
 
-  return text
+  text = text
     .replace(/\s*\/\s*/g, ' / ')
     .replace(/\s{2,}/g, ' ')
     .trim();
+
+  // Capitalize a lowercase initial letter (e.g. Google Translate returning "desvio" for "【逸脱】")
+  if (/^\p{Ll}/u.test(text)) {
+    text = text.charAt(0).toLocaleUpperCase('pt-BR') + text.slice(1);
+  }
+
+  return text;
 }
 
 /**
@@ -203,36 +231,6 @@ export async function translateEnglishToPtBr(
   return joined || null;
 }
 
-/**
- * Translates a single short text (such as an episode title) from `sourceLang` (`en`, `ja`, or `auto`)
- * into Brazilian Portuguese via Google Translate.
- */
-export async function translateTextToPtBr(
-  fetchHttp: HttpFetcher,
-  rawText: string,
-  sourceLang: 'auto' | 'en' | 'ja' = 'auto',
-  timeoutMs = 5000
-): Promise<string | null> {
-  const normalized = normalizeTitleForTranslation(rawText);
-  if (!normalized) return null;
-
-  const resolvedSourceLang =
-    sourceLang === 'auto' && hasJapaneseKana(normalized) ? 'ja' : sourceLang;
-  const queryUrl =
-    `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=${resolvedSourceLang}&tl=pt-BR&dt=t&q=${encodeURIComponent(normalized)}`;
-  try {
-    const res = await fetchHttp(queryUrl, {
-      accept: 'application/json, text/plain, */*',
-      timeoutMs,
-    });
-    if (!res.ok) return null;
-    const translated = cleanTranslatedTitle(parseGoogleTranslateResponse(res.body));
-    return translated || null;
-  } catch {
-    return null;
-  }
-}
-
 const TITLE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const TITLE_CACHE_MAX_ENTRIES = 1500;
 const titleTranslationCache = new Map<string, { value: string; expiresAt: number }>();
@@ -261,6 +259,49 @@ function writeTitleCache(key: string, value: string): void {
     value,
     expiresAt: Date.now() + TITLE_CACHE_TTL_MS,
   });
+}
+
+/**
+ * Translates a single short text (such as an episode title) from `sourceLang` (`en`, `ja`, or `auto`)
+ * into Brazilian Portuguese via Google Translate, reusing the shared title translation cache.
+ */
+export async function translateTextToPtBr(
+  fetchHttp: HttpFetcher,
+  rawText: string,
+  sourceLang: 'auto' | 'en' | 'ja' = 'auto',
+  timeoutMs = 5000,
+  useCache = true
+): Promise<string | null> {
+  const raw = rawText.trim();
+  if (!raw) return null;
+  const normalized = normalizeTitleForTranslation(raw);
+  if (!normalized) return null;
+
+  if (useCache) {
+    const cached = readTitleCache(raw) || readTitleCache(normalized);
+    if (cached) return cached;
+  }
+
+  const resolvedSourceLang =
+    sourceLang === 'auto' && hasJapaneseKana(normalized) ? 'ja' : sourceLang;
+  const queryUrl =
+    `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=${resolvedSourceLang}&tl=pt-BR&dt=t&q=${encodeURIComponent(normalized)}`;
+  try {
+    const res = await fetchHttp(queryUrl, {
+      accept: 'application/json, text/plain, */*',
+      timeoutMs,
+    });
+    if (!res.ok) return null;
+    const translated = cleanTranslatedTitle(parseGoogleTranslateResponse(res.body));
+    if (!translated) return null;
+    if (useCache) {
+      writeTitleCache(raw, translated);
+      if (normalized !== raw) writeTitleCache(normalized, translated);
+    }
+    return translated;
+  } catch {
+    return null;
+  }
 }
 
 interface TitleBatchItem {

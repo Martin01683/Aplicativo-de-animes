@@ -21,6 +21,7 @@ import {
   isAnisyncUri,
   parseAnisyncUri,
 } from './catalog/idCodec.ts';
+import { resolveLocalizedEpisodeTitlesByIds } from './catalog/providers/thetvdbProvider.ts';
 import type { SnapshotAssetReader } from './catalog/serverCatalog.ts';
 import {
   extractEpisodeNumber,
@@ -721,6 +722,32 @@ export async function dispatchAnisyncApiRequest(
       return { status: 200, body: { result } };
     } catch {
       return { status: 200, body: { result: null } };
+    }
+  }
+
+  if (pathname === '/api/episode-titles') {
+    const rawIds = (url.searchParams.get('ids') || '').trim();
+    const tvdbSlug = (url.searchParams.get('tvdbSlug') || '').trim() || undefined;
+    const tvdbIdRaw = Number.parseInt(url.searchParams.get('tvdbId') || '', 10);
+    const ids = rawIds
+      .split(',')
+      .map((s) => Number.parseInt(s.trim(), 10))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .slice(0, 28);
+
+    if (ids.length === 0) {
+      return { status: 200, body: { titlesById: {} } };
+    }
+
+    try {
+      const titlesById = await resolveLocalizedEpisodeTitlesByIds(fetchHttp, ids, {
+        tvdbSlug,
+        tvdbSeriesId: Number.isFinite(tvdbIdRaw) && tvdbIdRaw > 0 ? tvdbIdRaw : undefined,
+        useCache,
+      });
+      return { status: 200, body: { titlesById } };
+    } catch {
+      return { status: 200, body: { titlesById: {} } };
     }
   }
 

@@ -716,6 +716,7 @@ export function mergeServerAndCatalogEpisodes(params: {
       merged.push({
         ...matchedServer,
         title: preferCatalogTitle ? catEp.title : matchedServer.title,
+        ...(preferCatalogTitle && catEp.titleLocalized ? { titleLocalized: true } : {}),
         ...(uncensored ? { uncensored: true } : {}),
         seasonNumber: sNum,
         seasonLabel: catEp.seasonLabel || matchedServer.seasonLabel || `Temporada ${sNum}`,

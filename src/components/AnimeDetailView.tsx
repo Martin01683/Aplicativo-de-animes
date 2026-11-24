@@ -115,6 +115,14 @@ export function AnimeDetailView({
     loading: boolean;
     result: AnimeSynopsisResult | null;
   }>({ animeUrl: '', loading: false, result: null });
+  const [hydratedTitlesState, setHydratedTitlesState] = useState<{
+    animeUrl: string;
+    byId: Record<number, string>;
+  }>({ animeUrl: '', byId: {} });
+  const requestedEpisodeTitleIdsRef = useRef<{ animeUrl: string; ids: Set<number> }>({
+    animeUrl: '',
+    ids: new Set(),
+  });
 
   useEffect(() => {
     setEpisodeFilter('');
@@ -325,6 +333,11 @@ export function AnimeDetailView({
     return exists ? selectedSeasonState.season : 'all';
   }, [anime.url, baseSeasonGroups, selectedSeasonState.animeUrl, selectedSeasonState.season]);
 
+  const hydratedTitlesById = useMemo(
+    () => (hydratedTitlesState.animeUrl === anime.url ? hydratedTitlesState.byId : {}),
+    [anime.url, hydratedTitlesState.animeUrl, hydratedTitlesState.byId]
+  );
+
   const visibleSeasonGroups = useMemo(() => {
     const query = episodeFilter.trim().toLowerCase();
     const isPureDigits = /^\d+$/.test(query);
@@ -340,6 +353,9 @@ export function AnimeDetailView({
         const filtered = !query
           ? group.episodes
           : group.episodes.filter((ep) => {
+              const hydratedTitle = ep.tvdbEpisodeId
+                ? hydratedTitlesById[ep.tvdbEpisodeId] || ''
+                : '';
               if (numericTarget !== null) {
                 if (ep.episodeNumber === numericTarget) return true;
                 const labelMatch = ep.numberLabel.match(/(\d+)\s*$/);
@@ -352,11 +368,13 @@ export function AnimeDetailView({
                 }
                 return (
                   ep.numberLabel.toLowerCase().includes(query) ||
-                  ep.title.toLowerCase().includes(query)
+                  ep.title.toLowerCase().includes(query) ||
+                  hydratedTitle.toLowerCase().includes(query)
                 );
               }
               return (
                 ep.title.toLowerCase().includes(query) ||
+                hydratedTitle.toLowerCase().includes(query) ||
                 ep.numberLabel.toLowerCase().includes(query) ||
                 (ep.date && ep.date.toLowerCase().includes(query)) ||
                 (isEpisodeUncensored(ep) && 'sem censura uncensored'.includes(query))
@@ -368,7 +386,7 @@ export function AnimeDetailView({
       .filter((g) => g.episodes.length > 0);
 
     return sortDesc ? [...groups].reverse() : groups;
-  }, [activeSeasonTab, baseSeasonGroups, episodeFilter, sortDesc]);
+  }, [activeSeasonTab, baseSeasonGroups, episodeFilter, hydratedTitlesById, sortDesc]);
 
   const isWatchedEpisode = (ep: AnimeEpisodeLink) =>
     isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls);
@@ -384,6 +402,115 @@ export function AnimeDetailView({
     }
     return baseSeasonGroups.length <= 1;
   };
+
+  // On large multi-season series (> 28 eps), hydrate official TheTVDB PT-BR episode titles
+  // for whichever seasons are expanded so list and player stay 100% consistent without stalling load.
+  const pendingExpandedTitleIdsKey = useMemo(() => {
+    if (isMovie) return '';
+    const ids: number[] = [];
+    const seen = new Set<number>();
+    for (const group of visibleSeasonGroups) {
+      const expanded =
+        hasActiveEpisodeSearch || activeSeasonTab !== 'all'
+          ? true
+          : seasonExpandState.animeUrl === anime.url &&
+              Object.prototype.hasOwnProperty.call(
+                seasonExpandState.overrides,
+                group.seasonNumber
+              )
+            ? seasonExpandState.overrides[group.seasonNumber]
+            : baseSeasonGroups.length <= 1;
+      if (!expanded) continue;
+      for (const ep of group.episodes) {
+        if (
+          ep.titleLocalized ||
+          !ep.tvdbEpisodeId ||
+          ep.tvdbEpisodeId <= 0 ||
+          hydratedTitlesById[ep.tvdbEpisodeId] ||
+          seen.has(ep.tvdbEpisodeId)
+        ) {
+          continue;
+        }
+        seen.add(ep.tvdbEpisodeId);
+        ids.push(ep.tvdbEpisodeId);
+        if (ids.length >= 28) break;
+      }
+      if (ids.length >= 28) break;
+    }
+    return ids.join(',');
+  }, [
+    activeSeasonTab,
+    anime.url,
+    baseSeasonGroups.length,
+    hasActiveEpisodeSearch,
+    hydratedTitlesById,
+    isMovie,
+    seasonExpandState.animeUrl,
+    seasonExpandState.overrides,
+    visibleSeasonGroups,
+  ]);
+
+  useEffect(() => {
+    if (isMovie || !pendingExpandedTitleIdsKey) return;
+    if (requestedEpisodeTitleIdsRef.current.animeUrl !== anime.url) {
+      requestedEpisodeTitleIdsRef.current = { animeUrl: anime.url, ids: new Set() };
+    }
+    const idsToFetch = pendingExpandedTitleIdsKey
+      .split(',')
+      .map((s) => Number.parseInt(s, 10))
+      .filter(
+        (id) =>
+          Number.isFinite(id) &&
+          id > 0 &&
+          !requestedEpisodeTitleIdsRef.current.ids.has(id)
+      );
+    if (idsToFetch.length === 0) return;
+
+    for (const id of idsToFetch) {
+      requestedEpisodeTitleIdsRef.current.ids.add(id);
+    }
+
+    let cancelled = false;
+    const params = new URLSearchParams({ ids: idsToFetch.join(',') });
+    if (anime.externalIds?.tvdbSlug) params.set('tvdbSlug', anime.externalIds.tvdbSlug);
+    if (anime.externalIds?.tvdbId) params.set('tvdbId', String(anime.externalIds.tvdbId));
+
+    apiFetch(`/api/episode-titles?${params.toString()}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { titlesById?: Record<string, string> } | null) => {
+        if (cancelled || !data?.titlesById) return;
+        const nextEntries: Record<number, string> = {};
+        let count = 0;
+        for (const [k, v] of Object.entries(data.titlesById)) {
+          const numId = Number.parseInt(k, 10);
+          if (Number.isFinite(numId) && numId > 0 && typeof v === 'string' && v.trim()) {
+            nextEntries[numId] = v.trim();
+            count++;
+          }
+        }
+        if (count === 0) return;
+        setHydratedTitlesState((prev) => ({
+          animeUrl: anime.url,
+          byId: {
+            ...(prev.animeUrl === anime.url ? prev.byId : {}),
+            ...nextEntries,
+          },
+        }));
+      })
+      .catch(() => {
+        // Non-fatal: keep existing guide titles
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    anime.externalIds?.tvdbId,
+    anime.externalIds?.tvdbSlug,
+    anime.url,
+    isMovie,
+    pendingExpandedTitleIdsKey,
+  ]);
 
   const toggleSeasonExpanded = (seasonNumber: number) => {
     const currentlyExpanded = isSeasonExpanded(seasonNumber);
@@ -1213,7 +1340,10 @@ export function AnimeDetailView({
                         ep.hasExactAiringTime
                       );
                       const epBadge = formatEpisodeCardBadge(ep, isMovie);
-                      const epDisplayTitle = formatEpisodeCardTitle(ep, isMovie);
+                      const hydratedTitle = ep.tvdbEpisodeId
+                        ? hydratedTitlesById[ep.tvdbEpisodeId]
+                        : undefined;
+                      const epDisplayTitle = hydratedTitle || formatEpisodeCardTitle(ep, isMovie);
                       const uncensored = isEpisodeUncensored(ep);
 
                       if (!available) {

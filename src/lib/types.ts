@@ -187,6 +187,7 @@ export interface AnimeEpisodeLink {
   hasExactAiringTime?: boolean;
   tvdbEpisodeId?: number;
   uncensored?: boolean;
+  titleLocalized?: boolean;
 }
 
 export interface AnimeAudioTrackData {

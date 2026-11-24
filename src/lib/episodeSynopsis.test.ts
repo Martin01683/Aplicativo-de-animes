@@ -2,12 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { HttpFetcher } from './httpTypes.ts';
 import {
+  clearTvdbEpisodePageCache,
   localizeTvdbEpisodeListTitles,
   parseTvdbAllSeasonsHtml,
   parseTvdbEpisodePageHtml,
   parseTvdbMediaPageTranslations,
+  resolveLocalizedEpisodeTitlesByIds,
 } from './catalog/providers/thetvdbProvider.ts';
 import {
+  cleanTranslatedTitle,
   clearTitleTranslationCache,
   normalizeTitleForTranslation,
   translateTitlesBatchToPtBr,
@@ -552,9 +555,12 @@ test('localizeTvdbEpisodeListTitles translates public /allseasons/official Japan
   `;
   const parsed = parseTvdbAllSeasonsHtml(html, 463051, 'anime');
 
-  // Simulate batch returning wrong line count -> must safely fall back to per-item translation
+  // Simulate batch returning wrong line count when direct episode pages are unavailable
   let batchAttempted = false;
   const mockFetch: HttpFetcher = async (url) => {
+    if (!url.includes('translate.googleapis.com')) {
+      return { ok: false, status: 404, finalUrl: url, body: '' };
+    }
     const q = new URL(url).searchParams.get('q') || '';
     if (q.includes('\n')) {
       batchAttempted = true;
@@ -586,4 +592,110 @@ test('localizeTvdbEpisodeListTitles translates public /allseasons/official Japan
   assert.equal(localized[0].title, 'Episódio 1 — Até o pirralho tem seus furos...');
   assert.equal(localized[1].title, 'Episódio 2 — A hora do rango também tem seus furos...');
 });
+
+test('localizeTvdbEpisodeListTitles directly fetches native TheTVDB PT-BR titles (matching EpisodeWorkspace) and warms shared cache', async () => {
+  clearEpisodeSynopsisCache();
+  clearTvdbEpisodePageCache();
+  clearTitleTranslationCache();
+
+  // Japanese lenticular brackets 【...】 and stray [desvio] are cleaned and capitalized
+  assert.equal(normalizeTitleForTranslation('【逸脱】'), '逸脱');
+  assert.equal(cleanTranslatedTitle('[desvio]'), 'Desvio');
+
+  const guideHtml = `
+    <ul>
+      <li class="list-group-item">
+        <span class="episode-label">S01E02</span>
+        <h4><a href="/series/kashita-maryoku/episodes/2002">【契約】</a></h4>
+      </li>
+      <li class="list-group-item">
+        <span class="episode-label">S01E05</span>
+        <h4><a href="/series/kashita-maryoku/episodes/2005">【逸脱】</a></h4>
+      </li>
+    </ul>
+  `;
+  const parsed = parseTvdbAllSeasonsHtml(guideHtml, 500001, 'anime');
+
+  let ep2005PageFetches = 0;
+  const translatedQueries: string[] = [];
+  const mockFetch: HttpFetcher = async (url) => {
+    if (url.includes('/series/kashita-maryoku/episodes/2005')) {
+      ep2005PageFetches++;
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: `
+          <div class="change_translation_text" data-language="pt" data-title="As Exceções">
+            <p>Lent salva Rinka, abandonada por seu grupo, de um irregular.</p>
+          </div>
+          <div class="change_translation_text" data-language="eng" data-title="The Outliers">
+            <p>Lent saves Rinka from an irregular.</p>
+          </div>
+        `,
+      };
+    }
+    if (url.includes('/series/kashita-maryoku/episodes/2002')) {
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: `
+          <div class="change_translation_text" data-language="eng" data-title="The Pact">
+            <p>A new pact is formed.</p>
+          </div>
+        `,
+      };
+    }
+    if (url.includes('translate.googleapis.com')) {
+      const q = new URL(url).searchParams.get('q') || '';
+      translatedQueries.push(q);
+      return {
+        ok: true,
+        status: 200,
+        finalUrl: url,
+        body: JSON.stringify([[['O Pacto', q]], null, 'en']),
+      };
+    }
+    return { ok: false, status: 404, finalUrl: url, body: '' };
+  };
+
+  const localized = await localizeTvdbEpisodeListTitles(mockFetch, parsed, {
+    tvdbSlug: 'kashita-maryoku',
+    tvdbSeriesId: 500001,
+    useCache: true,
+  });
+
+  // Ep 5 gets native TheTVDB PT-BR "As Exceções" directly without calling Google Translate
+  assert.equal(localized[1].title, 'Episódio 5 — As Exceções');
+  assert.equal(localized[1].titleLocalized, true);
+  // Ep 2 had no PT-BR on TheTVDB -> prefers official EN "The Pact" translated to PT-BR over Japanese 【契約】
+  assert.equal(localized[0].title, 'Episódio 2 — O Pacto');
+  assert.equal(localized[0].titleLocalized, true);
+  assert.deepEqual(translatedQueries, ['The Pact']);
+  assert.equal(ep2005PageFetches, 1);
+
+  // Opening Ep 5 in EpisodeWorkspace immediately hits the pre-warmed shared episode page cache (0 extra fetches!)
+  const workspaceResult = await resolveLocalizedEpisodeSynopsis(mockFetch, {
+    tvdbEpisodeId: 2005,
+    tvdbSlug: 'kashita-maryoku',
+    useCache: true,
+  });
+  assert.equal(ep2005PageFetches, 1);
+  assert.equal(workspaceResult?.episodeTitle, 'As Exceções');
+  assert.equal(workspaceResult?.source, 'thetvdb-pt-br');
+  assert.equal(
+    workspaceResult?.synopsis,
+    'Lent salva Rinka, abandonada por seu grupo, de um irregular.'
+  );
+
+  // On-demand /api/episode-titles helper resolves identically from cache too
+  const byIds = await resolveLocalizedEpisodeTitlesByIds(mockFetch, [2002, 2005], {
+    tvdbSlug: 'kashita-maryoku',
+    useCache: true,
+  });
+  assert.equal(ep2005PageFetches, 1);
+  assert.deepEqual(byIds, { 2002: 'O Pacto', 2005: 'As Exceções' });
+});
+
 

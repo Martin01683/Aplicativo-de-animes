@@ -1047,46 +1047,286 @@ export function parseTvdbAllSeasonsHtml(
 }
 
 const EPISODE_PREFIX_SUBTITLE_RE = /^Episódio\s+(\d+)\s+—\s+(.+)$/;
+const TVDB_EP_PAGE_CACHE_TTL_MS = 60 * 60 * 1000;
+const TVDB_EP_PAGE_CACHE_MAX_ENTRIES = 1000;
+const tvdbEpisodePageCache = new Map<
+  number,
+  { value: TvdbEpisodeTranslations; expiresAt: number }
+>();
+
+export function clearTvdbEpisodePageCache(): void {
+  tvdbEpisodePageCache.clear();
+}
+
+function readTvdbEpisodePageCache(tvdbEpisodeId: number): TvdbEpisodeTranslations | null {
+  const hit = tvdbEpisodePageCache.get(tvdbEpisodeId);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    tvdbEpisodePageCache.delete(tvdbEpisodeId);
+    return null;
+  }
+  return hit.value;
+}
+
+function writeTvdbEpisodePageCache(
+  tvdbEpisodeId: number,
+  value: TvdbEpisodeTranslations
+): void {
+  if (!Number.isFinite(tvdbEpisodeId) || tvdbEpisodeId <= 0) return;
+  if (tvdbEpisodePageCache.size >= TVDB_EP_PAGE_CACHE_MAX_ENTRIES) {
+    const oldest = tvdbEpisodePageCache.keys().next().value;
+    if (oldest !== undefined) tvdbEpisodePageCache.delete(oldest);
+  }
+  tvdbEpisodePageCache.set(tvdbEpisodeId, {
+    value,
+    expiresAt: Date.now() + TVDB_EP_PAGE_CACHE_TTL_MS,
+  });
+}
+
+async function fetchPublicTvdbEpisodePage(
+  fetchHttp: HttpFetcher,
+  tvdbEpisodeId: number,
+  options: {
+    tvdbSlug?: string;
+    tvdbSeriesId?: number;
+    timeoutMs?: number;
+    useCache?: boolean;
+  } = {}
+): Promise<TvdbEpisodeTranslations | null> {
+  if (!Number.isFinite(tvdbEpisodeId) || tvdbEpisodeId <= 0) return null;
+  const useCache = options.useCache !== false;
+  if (useCache) {
+    const cached = readTvdbEpisodePageCache(tvdbEpisodeId);
+    if (cached) return cached;
+  }
+
+  const slug = cleanText(options.tvdbSlug || '');
+  const epPageUrl = slug
+    ? `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(slug)}/episodes/${tvdbEpisodeId}`
+    : `${TVDB_WEB_ORIGIN}/dereferrer/episode/${tvdbEpisodeId}`;
+
+  try {
+    const res = await fetchHttp(epPageUrl, {
+      referer: `${TVDB_WEB_ORIGIN}/`,
+      timeoutMs: options.timeoutMs ?? 4500,
+    });
+    if (!res.ok) return null;
+    const parsed = parseTvdbEpisodePageHtml(res.body);
+    const enriched: TvdbEpisodeTranslations = {
+      ...parsed,
+      tvdbEpisodeId,
+      ...(options.tvdbSeriesId ? { tvdbSeriesId: options.tvdbSeriesId } : {}),
+    };
+    if (useCache) {
+      writeTvdbEpisodePageCache(tvdbEpisodeId, enriched);
+    }
+    return enriched;
+  } catch {
+    return null;
+  }
+}
 
 /**
- * Translates episode subtitles parsed from TheTVDB episode guides (which on public
- * `/allseasons/official` pages often return English or raw Japanese titles) to PT-BR
- * in fast batched requests, keeping original titles intact if translation fails.
+ * Resolves official localized PT-BR episode titles for a list of TheTVDB episode IDs
+ * following strict priority:
+ * 1. Native TheTVDB PT-BR title (`data-language="pt"`)
+ * 2. Official TheTVDB English title translated to PT-BR via Google Translate
+ * 3. Original (e.g. Japanese) title translated to PT-BR via Google Translate
+ * Also warms the shared episode page cache so opening any episode in EpisodeWorkspace is instant.
+ */
+export async function resolveLocalizedEpisodeTitlesByIds(
+  fetchHttp: HttpFetcher,
+  tvdbEpisodeIds: number[],
+  options: {
+    tvdbSlug?: string;
+    tvdbSeriesId?: number;
+    useCache?: boolean;
+    maxIds?: number;
+    concurrency?: number;
+    timeoutMs?: number;
+  } = {}
+): Promise<Record<number, string>> {
+  const maxIds = options.maxIds ?? 28;
+  const concurrency = options.concurrency ?? 6;
+  const timeoutMs = options.timeoutMs ?? 4500;
+  const useCache = options.useCache !== false;
+
+  const uniqueIds = Array.from(
+    new Set(tvdbEpisodeIds.filter((id) => Number.isFinite(id) && id > 0))
+  ).slice(0, maxIds);
+  if (uniqueIds.length === 0) return {};
+
+  const pageResults = new Map<number, TvdbEpisodeTranslations>();
+  for (let i = 0; i < uniqueIds.length; i += concurrency) {
+    const slice = uniqueIds.slice(i, i + concurrency);
+    await Promise.all(
+      slice.map(async (epId) => {
+        const trans = await fetchPublicTvdbEpisodePage(fetchHttp, epId, {
+          tvdbSlug: options.tvdbSlug,
+          tvdbSeriesId: options.tvdbSeriesId,
+          timeoutMs,
+          useCache,
+        });
+        if (trans) {
+          pageResults.set(epId, trans);
+        }
+      })
+    );
+  }
+
+  const resolved: Record<number, string> = {};
+  const toTranslateById = new Map<number, string>();
+  const toTranslateList: string[] = [];
+
+  for (const [epId, trans] of pageResults.entries()) {
+    if (trans.ptBrTitle) {
+      resolved[epId] = trans.ptBrTitle;
+      continue;
+    }
+    const candidate = trans.engTitle || trans.originalTitle || '';
+    if (candidate) {
+      toTranslateById.set(epId, candidate);
+      toTranslateList.push(candidate);
+    }
+  }
+
+  if (toTranslateList.length > 0) {
+    const translatedMap = await translateTitlesBatchToPtBr(fetchHttp, toTranslateList, {
+      useCache,
+    });
+    for (const [epId, rawCandidate] of toTranslateById.entries()) {
+      resolved[epId] = translatedMap.get(rawCandidate) || rawCandidate;
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * Localizes episode titles parsed from TheTVDB episode guides to PT-BR:
+ * - For seasonal/standard series (<= 28 episodes with `tvdbEpisodeId`), fetches each episode's
+ *   official TheTVDB page directly in parallel to get native PT-BR titles (e.g. "As Exceções")
+ *   and warm the shared episode synopsis/title cache so list and player match 100%.
+ * - Falls back to batched Google Translate (EN > original) for episodes without native PT-BR
+ *   or for large multi-season series (> 28 episodes, whose expanded seasons hydrate on demand).
  */
 export async function localizeTvdbEpisodeListTitles(
   fetchHttp: HttpFetcher,
   episodes: AnimeEpisodeLink[],
-  options: { onlyCjk?: boolean; useCache?: boolean } = {}
+  options: {
+    tvdbSlug?: string;
+    tvdbSeriesId?: number;
+    onlyCjk?: boolean;
+    useCache?: boolean;
+    skipDirectEpisodePages?: boolean;
+    maxDirectEpisodePages?: number;
+  } = {}
 ): Promise<AnimeEpisodeLink[]> {
   if (episodes.length === 0) return episodes;
+  const useCache = options.useCache !== false;
+  const maxDirect = options.maxDirectEpisodePages ?? 28;
 
-  const subtitlesToTranslate: string[] = [];
-  for (const ep of episodes) {
-    const m = ep.title.match(EPISODE_PREFIX_SUBTITLE_RE);
-    const sub = m?.[2]?.trim();
-    if (!sub) continue;
-    if (options.onlyCjk && !hasCjkOrJapaneseScript(sub)) continue;
-    subtitlesToTranslate.push(sub);
+  // 1. Directly fetch individual TheTVDB episode pages for native PT-BR titles on standard-sized series
+  const pageByEpisodeId = new Map<number, TvdbEpisodeTranslations>();
+  const eligibleIds =
+    !options.skipDirectEpisodePages && !options.onlyCjk
+      ? Array.from(
+          new Set(
+            episodes
+              .map((ep) => ep.tvdbEpisodeId)
+              .filter((id): id is number => typeof id === 'number' && Number.isFinite(id) && id > 0)
+          )
+        )
+      : [];
+
+  if (eligibleIds.length > 0 && eligibleIds.length <= maxDirect) {
+    const CONCURRENCY = 6;
+    for (let i = 0; i < eligibleIds.length; i += CONCURRENCY) {
+      const slice = eligibleIds.slice(i, i + CONCURRENCY);
+      await Promise.all(
+        slice.map(async (epId) => {
+          const trans = await fetchPublicTvdbEpisodePage(fetchHttp, epId, {
+            tvdbSlug: options.tvdbSlug,
+            tvdbSeriesId: options.tvdbSeriesId,
+            timeoutMs: 4500,
+            useCache,
+          });
+          if (trans) {
+            pageByEpisodeId.set(epId, trans);
+          }
+        })
+      );
+    }
   }
 
-  if (subtitlesToTranslate.length === 0) return episodes;
+  // 2. Collect non-native-PT-BR subtitles for batched Google Translate
+  const subtitlesToTranslate: string[] = [];
+  const candidateSubtitleByIndex = new Map<number, string>();
 
-  const translatedMap = await translateTitlesBatchToPtBr(fetchHttp, subtitlesToTranslate, {
-    useCache: options.useCache,
-  });
-  if (translatedMap.size === 0) return episodes;
+  episodes.forEach((ep, idx) => {
+    const pageTrans = ep.tvdbEpisodeId ? pageByEpisodeId.get(ep.tvdbEpisodeId) : undefined;
+    if (pageTrans?.ptBrTitle) {
+      return; // Official native TheTVDB PT-BR title — no machine translation needed
+    }
 
-  return episodes.map((ep) => {
     const m = ep.title.match(EPISODE_PREFIX_SUBTITLE_RE);
-    const epNum = m?.[1];
-    const sub = m?.[2]?.trim();
-    if (!epNum || !sub) return ep;
-    const translated = translatedMap.get(sub);
-    if (!translated) return ep;
-    return {
-      ...ep,
-      title: `Episódio ${epNum} — ${translated}`,
-    };
+    const guideSub = m?.[2]?.trim() || '';
+    const bestNonPtSub = pageTrans?.engTitle || pageTrans?.originalTitle || guideSub;
+    if (!bestNonPtSub) return;
+    if (options.onlyCjk && !hasCjkOrJapaneseScript(bestNonPtSub)) return;
+
+    candidateSubtitleByIndex.set(idx, bestNonPtSub);
+    subtitlesToTranslate.push(bestNonPtSub);
+  });
+
+  const translatedMap =
+    subtitlesToTranslate.length > 0
+      ? await translateTitlesBatchToPtBr(fetchHttp, subtitlesToTranslate, {
+          useCache,
+        })
+      : new Map<string, string>();
+
+  return episodes.map((ep, idx) => {
+    const pageTrans = ep.tvdbEpisodeId ? pageByEpisodeId.get(ep.tvdbEpisodeId) : undefined;
+    const epNum =
+      ep.episodeNumber && ep.episodeNumber > 0
+        ? String(ep.episodeNumber)
+        : ep.title.match(EPISODE_PREFIX_SUBTITLE_RE)?.[1] || '';
+
+    const extraFields: Partial<AnimeEpisodeLink> = {};
+    if (pageTrans) {
+      extraFields.titleLocalized = true;
+      if (!ep.thumb && pageTrans.episodeImage) {
+        extraFields.thumb = pageTrans.episodeImage;
+      }
+      if (!ep.overview && (pageTrans.ptBrOverview || pageTrans.engOverview)) {
+        extraFields.overview = pageTrans.ptBrOverview || pageTrans.engOverview;
+      }
+    }
+
+    // Priority 1: Native PT-BR title from TheTVDB episode page
+    if (pageTrans?.ptBrTitle) {
+      return {
+        ...ep,
+        ...extraFields,
+        title: epNum ? `Episódio ${epNum} — ${pageTrans.ptBrTitle}` : pageTrans.ptBrTitle,
+      };
+    }
+
+    // Priority 2/3: Translated EN or original title -> fallback to raw candidate
+    const candidate = candidateSubtitleByIndex.get(idx);
+    if (candidate) {
+      const translated = translatedMap.get(candidate) || (pageTrans?.engTitle ? pageTrans.engTitle : '');
+      if (translated) {
+        return {
+          ...ep,
+          ...extraFields,
+          title: epNum ? `Episódio ${epNum} — ${translated}` : translated,
+        };
+      }
+    }
+
+    return Object.keys(extraFields).length > 0 ? { ...ep, ...extraFields } : ep;
   });
 }
 
@@ -1098,6 +1338,7 @@ export async function fetchTheTvdbDetails(
     credentials?: CatalogSourceCredentials;
     slugHint?: string;
     includeEpisodes?: boolean;
+    skipEpisodePageHydration?: boolean;
   } = {}
 ): Promise<AnimeDetails | null> {
   if (!Number.isFinite(tvdbId) || tvdbId <= 0) return null;
@@ -1255,6 +1496,9 @@ export async function fetchTheTvdbDetails(
                 overview: ep.overview || undefined,
                 durationMinutes: ep.runtime || undefined,
                 tvdbEpisodeId: ep.id && ep.id > 0 ? ep.id : undefined,
+                ...(epsCameFromPt && cleanApiEpName && !hasCjkOrJapaneseScript(cleanApiEpName)
+                  ? { titleLocalized: true }
+                  : {}),
               });
             }
           }
@@ -1262,7 +1506,10 @@ export async function fetchTheTvdbDetails(
           const localizedV4Episodes =
             resolvedType !== 'movie' && episodes.length > 0
               ? await localizeTvdbEpisodeListTitles(fetchHttp, episodes, {
+                  tvdbSlug: externalIds.tvdbSlug,
+                  tvdbSeriesId: tvdbId,
                   onlyCjk: epsCameFromPt,
+                  skipDirectEpisodePages: options.skipEpisodePageHydration,
                 })
               : episodes;
 
@@ -1381,7 +1628,11 @@ export async function fetchTheTvdbDetails(
         (details.kind as CanonicalMediaType) || 'anime'
       );
       if (parsedEps.length > 0) {
-        details.episodes = await localizeTvdbEpisodeListTitles(fetchHttp, parsedEps);
+        details.episodes = await localizeTvdbEpisodeListTitles(fetchHttp, parsedEps, {
+          tvdbSlug: details.externalIds?.tvdbSlug,
+          tvdbSeriesId: details.externalIds?.tvdbId || tvdbId,
+          skipDirectEpisodePages: options.skipEpisodePageHydration,
+        });
         const seasons = new Set(details.episodes.map((e) => e.seasonNumber || 1));
         details.seasonsCount = String(seasons.size);
         details.episodesTotalCount = String(details.episodes.length);
@@ -1862,8 +2113,10 @@ export async function fetchTheTvdbEpisodeTranslations(
     tvdbEpisodeId?: number;
     fallbackEnglishOverview?: string;
     credentials?: CatalogSourceCredentials;
+    useCache?: boolean;
   }
 ): Promise<TvdbEpisodeTranslations | null> {
+  const useCache = options.useCache !== false;
   let tvdbEpisodeId =
     options.tvdbEpisodeId && options.tvdbEpisodeId > 0 ? options.tvdbEpisodeId : undefined;
   let tvdbSeriesId = options.tvdbId && options.tvdbId > 0 ? options.tvdbId : undefined;
@@ -1927,6 +2180,7 @@ export async function fetchTheTvdbEpisodeTranslations(
         slugHint: tvdbSlug,
         credentials: options.credentials,
         includeEpisodes: true,
+        skipEpisodePageHydration: true,
       }).catch(() => null);
       if (details) {
         seriesEpisodes = details.episodes;
@@ -1954,6 +2208,24 @@ export async function fetchTheTvdbEpisodeTranslations(
           tvdbSeriesId,
         }
       : null;
+  }
+
+  // Instant shared cache hit (pre-warmed when opening the anime page!)
+  if (useCache) {
+    const cached = readTvdbEpisodePageCache(tvdbEpisodeId);
+    if (cached) {
+      const episodeImage = cached.episodeImage || fallbackEpisodeImage;
+      return {
+        ptBrOverview: cached.ptBrOverview,
+        ptBrTitle: cached.ptBrTitle,
+        engOverview: cached.engOverview || fallbackEngOverview,
+        engTitle: cached.engTitle,
+        ...(cached.originalTitle ? { originalTitle: cached.originalTitle } : {}),
+        ...(episodeImage ? { episodeImage } : {}),
+        tvdbEpisodeId,
+        tvdbSeriesId: cached.tvdbSeriesId ?? tvdbSeriesId,
+      };
+    }
   }
 
   // 2. Try official TheTVDB v4 API episode translations when API key is configured
@@ -2003,7 +2275,7 @@ export async function fetchTheTvdbEpisodeTranslations(
       }
 
       if (ptBrOverview || engOverview) {
-        return {
+        const v4Result: TvdbEpisodeTranslations = {
           ptBrOverview,
           ptBrTitle,
           engOverview: engOverview || fallbackEngOverview,
@@ -2012,6 +2284,8 @@ export async function fetchTheTvdbEpisodeTranslations(
           tvdbEpisodeId,
           tvdbSeriesId,
         };
+        if (useCache) writeTvdbEpisodePageCache(tvdbEpisodeId, v4Result);
+        return v4Result;
       }
     } catch {
       // Fall through to public TheTVDB.com episode HTML page
@@ -2019,30 +2293,24 @@ export async function fetchTheTvdbEpisodeTranslations(
   }
 
   // 3. Public TheTVDB.com episode page (zero API key required)
-  const epPageUrl = tvdbSlug
-    ? `${TVDB_WEB_ORIGIN}/series/${encodeURIComponent(tvdbSlug)}/episodes/${tvdbEpisodeId}`
-    : `${TVDB_WEB_ORIGIN}/dereferrer/episode/${tvdbEpisodeId}`;
-
-  try {
-    const res = await fetchHttp(epPageUrl, {
-      referer: `${TVDB_WEB_ORIGIN}/`,
-      timeoutMs: 9000,
-    });
-    if (res.ok) {
-      const parsed = parseTvdbEpisodePageHtml(res.body);
-      const episodeImage = parsed.episodeImage || fallbackEpisodeImage;
-      return {
-        ptBrOverview: parsed.ptBrOverview,
-        ptBrTitle: parsed.ptBrTitle,
-        engOverview: parsed.engOverview || fallbackEngOverview,
-        engTitle: parsed.engTitle,
-        ...(episodeImage ? { episodeImage } : {}),
-        tvdbEpisodeId,
-        tvdbSeriesId,
-      };
-    }
-  } catch {
-    // Fall back to overview captured from /allseasons/official if available
+  const parsed = await fetchPublicTvdbEpisodePage(fetchHttp, tvdbEpisodeId, {
+    tvdbSlug,
+    tvdbSeriesId,
+    timeoutMs: 9000,
+    useCache,
+  });
+  if (parsed) {
+    const episodeImage = parsed.episodeImage || fallbackEpisodeImage;
+    return {
+      ptBrOverview: parsed.ptBrOverview,
+      ptBrTitle: parsed.ptBrTitle,
+      engOverview: parsed.engOverview || fallbackEngOverview,
+      engTitle: parsed.engTitle,
+      ...(parsed.originalTitle ? { originalTitle: parsed.originalTitle } : {}),
+      ...(episodeImage ? { episodeImage } : {}),
+      tvdbEpisodeId,
+      tvdbSeriesId,
+    };
   }
 
   if (fallbackEngOverview) {
