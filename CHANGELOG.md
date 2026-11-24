@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.35] — 2026-11-24
+
+### Novidades
+- Reorganize anime profile layout (Style A) and eagerly hydrate PT-BR episode titles with loading skeleton (`15648d2`)
+
 ## [v1.0.34] — 2026-11-24
 
 ### Correções
