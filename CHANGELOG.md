@@ -2,6 +2,14 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.39] — 2026-11-26
+
+### Correções
+- Corrige falso positivo de nova versão no fallback Atom e na comparação SemVer (`0131bad`)
+
+### Melhorias e Manutenção
+- Adiciona guarda de pre-push para workflows, scripts shell, OpenSSL e Java (`79dd9c6`)
+
 ## [v1.0.38] — 2026-11-26
 
 ### Novidades
