@@ -1,15 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildFallbackRemoteRelease,
   buildReleaseIdentityKey,
   compareSemver,
   evaluateUpdateStatus,
   extractCommitShaFromNotes,
   formatBytes,
   isAllowedGitHubDownloadUrl,
+  isAllowedRepoReleaseDownloadUrl,
   isCancelledApkProgressEvent,
   normalizeSha256Digest,
+  parseGitHubExpandedAssetsHtml,
+  parseGitHubLatestWebJson,
   parseGitHubReleasePayload,
+  parseGitHubReleasesAtom,
   reduceApkDownloadProgress,
 } from './appUpdater';
 
@@ -234,4 +239,86 @@ test('isCancelledApkProgressEvent and reduceApkDownloadProgress clear cancelled 
   assert.equal(failed.downloading, false);
   assert.equal(failed.progress?.stage, 'error');
   assert.equal(failed.toastMessage, 'Falha ao instalar atualização no sistema.');
+});
+
+test('parses non-API GitHub web fallback endpoints (latest JSON, expanded_assets HTML, and Atom feed) safely', () => {
+  const hint = parseGitHubLatestWebJson(
+    JSON.stringify({
+      id: 459686454,
+      tag_name: 'v1.0.36',
+      update_url: '/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.36',
+    })
+  );
+  assert.deepEqual(hint, {
+    id: 459686454,
+    tagName: 'v1.0.36',
+    htmlUrl: 'https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.36',
+  });
+
+  const assetsHtml = `
+    <ul>
+      <li class="Box-row">
+        <a href="/OtherUser/EvilRepo/releases/download/v1.0.36/Anisync.apk">Fake</a>
+      </li>
+      <li class="Box-row">
+        <a href="/Martin01683/Aplicativo-de-animes/releases/download/v1.0.36/Anisync.apk">Anisync.apk</a>
+        <span>sha256:71bc6bc403ba520afb88e9f8696b8b41fd737eeaba686731aca56a38a6e6c5b0</span>
+        <span>192 MB</span>
+        <relative-time datetime="2026-11-26T16:54:44Z">now</relative-time>
+      </li>
+      <li class="Box-row">
+        <a href="/Martin01683/Aplicativo-de-animes/archive/refs/tags/v1.0.36.zip">Source code</a>
+        <relative-time datetime="2026-11-26T16:49:33Z">now</relative-time>
+      </li>
+    </ul>
+  `;
+  const apk = parseGitHubExpandedAssetsHtml(assetsHtml, 'v1.0.36');
+  assert.ok(apk);
+  assert.equal(apk.name, 'Anisync.apk');
+  assert.equal(
+    apk.downloadUrl,
+    'https://github.com/Martin01683/Aplicativo-de-animes/releases/download/v1.0.36/Anisync.apk'
+  );
+  assert.equal(
+    apk.digest,
+    'sha256:71bc6bc403ba520afb88e9f8696b8b41fd737eeaba686731aca56a38a6e6c5b0'
+  );
+  assert.equal(apk.sizeBytes, Math.round(192 * 1024 * 1024));
+  assert.equal(apk.updatedAt, '2026-11-26T16:54:44Z');
+
+  assert.equal(
+    isAllowedRepoReleaseDownloadUrl(
+      'https://github.com/OtherUser/EvilRepo/releases/download/v1.0.36/Anisync.apk'
+    ),
+    false
+  );
+  assert.equal(isAllowedRepoReleaseDownloadUrl(apk.downloadUrl), true);
+
+  const atomXml = `<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>tag:github.com,2008:Repository/1465981220/v1.0.36</id>
+        <updated>2026-11-26T16:54:54Z</updated>
+        <link rel="alternate" type="text/html" href="https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.36"/>
+        <title>Anisync v1.0.36</title>
+        <content type="html">&lt;h2&gt;Changelog&lt;/h2&gt;&lt;h3&gt;Correções&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;Ajuste de busca (&lt;code&gt;4dd8ae3&lt;/code&gt;)&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;Build (4dd8ae301234567890abcdef1234567890abcdef).&lt;/p&gt;</content>
+      </entry>
+    </feed>`;
+  const atomEntry = parseGitHubReleasesAtom(atomXml, 'v1.0.36');
+  assert.ok(atomEntry);
+  assert.equal(atomEntry.tagName, 'v1.0.36');
+  assert.equal(atomEntry.releaseName, 'Anisync v1.0.36');
+  assert.equal(atomEntry.commitSha, '4dd8ae301234567890abcdef1234567890abcdef');
+  assert.match(atomEntry.notes, /### Correções/);
+  assert.match(atomEntry.notes, /- Ajuste de busca \(`4dd8ae3`\)/);
+
+  const release = buildFallbackRemoteRelease({
+    latestHint: hint,
+    atomEntry,
+    apkAsset: apk,
+  });
+  assert.ok(release);
+  assert.equal(release.id, 459686454);
+  assert.equal(release.tagName, 'v1.0.36');
+  assert.equal(release.apkAsset?.digest, apk.digest);
 });

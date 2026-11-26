@@ -176,6 +176,73 @@ test('routeNativeApiRequest parses GitHub Releases on /api/app-update/check', as
   assert.equal(body.release?.apkAsset?.name, 'Anisync.apk');
 });
 
+test('routeNativeApiRequest falls back to non-API github.com release endpoints when api.github.com returns HTTP 403', async () => {
+  const res = await routeNativeApiRequest('/api/app-update/check', undefined, {
+    fetchPage: async (url) => {
+      if (url.startsWith('https://api.github.com/')) {
+        return {
+          status: 403,
+          ok: false,
+          finalUrl: url,
+          body: JSON.stringify({ message: 'API rate limit exceeded' }),
+        };
+      }
+      if (url.endsWith('/releases/latest')) {
+        return {
+          status: 200,
+          ok: true,
+          finalUrl: 'https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.36',
+          body: JSON.stringify({
+            id: 459686454,
+            tag_name: 'v1.0.36',
+            update_url: '/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.36',
+          }),
+        };
+      }
+      if (url.endsWith('/releases.atom')) {
+        return {
+          status: 200,
+          ok: true,
+          finalUrl: url,
+          body: `<?xml version="1.0" encoding="UTF-8"?><feed><entry><id>tag:github.com,2008:Repository/1/v1.0.36</id><updated>2026-11-26T16:54:54Z</updated><link href="https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.36"/><title>Anisync v1.0.36</title><content type="html">&lt;h3&gt;Novidades&lt;/h3&gt;&lt;ul&gt;&lt;li&gt;Fallback anti-403&lt;/li&gt;&lt;/ul&gt;&lt;p&gt;Commit 4dd8ae301234567890abcdef1234567890abcdef&lt;/p&gt;</content></entry></feed>`,
+        };
+      }
+      if (url.includes('/releases/expanded_assets/v1.0.36')) {
+        return {
+          status: 200,
+          ok: true,
+          finalUrl: url,
+          body: `<ul><li><a href="/Martin01683/Aplicativo-de-animes/releases/download/v1.0.36/Anisync.apk">Anisync.apk</a><span>sha256:71bc6bc403ba520afb88e9f8696b8b41fd737eeaba686731aca56a38a6e6c5b0</span><span>192 MB</span><relative-time datetime="2026-11-26T16:54:44Z"></relative-time></li></ul>`,
+        };
+      }
+      return { status: 404, ok: false, finalUrl: url, body: '' };
+    },
+  });
+
+  assert.equal(res.status, 200);
+  const body = res.body as {
+    release: {
+      id: number;
+      tagName: string;
+      releaseName: string;
+      commitSha: string;
+      notes: string;
+      apkAsset: { name: string; downloadUrl: string; digest?: string; sizeBytes: number } | null;
+    } | null;
+  };
+  assert.ok(body.release);
+  assert.equal(body.release.id, 459686454);
+  assert.equal(body.release.tagName, 'v1.0.36');
+  assert.equal(body.release.releaseName, 'Anisync v1.0.36');
+  assert.equal(body.release.commitSha, '4dd8ae301234567890abcdef1234567890abcdef');
+  assert.equal(body.release.apkAsset?.name, 'Anisync.apk');
+  assert.equal(
+    body.release.apkAsset?.digest,
+    'sha256:71bc6bc403ba520afb88e9f8696b8b41fd737eeaba686731aca56a38a6e6c5b0'
+  );
+  assert.ok((body.release.apkAsset?.sizeBytes || 0) > 100_000_000);
+});
+
 test('routeNativeApiRequest serves /api/calendar weekly schedule from LiveChart.me with Dub/Sub & streaming service info', async () => {
   const tzShiftMs = -180 * 60 * 1000;
   const brtToday = new Date(Date.now() + tzShiftMs);

@@ -1,7 +1,15 @@
 import {
+  buildFallbackRemoteRelease,
+  buildGitHubExpandedAssetsUrl,
+  GITHUB_LATEST_RELEASE_WEB_URL,
   GITHUB_RELEASES_API_URL,
+  GITHUB_RELEASES_ATOM_URL,
   GITHUB_RELEASES_LIST_API_URL,
+  parseGitHubExpandedAssetsHtml,
+  parseGitHubLatestWebJson,
   parseGitHubReleasePayload,
+  parseGitHubReleasesAtom,
+  type RemoteAppRelease,
 } from './appUpdater.ts';
 import {
   enrichServerDetailsWithTheTvdb,
@@ -615,38 +623,120 @@ export async function dispatchAnisyncApiRequest(
   }
 
   if (pathname === '/api/app-update/check') {
-    try {
-      let response = await fetchHttp(GITHUB_RELEASES_API_URL, {
-        accept: 'application/vnd.github+json',
-        timeoutMs: 10000,
-      });
+    const fetchGitHubWebFallbackRelease = async (): Promise<RemoteAppRelease | null> => {
+      const [latestSettled, atomSettled] = await Promise.allSettled([
+        fetchHttp(GITHUB_LATEST_RELEASE_WEB_URL, {
+          accept: 'application/json',
+          timeoutMs: 10000,
+        }),
+        fetchHttp(GITHUB_RELEASES_ATOM_URL, {
+          accept: 'application/atom+xml, application/xml, text/xml',
+          timeoutMs: 10000,
+        }),
+      ]);
 
+      const latestHint =
+        latestSettled.status === 'fulfilled' && latestSettled.value.ok
+          ? parseGitHubLatestWebJson(latestSettled.value.body, latestSettled.value.finalUrl)
+          : null;
+      const atomXml =
+        atomSettled.status === 'fulfilled' && atomSettled.value.ok ? atomSettled.value.body : '';
+      const atomEntry = atomXml ? parseGitHubReleasesAtom(atomXml, latestHint?.tagName) : null;
+      const resolvedTag = latestHint?.tagName || atomEntry?.tagName || '';
+      if (!resolvedTag) return null;
+
+      let apkAsset = null;
+      try {
+        const assetsRes = await fetchHttp(buildGitHubExpandedAssetsUrl(resolvedTag), {
+          accept: 'text/html',
+          timeoutMs: 10000,
+        });
+        if (assetsRes.ok) {
+          apkAsset = parseGitHubExpandedAssetsHtml(assetsRes.body, resolvedTag);
+        }
+      } catch {
+        // Fall back to deterministic official GitHub release download URL below
+      }
+
+      return buildFallbackRemoteRelease({
+        latestHint,
+        atomEntry,
+        apkAsset,
+      });
+    };
+
+    try {
+      let apiStatus = 0;
+      let apiOk = false;
       let payload: unknown = null;
-      if (response.ok) {
-        payload = JSON.parse(response.body);
-      } else if (response.status === 404) {
-        response = await fetchHttp(GITHUB_RELEASES_LIST_API_URL, {
+
+      try {
+        let response = await fetchHttp(GITHUB_RELEASES_API_URL, {
           accept: 'application/vnd.github+json',
           timeoutMs: 10000,
         });
+        apiStatus = response.status;
+        apiOk = response.ok;
+
         if (response.ok) {
-          const list = JSON.parse(response.body) as unknown[];
-          payload = Array.isArray(list) ? list[0] : null;
+          payload = JSON.parse(response.body);
+        } else if (response.status === 404) {
+          response = await fetchHttp(GITHUB_RELEASES_LIST_API_URL, {
+            accept: 'application/vnd.github+json',
+            timeoutMs: 10000,
+          });
+          apiStatus = response.status;
+          apiOk = response.ok;
+          if (response.ok) {
+            const list = JSON.parse(response.body) as unknown[];
+            payload = Array.isArray(list) ? list[0] : null;
+          }
         }
+      } catch {
+        apiOk = false;
       }
 
-      if (!response.ok && response.status !== 404) {
+      const apiRelease = apiOk ? parseGitHubReleasePayload(payload) : null;
+      if (apiRelease || (apiOk && apiStatus !== 404)) {
         return {
-          status: 502,
-          body: { error: `GitHub retornou HTTP ${response.status} ao verificar atualizações.` },
+          status: 200,
+          body: {
+            checkedAt: new Date().toISOString(),
+            release: apiRelease,
+          },
+        };
+      }
+
+      // When api.github.com hits HTTP 403/429 (e.g. shared mobile 4G CGNAT rate limit) or fails,
+      // fall back cleanly to official github.com non-API release endpoints (latest + expanded_assets + Atom).
+      if (apiStatus !== 404) {
+        const fallbackRelease = await fetchGitHubWebFallbackRelease();
+        if (fallbackRelease) {
+          return {
+            status: 200,
+            body: {
+              checkedAt: new Date().toISOString(),
+              release: fallbackRelease,
+            },
+          };
+        }
+      } else {
+        return {
+          status: 200,
+          body: {
+            checkedAt: new Date().toISOString(),
+            release: null,
+          },
         };
       }
 
       return {
-        status: 200,
+        status: 502,
         body: {
-          checkedAt: new Date().toISOString(),
-          release: parseGitHubReleasePayload(payload),
+          error:
+            apiStatus > 0
+              ? `GitHub retornou HTTP ${apiStatus} ao verificar atualizações.`
+              : 'Não foi possível consultar atualizações no GitHub agora.',
         },
       };
     } catch (err) {

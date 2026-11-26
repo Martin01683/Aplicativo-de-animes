@@ -3,6 +3,19 @@ export const GITHUB_REPO_NAME = 'Aplicativo-de-animes';
 export const GITHUB_RELEASES_API_URL = `https://api.github.com/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases/latest`;
 export const GITHUB_RELEASES_LIST_API_URL = `https://api.github.com/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases?per_page=5`;
 export const GITHUB_RELEASES_PAGE_URL = `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases`;
+export const GITHUB_LATEST_RELEASE_WEB_URL = `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases/latest`;
+export const GITHUB_RELEASES_ATOM_URL = `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases.atom`;
+
+export function buildGitHubExpandedAssetsUrl(tagName: string): string {
+  return `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases/expanded_assets/${encodeURIComponent(tagName.trim())}`;
+}
+
+export function buildGitHubReleaseApkDownloadUrl(
+  tagName: string,
+  assetName = 'Anisync.apk'
+): string {
+  return `https://github.com/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases/download/${encodeURIComponent(tagName.trim())}/${encodeURIComponent(assetName.trim())}`;
+}
 
 export interface AppBuildInfo {
   version: string;
@@ -100,6 +113,278 @@ export function isAllowedGitHubDownloadUrl(rawUrl: string): boolean {
   } catch {
     return false;
   }
+}
+
+export function isAllowedRepoReleaseDownloadUrl(rawUrl: string): boolean {
+  if (!isAllowedGitHubDownloadUrl(rawUrl)) return false;
+  try {
+    const parsed = new URL(rawUrl.trim());
+    const host = parsed.hostname.toLowerCase();
+    if (host === 'github.com' || host.endsWith('.github.com')) {
+      const expectedPrefix = `/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases/download/`.toLowerCase();
+      return parsed.pathname.toLowerCase().startsWith(expectedPrefix);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function decodeHtmlXmlEntities(raw: string): string {
+  return raw
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => {
+      const code = Number.parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&#(\d+);/g, (_, dec: string) => {
+      const code = Number.parseInt(dec, 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&');
+}
+
+function convertReleaseHtmlToMarkdown(html: string): string {
+  return html
+    .replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, '\n## $1\n')
+    .replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, '\n### $1\n')
+    .replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, '- $1\n')
+    .replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, '`$1`')
+    .replace(/<strong[^>]*>([\s\S]*?)<\/strong>/gi, '**$1**')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<hr\s*\/?>/gi, '\n---\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function parseHumanFileSizeBytes(raw: string): number {
+  const match = raw.match(/\b(\d+(?:[.,]\d+)?)\s*(GB|MB|KB|Bytes?)\b/i);
+  if (!match) return 0;
+  const num = Number.parseFloat(match[1].replace(',', '.'));
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  const unit = match[2].toUpperCase();
+  if (unit === 'GB') return Math.round(num * 1024 * 1024 * 1024);
+  if (unit === 'MB') return Math.round(num * 1024 * 1024);
+  if (unit === 'KB') return Math.round(num * 1024);
+  return Math.round(num);
+}
+
+export function extractGitHubTagFromUrl(rawUrl: string): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '';
+  const match = rawUrl.match(/\/releases\/tag\/([^/?#"]+)/i);
+  if (!match?.[1]) return '';
+  try {
+    return decodeURIComponent(match[1]).trim();
+  } catch {
+    return match[1].trim();
+  }
+}
+
+export interface GitHubWebLatestReleaseHint {
+  id: number;
+  tagName: string;
+  htmlUrl: string;
+}
+
+export function parseGitHubLatestWebJson(
+  rawBody: string,
+  finalUrl = ''
+): GitHubWebLatestReleaseHint | null {
+  try {
+    const parsed = JSON.parse(rawBody) as Record<string, unknown> | null;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const tagName = typeof parsed.tag_name === 'string' ? parsed.tag_name.trim() : '';
+      if (tagName) {
+        const id = typeof parsed.id === 'number' && Number.isFinite(parsed.id) ? parsed.id : 0;
+        const updatePath = typeof parsed.update_url === 'string' ? parsed.update_url.trim() : '';
+        const candidateUrl = updatePath.startsWith('/')
+          ? `https://github.com${updatePath}`
+          : `${GITHUB_RELEASES_PAGE_URL}/tag/${encodeURIComponent(tagName)}`;
+        return {
+          id,
+          tagName,
+          htmlUrl: isAllowedGitHubDownloadUrl(candidateUrl)
+            ? candidateUrl
+            : `${GITHUB_RELEASES_PAGE_URL}/tag/${encodeURIComponent(tagName)}`,
+        };
+      }
+    }
+  } catch {
+    // Non-JSON HTML redirect response — fall back to finalUrl extraction below
+  }
+
+  const tagFromUrl = extractGitHubTagFromUrl(finalUrl);
+  if (tagFromUrl) {
+    return {
+      id: 0,
+      tagName: tagFromUrl,
+      htmlUrl: `${GITHUB_RELEASES_PAGE_URL}/tag/${encodeURIComponent(tagFromUrl)}`,
+    };
+  }
+  return null;
+}
+
+export function parseGitHubExpandedAssetsHtml(
+  html: string,
+  expectedTagName?: string
+): RemoteApkAsset | null {
+  if (!html || typeof html !== 'string') return null;
+  const repoPrefix = `/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/releases/download/`.toLowerCase();
+  const listItems = html.match(/<li\b[^>]*>[\s\S]*?<\/li>/gi) || [html];
+
+  for (const block of listItems) {
+    const linkMatch = block.match(/href="([^"]*\/releases\/download\/[^"]+\.apk)"/i);
+    if (!linkMatch?.[1]) continue;
+
+    const rawHref = decodeHtmlXmlEntities(linkMatch[1]).trim();
+    const downloadUrl = rawHref.startsWith('https://')
+      ? rawHref
+      : rawHref.startsWith('/')
+        ? `https://github.com${rawHref}`
+        : '';
+    if (!downloadUrl || !isAllowedRepoReleaseDownloadUrl(downloadUrl)) continue;
+
+    const lowerPath = new URL(downloadUrl).pathname.toLowerCase();
+    if (!lowerPath.startsWith(repoPrefix)) continue;
+
+    if (expectedTagName) {
+      const encodedTag = encodeURIComponent(expectedTagName.trim()).toLowerCase();
+      const rawTag = expectedTagName.trim().toLowerCase();
+      if (
+        !lowerPath.includes(`/releases/download/${encodedTag}/`) &&
+        !lowerPath.includes(`/releases/download/${rawTag}/`)
+      ) {
+        continue;
+      }
+    }
+
+    const fileSegment = new URL(downloadUrl).pathname.split('/').pop() || 'Anisync.apk';
+    let name = fileSegment;
+    try {
+      name = decodeURIComponent(fileSegment);
+    } catch {
+      // keep raw file segment
+    }
+
+    const digestMatch = block.match(/\bsha256:([0-9a-f]{64})\b/i);
+    const digest = digestMatch?.[1] ? `sha256:${digestMatch[1].toLowerCase()}` : undefined;
+    const sizeBytes = parseHumanFileSizeBytes(block);
+    const timeMatch = block.match(/<relative-time\b[^>]*\bdatetime="([^"]+)"/i);
+    const updatedAt = timeMatch?.[1]?.trim() || '';
+
+    return {
+      name,
+      sizeBytes,
+      downloadUrl,
+      updatedAt,
+      ...(digest ? { digest } : {}),
+    };
+  }
+
+  return null;
+}
+
+export interface GitHubAtomReleaseEntry {
+  tagName: string;
+  releaseName: string;
+  htmlUrl: string;
+  updatedAt: string;
+  notes: string;
+  commitSha: string;
+}
+
+export function parseGitHubReleasesAtom(
+  xml: string,
+  expectedTagName?: string
+): GitHubAtomReleaseEntry | null {
+  if (!xml || typeof xml !== 'string') return null;
+  const entries = xml.match(/<entry\b[^>]*>[\s\S]*?<\/entry>/gi);
+  if (!entries || entries.length === 0) return null;
+
+  const parsedEntries: GitHubAtomReleaseEntry[] = [];
+  for (const entry of entries) {
+    const linkMatch = entry.match(/<link\b[^>]*\bhref="([^"]+)"/i);
+    const rawHref = linkMatch?.[1] ? decodeHtmlXmlEntities(linkMatch[1]).trim() : '';
+    const idMatch = entry.match(/<id>([\s\S]*?)<\/id>/i);
+    const idTag = idMatch?.[1]
+      ? decodeHtmlXmlEntities(idMatch[1]).trim().split('/').pop() || ''
+      : '';
+    const tagName = extractGitHubTagFromUrl(rawHref) || idTag;
+    if (!tagName) continue;
+
+    const titleMatch = entry.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const releaseName = titleMatch?.[1]
+      ? decodeHtmlXmlEntities(titleMatch[1]).trim() || tagName
+      : tagName;
+    const updatedMatch = entry.match(/<updated>([\s\S]*?)<\/updated>/i);
+    const updatedAt = updatedMatch?.[1] ? updatedMatch[1].trim() : '';
+    const contentMatch = entry.match(/<content[^>]*>([\s\S]*?)<\/content>/i);
+    const decodedContent = contentMatch?.[1] ? decodeHtmlXmlEntities(contentMatch[1]) : '';
+    const notes = convertReleaseHtmlToMarkdown(decodedContent);
+    const commitSha = extractCommitShaFromNotes(notes);
+    const htmlUrl =
+      rawHref && isAllowedGitHubDownloadUrl(rawHref)
+        ? rawHref
+        : `${GITHUB_RELEASES_PAGE_URL}/tag/${encodeURIComponent(tagName)}`;
+
+    parsedEntries.push({
+      tagName,
+      releaseName,
+      htmlUrl,
+      updatedAt,
+      notes,
+      commitSha,
+    });
+  }
+
+  if (parsedEntries.length === 0) return null;
+  if (expectedTagName) {
+    const target = expectedTagName.trim().toLowerCase();
+    const matched = parsedEntries.find((e) => e.tagName.toLowerCase() === target);
+    if (matched) return matched;
+  }
+  return parsedEntries[0];
+}
+
+export function buildFallbackRemoteRelease(params: {
+  latestHint?: GitHubWebLatestReleaseHint | null;
+  atomEntry?: GitHubAtomReleaseEntry | null;
+  apkAsset?: RemoteApkAsset | null;
+}): RemoteAppRelease | null {
+  const tagName = (params.latestHint?.tagName || params.atomEntry?.tagName || '').trim();
+  if (!tagName) return null;
+
+  const htmlUrl =
+    params.latestHint?.htmlUrl ||
+    params.atomEntry?.htmlUrl ||
+    `${GITHUB_RELEASES_PAGE_URL}/tag/${encodeURIComponent(tagName)}`;
+  const publishedAt = params.atomEntry?.updatedAt || params.apkAsset?.updatedAt || '';
+  const updatedAt = params.apkAsset?.updatedAt || params.atomEntry?.updatedAt || '';
+  const apkAsset: RemoteApkAsset = params.apkAsset || {
+    name: 'Anisync.apk',
+    sizeBytes: 0,
+    downloadUrl: buildGitHubReleaseApkDownloadUrl(tagName),
+    updatedAt,
+  };
+
+  return {
+    id: params.latestHint?.id || 0,
+    tagName,
+    releaseName: params.atomEntry?.releaseName || `Anisync ${tagName}`,
+    htmlUrl,
+    publishedAt,
+    updatedAt,
+    commitSha: params.atomEntry?.commitSha || '',
+    notes: params.atomEntry?.notes || '',
+    apkAsset,
+  };
 }
 
 export function normalizeSha256Digest(raw?: string | null): string {

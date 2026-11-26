@@ -25,12 +25,14 @@ export interface ParsedChangelogSection {
 }
 
 const COMMIT_LINK_RE = /\s*\(\[([0-9a-f]{7,40})\]\([^)]+\/commit\/[^)]+\)\)/gi;
-const BARE_COMMIT_PARENS_RE = /\s*\([0-9a-f]{7,40}\)\s*$/i;
+const BARE_COMMIT_PARENS_RE = /\s*\(`?[0-9a-f]{7,40}`?\)\s*$/i;
 const SECTION_HEADING_RE = /^\s*#{1,6}\s+(.+?)\s*$/;
+const CONTAINER_HEADING_RE = /^(?:changelog|release\s+notes|notas\s+da\s+vers[aã]o|hist[oó]rico\s+de\s+altera[cç][oõ]es)$/i;
 const HEADING_DECORATION_RE = /^[^\p{L}\p{N}]+/u;
 const LIST_ITEM_RE = /^\s*(?:[*+-]|\d+[.)])\s+(.+?)\s*$/;
+const HORIZONTAL_RULE_RE = /^\s*[-=_*]{3,}\s*$/;
 const NOISE_LINE_RE =
-  /^\s*(?:[-=_*~]{3,}|[<=>]{7}.*|```.*|<[^>]+>|(?:signed-off-by|co-authored-by):.*)\s*$/i;
+  /^\s*(?:[~]{3,}|[<=>]{7}.*|```.*|<[^>]+>|(?:signed-off-by|co-authored-by):.*)\s*$/i;
 const QUOTE_PREFIX_RE = /^\s*>\s?/;
 const IMAGE_RE = /!\[[^\]]*\]\([^)]*\)/g;
 const MARKDOWN_LINK_RE = /\[([^\]]+)\]\([^)]*\)/g;
@@ -38,7 +40,7 @@ const SCOPED_BODY_RE = /^\*\*([^*]+?):\*\*\s*(.*)$/;
 const INLINE_BOLD_RE = /\*\*([^*]+)\*\*/g;
 const INLINE_CODE_RE = /`([^`]+)`/g;
 const FULL_CHANGELOG_LINE_RE =
-  /^\*{0,2}\s*(?:full\s+changelog|changelog\s+completo)\s*:?\s*\*{0,2}\s*:?\s*https?:\/\//i;
+  /^\*{0,2}\s*(?:full\s+changelog|changelog\s+completo|compara[cç][aã]o\s+completa)\s*:?\s*\*{0,2}\s*:?\s*https?:\/\//i;
 
 function classifyHeading(rawHeading: string): { kind: ChangelogSectionKind; label: string } {
   const cleaned = rawHeading
@@ -79,8 +81,10 @@ export function parseReleaseChangelog(markdown: string | null | undefined): Pars
   if (!markdown || !markdown.trim()) return [];
 
   const sections: ParsedChangelogSection[] = [];
+  const footerItems: ParsedChangelogItem[] = [];
   let current: ParsedChangelogSection | null = null;
   let inCodeFence = false;
+  let afterFooterDivider = false;
 
   const ensureSection = (kind: ChangelogSectionKind = 'other', title = 'Alterações') => {
     if (!current) {
@@ -97,16 +101,33 @@ export function parseReleaseChangelog(markdown: string | null | undefined): Pars
       continue;
     }
     if (inCodeFence || !trimmed) continue;
+    if (HORIZONTAL_RULE_RE.test(trimmed)) {
+      if (sections.some((s) => s.items.length > 0)) {
+        afterFooterDivider = true;
+        current = null;
+      }
+      continue;
+    }
     if (NOISE_LINE_RE.test(trimmed)) continue;
     if (FULL_CHANGELOG_LINE_RE.test(trimmed)) continue;
 
-    // Skip release version header lines like "# v1.2.0 (2026-11-26)" or "## Anisync v1.2"
+    // Skip release version header lines like "# v1.2.0 (2026-11-26)" and generic "## Changelog" wrappers
     const headingMatch = trimmed.match(SECTION_HEADING_RE);
     if (headingMatch?.[1]) {
       const rawTitle = headingMatch[1].trim();
-      if (/^(?:anisync\s+)?\[?v?\d+\.\d+/i.test(rawTitle) || /\(\d{4}-\d{2}-\d{2}\)\s*$/.test(rawTitle)) {
+      const plainTitle = rawTitle
+        .replace(HEADING_DECORATION_RE, '')
+        .replace(MARKDOWN_LINK_RE, '$1')
+        .replace(INLINE_BOLD_RE, '$1')
+        .trim();
+      if (
+        /^(?:anisync\s+)?\[?v?\d+\.\d+/i.test(plainTitle) ||
+        /\(\d{4}-\d{2}-\d{2}\)\s*$/.test(plainTitle) ||
+        CONTAINER_HEADING_RE.test(plainTitle)
+      ) {
         continue;
       }
+      afterFooterDivider = false;
       const { kind, label } = classifyHeading(rawTitle);
       const existing = sections.find((s) => s.title.toLowerCase() === label.toLowerCase());
       if (existing) {
@@ -128,16 +149,17 @@ export function parseReleaseChangelog(markdown: string | null | undefined): Pars
       if (/^(?:commit|sha|build)\s*[:=-]\s*`?[0-9a-f]{7,40}`?$/i.test(bodyRaw)) continue;
 
       const scopedMatch = bodyRaw.match(SCOPED_BODY_RE);
+      const targetItems = afterFooterDivider ? footerItems : ensureSection().items;
       if (scopedMatch?.[1]) {
         const scope = cleanInlineMarkdown(scopedMatch[1]);
         const text = cleanInlineMarkdown(scopedMatch[2] || '');
         if (text) {
-          ensureSection().items.push({ scope: scope || undefined, text, isBullet: true });
+          targetItems.push({ scope: scope || undefined, text, isBullet: true });
         }
       } else {
         const text = cleanInlineMarkdown(bodyRaw);
         if (text) {
-          ensureSection().items.push({ text, isBullet: true });
+          targetItems.push({ text, isBullet: true });
         }
       }
       continue;
@@ -147,9 +169,21 @@ export function parseReleaseChangelog(markdown: string | null | undefined): Pars
     if (/^(?:commit|sha|build|tag)\s*[:=-]\s*`?[0-9a-f]{7,40}`?$/i.test(unquoted)) continue;
     const text = cleanInlineMarkdown(unquoted);
     if (text) {
-      ensureSection().items.push({ text, isBullet: false });
+      if (afterFooterDivider) {
+        footerItems.push({ text, isBullet: false });
+      } else {
+        ensureSection().items.push({ text, isBullet: false });
+      }
     }
   }
 
-  return sections.filter((section) => section.items.length > 0);
+  const ordered = sections.filter((section) => section.items.length > 0);
+  if (footerItems.length > 0) {
+    ordered.push({
+      kind: 'other',
+      title: 'Informações',
+      items: footerItems,
+    });
+  }
+  return ordered;
 }

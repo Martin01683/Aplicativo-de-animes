@@ -300,6 +300,40 @@ describe('App resilience, backup, changelog, and updater enhancements', () => {
     assert.equal(sections[1].title, 'Correções');
     assert.equal(sections[1].items.length, 1);
     assert.equal(sections[1].items[0].scope, 'TheTVDB');
+
+    // Regression: "## Changelog" wrapper must NOT hijack "Melhorias" to index 0,
+    // and footer build/install notes after "---" must stay at the very end.
+    const anisyncReleaseNotes = `
+## Changelog
+
+### Novidades
+- TV Cast em segundo plano (\`b8363c0\`)
+
+### Correções
+- Corrige barra de tempo (\`4dd8ae3\`)
+
+### Melhorias e Manutenção
+- Atualiza descrições (\`97b50dc\`)
+
+**Comparação completa:** https://github.com/Martin01683/Aplicativo-de-animes/compare/v1.0.35...v1.0.36
+
+---
+
+Build automático (release assinado) gerado após validação (4dd8ae3087718a89d2b99b2715cbcc9cc62d0aa1).
+
+Instalação: baixe Anisync.apk e instale por cima da versão anterior.
+`;
+    const ordered = parseReleaseChangelog(anisyncReleaseNotes);
+    assert.deepEqual(
+      ordered.map((s) => s.title),
+      ['Novidades', 'Correções', 'Melhorias', 'Informações']
+    );
+    assert.equal(ordered[0].items[0].text, 'TV Cast em segundo plano');
+    assert.equal(ordered[2].items.length, 1);
+    assert.equal(ordered[2].items[0].text, 'Atualiza descrições');
+    assert.equal(ordered[3].items.length, 2);
+    assert.match(ordered[3].items[0].text, /^Build automático/);
+    assert.match(ordered[3].items[1].text, /^Instalação: baixe Anisync\.apk/);
   });
 
   it('wires hardened Android self-updater, background confirmation handoff, watchdog, and Manifest permissions', () => {
