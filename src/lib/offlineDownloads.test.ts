@@ -15,6 +15,7 @@ import {
   OFFLINE_LOCAL_SERVER_NUME,
   pickBestOfflineStream,
   SerialDownloadQueue,
+  shouldAutoSelectCompletedOfflineOption,
   type OfflineDownloadRecord,
 } from './offlineDownloads.ts';
 import { buildServerAria2Args } from './serverDownloadEngines.ts';
@@ -506,5 +507,89 @@ describe('offline video download engine helpers', () => {
 
     assert.equal(peakActive, 3, 'Never exceeded configured peak concurrency of 3');
     assert.deepEqual(startedIds, ['ep_1', 'ep_2', 'ep_3', 'ep_4', 'ep_5', 'ep_6']);
+  });
+
+  it('auto-selects downloaded version only on live completion transition while on the same episode profile page', () => {
+    const epUrl = 'https://topanimes.net/episodio/frieren-ep-1/';
+    // Live transition from not-ready -> completed on same episode (ignoring trailing slash/case)
+    assert.equal(
+      shouldAutoSelectCompletedOfflineOption({
+        previousEpisodeUrl: epUrl,
+        currentEpisodeUrl: 'https://TOPANIMES.NET/episodio/frieren-ep-1#top',
+        previousReadyId: null,
+        currentReadyId: 'dl_1111_2222',
+        currentSelectedNume: '1',
+        isLocallyPlaying: false,
+        isCastingThisEpisode: false,
+      }),
+      true
+    );
+
+    // Respect manual server switch after download was already ready
+    assert.equal(
+      shouldAutoSelectCompletedOfflineOption({
+        previousEpisodeUrl: epUrl,
+        currentEpisodeUrl: epUrl,
+        previousReadyId: 'dl_1111_2222',
+        currentReadyId: 'dl_1111_2222',
+        currentSelectedNume: '2',
+        isLocallyPlaying: false,
+        isCastingThisEpisode: false,
+      }),
+      false
+    );
+
+    // Do not disrupt active local playback or active TV cast
+    assert.equal(
+      shouldAutoSelectCompletedOfflineOption({
+        previousEpisodeUrl: epUrl,
+        currentEpisodeUrl: epUrl,
+        previousReadyId: null,
+        currentReadyId: 'dl_1111_2222',
+        currentSelectedNume: '1',
+        isLocallyPlaying: true,
+        isCastingThisEpisode: false,
+      }),
+      false
+    );
+    assert.equal(
+      shouldAutoSelectCompletedOfflineOption({
+        previousEpisodeUrl: epUrl,
+        currentEpisodeUrl: epUrl,
+        previousReadyId: null,
+        currentReadyId: 'dl_1111_2222',
+        currentSelectedNume: '1',
+        isLocallyPlaying: false,
+        isCastingThisEpisode: true,
+      }),
+      false
+    );
+
+    // Already selected offline or navigated to a different episode
+    assert.equal(
+      shouldAutoSelectCompletedOfflineOption({
+        previousEpisodeUrl: epUrl,
+        currentEpisodeUrl: epUrl,
+        previousReadyId: null,
+        currentReadyId: 'dl_1111_2222',
+        currentSelectedNume: OFFLINE_LOCAL_SERVER_NUME,
+      }),
+      false
+    );
+    assert.equal(
+      shouldAutoSelectCompletedOfflineOption({
+        previousEpisodeUrl: 'https://topanimes.net/episodio/frieren-ep-2/',
+        currentEpisodeUrl: epUrl,
+        previousReadyId: null,
+        currentReadyId: 'dl_1111_2222',
+        currentSelectedNume: '1',
+      }),
+      false
+    );
+
+    // Verify EpisodeWorkspace wires the auto-select transition
+    const workspace = readRepoFile('src/components/EpisodeWorkspace.tsx');
+    assert.match(workspace, /shouldAutoSelectCompletedOfflineOption\(/);
+    assert.match(workspace, /Download concluído — versão baixada selecionada automaticamente/);
   });
 });

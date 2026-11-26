@@ -144,4 +144,42 @@ public class VlcSeekGuardTest {
         assertTrue(VlcPlayerActivity.hasActiveSeekArrived(60_000L, 60_000L, 65_000L, 5_100L));
         assertTrue(VlcPlayerActivity.hasActiveSeekArrived(60_000L, -1L, -1L, 0L));
     }
+
+    @Test
+    public void downloadedLocalOfflineVideoReportsRealFullLoadedProgressInsteadOfFakeBuffer() {
+        long durationMs = 1_440_000L; // 24 minutes
+
+        // Downloaded local file must ALWAYS show 100% loaded (full duration), even at 0:00 or after seeking
+        assertEquals(
+            durationMs,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(true, 0L, 0L, durationMs)
+        );
+        assertEquals(
+            durationMs,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(true, 60_000L, 75_000L, durationMs)
+        );
+        assertEquals(
+            durationMs,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(true, 120_000L, 120_000L, durationMs)
+        );
+        // Duration unknown -> 0
+        assertEquals(
+            0L,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(true, 5_000L, 5_000L, 0L)
+        );
+
+        // Online streaming still reports real buffered position clamped between currentPos and totalDuration
+        assertEquals(
+            300_000L,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(false, 60_000L, 300_000L, durationMs)
+        );
+        assertEquals(
+            400_000L,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(false, 400_000L, 300_000L, durationMs)
+        );
+        assertEquals(
+            durationMs,
+            VlcPlayerActivity.resolveEffectiveBufferedPositionMs(false, 1_400_000L, 1_600_000L, durationMs)
+        );
+    }
 }

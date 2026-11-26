@@ -26,9 +26,12 @@ import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -38,11 +41,14 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -50,7 +56,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSocket;
@@ -68,6 +77,7 @@ public class TvCastService extends Service {
     private static final String CHANNEL_CAST_ID = "anisync_tv_cast";
     private static final int CAST_NOTIFICATION_ID = 42001;
     private static final long WAKE_LOCK_TIMEOUT_MS = 6L * 60L * 60L * 1000L;
+    private static final Pattern BYTE_RANGE_PATTERN = Pattern.compile("^bytes=(\\d*)-(\\d*)$", Pattern.CASE_INSENSITIVE);
 
     public static final String ACTION_START_CAST = "com.topanimes.player.cast.START";
     public static final String ACTION_PREPARE_LAN_ONLY = "com.topanimes.player.cast.PREPARE_LAN";
@@ -77,6 +87,7 @@ public class TvCastService extends Service {
     public static final String ACTION_SEEK_TO = "com.topanimes.player.cast.SEEK_TO";
     public static final String ACTION_SEEK_BY = "com.topanimes.player.cast.SEEK_BY";
     public static final String ACTION_SET_VOLUME = "com.topanimes.player.cast.SET_VOLUME";
+    public static final String ACTION_SET_TRACKS = "com.topanimes.player.cast.SET_TRACKS";
     public static final String ACTION_NEXT_EPISODE = "com.topanimes.player.cast.NEXT_EP";
     public static final String ACTION_PREV_EPISODE = "com.topanimes.player.cast.PREV_EP";
     public static final String ACTION_STOP_CAST = "com.topanimes.player.cast.STOP";
@@ -87,15 +98,30 @@ public class TvCastService extends Service {
     public static final String EXTRA_DELTA_MS = "deltaMs";
     public static final String EXTRA_VOLUME = "volume";
     public static final String EXTRA_DELIVERY_MODE = "deliveryMode";
+    public static final String EXTRA_PRESERVE_ACTIVE_CONTROLLER = "preserveActiveController";
+    public static final String EXTRA_TRACKS_JSON = "tracksJson";
 
     public interface StateListener {
         void onCastStateChanged(JSONObject stateSnapshot);
+    }
+
+    private static final class SubtitleEntry {
+        final String label;
+        final String url;
+        final boolean isDefault;
+
+        SubtitleEntry(String label, String url, boolean isDefault) {
+            this.label = label != null ? label : "Legenda";
+            this.url = url != null ? url : "";
+            this.isDefault = isDefault;
+        }
     }
 
     private static final Set<StateListener> STATE_LISTENERS = new CopyOnWriteArraySet<>();
     private static final Object STATE_LOCK = new Object();
     private static volatile TvCastService runningInstance = null;
     private static volatile JSONObject latestStateJson = buildIdleStateJson();
+    private static volatile String latestPreparedLanStreamUrl = "";
 
     private static final long MEDIA_SESSION_ACTIONS =
         PlaybackState.ACTION_PLAY
@@ -134,8 +160,28 @@ public class TvCastService extends Service {
         return latestStateJson.optBoolean("active", false);
     }
 
+    public static boolean hasActiveRemoteController() {
+        return isCastActive()
+            && TvCastProtocol.hasRemotePlaybackControls(
+                latestStateJson.optString("deviceProtocol", ""),
+                latestStateJson.optString("deliveryMode", "")
+            );
+    }
+
     public static String getActiveLanStreamUrl() {
         return latestStateJson.optString("lanStreamUrl", "");
+    }
+
+    public static String getPreparedLanStreamUrl() {
+        String prepared = latestPreparedLanStreamUrl;
+        if (prepared != null && !prepared.isEmpty()) {
+            return prepared;
+        }
+        return getActiveLanStreamUrl();
+    }
+
+    public static void clearPreparedLanStreamUrl() {
+        latestPreparedLanStreamUrl = "";
     }
 
     private static JSONObject buildIdleStateJson() {
@@ -156,11 +202,19 @@ public class TvCastService extends Service {
             o.put("lanStreamUrl", "");
             o.put("positionMs", 0L);
             o.put("durationMs", 0L);
+            o.put("stateTimestampMs", 0L);
             o.put("volume", 0.0);
             o.put("muted", false);
             o.put("volumeSynced", false);
             o.put("hasPrev", false);
             o.put("hasNext", false);
+            o.put("selectedServerNume", "");
+            o.put("qualityLabel", "");
+            o.put("audioLabel", "");
+            o.put("subtitleUrl", "");
+            o.put("subtitleLabel", "");
+            o.put("mediaTracks", new JSONArray());
+            o.put("activeTrackIds", new JSONArray());
             o.put("errorMessage", "");
         } catch (Exception ignored) {
         }
@@ -194,6 +248,7 @@ public class TvCastService extends Service {
     private volatile String lanSecretToken = "";
     private volatile String activeSubtitleSourceUrl = "";
     private volatile String activeSubtitleReferer = "https://topanimes.net/";
+    private final List<SubtitleEntry> subtitleEntries = new CopyOnWriteArrayList<>();
 
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
@@ -219,13 +274,18 @@ public class TvCastService extends Service {
     private String referer = "https://topanimes.net/";
     private boolean preferDirect = false;
     private String subtitleUrl = "";
-    private String subtitleLabel = "Legenda";
+    private String subtitleLabel = "";
+    private boolean subtitleDisabled = false;
+    private String qualityLabel = "";
+    private String audioLabel = "";
     private String selectedServerNume = "";
     private String prevUrl = "";
     private String nextUrl = "";
     private boolean autoPlayNextEpisode = false;
     private String deliveryPreference = "auto";
     private String lanStreamUrl = "";
+    private volatile JSONArray activeMediaTracksJson = new JSONArray();
+    private volatile JSONArray activeTrackIdsJson = new JSONArray();
 
     private volatile long positionMs = 0L;
     private volatile long durationMs = 0L;
@@ -287,7 +347,8 @@ public class TvCastService extends Service {
             }
             case ACTION_PREPARE_LAN_ONLY: {
                 String mediaRaw = intent.getStringExtra(EXTRA_MEDIA_JSON);
-                handlePrepareLanOnlyRequest(mediaRaw);
+                boolean preserveActive = intent.getBooleanExtra(EXTRA_PRESERVE_ACTIVE_CONTROLLER, false);
+                handlePrepareLanOnlyRequest(mediaRaw, preserveActive);
                 break;
             }
             case ACTION_PLAY:
@@ -312,6 +373,11 @@ public class TvCastService extends Service {
             case ACTION_SET_VOLUME: {
                 double vol = intent.getDoubleExtra(EXTRA_VOLUME, 1.0);
                 ioExecutor.execute(() -> performSetVolume(Math.max(0.0, Math.min(1.0, vol))));
+                break;
+            }
+            case ACTION_SET_TRACKS: {
+                String tracksRaw = intent.getStringExtra(EXTRA_TRACKS_JSON);
+                ioExecutor.execute(() -> performSetTracks(tracksRaw));
                 break;
             }
             case ACTION_NEXT_EPISODE:
@@ -357,6 +423,7 @@ public class TvCastService extends Service {
         if (runningInstance == this) {
             runningInstance = null;
         }
+        latestPreparedLanStreamUrl = "";
         broadcastState(buildIdleStateJson());
         super.onDestroy();
     }
@@ -386,16 +453,28 @@ public class TvCastService extends Service {
         deliveryPreference = (modePref != null && !modePref.trim().isEmpty())
             ? modePref.trim().toLowerCase(Locale.ROOT)
             : "auto";
+        boolean isLocalOffline = TvCastProtocol.parseLocalOfflineAsset(streamUrl) != null;
+        boolean sameDeviceReconnect = activeDevice != null
+            && activeDevice.id.equals(parsedDevice.id)
+            && activeDevice.protocol.equals(parsedDevice.protocol);
         activeDevice = parsedDevice;
         sessionActive = true;
+        // Always reset deliveryMode immediately so controls never vanish after a previous lan-link session
+        deliveryMode = (!isLocalOffline && "direct".equals(deliveryPreference))
+            ? "direct"
+            : "background-proxy";
         status = "connecting";
         errorMessage = "";
-        volume = 0.0;
-        muted = false;
-        volumeSynced = false;
-        lastVolumeSetAtMs = 0L;
-        lastSeekTargetMs = -1L;
-        lastSeekRequestedAtMs = 0L;
+        if (!sameDeviceReconnect) {
+            volume = 0.0;
+            muted = false;
+            volumeSynced = false;
+            lastVolumeSetAtMs = 0L;
+        }
+        activeMediaTracksJson = new JSONArray();
+        activeTrackIdsJson = new JSONArray();
+        lastSeekTargetMs = positionMs > 2000L ? positionMs : -1L;
+        lastSeekRequestedAtMs = positionMs > 2000L ? System.currentTimeMillis() : 0L;
         handledCompletionForEpisode = false;
         attemptedDirectFallback = false;
 
@@ -407,7 +486,24 @@ public class TvCastService extends Service {
         ioExecutor.execute(() -> connectAndLoadMedia(gen, false));
     }
 
-    private void handlePrepareLanOnlyRequest(String mediaRaw) {
+    private void handlePrepareLanOnlyRequest(String mediaRaw, boolean preserveActiveController) {
+        boolean hasLiveTvController = sessionActive
+            && activeDevice != null
+            && TvCastProtocol.hasRemotePlaybackControls(activeDevice.protocol, deliveryMode)
+            && (dlnaController != null || chromecastController != null);
+
+        if (preserveActiveController && hasLiveTvController) {
+            // Preserve the active TV session and remote controls; only build a LAN proxy URL for copying/sharing.
+            ioExecutor.execute(() -> {
+                String built = buildLanStreamUrlFromRawMediaJson(mediaRaw);
+                if (built.isEmpty()) {
+                    built = ensureLanStreamUrlForCurrentMedia();
+                }
+                latestPreparedLanStreamUrl = built;
+            });
+            return;
+        }
+
         if (!applyMediaJson(mediaRaw)) {
             errorMessage = "Nenhum stream válido disponível para preparar o link de TV.";
             status = "error";
@@ -446,9 +542,30 @@ public class TvCastService extends Service {
                 return;
             }
             lanStreamUrl = lanUrl;
+            latestPreparedLanStreamUrl = lanUrl;
             updateNotification();
             publishCurrentState();
         });
+    }
+
+    private String buildLanStreamUrlFromRawMediaJson(String raw) {
+        String base = ensureLanProxyBaseUrl();
+        if (base.isEmpty() || lanSecretToken.isEmpty() || raw == null || raw.trim().isEmpty()) return "";
+        try {
+            JSONObject m = new JSONObject(raw);
+            String sUrl = m.optString("streamUrl", "").trim();
+            String sFmt = m.optString("streamFormat", "mp4").trim();
+            String sRef = m.optString("referer", "https://topanimes.net/").trim();
+            TvCastProtocol.LocalOfflineAsset offline = TvCastProtocol.parseLocalOfflineAsset(sUrl);
+            if (offline != null) {
+                return TvCastProtocol.buildLanOfflineAssetUrl(base, lanSecretToken, offline.downloadId, offline.fileName);
+            }
+            if (!TvCastProtocol.isSafeExternalHttpUrl(sUrl)) return "";
+            boolean isHls = TvCastProtocol.isHlsStreamUrl(sUrl, sFmt);
+            return TvCastProtocol.buildLanProxyUrl(base, lanSecretToken, sUrl, sRef, false, isHls);
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private void connectAndLoadMedia(int gen, boolean forceProxy) {
@@ -456,19 +573,26 @@ public class TvCastService extends Service {
 
         closeActiveRemoteControllers();
 
+        TvCastProtocol.LocalOfflineAsset localOffline = TvCastProtocol.parseLocalOfflineAsset(streamUrl);
+        boolean isLocalOffline = localOffline != null;
         boolean isHls = TvCastProtocol.isHlsStreamUrl(streamUrl, streamFormat);
         String mimeType = TvCastProtocol.inferStreamMimeType(streamUrl, streamFormat);
 
         String builtLanUrl = ensureLanStreamUrlForCurrentMedia();
         lanStreamUrl = builtLanUrl;
+        if (!builtLanUrl.isEmpty()) {
+            latestPreparedLanStreamUrl = builtLanUrl;
+        }
 
         String targetUrl = "";
         String chosenMode = "background-proxy";
 
+        boolean hasActiveSubtitle = !subtitleDisabled && !subtitleUrl.isEmpty();
         boolean canTryDirect = !forceProxy
+            && !isLocalOffline
             && !"proxy".equals(deliveryPreference)
             && !isHls
-            && (subtitleUrl.isEmpty() || TvCastProtocol.PROTOCOL_DLNA.equals(activeDevice.protocol));
+            && !hasActiveSubtitle;
 
         if (canTryDirect) {
             boolean directPrefForced = "direct".equals(deliveryPreference);
@@ -481,7 +605,7 @@ public class TvCastService extends Service {
 
         if (targetUrl.isEmpty()) {
             if (builtLanUrl.isEmpty()) {
-                if (probeDirectPlayable(streamUrl)) {
+                if (!isLocalOffline && probeDirectPlayable(streamUrl)) {
                     targetUrl = streamUrl;
                     chosenMode = "direct";
                 } else {
@@ -502,65 +626,105 @@ public class TvCastService extends Service {
         updateNotification();
         publishCurrentState();
 
-        String lanSubtitleUrl = (!subtitleUrl.isEmpty() && !builtLanUrl.isEmpty())
+        String lanSubtitleVttUrl = (hasActiveSubtitle && !builtLanUrl.isEmpty())
             ? buildLanSubtitleUrl()
             : "";
+        String lanSubtitleSrtUrl = (hasActiveSubtitle && !builtLanUrl.isEmpty())
+            ? buildLanSubtitleSrtUrl()
+            : "";
 
-        try {
-            if (TvCastProtocol.PROTOCOL_DLNA.equals(activeDevice.protocol)) {
-                DlnaController dlna = new DlnaController(activeDevice);
-                synchronized (sessionLock) {
-                    dlnaController = dlna;
-                }
-                // Sync the TV's actual volume & mute BEFORE loading or playing media
-                // so the app matches the TV instead of assuming 100%.
-                if (dlna.syncVolumeFromTv()) {
+        Exception lastError = null;
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            if (gen != castSessionGen.get()) return;
+            try {
+                if (TvCastProtocol.PROTOCOL_DLNA.equals(activeDevice.protocol)) {
+                    DlnaController dlna = new DlnaController(activeDevice);
+                    synchronized (sessionLock) {
+                        dlnaController = dlna;
+                    }
+                    // Sync the TV's actual volume & mute BEFORE loading or playing media
+                    // so the app matches the TV instead of assuming 100%.
+                    if (dlna.syncVolumeFromTv()) {
+                        publishCurrentState();
+                    }
+                    try {
+                        dlna.loadAndPlay(
+                            targetUrl,
+                            mimeType,
+                            episodeTitle,
+                            seriesTitle,
+                            posterUrl,
+                            positionMs,
+                            lanSubtitleSrtUrl
+                        );
+                    } catch (Exception directErr) {
+                        if ("direct".equals(chosenMode) && !builtLanUrl.isEmpty() && !attemptedDirectFallback) {
+                            attemptedDirectFallback = true;
+                            deliveryMode = "background-proxy";
+                            dlna.loadAndPlay(
+                                builtLanUrl,
+                                mimeType,
+                                episodeTitle,
+                                seriesTitle,
+                                posterUrl,
+                                positionMs,
+                                lanSubtitleSrtUrl
+                            );
+                        } else {
+                            throw directErr;
+                        }
+                    }
+                    if (gen != castSessionGen.get()) return;
+                    status = "playing";
+                    startPollingLoop(gen);
+                    updateNotification();
                     publishCurrentState();
+                    return;
+                } else {
+                    ChromecastController cast = new ChromecastController(activeDevice, gen);
+                    synchronized (sessionLock) {
+                        chromecastController = cast;
+                    }
+                    cast.connectAndLoad(
+                        targetUrl,
+                        mimeType,
+                        episodeTitle,
+                        seriesTitle,
+                        posterUrl,
+                        positionMs,
+                        lanSubtitleVttUrl,
+                        subtitleLabel,
+                        subtitleDisabled
+                    );
+                    if (gen != castSessionGen.get()) return;
+                    startPollingLoop(gen);
+                    updateNotification();
+                    publishCurrentState();
+                    return;
                 }
-                try {
-                    dlna.loadAndPlay(targetUrl, mimeType, episodeTitle, seriesTitle, posterUrl, positionMs);
-                } catch (Exception directErr) {
-                    if ("direct".equals(chosenMode) && !builtLanUrl.isEmpty() && !attemptedDirectFallback) {
-                        attemptedDirectFallback = true;
-                        deliveryMode = "background-proxy";
-                        dlna.loadAndPlay(builtLanUrl, mimeType, episodeTitle, seriesTitle, posterUrl, positionMs);
-                    } else {
-                        throw directErr;
+            } catch (Exception e) {
+                lastError = e;
+                closeActiveRemoteControllers();
+                if (attempt < 2 && gen == castSessionGen.get()) {
+                    Log.w(TAG, "Cast attempt " + attempt + " failed (" + e.getMessage() + "), retrying...");
+                    try {
+                        Thread.sleep(700L);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
                     }
                 }
-                if (gen != castSessionGen.get()) return;
-                status = "playing";
-                startPollingLoop(gen);
-                updateNotification();
-                publishCurrentState();
-            } else {
-                ChromecastController cast = new ChromecastController(activeDevice, gen);
-                synchronized (sessionLock) {
-                    chromecastController = cast;
-                }
-                cast.connectAndLoad(
-                    targetUrl,
-                    mimeType,
-                    episodeTitle,
-                    seriesTitle,
-                    posterUrl,
-                    positionMs,
-                    lanSubtitleUrl,
-                    subtitleLabel
-                );
-                if (gen != castSessionGen.get()) return;
-                startPollingLoop(gen);
-                updateNotification();
-                publishCurrentState();
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Cast connection/load failed", e);
-            failSession(
-                gen,
-                "Não foi possível conectar à TV (" + activeDevice.name + "): "
-                    + (e.getMessage() != null ? e.getMessage() : "verifique se estão no mesmo Wi-Fi.")
-            );
         }
+
+        Log.e(TAG, "Cast connection/load failed", lastError);
+        failSession(
+            gen,
+            "Não foi possível conectar à TV (" + activeDevice.name + "): "
+                + (lastError != null && lastError.getMessage() != null
+                    ? lastError.getMessage()
+                    : "verifique se estão no mesmo Wi-Fi.")
+        );
     }
 
     private void failSession(int gen, String msg) {
@@ -654,6 +818,64 @@ public class TvCastService extends Service {
         }
     }
 
+    private void performSetTracks(String tracksRaw) {
+        if (!sessionActive || activeDevice == null || tracksRaw == null || tracksRaw.trim().isEmpty()) {
+            return;
+        }
+        try {
+            JSONObject obj = new JSONObject(tracksRaw);
+            boolean hasActiveIds = obj.has("activeTrackIds");
+            List<Long> trackIds = new ArrayList<>();
+            if (hasActiveIds) {
+                JSONArray arr = obj.optJSONArray("activeTrackIds");
+                if (arr != null) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        long id = arr.optLong(i, -1L);
+                        if (id >= 0L) trackIds.add(id);
+                    }
+                }
+            }
+            if (obj.has("subtitleDisabled")) {
+                subtitleDisabled = obj.optBoolean("subtitleDisabled", false);
+            }
+            if (obj.has("subtitleUrl")) {
+                String nextSubUrl = obj.optString("subtitleUrl", "").trim();
+                subtitleUrl = subtitleDisabled ? "" : nextSubUrl;
+                activeSubtitleSourceUrl = subtitleUrl;
+            }
+            if (obj.has("subtitleLabel")) {
+                subtitleLabel = subtitleDisabled ? "" : obj.optString("subtitleLabel", "").trim();
+            }
+
+            ChromecastController cc;
+            DlnaController dc;
+            synchronized (sessionLock) {
+                cc = chromecastController;
+                dc = dlnaController;
+            }
+
+            if (cc != null && hasActiveIds) {
+                cc.editTracksInfo(trackIds);
+                JSONArray nextIds = new JSONArray();
+                for (Long id : trackIds) nextIds.put(id);
+                activeTrackIdsJson = nextIds;
+                publishCurrentState();
+                return;
+            }
+
+            if (dc != null && obj.has("subtitleUrl")) {
+                // Reload DLNA URI at current playback position with updated DIDL-Lite subtitle sidecar (or none)
+                final int gen = castSessionGen.incrementAndGet();
+                connectAndLoadMedia(gen, true);
+                return;
+            }
+
+            publishCurrentState();
+        } catch (Exception e) {
+            Log.w(TAG, "SetTracks failed: " + e.getMessage());
+        }
+    }
+
     private void switchEpisodeInBackground(String targetEpisodeUrl) {
         if (!sessionActive || activeDevice == null || targetEpisodeUrl == null || targetEpisodeUrl.trim().isEmpty()) {
             return;
@@ -666,6 +888,40 @@ public class TvCastService extends Service {
         publishCurrentState();
 
         try {
+            OfflineDownloadsPlugin.OfflinePlaybackInfo offline =
+                OfflineDownloadsPlugin.findCompletedDownloadForEpisodeUrl(this, targetEpisodeUrl.trim());
+            if (gen != castSessionGen.get()) return;
+            if (offline != null && offline.playbackUrl != null && !offline.playbackUrl.isEmpty()) {
+                episodeUrl = offline.episodeUrl;
+                episodeTitle = offline.title;
+                if (offline.seriesUrl != null && !offline.seriesUrl.isEmpty()) {
+                    seriesUrl = offline.seriesUrl;
+                }
+                selectedServerNume = "offline-local";
+                streamUrl = offline.playbackUrl;
+                streamFormat = offline.format != null ? offline.format : "mp4";
+                qualityLabel = offline.qualityLabel != null ? offline.qualityLabel : "Offline";
+                subtitleEntries.clear();
+                for (OfflineDownloadsPlugin.OfflineSubtitleInfo sub : offline.subtitles) {
+                    subtitleEntries.add(new SubtitleEntry(sub.label, sub.url, sub.isDefault));
+                }
+                if (!subtitleDisabled && !offline.subtitles.isEmpty()) {
+                    subtitleUrl = offline.subtitles.get(0).url;
+                    subtitleLabel = offline.subtitles.get(0).label;
+                } else {
+                    subtitleUrl = "";
+                    subtitleLabel = "";
+                }
+                positionMs = 0L;
+                durationMs = 0L;
+                lastSeekTargetMs = -1L;
+                lastSeekRequestedAtMs = 0L;
+                handledCompletionForEpisode = false;
+                attemptedDirectFallback = false;
+                connectAndLoadMedia(gen, true);
+                return;
+            }
+
             TopAnimesEpisodeResolver.ResolvedEpisodeData resolved =
                 TopAnimesEpisodeResolver.resolveEpisode(targetEpisodeUrl.trim(), selectedServerNume);
             if (gen != castSessionGen.get()) return;
@@ -692,8 +948,18 @@ public class TvCastService extends Service {
             preferDirect = resolved.preferDirect;
             streamUrl = best.url;
             streamFormat = best.format != null ? best.format : "mp4";
-            subtitleUrl = !resolved.subtitles.isEmpty() ? resolved.subtitles.get(0).url : "";
-            subtitleLabel = !resolved.subtitles.isEmpty() ? resolved.subtitles.get(0).label : "Legenda";
+            qualityLabel = best.label != null ? best.label : "";
+            subtitleEntries.clear();
+            for (TopAnimesEpisodeResolver.SubtitleCandidate sub : resolved.subtitles) {
+                subtitleEntries.add(new SubtitleEntry(sub.label, sub.url, sub.isDefault));
+            }
+            if (!subtitleDisabled && !resolved.subtitles.isEmpty()) {
+                subtitleUrl = resolved.subtitles.get(0).url;
+                subtitleLabel = resolved.subtitles.get(0).label;
+            } else {
+                subtitleUrl = "";
+                subtitleLabel = "";
+            }
             positionMs = 0L;
             durationMs = 0L;
             lastSeekTargetMs = -1L;
@@ -728,6 +994,7 @@ public class TvCastService extends Service {
         persistProgressIfNeeded(true, false);
         sessionActive = false;
         status = "idle";
+        latestPreparedLanStreamUrl = "";
         teardownControllersAndServer();
         releaseLocks();
         broadcastState(buildIdleStateJson());
@@ -761,6 +1028,7 @@ public class TvCastService extends Service {
     private void startPollingLoop(int gen) {
         stopPollingLoop();
         if (scheduler == null || scheduler.isShutdown()) return;
+        // Poll every 1s for real-time playback time sync with the TV; catch Throwable so the scheduler never stops.
         pollFuture = scheduler.scheduleAtFixedRate(() -> {
             if (gen != castSessionGen.get() || !sessionActive) return;
             try {
@@ -775,10 +1043,10 @@ public class TvCastService extends Service {
                 } else if (dc != null) {
                     dc.pollStatus(gen);
                 }
-            } catch (Exception e) {
-                Log.d(TAG, "Status poll error: " + e.getMessage());
+            } catch (Throwable t) {
+                Log.d(TAG, "Status poll error: " + t.getMessage());
             }
-        }, 2, 2, TimeUnit.SECONDS);
+        }, 1, 1, TimeUnit.SECONDS);
     }
 
     private void stopPollingLoop() {
@@ -898,21 +1166,42 @@ public class TvCastService extends Service {
     private String ensureLanStreamUrlForCurrentMedia() {
         String base = ensureLanProxyBaseUrl();
         if (base.isEmpty() || streamUrl.isEmpty() || lanSecretToken.isEmpty()) return "";
-        activeSubtitleSourceUrl = subtitleUrl;
+        activeSubtitleSourceUrl = subtitleDisabled ? "" : subtitleUrl;
         activeSubtitleReferer = referer;
+        TvCastProtocol.LocalOfflineAsset offline = TvCastProtocol.parseLocalOfflineAsset(streamUrl);
+        if (offline != null) {
+            return TvCastProtocol.buildLanOfflineAssetUrl(base, lanSecretToken, offline.downloadId, offline.fileName);
+        }
         boolean isHls = TvCastProtocol.isHlsStreamUrl(streamUrl, streamFormat);
         return TvCastProtocol.buildLanProxyUrl(base, lanSecretToken, streamUrl, referer, false, isHls);
     }
 
     private String buildLanSubtitleUrl() {
         String base = ensureLanProxyBaseUrl();
-        if (base.isEmpty() || lanSecretToken.isEmpty() || subtitleUrl.isEmpty()) return "";
+        if (base.isEmpty() || lanSecretToken.isEmpty() || subtitleDisabled || subtitleUrl.isEmpty()) return "";
         return base + "/cast/" + lanSecretToken + "/subtitle.vtt";
+    }
+
+    private String buildLanSubtitleSrtUrl() {
+        String base = ensureLanProxyBaseUrl();
+        if (base.isEmpty() || lanSecretToken.isEmpty() || subtitleDisabled || subtitleUrl.isEmpty()) return "";
+        return base + "/cast/" + lanSecretToken + "/subtitle.srt";
+    }
+
+    private String buildLanIndexedSubtitleUrl(int idx, boolean asSrt) {
+        String base = ensureLanProxyBaseUrl();
+        if (base.isEmpty() || lanSecretToken.isEmpty() || idx < 0) return "";
+        return base + "/cast/" + lanSecretToken + "/subtitles/" + idx + (asSrt ? ".srt" : ".vtt");
     }
 
     private void handleLanClientSocket(Socket client) {
         try (Socket sock = client) {
             sock.setSoTimeout(30000);
+            try {
+                sock.setKeepAlive(true);
+                sock.setTcpNoDelay(true);
+            } catch (Exception ignored) {
+            }
             InputStream in = new BufferedInputStream(sock.getInputStream());
             OutputStream out = sock.getOutputStream();
 
@@ -937,7 +1226,7 @@ public class TvCastService extends Service {
             }
 
             if ("OPTIONS".equals(method)) {
-                writeLanHeaders(out, 204, "No Content", null, 0L, null, null);
+                writeLanHeaders(out, 204, "No Content", null, 0L, null, null, null);
                 out.flush();
                 return;
             }
@@ -957,13 +1246,53 @@ public class TvCastService extends Service {
                 ? ("http://" + hostHeader.trim())
                 : ensureLanProxyBaseUrl();
 
-            if (pathOnly.endsWith("/subtitle.vtt")) {
-                serveLanSubtitle(out, method);
+            String relPath = pathOnly.substring(expectedPrefix.length());
+            if ("subtitle.vtt".equals(relPath)) {
+                serveLanSubtitle(out, method, activeSubtitleSourceUrl, false);
+                return;
+            }
+            if ("subtitle.srt".equals(relPath)) {
+                serveLanSubtitle(out, method, activeSubtitleSourceUrl, true);
+                return;
+            }
+            if (relPath.startsWith("subtitles/")) {
+                String subSpec = relPath.substring("subtitles/".length());
+                boolean wantSrt = subSpec.endsWith(".srt");
+                boolean wantVtt = subSpec.endsWith(".vtt");
+                if (wantSrt || wantVtt) {
+                    String numPart = subSpec.substring(0, subSpec.length() - 4);
+                    try {
+                        int subIdx = Integer.parseInt(numPart);
+                        if (subIdx >= 0 && subIdx < subtitleEntries.size()) {
+                            serveLanSubtitle(out, method, subtitleEntries.get(subIdx).url, wantSrt);
+                            return;
+                        }
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                writeLanSimpleError(out, 404, "Not Found", "Subtitle track not found");
+                return;
+            }
+
+            if (relPath.startsWith("offline/")) {
+                serveLanOfflineAsset(relPath.substring("offline/".length()), method, reqHeaders, lanBase, out);
                 return;
             }
 
             Map<String, String> query = LocalProxyPlugin.parseQuery(target);
             String targetUrl = query.getOrDefault("url", streamUrl);
+            TvCastProtocol.LocalOfflineAsset targetOffline = TvCastProtocol.parseLocalOfflineAsset(targetUrl);
+            if (targetOffline != null) {
+                serveLanOfflineAsset(
+                    targetOffline.downloadId + "/" + targetOffline.fileName,
+                    method,
+                    reqHeaders,
+                    lanBase,
+                    out
+                );
+                return;
+            }
+
             String refParam = query.getOrDefault("referer", referer);
             String safeRef = LocalProxyPlugin.isSafeHttpUrl(refParam) ? refParam : "https://topanimes.net/";
             boolean isHlsSegment = "1".equals(query.get("hls_seg"));
@@ -973,17 +1302,18 @@ public class TvCastService extends Service {
                 return;
             }
 
+            String captionHeaderUrl = (!subtitleDisabled && !activeSubtitleSourceUrl.isEmpty() && !isHlsSegment)
+                ? (lanBase + "/cast/" + lanSecretToken + "/subtitle.srt")
+                : null;
             String rangeHeader = reqHeaders.get("range");
             boolean isHeadRequest = "HEAD".equals(method);
             boolean likelyPlaylistRequest = pathOnly.endsWith(".m3u8") || TvCastProtocol.isHlsStreamUrl(targetUrl, "");
             HttpURLConnection conn = null;
             try {
-                LocalProxyPlugin.RedirectResult upstream = LocalProxyPlugin.openWithRedirects(
+                LocalProxyPlugin.RedirectResult upstream = openUpstreamWithRetry(
                     targetUrl,
                     safeRef,
-                    "*/*",
                     isHeadRequest ? null : rangeHeader,
-                    20000,
                     (isHeadRequest && !likelyPlaylistRequest) ? "HEAD" : "GET"
                 );
                 conn = upstream.connection;
@@ -1010,7 +1340,8 @@ public class TvCastService extends Service {
                         "application/vnd.apple.mpegurl; charset=utf-8",
                         payload.length,
                         null,
-                        null
+                        null,
+                        captionHeaderUrl
                     );
                     if (!"HEAD".equals(method)) {
                         out.write(payload);
@@ -1070,7 +1401,8 @@ public class TvCastService extends Service {
                             "application/vnd.apple.mpegurl; charset=utf-8",
                             payload.length,
                             null,
-                            null
+                            null,
+                            captionHeaderUrl
                         );
                         if (!"HEAD".equals(method)) {
                             out.write(payload);
@@ -1109,7 +1441,7 @@ public class TvCastService extends Service {
                         }
                     }
 
-                    writeLanHeaders(out, outStatus, outStatusText, outCt, outCl, outCr, outAr);
+                    writeLanHeaders(out, outStatus, outStatusText, outCt, outCl, outCr, outAr, captionHeaderUrl);
                     if (!"HEAD".equals(method)) {
                         int startOff = Math.max(0, tsOffset);
                         if (probeLen > startOff) {
@@ -1130,7 +1462,7 @@ public class TvCastService extends Service {
                 String outCt = contentType != null && !contentType.isEmpty()
                     ? contentType
                     : TvCastProtocol.inferStreamMimeType(targetUrl, streamFormat);
-                writeLanHeaders(out, code, statusText, outCt, contentLength, contentRange, acceptRanges);
+                writeLanHeaders(out, code, statusText, outCt, contentLength, contentRange, acceptRanges, captionHeaderUrl);
                 if (bodyStream != null && !"HEAD".equals(method)) {
                     byte[] buf = new byte[65536];
                     int rn;
@@ -1147,38 +1479,257 @@ public class TvCastService extends Service {
         }
     }
 
-    private void serveLanSubtitle(OutputStream out, String method) throws IOException {
-        String subUrl = activeSubtitleSourceUrl;
-        if (subUrl == null || subUrl.isEmpty() || !LocalProxyPlugin.isSafeHttpUrl(subUrl)) {
-            writeLanSimpleError(out, 404, "Not Found", "No subtitle");
+    private LocalProxyPlugin.RedirectResult openUpstreamWithRetry(
+        String targetUrl,
+        String safeRef,
+        String rangeHeader,
+        String method
+    ) throws IOException {
+        IOException lastErr = null;
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            try {
+                return LocalProxyPlugin.openWithRedirects(
+                    targetUrl,
+                    safeRef,
+                    "*/*",
+                    rangeHeader,
+                    20000,
+                    method
+                );
+            } catch (IOException ioe) {
+                lastErr = ioe;
+                if (attempt < 2) {
+                    try {
+                        Thread.sleep(300L);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw ioe;
+                    }
+                }
+            }
+        }
+        throw lastErr != null ? lastErr : new IOException("Falha ao acessar stream remoto.");
+    }
+
+    private void serveLanOfflineAsset(
+        String rel,
+        String method,
+        Map<String, String> reqHeaders,
+        String lanBase,
+        OutputStream out
+    ) throws IOException {
+        if (!"GET".equals(method) && !"HEAD".equals(method)) {
+            writeLanSimpleError(out, 405, "Method Not Allowed", "Method Not Allowed");
             return;
         }
-        HttpURLConnection conn = null;
-        try {
-            LocalProxyPlugin.RedirectResult res = LocalProxyPlugin.openWithRedirects(
-                subUrl,
-                activeSubtitleReferer,
-                "text/vtt,text/plain,*/*",
-                null,
-                10000
-            );
-            conn = res.connection;
-            int code = conn.getResponseCode();
-            if (code < 200 || code >= 300) {
-                writeLanSimpleError(out, 404, "Not Found", "Subtitle unavailable");
-                return;
+        int slashIdx = rel.indexOf('/');
+        if (slashIdx <= 0 || slashIdx >= rel.length() - 1) {
+            writeLanSimpleError(out, 404, "Not Found", "Invalid offline asset path");
+            return;
+        }
+        String downloadId = rel.substring(0, slashIdx);
+        String fileName = rel.substring(slashIdx + 1);
+        if (!TvCastProtocol.isSafeOfflineAssetName(downloadId, fileName)) {
+            writeLanSimpleError(out, 400, "Bad Request", "Unsafe offline asset path");
+            return;
+        }
+
+        File root = LocalProxyPlugin.getOfflineMediaRootDir(this);
+        if (root == null || !root.exists()) {
+            writeLanSimpleError(out, 404, "Not Found", "Offline storage unavailable");
+            return;
+        }
+        File targetFile = new File(new File(root, downloadId), fileName);
+        String rootCanon = root.getCanonicalPath();
+        String fileCanon = targetFile.getCanonicalPath();
+        if (!fileCanon.startsWith(rootCanon + File.separator) || !targetFile.isFile()) {
+            writeLanSimpleError(out, 404, "Not Found", "Offline asset not found");
+            return;
+        }
+
+        String lowerName = fileName.toLowerCase(Locale.ROOT);
+        String captionHeaderUrl = (!subtitleDisabled && !activeSubtitleSourceUrl.isEmpty()
+            && (lowerName.endsWith(".mp4") || lowerName.endsWith(".m3u8")))
+            ? (lanBase + "/cast/" + lanSecretToken + "/subtitle.srt")
+            : null;
+
+        if (lowerName.endsWith(".m3u8")) {
+            String rawManifest;
+            try (FileInputStream fis = new FileInputStream(targetFile)) {
+                rawManifest = LocalProxyPlugin.readStreamAsString(fis);
             }
-            String raw = LocalProxyPlugin.readStreamAsString(conn.getInputStream());
-            String vtt = TvCastProtocol.convertSrtToVtt(raw);
-            byte[] payload = vtt.getBytes(StandardCharsets.UTF_8);
-            writeLanHeaders(out, 200, "OK", "text/vtt; charset=utf-8", payload.length, null, null);
+            String rewritten = TvCastProtocol.rewriteOfflineM3u8ForLanProxy(
+                rawManifest,
+                lanBase,
+                lanSecretToken,
+                downloadId
+            );
+            byte[] payload = rewritten.getBytes(StandardCharsets.UTF_8);
+            writeLanHeaders(
+                out,
+                200,
+                "OK",
+                "application/vnd.apple.mpegurl; charset=utf-8",
+                payload.length,
+                null,
+                null,
+                captionHeaderUrl
+            );
             if (!"HEAD".equals(method)) {
                 out.write(payload);
             }
             out.flush();
-        } finally {
-            if (conn != null) conn.disconnect();
+            return;
         }
+
+        long fileLen = targetFile.length();
+        String mime = TvCastProtocol.guessOfflineMimeType(fileName);
+        long start = 0L;
+        long end = fileLen > 0L ? fileLen - 1L : -1L;
+        boolean isRange = false;
+
+        String rangeHeader = reqHeaders.get("range");
+        if (rangeHeader != null && !rangeHeader.trim().isEmpty() && fileLen > 0L) {
+            String firstSpec = rangeHeader.trim();
+            int commaIdx = firstSpec.indexOf(',');
+            if (commaIdx > 0) {
+                firstSpec = firstSpec.substring(0, commaIdx).trim();
+            }
+            Matcher m = BYTE_RANGE_PATTERN.matcher(firstSpec);
+            if (m.matches()) {
+                String startStr = m.group(1);
+                String endStr = m.group(2);
+                try {
+                    if (startStr != null && !startStr.isEmpty()) {
+                        start = Long.parseLong(startStr);
+                        end = (endStr != null && !endStr.isEmpty())
+                            ? Math.min(Long.parseLong(endStr), fileLen - 1L)
+                            : fileLen - 1L;
+                    } else if (endStr != null && !endStr.isEmpty()) {
+                        long suffixLen = Long.parseLong(endStr);
+                        if (suffixLen > 0L) {
+                            start = Math.max(0L, fileLen - suffixLen);
+                            end = fileLen - 1L;
+                        }
+                    }
+                    if (start < 0L || start >= fileLen || start > end) {
+                        writeLanHeaders(
+                            out,
+                            416,
+                            "Range Not Satisfiable",
+                            "text/plain; charset=utf-8",
+                            0L,
+                            "bytes */" + fileLen,
+                            "bytes",
+                            null
+                        );
+                        out.flush();
+                        return;
+                    }
+                    isRange = true;
+                } catch (NumberFormatException ignored) {
+                    start = 0L;
+                    end = fileLen - 1L;
+                    isRange = false;
+                }
+            }
+        }
+
+        long contentLength = fileLen == 0L ? 0L : (end - start + 1L);
+        if (isRange) {
+            writeLanHeaders(
+                out,
+                206,
+                "Partial Content",
+                mime,
+                contentLength,
+                "bytes " + start + "-" + end + "/" + fileLen,
+                "bytes",
+                captionHeaderUrl
+            );
+        } else {
+            writeLanHeaders(
+                out,
+                200,
+                "OK",
+                mime,
+                contentLength,
+                null,
+                "bytes",
+                captionHeaderUrl
+            );
+        }
+
+        if (!"HEAD".equals(method) && contentLength > 0L) {
+            try (RandomAccessFile raf = new RandomAccessFile(targetFile, "r")) {
+                raf.seek(start);
+                byte[] buf = new byte[65536];
+                long remaining = contentLength;
+                while (remaining > 0L) {
+                    int toRead = (int) Math.min(buf.length, remaining);
+                    int n = raf.read(buf, 0, toRead);
+                    if (n == -1) break;
+                    out.write(buf, 0, n);
+                    remaining -= n;
+                }
+            }
+        }
+        out.flush();
+    }
+
+    private void serveLanSubtitle(OutputStream out, String method, String subUrl, boolean asSrt) throws IOException {
+        if (subUrl == null || subUrl.isEmpty() || !TvCastProtocol.isSupportedCastSourceUrl(subUrl)) {
+            writeLanSimpleError(out, 404, "Not Found", "No subtitle");
+            return;
+        }
+        String raw = null;
+        TvCastProtocol.LocalOfflineAsset offlineSub = TvCastProtocol.parseLocalOfflineAsset(subUrl);
+        if (offlineSub != null) {
+            File root = LocalProxyPlugin.getOfflineMediaRootDir(this);
+            if (root != null && root.exists()) {
+                File subFile = new File(new File(root, offlineSub.downloadId), offlineSub.fileName);
+                String rootCanon = root.getCanonicalPath();
+                String fileCanon = subFile.getCanonicalPath();
+                if (fileCanon.startsWith(rootCanon + File.separator) && subFile.isFile()) {
+                    try (FileInputStream fis = new FileInputStream(subFile)) {
+                        raw = LocalProxyPlugin.readStreamAsString(fis);
+                    }
+                }
+            }
+            if (raw == null) {
+                writeLanSimpleError(out, 404, "Not Found", "Offline subtitle unavailable");
+                return;
+            }
+        } else {
+            HttpURLConnection conn = null;
+            try {
+                LocalProxyPlugin.RedirectResult res = LocalProxyPlugin.openWithRedirects(
+                    subUrl,
+                    activeSubtitleReferer,
+                    "text/vtt,text/plain,*/*",
+                    null,
+                    10000
+                );
+                conn = res.connection;
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) {
+                    writeLanSimpleError(out, 404, "Not Found", "Subtitle unavailable");
+                    return;
+                }
+                raw = LocalProxyPlugin.readStreamAsString(conn.getInputStream());
+            } finally {
+                if (conn != null) conn.disconnect();
+            }
+        }
+
+        String body = asSrt ? TvCastProtocol.convertVttToSrt(raw) : TvCastProtocol.convertSrtToVtt(raw);
+        String ct = asSrt ? "text/srt; charset=utf-8" : "text/vtt; charset=utf-8";
+        byte[] payload = body.getBytes(StandardCharsets.UTF_8);
+        writeLanHeaders(out, 200, "OK", ct, payload.length, null, null, null);
+        if (!"HEAD".equals(method)) {
+            out.write(payload);
+        }
+        out.flush();
     }
 
     private static void writeLanHeaders(
@@ -1188,9 +1739,10 @@ public class TvCastService extends Service {
         String contentType,
         long contentLength,
         String contentRange,
-        String acceptRanges
+        String acceptRanges,
+        String captionInfoUrl
     ) throws IOException {
-        StringBuilder sb = new StringBuilder(320);
+        StringBuilder sb = new StringBuilder(384);
         sb.append("HTTP/1.1 ").append(status).append(' ').append(statusText).append("\r\n");
         sb.append("Access-Control-Allow-Origin: *\r\n");
         sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
@@ -1201,6 +1753,9 @@ public class TvCastService extends Service {
         sb.append("contentFeatures.dlna.org: DLNA.ORG_OP=")
             .append(isHlsCt ? "10" : "01")
             .append(";DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n");
+        if (captionInfoUrl != null && !captionInfoUrl.isEmpty()) {
+            sb.append("CaptionInfo.sec: ").append(captionInfoUrl).append("\r\n");
+        }
         sb.append("Connection: close\r\n");
         if (contentType != null && !contentType.isEmpty()) {
             sb.append("Content-Type: ").append(contentType).append("\r\n");
@@ -1220,7 +1775,7 @@ public class TvCastService extends Service {
 
     private static void writeLanSimpleError(OutputStream out, int code, String reason, String body) throws IOException {
         byte[] payload = body.getBytes(StandardCharsets.UTF_8);
-        writeLanHeaders(out, code, reason, "text/plain; charset=utf-8", payload.length, null, null);
+        writeLanHeaders(out, code, reason, "text/plain; charset=utf-8", payload.length, null, null, null);
         out.write(payload);
         out.flush();
     }
@@ -1235,14 +1790,16 @@ public class TvCastService extends Service {
         private final String senderId = "sender-anisync-" + (System.currentTimeMillis() & 0xffff);
         private final AtomicInteger requestIdSeq = new AtomicInteger(1);
         private final Object writeLock = new Object();
+        private final AtomicBoolean reconnecting = new AtomicBoolean(false);
 
-        private SSLSocket socket;
-        private OutputStream outStream;
+        private volatile SSLSocket socket;
+        private volatile OutputStream outStream;
         private volatile boolean closed = false;
         private volatile String appSessionId = "";
         private volatile String transportId = "";
         private volatile long mediaSessionId = -1L;
         private volatile boolean mediaLoaded = false;
+        private volatile boolean reattachPending = false;
         private final CountDownLatch initialVolumeLatch = new CountDownLatch(1);
 
         private String pendingMediaUrl = "";
@@ -1253,7 +1810,10 @@ public class TvCastService extends Service {
         private long pendingStartMs = 0L;
         private String pendingVttUrl = "";
         private String pendingVttLabel = "";
-        private long lastPingSentMs = 0L;
+        private boolean pendingSubDisabled = false;
+        private volatile long lastPingSentMs = 0L;
+        private volatile long lastPacketReceivedMs = 0L;
+        private volatile int reconnectAttempts = 0;
 
         ChromecastController(TvCastProtocol.CastDevice device, int gen) {
             this.device = device;
@@ -1268,7 +1828,8 @@ public class TvCastService extends Service {
             String poster,
             long startPosMs,
             String vttUrl,
-            String vttLabel
+            String vttLabel,
+            boolean subDisabled
         ) throws Exception {
             this.pendingMediaUrl = mediaUrl;
             this.pendingMimeType = mimeType;
@@ -1278,21 +1839,9 @@ public class TvCastService extends Service {
             this.pendingStartMs = startPosMs;
             this.pendingVttUrl = vttUrl != null ? vttUrl : "";
             this.pendingVttLabel = vttLabel != null ? vttLabel : "Legenda";
+            this.pendingSubDisabled = subDisabled;
 
-            SSLContext sslCtx = SSLContext.getInstance("TLS");
-            sslCtx.init(null, new TrustManager[] { new LanCastTrustManager() }, new SecureRandom());
-            SSLSocket sslSocket = (SSLSocket) sslCtx.getSocketFactory().createSocket();
-            sslSocket.connect(new InetSocketAddress(device.host, device.port), 8000);
-            sslSocket.setSoTimeout(0);
-            sslSocket.startHandshake();
-
-            this.socket = sslSocket;
-            this.outStream = sslSocket.getOutputStream();
-            this.lastPingSentMs = System.currentTimeMillis();
-
-            Thread reader = new Thread(this::readLoop, "AnisyncCastReader");
-            reader.setDaemon(true);
-            reader.start();
+            openTlsSocketAndReader();
 
             sendJson("receiver-0", TvCastProtocol.CAST_NS_CONNECTION, "{\"type\":\"CONNECT\",\"origin\":{}}");
             // Query receiver status first so the TV's real volume & mute are synced BEFORE launching/loading media.
@@ -1316,17 +1865,106 @@ public class TvCastService extends Service {
             }
         }
 
-        private void readLoop() {
+        private void openTlsSocketAndReader() throws Exception {
+            SSLContext sslCtx = SSLContext.getInstance("TLS");
+            sslCtx.init(null, new TrustManager[] { new LanCastTrustManager() }, new SecureRandom());
+            SSLSocket sslSocket = (SSLSocket) sslCtx.getSocketFactory().createSocket();
+            sslSocket.connect(new InetSocketAddress(device.host, device.port), 8000);
             try {
-                InputStream in = socket.getInputStream();
-                while (!closed && socket != null && !socket.isClosed()) {
+                sslSocket.setKeepAlive(true);
+                sslSocket.setTcpNoDelay(true);
+            } catch (Exception ignored) {
+            }
+            sslSocket.setSoTimeout(0);
+            sslSocket.startHandshake();
+
+            synchronized (writeLock) {
+                this.socket = sslSocket;
+                this.outStream = sslSocket.getOutputStream();
+            }
+            long now = System.currentTimeMillis();
+            this.lastPingSentMs = now;
+            this.lastPacketReceivedMs = now;
+
+            final SSLSocket readerSocket = sslSocket;
+            Thread reader = new Thread(() -> readLoop(readerSocket), "AnisyncCastReader");
+            reader.setDaemon(true);
+            reader.start();
+        }
+
+        private void readLoop(SSLSocket targetSocket) {
+            try {
+                InputStream in = targetSocket.getInputStream();
+                while (!closed && targetSocket == socket && !targetSocket.isClosed()) {
                     TvCastProtocol.CastPacket packet = TvCastProtocol.readFramedCastMessage(in);
                     if (packet == null) break;
+                    lastPacketReceivedMs = System.currentTimeMillis();
+                    reconnectAttempts = 0;
                     handleIncomingPacket(packet);
                 }
             } catch (Exception e) {
-                if (!closed) {
+                if (!closed && targetSocket == socket) {
                     Log.d(TAG, "Chromecast socket closed: " + e.getMessage());
+                }
+            }
+            if (!closed && targetSocket == socket && gen == castSessionGen.get() && sessionActive) {
+                reconnectAsync();
+            }
+        }
+
+        private void reconnectAsync() {
+            if (closed || gen != castSessionGen.get() || !sessionActive) return;
+            if (!reconnecting.compareAndSet(false, true)) return;
+
+            Thread t = new Thread(() -> {
+                try {
+                    while (!closed && gen == castSessionGen.get() && sessionActive && reconnectAttempts < 5) {
+                        reconnectAttempts++;
+                        long backoffMs = Math.min(4000L, 700L * reconnectAttempts);
+                        try {
+                            Thread.sleep(backoffMs);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                        if (closed || gen != castSessionGen.get() || !sessionActive) return;
+                        try {
+                            closeSocketOnly();
+                            // Clear transportId while keeping mediaLoaded=true so RECEIVER_STATUS re-attaches
+                            // cleanly to the running media receiver without restarting playback.
+                            transportId = "";
+                            reattachPending = true;
+                            openTlsSocketAndReader();
+                            sendJson("receiver-0", TvCastProtocol.CAST_NS_CONNECTION, "{\"type\":\"CONNECT\",\"origin\":{}}");
+                            JSONObject statusReq = new JSONObject();
+                            statusReq.put("type", "GET_STATUS");
+                            statusReq.put("requestId", requestIdSeq.getAndIncrement());
+                            sendJson("receiver-0", TvCastProtocol.CAST_NS_RECEIVER, statusReq.toString());
+                            Log.i(TAG, "Chromecast reconnected on attempt " + reconnectAttempts);
+                            return;
+                        } catch (Exception e) {
+                            Log.w(TAG, "Chromecast reconnect attempt " + reconnectAttempts + " failed: " + e.getMessage());
+                        }
+                    }
+                } finally {
+                    reconnecting.set(false);
+                }
+            }, "AnisyncCastReconnect");
+            t.setDaemon(true);
+            t.start();
+        }
+
+        private void closeSocketOnly() {
+            SSLSocket old;
+            synchronized (writeLock) {
+                old = socket;
+                socket = null;
+                outStream = null;
+            }
+            if (old != null) {
+                try {
+                    old.close();
+                } catch (Exception ignored) {
                 }
             }
         }
@@ -1383,13 +2021,20 @@ public class TvCastService extends Service {
                             if (TvCastProtocol.CHROMECAST_DEFAULT_MEDIA_RECEIVER_APP_ID.equals(appId)) {
                                 String newTransport = app.optString("transportId", "");
                                 String newSession = app.optString("sessionId", "");
-                                if (!newTransport.isEmpty() && !newTransport.equals(transportId)) {
+                                if (!newTransport.isEmpty() && (!newTransport.equals(transportId) || reattachPending)) {
                                     transportId = newTransport;
                                     appSessionId = newSession;
+                                    reattachPending = false;
                                     sendJson(transportId, TvCastProtocol.CAST_NS_CONNECTION, "{\"type\":\"CONNECT\",\"origin\":{}}");
                                     if (!mediaLoaded) {
                                         mediaLoaded = true;
                                         sendLoadCommand(pendingMediaUrl);
+                                    } else {
+                                        // Re-attached after a transient socket drop: fetch live status without reloading!
+                                        JSONObject msReq = new JSONObject();
+                                        msReq.put("type", "GET_STATUS");
+                                        msReq.put("requestId", requestIdSeq.getAndIncrement());
+                                        sendJson(transportId, TvCastProtocol.CAST_NS_MEDIA, msReq.toString());
                                     }
                                 }
                                 break;
@@ -1425,9 +2070,43 @@ public class TvCastService extends Service {
                             if (tMs >= 0L) positionMs = tMs;
                         }
                         JSONObject mediaObj = ms.optJSONObject("media");
-                        if (mediaObj != null && mediaObj.has("duration")) {
-                            long dMs = Math.round(mediaObj.optDouble("duration", 0.0) * 1000.0);
-                            if (dMs > 0L) durationMs = dMs;
+                        if (mediaObj != null) {
+                            if (mediaObj.has("duration")) {
+                                long dMs = Math.round(mediaObj.optDouble("duration", 0.0) * 1000.0);
+                                if (dMs > 0L) durationMs = dMs;
+                            }
+                            if (mediaObj.has("tracks")) {
+                                JSONArray rawTracks = mediaObj.optJSONArray("tracks");
+                                JSONArray parsedTracks = new JSONArray();
+                                if (rawTracks != null) {
+                                    for (int i = 0; i < rawTracks.length(); i++) {
+                                        JSONObject tr = rawTracks.optJSONObject(i);
+                                        if (tr == null) continue;
+                                        long trId = tr.optLong("trackId", -1L);
+                                        String trType = tr.optString("type", "").toUpperCase(Locale.ROOT);
+                                        if (trId < 0L || trType.isEmpty()) continue;
+                                        JSONObject norm = new JSONObject();
+                                        norm.put("trackId", trId);
+                                        norm.put("type", trType);
+                                        norm.put("name", tr.optString("name", ""));
+                                        norm.put("language", tr.optString("language", ""));
+                                        norm.put("subtype", tr.optString("subtype", ""));
+                                        parsedTracks.put(norm);
+                                    }
+                                }
+                                activeMediaTracksJson = parsedTracks;
+                            }
+                        }
+                        if (ms.has("activeTrackIds")) {
+                            JSONArray rawActive = ms.optJSONArray("activeTrackIds");
+                            JSONArray normActive = new JSONArray();
+                            if (rawActive != null) {
+                                for (int i = 0; i < rawActive.length(); i++) {
+                                    long id = rawActive.optLong(i, -1L);
+                                    if (id >= 0L) normActive.put(id);
+                                }
+                            }
+                            activeTrackIdsJson = normActive;
                         }
 
                         if ("PLAYING".equals(playerState)) {
@@ -1492,26 +2171,78 @@ public class TvCastService extends Service {
                 load.put("currentTime", pendingStartMs / 1000.0);
             }
 
-            if (!pendingVttUrl.isEmpty() && "background-proxy".equals(deliveryMode)) {
+            if ("background-proxy".equals(deliveryMode)) {
                 JSONArray tracks = new JSONArray();
-                JSONObject track = new JSONObject();
-                track.put("trackId", 1);
-                track.put("type", "TEXT");
-                track.put("trackContentId", pendingVttUrl);
-                track.put("trackContentType", "text/vtt");
-                track.put("name", pendingVttLabel.isEmpty() ? "Português" : pendingVttLabel);
-                track.put("language", "pt-BR");
-                track.put("subtype", "SUBTITLES");
-                tracks.put(track);
-                media.put("tracks", tracks);
+                long selectedTrackId = -1L;
+                if (!subtitleEntries.isEmpty()) {
+                    for (int i = 0; i < subtitleEntries.size(); i++) {
+                        SubtitleEntry entry = subtitleEntries.get(i);
+                        String indexedVtt = buildLanIndexedSubtitleUrl(i, false);
+                        if (indexedVtt.isEmpty()) continue;
+                        long trackId = i + 1L;
+                        JSONObject track = new JSONObject();
+                        track.put("trackId", trackId);
+                        track.put("type", "TEXT");
+                        track.put("trackContentId", indexedVtt);
+                        track.put("trackContentType", "text/vtt");
+                        track.put("name", entry.label.isEmpty() ? ("Legenda " + trackId) : entry.label);
+                        track.put("language", "pt-BR");
+                        track.put("subtype", "SUBTITLES");
+                        tracks.put(track);
+                        if (!pendingSubDisabled) {
+                            if (!subtitleUrl.isEmpty() && subtitleUrl.equals(entry.url)) {
+                                selectedTrackId = trackId;
+                            } else if (selectedTrackId < 0L && entry.isDefault) {
+                                selectedTrackId = trackId;
+                            }
+                        }
+                    }
+                    if (!pendingSubDisabled && selectedTrackId < 0L && tracks.length() > 0 && !subtitleUrl.isEmpty()) {
+                        selectedTrackId = 1L;
+                    }
+                } else if (!pendingVttUrl.isEmpty()) {
+                    JSONObject track = new JSONObject();
+                    track.put("trackId", 1L);
+                    track.put("type", "TEXT");
+                    track.put("trackContentId", pendingVttUrl);
+                    track.put("trackContentType", "text/vtt");
+                    track.put("name", pendingVttLabel.isEmpty() ? "Português" : pendingVttLabel);
+                    track.put("language", "pt-BR");
+                    track.put("subtype", "SUBTITLES");
+                    tracks.put(track);
+                    if (!pendingSubDisabled) {
+                        selectedTrackId = 1L;
+                    }
+                }
 
-                JSONArray activeIds = new JSONArray();
-                activeIds.put(1);
-                load.put("activeTrackIds", activeIds);
+                if (tracks.length() > 0) {
+                    media.put("tracks", tracks);
+                    JSONArray activeIds = new JSONArray();
+                    if (!pendingSubDisabled && selectedTrackId > 0L) {
+                        activeIds.put(selectedTrackId);
+                    }
+                    load.put("activeTrackIds", activeIds);
+                }
             }
 
             load.put("media", media);
             sendJson(transportId, TvCastProtocol.CAST_NS_MEDIA, load.toString());
+        }
+
+        void editTracksInfo(List<Long> trackIds) throws Exception {
+            if (transportId.isEmpty() || mediaSessionId < 0L) return;
+            JSONObject cmd = new JSONObject();
+            cmd.put("type", "EDIT_TRACKS_INFO");
+            cmd.put("mediaSessionId", mediaSessionId);
+            JSONArray ids = new JSONArray();
+            if (trackIds != null) {
+                for (Long id : trackIds) {
+                    if (id != null && id >= 0L) ids.put(id.longValue());
+                }
+            }
+            cmd.put("activeTrackIds", ids);
+            cmd.put("requestId", requestIdSeq.getAndIncrement());
+            sendJson(transportId, TvCastProtocol.CAST_NS_MEDIA, cmd.toString());
         }
 
         void play() throws Exception {
@@ -1554,18 +2285,30 @@ public class TvCastService extends Service {
             sendJson("receiver-0", TvCastProtocol.CAST_NS_RECEIVER, cmd.toString());
         }
 
-        void pollStatus() throws Exception {
-            if (closed) return;
+        void pollStatus() {
+            if (closed || reconnecting.get()) return;
             long now = System.currentTimeMillis();
-            if (now - lastPingSentMs >= 4500L) {
-                lastPingSentMs = now;
-                sendJson("receiver-0", TvCastProtocol.CAST_NS_HEARTBEAT, "{\"type\":\"PING\"}");
+            if (lastPacketReceivedMs > 0L && (now - lastPacketReceivedMs) > 15_000L) {
+                Log.w(TAG, "Chromecast heartbeat timeout (" + (now - lastPacketReceivedMs) + "ms); reconnecting");
+                closeSocketOnly();
+                reconnectAsync();
+                return;
             }
-            if (!transportId.isEmpty()) {
-                JSONObject st = new JSONObject();
-                st.put("type", "GET_STATUS");
-                st.put("requestId", requestIdSeq.getAndIncrement());
-                sendJson(transportId, TvCastProtocol.CAST_NS_MEDIA, st.toString());
+            try {
+                if (now - lastPingSentMs >= 4500L) {
+                    lastPingSentMs = now;
+                    sendJson("receiver-0", TvCastProtocol.CAST_NS_HEARTBEAT, "{\"type\":\"PING\"}");
+                }
+                if (!transportId.isEmpty()) {
+                    JSONObject st = new JSONObject();
+                    st.put("type", "GET_STATUS");
+                    st.put("requestId", requestIdSeq.getAndIncrement());
+                    sendJson(transportId, TvCastProtocol.CAST_NS_MEDIA, st.toString());
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Chromecast poll failed (" + e.getMessage() + "); scheduling reconnect");
+                closeSocketOnly();
+                reconnectAsync();
             }
         }
 
@@ -1589,10 +2332,7 @@ public class TvCastService extends Service {
                 }
             } catch (Exception ignored) {
             }
-            try {
-                if (socket != null) socket.close();
-            } catch (Exception ignored) {
-            }
+            closeSocketOnly();
         }
 
         private void sendJson(String destination, String namespace, String payload) throws IOException {
@@ -1622,17 +2362,33 @@ public class TvCastService extends Service {
         }
     }
 
+    private static final class SoapHttpException extends IOException {
+        final int statusCode;
+
+        SoapHttpException(int statusCode, String message) {
+            super(message);
+            this.statusCode = statusCode;
+        }
+    }
+
     // -------------------------------------------------------------------------
     // DLNA / UPnP AVTransport + RenderingControl SOAP Controller
     // -------------------------------------------------------------------------
 
     private final class DlnaController {
         private final TvCastProtocol.CastDevice device;
+        private volatile String avTransportUrl;
+        private volatile String renderingControlUrl;
         private boolean sawPlaying = false;
         private int pollCount = 0;
+        private int consecutiveStoppedPolls = 0;
+        private int consecutivePollFailures = 0;
+        private long lastControlRefreshAtMs = 0L;
 
         DlnaController(TvCastProtocol.CastDevice device) {
             this.device = device;
+            this.avTransportUrl = device.avTransportControlUrl != null ? device.avTransportControlUrl : "";
+            this.renderingControlUrl = device.renderingControlUrl != null ? device.renderingControlUrl : "";
         }
 
         void loadAndPlay(
@@ -1641,11 +2397,16 @@ public class TvCastService extends Service {
             String title,
             String series,
             String poster,
-            long startPosMs
+            long startPosMs,
+            String subtitleSrtUrl
         ) throws IOException {
+            sawPlaying = false;
+            consecutiveStoppedPolls = 0;
+            consecutivePollFailures = 0;
+
             try {
                 sendSoap(
-                    device.avTransportControlUrl,
+                    avTransportUrl,
                     TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                     "Stop",
                     singletonInstanceArgs()
@@ -1653,7 +2414,14 @@ public class TvCastService extends Service {
             } catch (Exception ignored) {
             }
 
-            String didl = TvCastProtocol.buildDidlLiteMetadata(title, series, poster, mediaUrl, mimeType);
+            String didl = TvCastProtocol.buildDidlLiteMetadata(
+                title,
+                series,
+                poster,
+                mediaUrl,
+                mimeType,
+                subtitleSrtUrl
+            );
             Map<String, String> setUriArgs = new LinkedHashMap<>();
             setUriArgs.put("InstanceID", "0");
             setUriArgs.put("CurrentURI", mediaUrl);
@@ -1661,43 +2429,72 @@ public class TvCastService extends Service {
 
             try {
                 sendSoap(
-                    device.avTransportControlUrl,
+                    avTransportUrl,
                     TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                     "SetAVTransportURI",
                     setUriArgs
                 );
             } catch (IOException metadataErr) {
-                // Some Smart TVs reject DIDL-Lite metadata; retry cleanly with empty metadata
-                setUriArgs.put("CurrentURIMetaData", "");
-                sendSoap(
-                    device.avTransportControlUrl,
-                    TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                    "SetAVTransportURI",
-                    setUriArgs
-                );
+                if (subtitleSrtUrl != null && !subtitleSrtUrl.isEmpty()) {
+                    try {
+                        setUriArgs.put(
+                            "CurrentURIMetaData",
+                            TvCastProtocol.buildDidlLiteMetadata(title, series, poster, mediaUrl, mimeType)
+                        );
+                        sendSoap(
+                            avTransportUrl,
+                            TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                            "SetAVTransportURI",
+                            setUriArgs
+                        );
+                    } catch (IOException plainMetaErr) {
+                        setUriArgs.put("CurrentURIMetaData", "");
+                        sendSoap(
+                            avTransportUrl,
+                            TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                            "SetAVTransportURI",
+                            setUriArgs
+                        );
+                    }
+                } else {
+                    // Some Smart TVs reject DIDL-Lite metadata; retry cleanly with empty metadata
+                    setUriArgs.put("CurrentURIMetaData", "");
+                    sendSoap(
+                        avTransportUrl,
+                        TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                        "SetAVTransportURI",
+                        setUriArgs
+                    );
+                }
             }
 
             Map<String, String> playArgs = new LinkedHashMap<>();
             playArgs.put("InstanceID", "0");
             playArgs.put("Speed", "1");
             sendSoap(
-                device.avTransportControlUrl,
+                avTransportUrl,
                 TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                 "Play",
                 playArgs
             );
 
             if (startPosMs > 2000L) {
+                // Arm seek guard BEFORE seeking so early 00:00:00 polls cannot reset positionMs to 0
+                lastSeekTargetMs = startPosMs;
+                lastSeekRequestedAtMs = System.currentTimeMillis();
                 try {
-                    long deadline = System.currentTimeMillis() + 4000L;
+                    long deadline = System.currentTimeMillis() + 4500L;
                     while (System.currentTimeMillis() < deadline) {
                         Thread.sleep(350L);
                         try {
                             String tXml = sendSoap(
-                                device.avTransportControlUrl,
+                                avTransportUrl,
                                 TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                                 "GetTransportInfo",
-                                singletonInstanceArgs()
+                                singletonInstanceArgs(),
+                                2500,
+                                3000,
+                                1
                             );
                             String tState = TvCastProtocol.extractXmlTagValue(tXml, "CurrentTransportState")
                                 .toUpperCase(Locale.ROOT);
@@ -1708,6 +2505,7 @@ public class TvCastService extends Service {
                             break;
                         }
                     }
+                    lastSeekRequestedAtMs = System.currentTimeMillis();
                     seek(startPosMs);
                 } catch (Exception ignored) {
                 }
@@ -1718,12 +2516,12 @@ public class TvCastService extends Service {
             Map<String, String> args = new LinkedHashMap<>();
             args.put("InstanceID", "0");
             args.put("Speed", "1");
-            sendSoap(device.avTransportControlUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Play", args);
+            sendSoap(avTransportUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Play", args);
         }
 
         void pause() throws IOException {
             sendSoap(
-                device.avTransportControlUrl,
+                avTransportUrl,
                 TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                 "Pause",
                 singletonInstanceArgs()
@@ -1737,7 +2535,7 @@ public class TvCastService extends Service {
             args.put("Unit", "REL_TIME");
             args.put("Target", formatted);
             try {
-                sendSoap(device.avTransportControlUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", args);
+                sendSoap(avTransportUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", args);
             } catch (IOException relErr) {
                 // Some DLNA Smart TVs reject REL_TIME (SOAP 710) and require ABS_TIME.
                 Map<String, String> absArgs = new LinkedHashMap<>();
@@ -1745,7 +2543,7 @@ public class TvCastService extends Service {
                 absArgs.put("Unit", "ABS_TIME");
                 absArgs.put("Target", formatted);
                 try {
-                    sendSoap(device.avTransportControlUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", absArgs);
+                    sendSoap(avTransportUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", absArgs);
                 } catch (IOException absErr) {
                     throw relErr;
                 }
@@ -1753,17 +2551,20 @@ public class TvCastService extends Service {
         }
 
         boolean syncVolumeFromTv() {
-            if (device.renderingControlUrl.isEmpty()) return false;
+            if (renderingControlUrl == null || renderingControlUrl.isEmpty()) return false;
             boolean syncedAny = false;
             try {
                 Map<String, String> volArgs = new LinkedHashMap<>();
                 volArgs.put("InstanceID", "0");
                 volArgs.put("Channel", "Master");
                 String volXml = sendSoap(
-                    device.renderingControlUrl,
+                    renderingControlUrl,
                     TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE,
                     "GetVolume",
-                    volArgs
+                    volArgs,
+                    2500,
+                    3000,
+                    1
                 );
                 double parsedVol = TvCastProtocol.parseDlnaVolumeLevel(volXml);
                 if (parsedVol >= 0.0) {
@@ -1779,10 +2580,13 @@ public class TvCastService extends Service {
                 muteArgs.put("InstanceID", "0");
                 muteArgs.put("Channel", "Master");
                 String muteXml = sendSoap(
-                    device.renderingControlUrl,
+                    renderingControlUrl,
                     TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE,
                     "GetMute",
-                    muteArgs
+                    muteArgs,
+                    2500,
+                    3000,
+                    1
                 );
                 Boolean parsedMute = TvCastProtocol.parseDlnaMuteState(muteXml);
                 if (parsedMute != null) {
@@ -1796,7 +2600,7 @@ public class TvCastService extends Service {
         }
 
         void setVolume(double level) throws IOException {
-            if (device.renderingControlUrl.isEmpty()) return;
+            if (renderingControlUrl == null || renderingControlUrl.isEmpty()) return;
             int volInt = (int) Math.round(Math.max(0.0, Math.min(1.0, level)) * 100.0);
             if (volInt > 0 && muted) {
                 try {
@@ -1804,7 +2608,7 @@ public class TvCastService extends Service {
                     unmuteArgs.put("InstanceID", "0");
                     unmuteArgs.put("Channel", "Master");
                     unmuteArgs.put("DesiredMute", "0");
-                    sendSoap(device.renderingControlUrl, TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE, "SetMute", unmuteArgs);
+                    sendSoap(renderingControlUrl, TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE, "SetMute", unmuteArgs);
                 } catch (Exception ignored) {
                 }
             }
@@ -1812,73 +2616,144 @@ public class TvCastService extends Service {
             args.put("InstanceID", "0");
             args.put("Channel", "Master");
             args.put("DesiredVolume", String.valueOf(volInt));
-            sendSoap(device.renderingControlUrl, TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE, "SetVolume", args);
+            sendSoap(renderingControlUrl, TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE, "SetVolume", args);
         }
 
         void stopQuietly() {
             try {
                 sendSoap(
-                    device.avTransportControlUrl,
+                    avTransportUrl,
                     TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                     "Stop",
-                    singletonInstanceArgs()
+                    singletonInstanceArgs(),
+                    2000,
+                    2000,
+                    1
                 );
             } catch (Exception ignored) {
             }
         }
 
-        void pollStatus(int gen) throws IOException {
-            String transportXml = sendSoap(
-                device.avTransportControlUrl,
-                TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                "GetTransportInfo",
-                singletonInstanceArgs()
-            );
-            String transportState = TvCastProtocol.extractXmlTagValue(transportXml, "CurrentTransportState")
-                .toUpperCase(Locale.ROOT);
-
-            String posXml = sendSoap(
-                device.avTransportControlUrl,
-                TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                "GetPositionInfo",
-                singletonInstanceArgs()
-            );
-            long relRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "RelTime"));
-            long absRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "AbsTime"));
-            long reportedPos = relRaw > 0L ? relRaw : (absRaw > 0L ? absRaw : relRaw);
-            long durMs = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "TrackDuration"));
-            long nowMs = System.currentTimeMillis();
-            boolean withinSeekGrace = lastSeekTargetMs >= 0L && (nowMs - lastSeekRequestedAtMs) < 8000L;
-            boolean userSoughtNearStart = lastSeekTargetMs >= 0L && lastSeekTargetMs <= 2000L;
-            boolean ignoreZeroReset = reportedPos <= 2000L
-                && !userSoughtNearStart
-                && positionMs >= 8000L
-                && ("TRANSITIONING".equals(transportState) || "PLAYING".equals(transportState) || withinSeekGrace);
-            boolean ignoreStaleSeekPoll = withinSeekGrace
-                && Math.abs(reportedPos - lastSeekTargetMs) > 12_000L;
-            if (reportedPos >= 0L && !ignoreZeroReset && !ignoreStaleSeekPoll) {
-                positionMs = reportedPos;
-                if (withinSeekGrace && Math.abs(reportedPos - lastSeekTargetMs) <= 8000L) {
-                    lastSeekTargetMs = -1L;
+        private void refreshControlUrlsFromLocation() {
+            if (device.locationUrl == null || device.locationUrl.isEmpty()) return;
+            long now = System.currentTimeMillis();
+            if ((now - lastControlRefreshAtMs) < 10_000L) return;
+            lastControlRefreshAtMs = now;
+            HttpURLConnection conn = null;
+            try {
+                conn = (HttpURLConnection) new URL(device.locationUrl).openConnection();
+                conn.setConnectTimeout(2500);
+                conn.setReadTimeout(2500);
+                conn.setRequestMethod("GET");
+                conn.setRequestProperty("Connection", "close");
+                int code = conn.getResponseCode();
+                if (code < 200 || code >= 300) return;
+                String xml;
+                try (InputStream in = conn.getInputStream()) {
+                    xml = LocalProxyPlugin.readStreamAsString(in);
                 }
+                TvCastProtocol.CastDevice refreshed = TvCastProtocol.parseUpnpDeviceDescription(xml, device.locationUrl);
+                if (refreshed != null) {
+                    if (!refreshed.avTransportControlUrl.isEmpty()) {
+                        avTransportUrl = refreshed.avTransportControlUrl;
+                    }
+                    if (!refreshed.renderingControlUrl.isEmpty()) {
+                        renderingControlUrl = refreshed.renderingControlUrl;
+                    }
+                    Log.i(TAG, "Refreshed DLNA control URLs from " + device.locationUrl);
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "DLNA control URL refresh failed: " + e.getMessage());
+            } finally {
+                if (conn != null) conn.disconnect();
             }
-            if (durMs > 0L) durationMs = durMs;
+        }
+
+        void pollStatus(int gen) {
+            String transportState = "";
+            boolean transportOk = false;
+            boolean posOk = false;
+
+            try {
+                String transportXml = sendSoap(
+                    avTransportUrl,
+                    TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                    "GetTransportInfo",
+                    singletonInstanceArgs(),
+                    3000,
+                    3500,
+                    2
+                );
+                transportState = TvCastProtocol.extractXmlTagValue(transportXml, "CurrentTransportState")
+                    .toUpperCase(Locale.ROOT);
+                transportOk = true;
+            } catch (Exception e) {
+                Log.d(TAG, "DLNA GetTransportInfo error: " + e.getMessage());
+            }
+
+            try {
+                String posXml = sendSoap(
+                    avTransportUrl,
+                    TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                    "GetPositionInfo",
+                    singletonInstanceArgs(),
+                    3000,
+                    3500,
+                    2
+                );
+                long relRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "RelTime"));
+                long absRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "AbsTime"));
+                long reportedPos = relRaw > 0L ? relRaw : (absRaw > 0L ? absRaw : relRaw);
+                long durMs = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "TrackDuration"));
+                long nowMs = System.currentTimeMillis();
+                boolean withinSeekGrace = lastSeekTargetMs >= 0L && (nowMs - lastSeekRequestedAtMs) < 8000L;
+                boolean userSoughtNearStart = lastSeekTargetMs >= 0L && lastSeekTargetMs <= 2000L;
+                boolean ignoreZeroReset = reportedPos <= 2000L
+                    && !userSoughtNearStart
+                    && positionMs >= 8000L
+                    && ("TRANSITIONING".equals(transportState) || "PLAYING".equals(transportState) || withinSeekGrace);
+                boolean ignoreStaleSeekPoll = withinSeekGrace
+                    && Math.abs(reportedPos - lastSeekTargetMs) > 12_000L;
+                if (reportedPos >= 0L && !ignoreZeroReset && !ignoreStaleSeekPoll) {
+                    positionMs = reportedPos;
+                    if (withinSeekGrace && Math.abs(reportedPos - lastSeekTargetMs) <= 8000L) {
+                        lastSeekTargetMs = -1L;
+                    }
+                }
+                if (durMs > 0L) durationMs = durMs;
+                posOk = true;
+            } catch (Exception e) {
+                Log.d(TAG, "DLNA GetPositionInfo error: " + e.getMessage());
+            }
+
+            if (!transportOk && !posOk) {
+                consecutivePollFailures++;
+                if (consecutivePollFailures >= 4) {
+                    refreshControlUrlsFromLocation();
+                }
+                return;
+            }
+            consecutivePollFailures = 0;
 
             if ("PLAYING".equals(transportState)) {
                 sawPlaying = true;
+                consecutiveStoppedPolls = 0;
                 status = "playing";
             } else if ("PAUSED_PLAYBACK".equals(transportState)) {
+                consecutiveStoppedPolls = 0;
                 status = "paused";
             } else if ("TRANSITIONING".equals(transportState)) {
+                consecutiveStoppedPolls = 0;
                 status = "buffering";
             } else if ("STOPPED".equals(transportState) || "NO_MEDIA_PRESENT".equals(transportState)) {
-                if (sawPlaying && durationMs > 10_000L && positionMs >= durationMs - 20_000L) {
+                consecutiveStoppedPolls++;
+                if (TvCastProtocol.isGenuineDlnaCompletion(sawPlaying, positionMs, durationMs, consecutiveStoppedPolls)) {
                     handleNaturalEpisodeCompleted(gen);
                     return;
                 }
             }
             pollCount++;
-            if ((!volumeSynced || (pollCount % 2 == 0)) && (System.currentTimeMillis() - lastVolumeSetAtMs) >= 2500L) {
+            if ((!volumeSynced || (pollCount % 4 == 0)) && (System.currentTimeMillis() - lastVolumeSetAtMs) >= 2500L) {
                 syncVolumeFromTv();
             }
             persistProgressIfNeeded(false, false);
@@ -1898,34 +2773,65 @@ public class TvCastService extends Service {
             String action,
             Map<String, String> args
         ) throws IOException {
+            return sendSoap(controlUrl, serviceType, action, args, 4500, 5000, 3);
+        }
+
+        private String sendSoap(
+            String controlUrl,
+            String serviceType,
+            String action,
+            Map<String, String> args,
+            int connectTimeoutMs,
+            int readTimeoutMs,
+            int maxAttempts
+        ) throws IOException {
             if (controlUrl == null || controlUrl.isEmpty()) {
                 throw new IOException("Missing DLNA control URL");
             }
             byte[] payload = TvCastProtocol.buildSoapEnvelope(serviceType, action, args)
                 .getBytes(StandardCharsets.UTF_8);
-            HttpURLConnection conn = null;
-            try {
-                conn = (HttpURLConnection) new URL(controlUrl).openConnection();
-                conn.setConnectTimeout(5000);
-                conn.setReadTimeout(6000);
-                conn.setRequestMethod("POST");
-                conn.setDoOutput(true);
-                conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
-                conn.setRequestProperty("SOAPACTION", "\"" + serviceType + "#" + action + "\"");
-                conn.setFixedLengthStreamingMode(payload.length);
-                try (OutputStream out = conn.getOutputStream()) {
-                    out.write(payload);
+            int attempts = Math.max(1, maxAttempts);
+            IOException lastErr = null;
+            for (int attempt = 1; attempt <= attempts; attempt++) {
+                HttpURLConnection conn = null;
+                try {
+                    conn = (HttpURLConnection) new URL(controlUrl).openConnection();
+                    conn.setConnectTimeout(connectTimeoutMs);
+                    conn.setReadTimeout(readTimeoutMs);
+                    conn.setRequestMethod("POST");
+                    conn.setDoOutput(true);
+                    conn.setRequestProperty("Connection", "close");
+                    conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
+                    conn.setRequestProperty("SOAPACTION", "\"" + serviceType + "#" + action + "\"");
+                    conn.setFixedLengthStreamingMode(payload.length);
+                    try (OutputStream out = conn.getOutputStream()) {
+                        out.write(payload);
+                    }
+                    int code = conn.getResponseCode();
+                    InputStream stream = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+                    String responseBody = stream != null ? LocalProxyPlugin.readStreamAsString(stream) : "";
+                    if (code < 200 || code >= 300) {
+                        throw new SoapHttpException(code, "TV DLNA retornou HTTP " + code + " para " + action);
+                    }
+                    return responseBody;
+                } catch (SoapHttpException httpErr) {
+                    // SOAP faults (e.g. HTTP 500 / UPnP 710) are deterministic; fail fast for fallbacks
+                    throw httpErr;
+                } catch (IOException ioErr) {
+                    lastErr = ioErr;
+                    if (attempt < attempts) {
+                        try {
+                            Thread.sleep(180L * attempt);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw ioErr;
+                        }
+                    }
+                } finally {
+                    if (conn != null) conn.disconnect();
                 }
-                int code = conn.getResponseCode();
-                InputStream stream = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
-                String responseBody = stream != null ? LocalProxyPlugin.readStreamAsString(stream) : "";
-                if (code < 200 || code >= 300) {
-                    throw new IOException("TV DLNA retornou HTTP " + code + " para " + action);
-                }
-                return responseBody;
-            } finally {
-                if (conn != null) conn.disconnect();
             }
+            throw lastErr != null ? lastErr : new IOException("DLNA SOAP falhou para " + action);
         }
     }
 
@@ -2077,7 +2983,11 @@ public class TvCastService extends Service {
             builder.setContentIntent(contentIntent);
         }
 
-        if ("lan-link".equals(deliveryMode)) {
+        boolean hasControls = TvCastProtocol.hasRemotePlaybackControls(
+            activeDevice != null ? activeDevice.protocol : "",
+            deliveryMode
+        );
+        if (!hasControls) {
             builder.addAction(buildServiceAction(
                 R.drawable.ic_player_close,
                 "Parar servidor",
@@ -2269,11 +3179,19 @@ public class TvCastService extends Service {
             o.put("lanStreamUrl", lanStreamUrl);
             o.put("positionMs", Math.max(0L, positionMs));
             o.put("durationMs", Math.max(0L, durationMs));
+            o.put("stateTimestampMs", System.currentTimeMillis());
             o.put("volume", volume);
             o.put("muted", muted);
             o.put("volumeSynced", volumeSynced);
             o.put("hasPrev", prevUrl != null && !prevUrl.isEmpty());
             o.put("hasNext", nextUrl != null && !nextUrl.isEmpty());
+            o.put("selectedServerNume", selectedServerNume != null ? selectedServerNume : "");
+            o.put("qualityLabel", qualityLabel != null ? qualityLabel : "");
+            o.put("audioLabel", audioLabel != null ? audioLabel : "");
+            o.put("subtitleUrl", subtitleDisabled ? "" : (subtitleUrl != null ? subtitleUrl : ""));
+            o.put("subtitleLabel", subtitleDisabled ? "" : (subtitleLabel != null ? subtitleLabel : ""));
+            o.put("mediaTracks", new JSONArray(activeMediaTracksJson.toString()));
+            o.put("activeTrackIds", new JSONArray(activeTrackIdsJson.toString()));
             o.put("errorMessage", errorMessage != null ? errorMessage : "");
         } catch (Exception ignored) {
         }
@@ -2285,7 +3203,7 @@ public class TvCastService extends Service {
         try {
             JSONObject m = new JSONObject(raw);
             String sUrl = m.optString("streamUrl", "").trim();
-            if (!TvCastProtocol.isSafeExternalHttpUrl(sUrl)) {
+            if (!TvCastProtocol.isSupportedCastSourceUrl(sUrl)) {
                 return false;
             }
             streamUrl = sUrl;
@@ -2299,14 +3217,36 @@ public class TvCastService extends Service {
             seriesUrl = m.optString("seriesUrl", "").trim();
             posterUrl = m.optString("poster", "").trim();
             isMovie = m.optBoolean("isMovie", false);
-            subtitleUrl = m.optString("subtitleUrl", "").trim();
-            subtitleLabel = m.optString("subtitleLabel", "Legenda").trim();
+            subtitleDisabled = m.optBoolean("subtitleDisabled", false);
+            subtitleUrl = subtitleDisabled ? "" : m.optString("subtitleUrl", "").trim();
+            subtitleLabel = subtitleDisabled ? "" : m.optString("subtitleLabel", "Legenda").trim();
+            qualityLabel = m.optString("qualityLabel", "").trim();
+            audioLabel = m.optString("audioLabel", "").trim();
             selectedServerNume = m.optString("selectedServerNume", "").trim();
             prevUrl = m.optString("prevUrl", "").trim();
             nextUrl = m.optString("nextUrl", "").trim();
             autoPlayNextEpisode = m.optBoolean("autoPlayNextEpisode", false);
             positionMs = Math.max(0L, m.optLong("startPositionMs", 0L));
             durationMs = Math.max(0L, m.optLong("durationMs", 0L));
+
+            subtitleEntries.clear();
+            JSONArray rawSubs = m.optJSONArray("subtitles");
+            if (rawSubs != null) {
+                for (int i = 0; i < rawSubs.length(); i++) {
+                    JSONObject subObj = rawSubs.optJSONObject(i);
+                    if (subObj == null) continue;
+                    String subU = subObj.optString("url", "").trim();
+                    if (!TvCastProtocol.isSupportedCastSourceUrl(subU)) continue;
+                    String subL = subObj.optString("label", "Legenda").trim();
+                    boolean subDef = subObj.optBoolean("default", false);
+                    subtitleEntries.add(new SubtitleEntry(subL, subU, subDef));
+                }
+            }
+            if (subtitleEntries.isEmpty() && !subtitleUrl.isEmpty() && TvCastProtocol.isSupportedCastSourceUrl(subtitleUrl)) {
+                subtitleEntries.add(new SubtitleEntry(subtitleLabel.isEmpty() ? "Legenda" : subtitleLabel, subtitleUrl, true));
+            }
+            activeMediaTracksJson = new JSONArray();
+            activeTrackIdsJson = new JSONArray();
             return true;
         } catch (Exception e) {
             return false;

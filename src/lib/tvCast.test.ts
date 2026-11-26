@@ -14,8 +14,10 @@ import {
   formatCastDurationMs,
   formatCastProtocolLabel,
   formatCastStatusLabel,
+  hasRemoteTvControls,
   IDLE_TV_CAST_STATE,
   markCastClockSeek,
+  parseHlsMasterVariants,
   reconcileCastClock,
   resolveActiveTvCastDevice,
   resolveCastDisplayedPositionMs,
@@ -30,11 +32,13 @@ import {
   buildSoapEnvelope,
   CAST_NS_RECEIVER,
   convertSrtToVtt,
+  convertVttToSrt,
   decodeCastV2Message,
   encodeCastV2Message,
   formatDlnaTime,
   frameCastV2Message,
   isChromecastVideoCapable,
+  isGenuineServerDlnaCompletion,
   parseDlnaMuteState,
   parseDlnaTimeMs,
   parseDlnaVolumeLevel,
@@ -678,5 +682,134 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     assert.equal(manual.port, 8009);
     assert.equal(manual.protocol, 'chromecast');
     assert.equal(manual.name, 'TV Quarto');
+  });
+
+  it('guards Bug #1/#2/#3/#4/#5 and Quality/Audio/Subtitles TV Cast features end-to-end', () => {
+    // Bug #1: hasRemoteTvControls keeps controls visible for DLNA/Chromecast and hides only pure lan-link
+    assert.equal(
+      hasRemoteTvControls({ active: true, deviceProtocol: 'dlna', deliveryMode: 'background-proxy' }),
+      true
+    );
+    assert.equal(
+      hasRemoteTvControls({ active: true, deviceProtocol: 'chromecast', deliveryMode: 'direct' }),
+      true
+    );
+    assert.equal(
+      hasRemoteTvControls({ active: true, deviceProtocol: 'dlna', deliveryMode: 'lan-link' }),
+      true
+    );
+    assert.equal(
+      hasRemoteTvControls({ active: true, deviceProtocol: 'lan', deliveryMode: 'lan-link' }),
+      false
+    );
+    assert.equal(
+      hasRemoteTvControls({ active: false, deviceProtocol: 'dlna', deliveryMode: 'background-proxy' }),
+      false
+    );
+
+    // Bug #2: reconcileCastClock uses stateTimestampMs to remove bridge latency & syncs paused at 0
+    const tsBase: TvCastStateSnapshot = {
+      ...IDLE_TV_CAST_STATE,
+      active: true,
+      status: 'playing',
+      deviceId: 'dlna:lg',
+      deviceName: 'LG TV',
+      deviceProtocol: 'dlna',
+      deliveryMode: 'background-proxy',
+      episodeUrl: 'https://topanimes.net/episodio/test-1/',
+      positionMs: 30_000,
+      durationMs: 1_440_000,
+      stateTimestampMs: 100_000,
+    };
+    let clock = reconcileCastClock(null, tsBase, 100_400);
+    assert.ok(clock);
+    assert.equal(computeSyncedCastPositionMs(clock, tsBase.durationMs, 100_400), 30_400);
+    clock = reconcileCastClock(
+      clock,
+      { ...tsBase, status: 'paused', positionMs: 0, stateTimestampMs: 101_000 },
+      101_000
+    );
+    assert.ok(clock);
+    assert.equal(computeSyncedCastPositionMs(clock, tsBase.durationMs, 102_000), 0);
+
+    // Bug #3: isGenuineServerDlnaCompletion prevents premature disconnects on short segments or single hiccups
+    assert.equal(isGenuineServerDlnaCompletion(true, 0, 15_000, 5), false);
+    assert.equal(isGenuineServerDlnaCompletion(true, 1_435_000, 1_440_000, 1), false);
+    assert.equal(isGenuineServerDlnaCompletion(true, 1_435_000, 1_440_000, 2), false);
+    assert.equal(isGenuineServerDlnaCompletion(true, 500_000, 1_440_000, 5), false);
+    assert.equal(isGenuineServerDlnaCompletion(true, 1_432_000, 1_440_000, 3), true);
+
+    // Alteração #1: VTT->SRT + DLNA DIDL-Lite subtitle sidecar + HLS master variants + subtitleDisabled payload
+    const srt = convertVttToSrt('WEBVTT\n\n00:02.500 --> 00:05.000 align:center\n<b>Oi!</b>\n');
+    assert.match(srt, /^1\n00:00:02,500 --> 00:00:05,000\nOi!/);
+
+    const didlSub = buildDidlLiteMetadata({
+      title: 'Ep 1',
+      mediaUrl: 'http://192.168.1.10:3000/api/tv-cast/media/tok/stream.mp4',
+      mimeType: 'video/mp4',
+      subtitleUrl: 'http://192.168.1.10:3000/api/tv-cast/media/tok/subtitle.srt',
+    });
+    assert.match(didlSub, /protocolInfo="http-get:\*:text\/srt:\*"/);
+    assert.match(didlSub, /sec:CaptionInfoEx sec:type="srt"/);
+
+    const masterM3u8 = [
+      '#EXTM3U',
+      '#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=854x480',
+      '480p/index.m3u8',
+      '#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080',
+      '1080p/index.m3u8',
+      '#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720',
+      'https://cdn.example.com/720p.m3u8',
+    ].join('\n');
+    const variants = parseHlsMasterVariants(masterM3u8, 'https://cdn.example.com/hls/master.m3u8');
+    assert.equal(variants.length, 3);
+    assert.equal(variants[0]?.label, '1080p');
+    assert.equal(variants[0]?.url, 'https://cdn.example.com/hls/1080p/index.m3u8');
+    assert.equal(variants[1]?.label, '720p');
+    assert.equal(variants[2]?.label, '480p');
+
+    const disabledSubPayload = buildCastMediaPayload({
+      stream: { label: '1080p', height: 1080, url: 'https://cdn.example.com/ep.mp4', format: 'mp4' },
+      subtitles: [{ label: 'PT-BR', url: 'https://cdn.example.com/pt.vtt', isDefault: true }],
+      subtitleDisabled: true,
+      qualityLabel: '1080p',
+      audioLabel: 'Legendado',
+      title: 'Ep 1',
+    });
+    assert.equal(disabledSubPayload.subtitleDisabled, true);
+    assert.equal(disabledSubPayload.subtitleUrl, '');
+    assert.equal(disabledSubPayload.subtitles?.length, 1);
+    assert.equal(disabledSubPayload.qualityLabel, '1080p');
+    assert.equal(disabledSubPayload.audioLabel, 'Legendado');
+
+    // Static architecture guards across Android & UI
+    const modal = readFileSync(resolve(ROOT, 'src/components/TvCastModal.tsx'), 'utf8');
+    assert.match(modal, /hasRemoteTvControls\(castState\)/);
+    assert.match(modal, /data-cast-quality-selector="true"/);
+    assert.match(modal, /data-cast-audio-selector="true"/);
+    assert.match(modal, /data-cast-subtitle-selector="true"/);
+
+    const bar = readFileSync(resolve(ROOT, 'src/components/ActiveCastBar.tsx'), 'utf8');
+    assert.match(bar, /hasRemoteTvControls\(castState\)/);
+
+    const svc = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/TvCastService.java'),
+      'utf8'
+    );
+    assert.match(svc, /EXTRA_PRESERVE_ACTIVE_CONTROLLER/);
+    assert.match(svc, /ACTION_SET_TRACKS/);
+    assert.match(svc, /EDIT_TRACKS_INFO/);
+    assert.match(svc, /isSupportedCastSourceUrl/);
+    assert.match(svc, /rewriteOfflineM3u8ForLanProxy/);
+    assert.match(svc, /isGenuineDlnaCompletion/);
+    assert.match(svc, /setKeepAlive\(true\)/);
+
+    const vlc = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java'),
+      'utf8'
+    );
+    assert.match(vlc, /currentStreamIsLocalOffline/);
+    assert.match(vlc, /resolveEffectiveBufferedPositionMs/);
+    assert.match(vlc, /!currentStreamIsLocalOffline && !hasProxyBufferTelemetry/);
   });
 });

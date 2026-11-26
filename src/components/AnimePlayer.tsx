@@ -156,6 +156,8 @@ interface AnimePlayerProps {
       pauseLocal?: () => void;
       canPromptWebRemote?: boolean;
       promptWebRemote?: () => Promise<void>;
+      availableStreams?: StreamQuality[];
+      availableSubtitles?: SubtitleTrack[];
     }
   ) => void;
   offlineDownload?: OfflineDownloadRecord;
@@ -167,6 +169,7 @@ interface AnimePlayerProps {
       promptWebRemote: () => Promise<void>;
       getCurrentTimeMs: () => number;
       getDurationMs: () => number;
+      isLocallyPlaying?: () => boolean;
     } | null
   ) => void;
   onToast: (message: string) => void;
@@ -1563,11 +1566,46 @@ export function AnimePlayer({
         const d = Number.isFinite(vDur) && vDur && vDur > 0 ? vDur : snap.duration || 0;
         return Math.max(0, Math.round(d * 1000));
       },
+      isLocallyPlaying: () =>
+        !castRuntimeRef.current.useNativeVlc &&
+        Boolean(videoRef.current && !videoRef.current.paused && !videoRef.current.ended),
     });
     return () => {
       onRegisterCastHelpers(null);
     };
   }, [onRegisterCastHelpers, onToast]);
+
+  const isCastingCurrentEpisode = Boolean(
+    castState?.active &&
+      episodeUrl &&
+      castState.episodeUrl &&
+      isSameEpisodeUrl(castState.episodeUrl, episodeUrl)
+  );
+
+  // Real-time playback time sync with TV when casting the currently viewed episode
+  useEffect(() => {
+    if (!isCastingCurrentEpisode || !castState) return;
+    const tvPosMs = Math.max(0, Math.round(castState.positionMs || 0));
+    const tvDurMs = Math.max(0, Math.round(castState.durationMs || 0));
+    if (tvPosMs > 0 || castState.status === 'paused') {
+      setNativeResumeMs(tvPosMs);
+    }
+    if (tvDurMs > 0) {
+      setNativeDurationMs(tvDurMs);
+    }
+    if (!useNativeVlc) {
+      const v = videoRef.current;
+      const localPaused = !v || v.paused;
+      if (localPaused) {
+        if (tvPosMs > 0 || castState.status === 'paused') {
+          setCurrentTime(tvPosMs / 1000);
+        }
+        if (tvDurMs > 0) {
+          setDuration(tvDurMs / 1000);
+        }
+      }
+    }
+  }, [castState, isCastingCurrentEpisode, useNativeVlc]);
 
   const handleOpenTvCast = useCallback(() => {
     if (!onOpenTvCast) return;
@@ -1575,11 +1613,21 @@ export function AnimePlayer({
     setEpisodesOpen(false);
     const activeSubEntry =
       activeSubId !== 'off' ? subEntries.find((s) => s.id === activeSubId) : undefined;
+    const selectedServerOpt = playerOptions.find((o) => o.nume === selectedServerNume);
+    const audioLabel =
+      selectedServerOpt?.audioType === 'DUB'
+        ? 'Dublado'
+        : selectedServerOpt?.audioType === 'LEG'
+          ? 'Legendado'
+          : selectedServerOpt?.label || '';
     const payload = activeStream
       ? buildCastMediaPayload({
           stream: activeStream,
           subtitles,
-          activeSubtitleUrl: activeSubEntry?.url,
+          activeSubtitleUrl: activeSubId === 'off' ? '' : activeSubEntry?.url,
+          subtitleDisabled: activeSubId === 'off',
+          qualityLabel: activeStream.label,
+          audioLabel,
           referer: referer || 'https://topanimes.net/',
           preferDirect,
           episodeUrl,
@@ -1615,6 +1663,8 @@ export function AnimePlayer({
           onToast('Não foi possível abrir o seletor de TV do navegador.');
         }
       },
+      availableStreams: streams,
+      availableSubtitles: subtitles,
     });
   }, [
     activeStream,
@@ -1629,6 +1679,7 @@ export function AnimePlayer({
     nextUrl,
     onOpenTvCast,
     onToast,
+    playerOptions,
     poster,
     preferDirect,
     prevUrl,
@@ -1636,6 +1687,7 @@ export function AnimePlayer({
     selectedServerNume,
     seriesTitle,
     seriesUrl,
+    streams,
     subEntries,
     subtitles,
     title,
@@ -2051,7 +2103,11 @@ export function AnimePlayer({
       ? Math.min(100, (displayCurrentSec / displayDurationSec) * 100)
       : 0;
   const bufferedPct =
-    !useNativeVlc && duration > 0 ? Math.min(100, (bufferedEnd / duration) * 100) : 0;
+    !useNativeVlc && duration > 0
+      ? isLocalOfflineActive
+        ? 100
+        : Math.min(100, (bufferedEnd / duration) * 100)
+      : 0;
 
   const effectiveErrorMsg = externalErrorMessage || errorMsg;
   const showEpisodeNav = Boolean(onPrevEpisode || onNextEpisode || seriesEpisodes.length > 0);

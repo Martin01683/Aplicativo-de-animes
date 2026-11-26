@@ -379,6 +379,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private long pendingBufferedRangeEnd = -1L;
     private long pendingBufferedTotalBytes = -1L;
     private boolean hasProxyBufferTelemetry = false;
+    private boolean currentStreamIsLocalOffline = false;
     private boolean playbackEnded = false;
     private boolean loadingEpisode = false;
     private boolean subtitlesAttached = false;
@@ -443,6 +444,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private boolean pendingPauseFromNoisyAudio = false;
     private TvCastDiscovery castDiscovery = null;
     private final List<TvCastProtocol.CastDevice> discoveredCastDevices = new ArrayList<>();
+    private TvCastProtocol.CastDevice lastCastTargetDevice = null;
+    private int castSubtitleSelectionIdx = -2;
     private boolean castScanning = false;
     private final TvCastService.StateListener castStateListener = snap -> uiHandler.post(() -> {
         if (isFinishing() || isDestroyed()) return;
@@ -583,7 +586,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     return;
                 }
                 if (settingsOverlay != null && settingsOverlay.getVisibility() == View.VISIBLE) {
-                    if (!"main".equals(settingsTab)) {
+                    if ("cast_quality".equals(settingsTab) || "cast_subs".equals(settingsTab) || "cast_audio".equals(settingsTab)) {
+                        renderSettingsTab("cast");
+                    } else if (!"main".equals(settingsTab)) {
                         renderSettingsTab("main");
                     } else {
                         closeSettingsMenu();
@@ -1209,7 +1214,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         if (activeSeekTargetMs >= 0L && pct < 100f) {
                             activeSeekLastBufferingElapsedMs = SystemClock.elapsedRealtime();
                         }
-                        if (!hasProxyBufferTelemetry && lastKnownDurationMs > 0L) {
+                        if (!currentStreamIsLocalOffline && !hasProxyBufferTelemetry && lastKnownDurationMs > 0L) {
                             long currentPos = Math.max(0L, lastKnownPositionMs);
                             float clampedPct = Math.max(0f, Math.min(100f, pct));
                             long cachedAheadMs = Math.round((clampedPct / 100f) * DIRECT_BUFFER_FALLBACK_WINDOW_MS);
@@ -1218,6 +1223,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                                 bufferedPositionMs = fallbackBuffered;
                                 updateSeekBarBufferedProgress();
                             }
+                        } else if (currentStreamIsLocalOffline && lastKnownDurationMs > 0L) {
+                            bufferedPositionMs = lastKnownDurationMs;
+                            updateSeekBarBufferedProgress();
                         }
                         if (pct >= 100f && !loadingEpisode && (hasActiveVout || hasPlaybackStartedForStream)) {
                             hideLoading();
@@ -1392,11 +1400,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             timeDurationView.setText(formatMs(totalLen));
                             flushPendingByteRangeBufferSample();
                         }
-                        if (!hasProxyBufferTelemetry && hasPlaybackStartedForStream && lastKnownDurationMs > 0L) {
+                        if (!currentStreamIsLocalOffline && !hasProxyBufferTelemetry && hasPlaybackStartedForStream && lastKnownDurationMs > 0L) {
                             long minDirectBuffered = Math.min(lastKnownDurationMs, timeMs + 3000L);
                             if (minDirectBuffered > bufferedPositionMs) {
                                 bufferedPositionMs = minDirectBuffered;
                             }
+                        } else if (currentStreamIsLocalOffline && lastKnownDurationMs > 0L) {
+                            bufferedPositionMs = lastKnownDurationMs;
                         }
                         updateSeekBarBufferedProgress();
                         if (pauseAfterRestoreFrame) {
@@ -1741,12 +1751,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
         final long nextBufferSession = ++bufferSessionCounter;
         activeBufferSessionId = nextBufferSession;
         hasProxyBufferTelemetry = false;
-        resetBufferProgress(pendingSeekMs);
 
         boolean isLocalOffline = isLocalOfflineUrl(item.url);
+        currentStreamIsLocalOffline = isLocalOffline;
         if (isLocalOffline) {
             useProxyForAttempt = false;
         }
+        resetBufferProgress(pendingSeekMs);
 
         String targetUrl = item.url;
         if (useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
@@ -2258,7 +2269,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
             // Consume clicks inside card
         });
         settingsHeader.setOnClickListener(v -> {
-            if ("quality".equals(settingsTab) || "subs".equals(settingsTab) || "cast".equals(settingsTab)) {
+            if ("cast_quality".equals(settingsTab) || "cast_subs".equals(settingsTab) || "cast_audio".equals(settingsTab)) {
+                renderSettingsTab("cast");
+            } else if ("quality".equals(settingsTab) || "subs".equals(settingsTab) || "cast".equals(settingsTab)) {
                 closeSettingsMenu();
             } else {
                 renderSettingsTab("main");
@@ -3370,6 +3383,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private JSONObject buildCurrentCastMediaJson() {
+        return buildCurrentCastMediaJson(Math.max(0L, captureCurrentPositionMs()));
+    }
+
+    private JSONObject buildCurrentCastMediaJson(long startPosMs) {
         JSONObject media = new JSONObject();
         try {
             StreamItem activeStream = (!streams.isEmpty() && currentStreamIdx >= 0 && currentStreamIdx < streams.size())
@@ -3388,37 +3405,94 @@ public class VlcPlayerActivity extends AppCompatActivity {
             media.put("poster", posterUrl != null ? posterUrl : "");
             media.put("isMovie", isMovieFlag);
             media.put("selectedServerNume", selectedServerNume != null ? selectedServerNume : "");
+            media.put("qualityLabel", activeStream != null && activeStream.label != null ? activeStream.label : "");
+            media.put("audioLabel", getCurrentCastAudioLabel());
             media.put("prevUrl", prevUrl != null ? prevUrl : "");
             media.put("nextUrl", nextUrl != null ? nextUrl : "");
             media.put("autoPlayNextEpisode", autoPlayNextEpisode);
-            media.put("startPositionMs", Math.max(0L, captureCurrentPositionMs()));
+            media.put("startPositionMs", Math.max(0L, startPosMs));
             media.put("durationMs", Math.max(0L, lastKnownDurationMs));
-            if (!userDisabledSubtitles && !subtitles.isEmpty()) {
-                SubtitleItem chosen = subtitles.get(0);
-                for (SubtitleItem s : subtitles) {
-                    if (s.isDefault) {
-                        chosen = s;
-                        break;
-                    }
+
+            JSONArray subsArr = new JSONArray();
+            for (SubtitleItem s : subtitles) {
+                if (s == null || s.url == null || s.url.trim().isEmpty()) continue;
+                JSONObject so = new JSONObject();
+                so.put("label", s.label != null ? s.label : "Legenda");
+                so.put("url", s.url.trim());
+                so.put("default", s.isDefault);
+                subsArr.put(so);
+            }
+            media.put("subtitles", subsArr);
+
+            boolean disableSubs = castSubtitleSelectionIdx == -1
+                || (castSubtitleSelectionIdx == -2 && userDisabledSubtitles);
+            media.put("subtitleDisabled", disableSubs);
+            if (!disableSubs && !subtitles.isEmpty()) {
+                SubtitleItem chosen = resolveActiveCastSubtitle();
+                if (chosen != null) {
+                    media.put("subtitleUrl", chosen.url);
+                    media.put("subtitleLabel", chosen.label);
                 }
-                media.put("subtitleUrl", chosen.url);
-                media.put("subtitleLabel", chosen.label);
+            } else {
+                media.put("subtitleUrl", "");
+                media.put("subtitleLabel", "");
             }
         } catch (Exception ignored) {
         }
         return media;
     }
 
+    private SubtitleItem resolveActiveCastSubtitle() {
+        if (subtitles.isEmpty()) return null;
+        if (castSubtitleSelectionIdx >= 0 && castSubtitleSelectionIdx < subtitles.size()) {
+            return subtitles.get(castSubtitleSelectionIdx);
+        }
+        if (castSubtitleSelectionIdx == -1 || (castSubtitleSelectionIdx == -2 && userDisabledSubtitles)) {
+            return null;
+        }
+        for (SubtitleItem s : subtitles) {
+            if (s.isDefault) return s;
+        }
+        return subtitles.get(0);
+    }
+
+    private String getCurrentCastAudioLabel() {
+        for (TopAnimesEpisodeResolver.ServerOption o : serverOptions) {
+            if (o.nume.equals(selectedServerNume) && o.label != null && !o.label.trim().isEmpty()) {
+                return o.label.trim();
+            }
+        }
+        return "";
+    }
+
+    private TvCastProtocol.CastDevice resolveActiveCastTargetDevice(JSONObject st) {
+        String activeId = st != null ? st.optString("deviceId", "") : "";
+        if (lastCastTargetDevice != null && (activeId.isEmpty() || activeId.equals(lastCastTargetDevice.id))) {
+            return lastCastTargetDevice;
+        }
+        for (TvCastProtocol.CastDevice dev : discoveredCastDevices) {
+            if (!activeId.isEmpty() && activeId.equals(dev.id)) {
+                return dev;
+            }
+        }
+        return lastCastTargetDevice;
+    }
+
     private void startCastToDevice(TvCastProtocol.CastDevice device) {
+        startCastToDeviceAt(device, Math.max(0L, captureCurrentPositionMs()));
+    }
+
+    private void startCastToDeviceAt(TvCastProtocol.CastDevice device, long startPosMs) {
         if (device == null || streams.isEmpty()) {
             Toast.makeText(this, "Nenhum vídeo carregado para transmitir.", Toast.LENGTH_SHORT).show();
             return;
         }
-        JSONObject media = buildCurrentCastMediaJson();
+        JSONObject media = buildCurrentCastMediaJson(startPosMs);
         if (media.optString("streamUrl", "").isEmpty()) {
             Toast.makeText(this, "Stream inválido para transmissão.", Toast.LENGTH_SHORT).show();
             return;
         }
+        lastCastTargetDevice = device;
         pausePlaybackForAudioRouteOrControl();
         saveCurrentEpisodeProgress(false);
 
@@ -3438,6 +3512,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
         renderSettingsTab("cast");
     }
 
+    private void sendCastSetTracks(JSONObject payload) {
+        if (!TvCastService.isCastActive() || payload == null) return;
+        Intent intent = new Intent(this, TvCastService.class);
+        intent.setAction(TvCastService.ACTION_SET_TRACKS);
+        intent.putExtra(TvCastService.EXTRA_TRACKS_JSON, payload.toString());
+        ContextCompat.startForegroundService(this, intent);
+    }
+
     private void launchExternalTvAppCast() {
         if (streams.isEmpty()) {
             Toast.makeText(this, "Nenhum vídeo carregado para transmitir.", Toast.LENGTH_SHORT).show();
@@ -3446,19 +3528,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
         JSONObject media = buildCurrentCastMediaJson();
         String fallbackUrl = media.optString("streamUrl", "");
         String format = media.optString("streamFormat", "mp4");
+        boolean preserveActiveController = TvCastService.hasActiveRemoteController();
         pausePlaybackForAudioRouteOrControl();
         saveCurrentEpisodeProgress(false);
 
+        TvCastService.clearPreparedLanStreamUrl();
         Intent serviceIntent = new Intent(this, TvCastService.class);
         serviceIntent.setAction(TvCastService.ACTION_PREPARE_LAN_ONLY);
         serviceIntent.putExtra(TvCastService.EXTRA_MEDIA_JSON, media.toString());
+        serviceIntent.putExtra(TvCastService.EXTRA_PRESERVE_ACTIVE_CONTROLLER, preserveActiveController);
         ContextCompat.startForegroundService(this, serviceIntent);
 
         bgExecutor.execute(() -> {
             String lanUrl = "";
             long deadline = System.currentTimeMillis() + 1500L;
             while (System.currentTimeMillis() < deadline) {
-                lanUrl = TvCastService.getActiveLanStreamUrl();
+                lanUrl = TvCastService.getPreparedLanStreamUrl();
                 if (lanUrl != null && !lanUrl.isEmpty()) break;
                 try {
                     Thread.sleep(60L);
@@ -3547,19 +3632,29 @@ public class VlcPlayerActivity extends AppCompatActivity {
             hint.setLayoutParams(hlp);
             settingsItems.addView(hint);
 
-            if (TvCastService.isCastActive()) {
-                JSONObject st = TvCastService.getCurrentStateJson();
+            JSONObject st = TvCastService.getCurrentStateJson();
+            boolean isActive = TvCastService.isCastActive();
+            if (isActive) {
                 String devName = st.optString("deviceName", "TV");
                 String stCode = st.optString("status", "playing");
                 boolean isPlayingOnTv = "playing".equals(stCode) || "buffering".equals(stCode);
+                long castPosMs = st.optLong("positionMs", 0L);
+                long castDurMs = st.optLong("durationMs", 0L);
                 String statusText = "playing".equals(stCode)
                     ? "Reproduzindo"
                     : "paused".equals(stCode)
                         ? "Pausado"
                         : "Conectando...";
+                if (castDurMs > 0L) {
+                    statusText = statusText + " · " + formatMs(castPosMs) + " / " + formatMs(castDurMs);
+                }
 
                 addSettingsRow(devName, statusText, true, v -> {});
-                if (!"lan-link".equals(st.optString("deliveryMode", ""))) {
+                boolean hasControls = TvCastProtocol.hasRemotePlaybackControls(
+                    st.optString("deviceProtocol", ""),
+                    st.optString("deliveryMode", "")
+                );
+                if (hasControls) {
                     addSettingsRow(
                         isPlayingOnTv ? "Pausar na TV" : "Reproduzir na TV",
                         "",
@@ -3608,6 +3703,52 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 settingsItems.addView(sep);
             }
 
+            // Quality / Audio / Subtitles options for TV casting (usable both before and during casting)
+            if (streams.size() > 1) {
+                String activeQ = (!streams.isEmpty() && currentStreamIdx >= 0 && currentStreamIdx < streams.size())
+                    ? streams.get(currentStreamIdx).label
+                    : "Auto";
+                addSettingsRow("Qualidade na TV", activeQ, false, v -> renderSettingsTab("cast_quality"));
+            }
+
+            JSONArray castMediaTracks = st.optJSONArray("mediaTracks");
+            boolean hasCastAudioTracks = false;
+            boolean hasCastTextTracks = false;
+            if (isActive && castMediaTracks != null) {
+                for (int i = 0; i < castMediaTracks.length(); i++) {
+                    JSONObject tr = castMediaTracks.optJSONObject(i);
+                    if (tr == null) continue;
+                    String tt = tr.optString("type", "");
+                    if ("AUDIO".equalsIgnoreCase(tt)) hasCastAudioTracks = true;
+                    if ("TEXT".equalsIgnoreCase(tt)) hasCastTextTracks = true;
+                }
+            }
+            if (hasCastAudioTracks || serverOptions.size() > 1) {
+                String audioSummary = getCurrentCastAudioLabel();
+                if (audioSummary.isEmpty()) audioSummary = "Padrão";
+                addSettingsRow("Áudio / Servidor na TV", audioSummary, false, v -> renderSettingsTab("cast_audio"));
+            }
+            if (!subtitles.isEmpty() || hasCastTextTracks) {
+                SubtitleItem activeCastSub = resolveActiveCastSubtitle();
+                String subSummary = activeCastSub != null ? activeCastSub.label : "Desativada";
+                if (isActive && st.has("subtitleLabel")) {
+                    String liveSub = st.optString("subtitleLabel", "").trim();
+                    subSummary = liveSub.isEmpty() ? "Desativada" : liveSub;
+                }
+                addSettingsRow("Legendas na TV", subSummary, false, v -> renderSettingsTab("cast_subs"));
+            }
+
+            View sep2 = new View(this);
+            LinearLayout.LayoutParams slp2 = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(1)
+            );
+            slp2.topMargin = dp(4);
+            slp2.bottomMargin = dp(6);
+            sep2.setLayoutParams(slp2);
+            sep2.setBackgroundColor(Color.parseColor("#1AFFFFFF"));
+            settingsItems.addView(sep2);
+
             if (discoveredCastDevices.isEmpty()) {
                 addSettingsRow(
                     castScanning ? "Buscando TVs no Wi-Fi..." : "Nenhuma TV encontrada no Wi-Fi",
@@ -3631,6 +3772,183 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 closeSettingsMenu();
                 launchExternalTvAppCast();
             });
+            return;
+        }
+
+        if ("cast_quality".equals(tab)) {
+            settingsHeaderTitle.setText("Qualidade na TV");
+            JSONObject st = TvCastService.getCurrentStateJson();
+            boolean isActive = TvCastService.isCastActive();
+            for (int i = 0; i < streams.size(); i++) {
+                final int idx = i;
+                boolean active = idx == currentStreamIdx;
+                addSettingsRow(
+                    streams.get(i).label,
+                    active ? "✓" : "",
+                    active,
+                    v -> {
+                        currentStreamIdx = idx;
+                        updateQualityLabel();
+                        if (isActive) {
+                            TvCastProtocol.CastDevice targetDev = resolveActiveCastTargetDevice(st);
+                            if (targetDev != null) {
+                                long livePos = Math.max(0L, st.optLong("positionMs", captureCurrentPositionMs()));
+                                startCastToDeviceAt(targetDev, livePos);
+                                return;
+                            }
+                        }
+                        renderSettingsTab("cast");
+                    }
+                );
+            }
+            return;
+        }
+
+        if ("cast_subs".equals(tab)) {
+            settingsHeaderTitle.setText("Legendas na TV");
+            JSONObject st = TvCastService.getCurrentStateJson();
+            boolean isActive = TvCastService.isCastActive();
+            boolean isChromecast = isActive
+                && TvCastProtocol.PROTOCOL_CHROMECAST.equalsIgnoreCase(st.optString("deviceProtocol", ""));
+
+            // Collect non-TEXT active trackIds (e.g. AUDIO) so changing subtitles preserves audio track on Chromecast
+            List<Long> preservedAudioTrackIds = new ArrayList<>();
+            JSONArray rawMediaTracks = st.optJSONArray("mediaTracks");
+            JSONArray rawActiveIds = st.optJSONArray("activeTrackIds");
+            if (isChromecast && rawMediaTracks != null && rawActiveIds != null) {
+                for (int i = 0; i < rawActiveIds.length(); i++) {
+                    long aid = rawActiveIds.optLong(i, -1L);
+                    if (aid < 0L) continue;
+                    for (int j = 0; j < rawMediaTracks.length(); j++) {
+                        JSONObject tr = rawMediaTracks.optJSONObject(j);
+                        if (tr != null && tr.optLong("trackId", -1L) == aid
+                            && !"TEXT".equalsIgnoreCase(tr.optString("type", ""))) {
+                            preservedAudioTrackIds.add(aid);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            SubtitleItem currentSub = resolveActiveCastSubtitle();
+            boolean isOff = isActive
+                ? st.optString("subtitleUrl", "").trim().isEmpty()
+                : (currentSub == null);
+            addSettingsRow("Desativada", isOff ? "✓" : "", isOff, v -> {
+                castSubtitleSelectionIdx = -1;
+                if (isActive) {
+                    try {
+                        JSONObject req = new JSONObject();
+                        req.put("subtitleDisabled", true);
+                        req.put("subtitleUrl", "");
+                        req.put("subtitleLabel", "");
+                        if (isChromecast) {
+                            JSONArray ids = new JSONArray();
+                            for (Long id : preservedAudioTrackIds) ids.put(id.longValue());
+                            req.put("activeTrackIds", ids);
+                        }
+                        sendCastSetTracks(req);
+                    } catch (Exception ignored) {
+                    }
+                }
+                renderSettingsTab("cast");
+            });
+
+            for (int i = 0; i < subtitles.size(); i++) {
+                final int idx = i;
+                final SubtitleItem sub = subtitles.get(i);
+                boolean active = !isOff && (isActive
+                    ? sub.url.equals(st.optString("subtitleUrl", ""))
+                    : (currentSub != null && sub.url.equals(currentSub.url)));
+                addSettingsRow(sub.label, active ? "✓" : "", active, v -> {
+                    castSubtitleSelectionIdx = idx;
+                    if (isActive) {
+                        try {
+                            JSONObject req = new JSONObject();
+                            req.put("subtitleDisabled", false);
+                            req.put("subtitleUrl", sub.url);
+                            req.put("subtitleLabel", sub.label);
+                            if (isChromecast) {
+                                JSONArray ids = new JSONArray();
+                                for (Long id : preservedAudioTrackIds) ids.put(id.longValue());
+                                ids.put(idx + 1L);
+                                req.put("activeTrackIds", ids);
+                            }
+                            sendCastSetTracks(req);
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    renderSettingsTab("cast");
+                });
+            }
+            return;
+        }
+
+        if ("cast_audio".equals(tab)) {
+            settingsHeaderTitle.setText("Áudio / Servidor na TV");
+            JSONObject st = TvCastService.getCurrentStateJson();
+            boolean isActive = TvCastService.isCastActive();
+            boolean isChromecast = isActive
+                && TvCastProtocol.PROTOCOL_CHROMECAST.equalsIgnoreCase(st.optString("deviceProtocol", ""));
+            JSONArray rawMediaTracks = st.optJSONArray("mediaTracks");
+            JSONArray rawActiveIds = st.optJSONArray("activeTrackIds");
+
+            if (isChromecast && rawMediaTracks != null) {
+                List<Long> preservedTextTrackIds = new ArrayList<>();
+                if (rawActiveIds != null) {
+                    for (int i = 0; i < rawActiveIds.length(); i++) {
+                        long aid = rawActiveIds.optLong(i, -1L);
+                        for (int j = 0; j < rawMediaTracks.length(); j++) {
+                            JSONObject tr = rawMediaTracks.optJSONObject(j);
+                            if (tr != null && tr.optLong("trackId", -1L) == aid
+                                && "TEXT".equalsIgnoreCase(tr.optString("type", ""))) {
+                                preservedTextTrackIds.add(aid);
+                                break;
+                            }
+                        }
+                    }
+                }
+                for (int i = 0; i < rawMediaTracks.length(); i++) {
+                    JSONObject tr = rawMediaTracks.optJSONObject(i);
+                    if (tr == null || !"AUDIO".equalsIgnoreCase(tr.optString("type", ""))) continue;
+                    final long trackId = tr.optLong("trackId", -1L);
+                    if (trackId < 0L) continue;
+                    String label = tr.optString("name", "").trim();
+                    String lang = tr.optString("language", "").trim();
+                    if (label.isEmpty()) label = lang.isEmpty() ? ("Faixa de Áudio " + trackId) : lang;
+                    boolean selected = false;
+                    if (rawActiveIds != null) {
+                        for (int k = 0; k < rawActiveIds.length(); k++) {
+                            if (rawActiveIds.optLong(k, -1L) == trackId) {
+                                selected = true;
+                                break;
+                            }
+                        }
+                    }
+                    addSettingsRow(label, selected ? "✓" : "TV", selected, v -> {
+                        try {
+                            JSONObject req = new JSONObject();
+                            JSONArray ids = new JSONArray();
+                            ids.put(trackId);
+                            for (Long tid : preservedTextTrackIds) ids.put(tid.longValue());
+                            req.put("activeTrackIds", ids);
+                            sendCastSetTracks(req);
+                        } catch (Exception ignored) {
+                        }
+                        renderSettingsTab("cast");
+                    });
+                }
+            }
+
+            for (TopAnimesEpisodeResolver.ServerOption opt : serverOptions) {
+                boolean active = opt.nume.equals(selectedServerNume);
+                addSettingsRow(opt.label, active ? "✓" : "", active, v -> {
+                    closeSettingsMenu();
+                    if (!active) {
+                        switchServerInFullscreen(opt);
+                    }
+                });
+            }
             return;
         }
 
@@ -4682,6 +5000,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
     }
 
+    static long resolveEffectiveBufferedPositionMs(
+        boolean isLocalOffline,
+        long currentPosMs,
+        long bufferedPosMs,
+        long totalDurationMs
+    ) {
+        if (totalDurationMs <= 0L) return 0L;
+        if (isLocalOffline) {
+            // Video is already 100% downloaded on device storage; never fabricate a partial buffer window.
+            return totalDurationMs;
+        }
+        long clampedPos = Math.max(0L, Math.min(currentPosMs, totalDurationMs));
+        long clampedBuf = Math.max(0L, Math.min(bufferedPosMs, totalDurationMs));
+        return Math.max(clampedPos, clampedBuf);
+    }
+
     private void updateSeekBarBufferedProgress() {
         if (seekBar == null) return;
         long total = lastKnownDurationMs;
@@ -4701,12 +5035,22 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return;
         }
         long currentPos = Math.max(0L, lastKnownPositionMs);
-        long effectiveBuffered = Math.max(currentPos, Math.min(bufferedPositionMs, total));
+        long effectiveBuffered = resolveEffectiveBufferedPositionMs(
+            currentStreamIsLocalOffline,
+            currentPos,
+            bufferedPositionMs,
+            total
+        );
+        if (currentStreamIsLocalOffline) {
+            bufferedPositionMs = total;
+        }
         seekBar.setSecondaryProgress((int) Math.min(Integer.MAX_VALUE, effectiveBuffered));
     }
 
     private void resetBufferProgress(long anchorMs) {
-        bufferedPositionMs = Math.max(0L, anchorMs);
+        bufferedPositionMs = (currentStreamIsLocalOffline && lastKnownDurationMs > 0L)
+            ? lastKnownDurationMs
+            : Math.max(0L, anchorMs);
         pendingBufferedRangeStart = -1L;
         pendingBufferedRangeEnd = -1L;
         pendingBufferedTotalBytes = -1L;
@@ -4714,9 +5058,13 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void onSeekCommitted(long previousPosMs, long targetMs) {
-        long clampedTarget = Math.max(0L, targetMs);
-        if (clampedTarget < previousPosMs || clampedTarget > bufferedPositionMs) {
-            bufferedPositionMs = clampedTarget;
+        if (currentStreamIsLocalOffline && lastKnownDurationMs > 0L) {
+            bufferedPositionMs = lastKnownDurationMs;
+        } else {
+            long clampedTarget = Math.max(0L, targetMs);
+            if (clampedTarget < previousPosMs || clampedTarget > bufferedPositionMs) {
+                bufferedPositionMs = clampedTarget;
+            }
         }
         pendingBufferedRangeStart = -1L;
         pendingBufferedRangeEnd = -1L;

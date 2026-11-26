@@ -2,6 +2,7 @@ import { Cast, ChevronUp, Loader2, Pause, Play, Square } from 'lucide-react';
 import {
   formatCastDurationMs,
   formatCastStatusLabel,
+  hasRemoteTvControls,
   tvCastPause,
   tvCastPlay,
   tvCastStop,
@@ -21,6 +22,7 @@ export function ActiveCastBar({ castState, onOpenControls, onStop }: ActiveCastB
     castState.status === 'playing' ||
     castState.status === 'buffering' ||
     castState.status === 'connecting';
+  const showRemoteControls = hasRemoteTvControls(castState);
 
   const progressPct =
     castState.durationMs > 0
@@ -78,7 +80,7 @@ export function ActiveCastBar({ castState, onOpenControls, onStop }: ActiveCastB
           <span className="hidden xs:inline sm:inline">Controles</span>
         </button>
 
-        {castState.deliveryMode !== 'lan-link' && (
+        {showRemoteControls && (
           <button
             type="button"
             onClick={() => void (isPlaying ? tvCastPause() : tvCastPlay())}

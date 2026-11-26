@@ -29,12 +29,15 @@ import {
 import {
   controlServerTvCast,
   convertSrtToVtt,
+  convertVttToSrt,
   discoverLanTvDevices,
   getCachedLanTvDevices,
   getServerCastSessionByToken,
   getServerCastState,
   prepareServerLanLink,
+  resolveServerOfflineAsset,
   rewriteM3u8ForServerLanProxy,
+  stageServerOfflineAsset,
   startServerTvCast,
   stopServerTvCast,
 } from './src/lib/serverTvCast.ts';
@@ -472,12 +475,39 @@ async function createAppServer(): Promise<void> {
     }
   });
 
+  app.post(
+    '/api/tv-cast/upload-offline',
+    express.raw({ type: '*/*', limit: '2gb' }),
+    (req: Request, res: Response) => {
+      const kind = String(req.query.kind || 'video') === 'subtitle' ? 'subtitle' : 'video';
+      const contentType = String(req.header('content-type') || (kind === 'subtitle' ? 'text/vtt' : 'video/mp4'));
+      const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      if (buf.length === 0) {
+        res.status(400).json({ ok: false, error: 'Arquivo offline vazio.' });
+        return;
+      }
+      try {
+        const offlineUrl = stageServerOfflineAsset(buf, contentType, kind);
+        res.json({ ok: true, offlineUrl });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'Falha ao preparar arquivo offline para TV.',
+        });
+      }
+    }
+  );
+
   app.post('/api/tv-cast/control', async (req: Request, res: Response) => {
     const body = (req.body || {}) as {
-      action?: 'play' | 'pause' | 'toggle' | 'seek' | 'seekBy' | 'volume';
+      action?: 'play' | 'pause' | 'toggle' | 'seek' | 'seekBy' | 'volume' | 'setTracks';
       positionMs?: number;
       deltaMs?: number;
       volume?: number;
+      activeTrackIds?: number[];
+      subtitleDisabled?: boolean;
+      subtitleUrl?: string;
+      subtitleLabel?: string;
     };
     if (!body.action) {
       res.status(400).json({ error: 'Ação de controle obrigatória.' });
@@ -489,6 +519,10 @@ async function createAppServer(): Promise<void> {
         positionMs: body.positionMs,
         deltaMs: body.deltaMs,
         volume: body.volume,
+        activeTrackIds: body.activeTrackIds,
+        subtitleDisabled: body.subtitleDisabled,
+        subtitleUrl: body.subtitleUrl,
+        subtitleLabel: body.subtitleLabel,
       });
       res.json({ ok: true, state });
     } catch (err) {
@@ -505,12 +539,15 @@ async function createAppServer(): Promise<void> {
   });
 
   app.post('/api/tv-cast/prepare-link', (req: Request, res: Response) => {
-    const body = (req.body || {}) as { media?: TvCastMediaPayload };
+    const body = (req.body || {}) as {
+      media?: TvCastMediaPayload;
+      preserveActiveController?: boolean;
+    };
     if (!body.media?.streamUrl) {
       res.status(400).json({ error: 'Stream obrigatório.' });
       return;
     }
-    const prepared = prepareServerLanLink(body.media, PORT);
+    const prepared = prepareServerLanLink(body.media, PORT, body.preserveActiveController !== false);
     res.json({ ...prepared, opened: false });
   });
 
@@ -546,28 +583,88 @@ async function createAppServer(): Promise<void> {
       if (!res.writableEnded) streamAbort.abort();
     });
 
-    if (asset === 'subtitle.vtt') {
-      if (!session.subtitleUrl || !isSafeExternalHttpUrl(session.subtitleUrl)) {
+    const indexedSubMatch = asset.match(/^sub-(\d+)\.(vtt|srt)$/i);
+    if (asset === 'subtitle.vtt' || asset === 'subtitle.srt' || indexedSubMatch) {
+      const asSrt = asset.toLowerCase().endsWith('.srt');
+      let targetSubUrl = session.subtitleUrl;
+      if (indexedSubMatch) {
+        const subIdx = Number.parseInt(indexedSubMatch[1], 10);
+        targetSubUrl = session.subtitles[subIdx]?.url || '';
+      }
+      if (!targetSubUrl) {
         res.status(404).send('Legenda indisponível');
         return;
       }
       try {
-        const subRes = await safeFetch(session.subtitleUrl, {
-          referer: session.referer,
-          accept: 'text/vtt,text/plain,*/*',
-          timeoutMs: 10000,
-          signal: streamAbort.signal,
-        });
-        if (!subRes.ok) {
+        let rawSubText = '';
+        const stagedSub = resolveServerOfflineAsset(targetSubUrl);
+        if (stagedSub) {
+          rawSubText = fs.readFileSync(stagedSub.filePath, 'utf8');
+        } else if (isSafeExternalHttpUrl(targetSubUrl)) {
+          const subRes = await safeFetch(targetSubUrl, {
+            referer: session.referer,
+            accept: 'text/vtt,text/plain,*/*',
+            timeoutMs: 10000,
+            signal: streamAbort.signal,
+          });
+          if (!subRes.ok) {
+            res.status(404).send('Legenda indisponível');
+            return;
+          }
+          rawSubText = await subRes.text();
+        } else {
           res.status(404).send('Legenda indisponível');
           return;
         }
-        const vtt = convertSrtToVtt(await subRes.text());
+        const body = asSrt ? convertVttToSrt(rawSubText) : convertSrtToVtt(rawSubText);
         res.status(200);
-        res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
-        res.send(vtt);
+        res.setHeader('Content-Type', asSrt ? 'text/srt; charset=utf-8' : 'text/vtt; charset=utf-8');
+        res.send(body);
       } catch {
         if (!res.headersSent) res.status(502).send('Erro ao carregar legenda');
+      }
+      return;
+    }
+
+    if (session.lanSubtitleSrtUrl) {
+      res.setHeader('CaptionInfo.sec', session.lanSubtitleSrtUrl);
+    }
+
+    const offlineVideo = resolveServerOfflineAsset(session.streamUrl);
+    if (offlineVideo && (asset === 'offline.mp4' || !req.query.url)) {
+      try {
+        const stat = fs.statSync(offlineVideo.filePath);
+        const totalSize = stat.size;
+        const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : '';
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', offlineVideo.mimeType || 'video/mp4');
+
+        if (rangeHeader) {
+          const m = rangeHeader.match(/^bytes=(\d*)-(\d*)$/i);
+          if (m) {
+            let start = m[1] ? Number.parseInt(m[1], 10) : 0;
+            let end = m[2] ? Math.min(Number.parseInt(m[2], 10), totalSize - 1) : totalSize - 1;
+            if (!m[1] && m[2]) {
+              const suffixLen = Number.parseInt(m[2], 10);
+              start = Math.max(0, totalSize - suffixLen);
+              end = totalSize - 1;
+            }
+            if (start < 0 || start >= totalSize || start > end) {
+              res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+              return;
+            }
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+            res.setHeader('Content-Length', String(end - start + 1));
+            fs.createReadStream(offlineVideo.filePath, { start, end }).pipe(res);
+            return;
+          }
+        }
+        res.status(200);
+        res.setHeader('Content-Length', String(totalSize));
+        fs.createReadStream(offlineVideo.filePath).pipe(res);
+      } catch {
+        if (!res.headersSent) res.status(404).send('Vídeo offline indisponível');
       }
       return;
     }

@@ -1,13 +1,17 @@
 import crypto from 'node:crypto';
 import dgram from 'node:dgram';
+import fs from 'node:fs';
 import os from 'node:os';
+import path from 'node:path';
 import tls from 'node:tls';
 import {
   IDLE_TV_CAST_STATE,
   dedupeCastDevices,
+  hasRemoteTvControls,
   type TvCastDeliveryPreference,
   type TvCastDevice,
   type TvCastMediaPayload,
+  type TvCastMediaTrack,
   type TvCastStateSnapshot,
 } from './tvCast.ts';
 import { isSafeExternalHttpUrl } from './urlSafety.ts';
@@ -380,16 +384,19 @@ export function buildDidlLiteMetadata(params: {
   poster?: string;
   mediaUrl: string;
   mimeType: string;
+  subtitleUrl?: string;
 }): string {
   const safeTitle = escapeXml(params.title || 'Anisync');
   const safeSeries = escapeXml(params.seriesTitle || '');
   const safeMime = escapeXml(params.mimeType || 'video/mp4');
   const safeUrl = escapeXml(params.mediaUrl);
+  const cleanSub = (params.subtitleUrl || '').trim();
 
   let xml =
     '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" ' +
     'xmlns:dc="http://purl.org/dc/elements/1.1/" ' +
-    'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">' +
+    'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" ' +
+    'xmlns:sec="http://www.sec.co.kr/">' +
     `<item id="0" parentID="-1" restricted="1"><dc:title>${safeTitle}</dc:title>`;
   if (safeSeries) {
     xml += `<upnp:seriesTitle>${safeSeries}</upnp:seriesTitle>`;
@@ -400,8 +407,15 @@ export function buildDidlLiteMetadata(params: {
   const dlnaOp = /mpegurl/i.test(safeMime) ? '10' : '01';
   xml +=
     '<upnp:class>object.item.videoItem.movie</upnp:class>' +
-    `<res protocolInfo="http-get:*:${safeMime}:DLNA.ORG_OP=${dlnaOp};DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000">${safeUrl}</res>` +
-    '</item></DIDL-Lite>';
+    `<res protocolInfo="http-get:*:${safeMime}:DLNA.ORG_OP=${dlnaOp};DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000">${safeUrl}</res>`;
+  if (cleanSub) {
+    const safeSub = escapeXml(cleanSub);
+    xml +=
+      `<res protocolInfo="http-get:*:text/srt:*">${safeSub}</res>` +
+      `<sec:CaptionInfoEx sec:type="srt">${safeSub}</sec:CaptionInfoEx>` +
+      `<sec:CaptionInfo sec:type="srt">${safeSub}</sec:CaptionInfo>`;
+  }
+  xml += '</item></DIDL-Lite>';
   return xml;
 }
 
@@ -460,6 +474,18 @@ export function parseDlnaMuteState(xml: string): boolean | null {
   return null;
 }
 
+export function isGenuineServerDlnaCompletion(
+  sawPlaying: boolean,
+  positionMs: number,
+  durationMs: number,
+  consecutiveStoppedPolls: number
+): boolean {
+  if (!sawPlaying || consecutiveStoppedPolls < 3) return false;
+  if (!Number.isFinite(durationMs) || durationMs < 60_000) return false;
+  const minThreshold = Math.max(durationMs - 15_000, Math.floor(durationMs * 0.92));
+  return positionMs >= minThreshold;
+}
+
 export function convertSrtToVtt(raw: string): string {
   const clean = String(raw || '')
     .replace(/^\uFEFF/, '')
@@ -472,6 +498,101 @@ export function convertSrtToVtt(raw: string): string {
     '$1.$2$3$4.$5'
   );
   return `WEBVTT\n\n${converted}\n`;
+}
+
+export function convertVttToSrt(raw: string): string {
+  const clean = String(raw || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+  if (!clean) return '';
+  if (!/^WEBVTT/i.test(clean)) return `${clean}\n`;
+
+  const blocks = clean.split(/\n{2,}/);
+  const out: string[] = [];
+  let cueIdx = 1;
+  for (const block of blocks) {
+    const lines = block.split('\n').map((l) => l.trimEnd());
+    if (lines.length === 0) continue;
+    if (/^(WEBVTT|NOTE|STYLE|REGION)\b/i.test(lines[0].trim())) continue;
+    let tsIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].includes('-->')) {
+        tsIdx = i;
+        break;
+      }
+    }
+    if (tsIdx < 0) continue;
+    const rawTs = lines[tsIdx]
+      .replace(/^(\d{2}:\d{2}\.\d{3})/, '00:$1')
+      .replace(/(-->\s*)(\d{2}:\d{2}\.\d{3})/, '$100:$2')
+      .replace(/(\d{1,2}:\d{2}:\d{2})\.(\d{1,3})/g, '$1,$2')
+      .replace(/\s+(?:align|position|line|size|vertical):[^\s]+/gi, '')
+      .trim();
+    const cueText = lines
+      .slice(tsIdx + 1)
+      .join('\n')
+      .replace(/<[^>]+>/g, '')
+      .trim();
+    if (!cueText) continue;
+    out.push(`${cueIdx}\n${rawTs}\n${cueText}`);
+    cueIdx++;
+  }
+  return out.length > 0 ? `${out.join('\n\n')}\n` : '';
+}
+
+interface StagedOfflineAsset {
+  id: string;
+  filePath: string;
+  mimeType: string;
+  createdAt: number;
+}
+
+const OFFLINE_URL_PREFIX = 'anisync-offline://';
+const OFFLINE_TMP_DIR = path.join(os.tmpdir(), 'anisync-tv-cast-offline');
+const stagedOfflineAssets = new Map<string, StagedOfflineAsset>();
+
+export function stageServerOfflineAsset(buffer: Buffer, mimeType: string, kind: 'video' | 'subtitle'): string {
+  fs.mkdirSync(OFFLINE_TMP_DIR, { recursive: true });
+  const now = Date.now();
+  // Clean up assets older than 6 hours
+  for (const [id, item] of stagedOfflineAssets.entries()) {
+    if (now - item.createdAt > 6 * 60 * 60 * 1000) {
+      stagedOfflineAssets.delete(id);
+      fs.promises.unlink(item.filePath).catch(() => {});
+    }
+  }
+  const id = crypto.randomBytes(12).toString('hex');
+  const ext = kind === 'subtitle' ? '.vtt' : mimeType.includes('webm') ? '.webm' : '.mp4';
+  const filePath = path.join(OFFLINE_TMP_DIR, `${id}${ext}`);
+  fs.writeFileSync(filePath, buffer);
+  stagedOfflineAssets.set(id, {
+    id,
+    filePath,
+    mimeType: mimeType || (kind === 'subtitle' ? 'text/vtt; charset=utf-8' : 'video/mp4'),
+    createdAt: now,
+  });
+  return `${OFFLINE_URL_PREFIX}${id}`;
+}
+
+export function resolveServerOfflineAsset(rawUrl: string): StagedOfflineAsset | null {
+  const clean = (rawUrl || '').trim();
+  if (!clean.startsWith(OFFLINE_URL_PREFIX)) return null;
+  const id = clean.slice(OFFLINE_URL_PREFIX.length).replace(/[^a-f0-9]/gi, '');
+  if (!id) return null;
+  const asset = stagedOfflineAssets.get(id);
+  if (!asset || !fs.existsSync(asset.filePath)) return null;
+  return asset;
+}
+
+export function isSupportedServerCastUrl(rawUrl: string | undefined): boolean {
+  const clean = (rawUrl || '').trim();
+  if (!clean) return false;
+  if (clean.startsWith(OFFLINE_URL_PREFIX)) {
+    return resolveServerOfflineAsset(clean) !== null;
+  }
+  return isSafeExternalHttpUrl(clean);
 }
 
 export function rewriteM3u8ForServerLanProxy(
@@ -865,6 +986,7 @@ interface ActiveServerCastSession {
   lanBaseUrl: string;
   lanStreamUrl: string;
   lanSubtitleUrl: string;
+  lanSubtitleSrtUrl: string;
   state: TvCastStateSnapshot;
   pollTimer?: ReturnType<typeof setInterval>;
   // Chromecast state
@@ -876,16 +998,33 @@ interface ActiveServerCastSession {
   appSessionId?: string;
   mediaSessionId?: number;
   mediaLoaded?: boolean;
+  reattachPending?: boolean;
+  reconnecting?: boolean;
+  reconnectAttempts?: number;
   lastPingMs?: number;
+  lastPacketMs?: number;
   initialVolumeResolve?: () => void;
   // DLNA / volume sync state
   dlnaSawPlaying?: boolean;
   dlnaPollCount?: number;
+  dlnaConsecutiveStoppedPolls?: number;
   lastVolumeSetAtMs?: number;
+  lastSeekTargetMs?: number;
+  lastSeekRequestedAtMs?: number;
+}
+
+interface PreparedLanLinkEntry {
+  streamUrl: string;
+  referer: string;
+  subtitleUrl: string;
+  subtitles: Array<{ label: string; url: string; default?: boolean }>;
+  streamFormat: string;
+  createdAt: number;
 }
 
 let activeSession: ActiveServerCastSession | null = null;
 let sessionGenCounter = 0;
+const preparedLanLinks = new Map<string, PreparedLanLinkEntry>();
 
 export function getServerCastState(): TvCastStateSnapshot {
   return activeSession ? { ...activeSession.state } : { ...IDLE_TV_CAST_STATE };
@@ -895,15 +1034,33 @@ export function getServerCastSessionByToken(token: string): {
   streamUrl: string;
   referer: string;
   subtitleUrl: string;
+  subtitles: Array<{ label: string; url: string; default?: boolean }>;
   streamFormat: string;
+  lanSubtitleSrtUrl: string;
 } | null {
-  if (!activeSession || !token || activeSession.token !== token) return null;
-  return {
-    streamUrl: activeSession.media.streamUrl,
-    referer: activeSession.media.referer || 'https://topanimes.net/',
-    subtitleUrl: activeSession.media.subtitleUrl || '',
-    streamFormat: activeSession.media.streamFormat || 'mp4',
-  };
+  if (!token) return null;
+  if (activeSession && activeSession.token === token) {
+    return {
+      streamUrl: activeSession.media.streamUrl,
+      referer: activeSession.media.referer || 'https://topanimes.net/',
+      subtitleUrl: activeSession.media.subtitleDisabled ? '' : activeSession.media.subtitleUrl || '',
+      subtitles: activeSession.media.subtitles || [],
+      streamFormat: activeSession.media.streamFormat || 'mp4',
+      lanSubtitleSrtUrl: activeSession.media.subtitleDisabled ? '' : activeSession.lanSubtitleSrtUrl || '',
+    };
+  }
+  const link = preparedLanLinks.get(token);
+  if (link) {
+    return {
+      streamUrl: link.streamUrl,
+      referer: link.referer,
+      subtitleUrl: link.subtitleUrl,
+      subtitles: link.subtitles,
+      streamFormat: link.streamFormat,
+      lanSubtitleSrtUrl: '',
+    };
+  }
+  return null;
 }
 
 async function probeDirectPlayable(rawUrl: string): Promise<boolean> {
@@ -968,9 +1125,37 @@ function sendChromecastLoad(sess: ActiveServerCastSession, urlToLoad: string): v
     loadMsg.currentTime = sess.media.startPositionMs / 1000;
   }
 
-  if (sess.lanSubtitleUrl && sess.state.deliveryMode === 'background-proxy') {
-    mediaObj.tracks = [
-      {
+  if (sess.state.deliveryMode === 'background-proxy' && sess.lanBaseUrl) {
+    const subDisabled = Boolean(sess.media.subtitleDisabled);
+    const subList = (sess.media.subtitles || []).filter((s) => Boolean(s?.url));
+    const tracks: Array<Record<string, unknown>> = [];
+    let selectedTrackId = -1;
+
+    if (subList.length > 0) {
+      subList.forEach((sub, idx) => {
+        const trackId = idx + 1;
+        tracks.push({
+          trackId,
+          type: 'TEXT',
+          trackContentId: `${sess.lanBaseUrl}/api/tv-cast/media/${sess.token}/sub-${idx}.vtt`,
+          trackContentType: 'text/vtt',
+          name: sub.label || `Legenda ${trackId}`,
+          language: 'pt-BR',
+          subtype: 'SUBTITLES',
+        });
+        if (!subDisabled) {
+          if (sess.media.subtitleUrl && sess.media.subtitleUrl === sub.url) {
+            selectedTrackId = trackId;
+          } else if (selectedTrackId < 0 && sub.default) {
+            selectedTrackId = trackId;
+          }
+        }
+      });
+      if (!subDisabled && selectedTrackId < 0 && sess.media.subtitleUrl) {
+        selectedTrackId = 1;
+      }
+    } else if (sess.lanSubtitleUrl) {
+      tracks.push({
         trackId: 1,
         type: 'TEXT',
         trackContentId: sess.lanSubtitleUrl,
@@ -978,35 +1163,66 @@ function sendChromecastLoad(sess: ActiveServerCastSession, urlToLoad: string): v
         name: sess.media.subtitleLabel || 'Português',
         language: 'pt-BR',
         subtype: 'SUBTITLES',
-      },
-    ];
-    loadMsg.activeTrackIds = [1];
+      });
+      if (!subDisabled) selectedTrackId = 1;
+    }
+
+    if (tracks.length > 0) {
+      mediaObj.tracks = tracks;
+      loadMsg.activeTrackIds = !subDisabled && selectedTrackId > 0 ? [selectedTrackId] : [];
+    }
   }
 
   sendCastJson(sess, sess.transportId, CAST_NS_MEDIA, loadMsg);
+}
+
+class DlnaSoapHttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
 }
 
 async function sendDlnaSoap(
   controlUrl: string,
   serviceType: string,
   action: string,
-  args: Record<string, string>
+  args: Record<string, string>,
+  timeoutMs = 4500,
+  maxAttempts = 2
 ): Promise<string> {
   const body = buildSoapEnvelope(serviceType, action, args);
-  const res = await fetch(controlUrl, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/xml; charset="utf-8"',
-      SOAPACTION: `"${serviceType}#${action}"`,
-    },
-    body,
-    signal: AbortSignal.timeout(5500),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`TV DLNA retornou HTTP ${res.status} (${action})`);
+  const attempts = Math.max(1, maxAttempts);
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      const res = await fetch(controlUrl, {
+        method: 'POST',
+        headers: {
+          Connection: 'close',
+          'Content-Type': 'text/xml; charset="utf-8"',
+          SOAPACTION: `"${serviceType}#${action}"`,
+        },
+        body,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      const text = await res.text();
+      if (!res.ok) {
+        throw new DlnaSoapHttpError(res.status, `TV DLNA retornou HTTP ${res.status} (${action})`);
+      }
+      return text;
+    } catch (err) {
+      if (err instanceof DlnaSoapHttpError) {
+        throw err;
+      }
+      lastErr = err;
+      if (attempt < attempts) {
+        await new Promise((r) => setTimeout(r, 180 * attempt));
+      }
+    }
   }
-  return text;
+  throw lastErr instanceof Error ? lastErr : new Error(`Falha DLNA SOAP (${action})`);
 }
 
 async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<boolean> {
@@ -1014,10 +1230,14 @@ async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<bool
   if (!renderingUrl) return false;
   let syncedAny = false;
   try {
-    const volXml = await sendDlnaSoap(renderingUrl, UPNP_RENDERING_CONTROL_SERVICE, 'GetVolume', {
-      InstanceID: '0',
-      Channel: 'Master',
-    });
+    const volXml = await sendDlnaSoap(
+      renderingUrl,
+      UPNP_RENDERING_CONTROL_SERVICE,
+      'GetVolume',
+      { InstanceID: '0', Channel: 'Master' },
+      2800,
+      1
+    );
     const parsedVol = parseDlnaVolumeLevel(volXml);
     if (parsedVol !== null) {
       sess.state.volume = parsedVol;
@@ -1028,10 +1248,14 @@ async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<bool
     // ignore TVs that do not implement GetVolume
   }
   try {
-    const muteXml = await sendDlnaSoap(renderingUrl, UPNP_RENDERING_CONTROL_SERVICE, 'GetMute', {
-      InstanceID: '0',
-      Channel: 'Master',
-    });
+    const muteXml = await sendDlnaSoap(
+      renderingUrl,
+      UPNP_RENDERING_CONTROL_SERVICE,
+      'GetMute',
+      { InstanceID: '0', Channel: 'Master' },
+      2800,
+      1
+    );
     const parsedMute = parseDlnaMuteState(muteXml);
     if (parsedMute !== null) {
       sess.state.muted = parsedMute;
@@ -1082,9 +1306,14 @@ function teardownSession(sess: ActiveServerCastSession | null, sendStopToTv: boo
     }
     sess.tlsSocket = undefined;
   } else if (sess.device.protocol === 'dlna' && sendStopToTv && sess.device.avTransportControlUrl) {
-    void sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Stop', {
-      InstanceID: '0',
-    }).catch(() => {});
+    void sendDlnaSoap(
+      sess.device.avTransportControlUrl,
+      UPNP_AV_TRANSPORT_SERVICE,
+      'Stop',
+      { InstanceID: '0' },
+      2000,
+      1
+    ).catch(() => {});
   }
 }
 
@@ -1095,252 +1324,84 @@ export async function stopServerTvCast(): Promise<TvCastStateSnapshot> {
   return { ...IDLE_TV_CAST_STATE };
 }
 
-export async function startServerTvCast(params: {
-  device: TvCastDevice;
-  media: TvCastMediaPayload;
-  serverPort: number;
-  deliveryMode?: TvCastDeliveryPreference;
-}): Promise<TvCastStateSnapshot> {
-  const { device, media, serverPort } = params;
-  if (!device?.host || !media?.streamUrl || !isSafeExternalHttpUrl(media.streamUrl)) {
-    throw new Error('Dispositivo de TV ou stream inválido.');
-  }
-
-  const prev = activeSession;
-  activeSession = null;
-  teardownSession(prev, true);
-
-  const gen = ++sessionGenCounter;
-  const token = crypto.randomBytes(16).toString('hex');
-  const lanIp = selectLanIpForDeviceHost(device.host);
-  const lanBaseUrl = lanIp ? `http://${lanIp}:${serverPort}` : '';
-  const isHls = media.streamFormat === 'hls' || M3U8_EXT_RE.test(media.streamUrl);
-  const mimeType = isHls ? 'application/x-mpegurl' : 'video/mp4';
-  const suffix = isHls ? 'playlist.m3u8' : 'stream.mp4';
-  const safeRef = isSafeExternalHttpUrl(media.referer) ? media.referer : 'https://topanimes.net/';
-  const lanStreamUrl = lanBaseUrl
-    ? `${lanBaseUrl}/api/tv-cast/media/${token}/${suffix}?url=${encodeURIComponent(
-        media.streamUrl
-      )}&referer=${encodeURIComponent(safeRef)}`
-    : '';
-  const lanSubtitleUrl =
-    lanBaseUrl && media.subtitleUrl ? `${lanBaseUrl}/api/tv-cast/media/${token}/subtitle.vtt` : '';
-
-  const deliveryPref: TvCastDeliveryPreference = params.deliveryMode || 'auto';
-  let chosenUrl = '';
-  let chosenDelivery: 'direct' | 'background-proxy' = 'background-proxy';
-
-  const canTryDirect =
-    deliveryPref !== 'proxy' &&
-    !isHls &&
-    (!media.subtitleUrl || device.protocol === 'dlna');
-
-  if (canTryDirect) {
-    if (deliveryPref === 'direct' || (device.protocol === 'chromecast' && (await probeDirectPlayable(media.streamUrl)))) {
-      chosenUrl = media.streamUrl;
-      chosenDelivery = 'direct';
-    }
-  }
-
-  if (!chosenUrl) {
-    if (lanStreamUrl) {
-      chosenUrl = lanStreamUrl;
-      chosenDelivery = 'background-proxy';
-    } else if (await probeDirectPlayable(media.streamUrl)) {
-      chosenUrl = media.streamUrl;
-      chosenDelivery = 'direct';
-    } else {
-      throw new Error('Não foi possível identificar o IP Wi-Fi local para transmitir à TV.');
-    }
-  }
-
-  const sess: ActiveServerCastSession = {
-    gen,
-    token,
-    device,
-    media,
-    deliveryPreference: deliveryPref,
-    attemptedDirectFallback: false,
-    lanBaseUrl,
-    lanStreamUrl,
-    lanSubtitleUrl,
-    state: {
-      active: true,
-      status: 'connecting',
-      deviceId: device.id,
-      deviceName: device.name,
-      deviceProtocol: device.protocol,
-      deliveryMode: chosenDelivery,
-      episodeUrl: media.episodeUrl || '',
-      episodeTitle: media.title || 'Anisync',
-      seriesTitle: media.seriesTitle || '',
-      seriesUrl: media.seriesUrl || '',
-      poster: media.poster || '',
-      streamUrl: media.streamUrl,
-      lanStreamUrl,
-      positionMs: Math.max(0, media.startPositionMs || 0),
-      durationMs: Math.max(0, media.durationMs || 0),
-      volume: 0,
-      muted: false,
-      volumeSynced: false,
-      hasPrev: Boolean(media.prevUrl),
-      hasNext: Boolean(media.nextUrl),
-      errorMessage: '',
-    },
-  };
-  activeSession = sess;
-
-  if (device.protocol === 'dlna') {
-    if (!device.avTransportControlUrl) {
-      activeSession = null;
-      throw new Error('URL de controle DLNA indisponível para esta TV.');
-    }
-    try {
-      // Sync the TV's real volume & mute BEFORE loading/starting playback so the UI never starts at 100%.
-      await syncServerDlnaVolume(sess);
-
-      await sendDlnaSoap(device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Stop', {
-        InstanceID: '0',
-      }).catch(() => {});
-
-      const loadDlna = async (urlToUse: string) => {
-        const didl = buildDidlLiteMetadata({
-          title: media.title || 'Anisync',
-          seriesTitle: media.seriesTitle,
-          poster: media.poster,
+async function setDlnaTransportUri(
+  sess: ActiveServerCastSession,
+  urlToUse: string,
+  mimeType: string,
+  subtitleSrtUrl: string
+): Promise<void> {
+  const controlUrl = sess.device.avTransportControlUrl!;
+  const didl = buildDidlLiteMetadata({
+    title: sess.media.title || 'Anisync',
+    seriesTitle: sess.media.seriesTitle,
+    poster: sess.media.poster,
+    mediaUrl: urlToUse,
+    mimeType,
+    subtitleUrl: subtitleSrtUrl || undefined,
+  });
+  try {
+    await sendDlnaSoap(controlUrl, UPNP_AV_TRANSPORT_SERVICE, 'SetAVTransportURI', {
+      InstanceID: '0',
+      CurrentURI: urlToUse,
+      CurrentURIMetaData: didl,
+    });
+  } catch {
+    if (subtitleSrtUrl) {
+      try {
+        const plainDidl = buildDidlLiteMetadata({
+          title: sess.media.title || 'Anisync',
+          seriesTitle: sess.media.seriesTitle,
+          poster: sess.media.poster,
           mediaUrl: urlToUse,
           mimeType,
         });
-        try {
-          await sendDlnaSoap(device.avTransportControlUrl!, UPNP_AV_TRANSPORT_SERVICE, 'SetAVTransportURI', {
-            InstanceID: '0',
-            CurrentURI: urlToUse,
-            CurrentURIMetaData: didl,
-          });
-        } catch {
-          await sendDlnaSoap(device.avTransportControlUrl!, UPNP_AV_TRANSPORT_SERVICE, 'SetAVTransportURI', {
-            InstanceID: '0',
-            CurrentURI: urlToUse,
-            CurrentURIMetaData: '',
-          });
-        }
-        await sendDlnaSoap(device.avTransportControlUrl!, UPNP_AV_TRANSPORT_SERVICE, 'Play', {
+        await sendDlnaSoap(controlUrl, UPNP_AV_TRANSPORT_SERVICE, 'SetAVTransportURI', {
           InstanceID: '0',
-          Speed: '1',
+          CurrentURI: urlToUse,
+          CurrentURIMetaData: plainDidl,
         });
-      };
-
-      try {
-        await loadDlna(chosenUrl);
-      } catch (err) {
-        if (chosenDelivery === 'direct' && lanStreamUrl) {
-          sess.attemptedDirectFallback = true;
-          sess.state.deliveryMode = 'background-proxy';
-          await loadDlna(lanStreamUrl);
-        } else {
-          throw err;
-        }
+      } catch {
+        await sendDlnaSoap(controlUrl, UPNP_AV_TRANSPORT_SERVICE, 'SetAVTransportURI', {
+          InstanceID: '0',
+          CurrentURI: urlToUse,
+          CurrentURIMetaData: '',
+        });
       }
-
-      if (media.startPositionMs && media.startPositionMs > 2000) {
-        setTimeout(() => {
-          if (activeSession?.gen !== gen || !device.avTransportControlUrl) return;
-          void sendDlnaSoap(device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
-            InstanceID: '0',
-            Unit: 'REL_TIME',
-            Target: formatDlnaTime(media.startPositionMs!),
-          }).catch(() => {});
-        }, 900);
-      }
-
-      sess.state.status = 'playing';
-      sess.pollTimer = setInterval(() => {
-        if (activeSession?.gen !== gen || !device.avTransportControlUrl) return;
-        void (async () => {
-          try {
-            const tXml = await sendDlnaSoap(
-              device.avTransportControlUrl!,
-              UPNP_AV_TRANSPORT_SERVICE,
-              'GetTransportInfo',
-              { InstanceID: '0' }
-            );
-            const tState = extractXmlTagValue(tXml, 'CurrentTransportState').toUpperCase();
-            const pXml = await sendDlnaSoap(
-              device.avTransportControlUrl!,
-              UPNP_AV_TRANSPORT_SERVICE,
-              'GetPositionInfo',
-              { InstanceID: '0' }
-            );
-            const relRaw = parseDlnaTimeMs(extractXmlTagValue(pXml, 'RelTime'));
-            const absRaw = parseDlnaTimeMs(extractXmlTagValue(pXml, 'AbsTime'));
-            const reportedPos = relRaw > 0 ? relRaw : absRaw > 0 ? absRaw : relRaw;
-            const dur = parseDlnaTimeMs(extractXmlTagValue(pXml, 'TrackDuration'));
-            const ignoreZeroReset =
-              reportedPos <= 2000 &&
-              sess.state.positionMs >= 8000 &&
-              (tState === 'TRANSITIONING' || tState === 'PLAYING');
-            if (reportedPos >= 0 && !ignoreZeroReset) {
-              sess.state.positionMs = reportedPos;
-            }
-            if (dur > 0) sess.state.durationMs = dur;
-
-            if (tState === 'PLAYING') {
-              sess.dlnaSawPlaying = true;
-              sess.state.status = 'playing';
-            } else if (tState === 'PAUSED_PLAYBACK') {
-              sess.state.status = 'paused';
-            } else if (tState === 'TRANSITIONING') {
-              sess.state.status = 'buffering';
-            } else if (
-              (tState === 'STOPPED' || tState === 'NO_MEDIA_PRESENT') &&
-              sess.dlnaSawPlaying &&
-              sess.state.durationMs > 10_000 &&
-              sess.state.positionMs >= sess.state.durationMs - 20_000
-            ) {
-              sess.state.status = 'stopped';
-              sess.state.active = false;
-              teardownSession(sess, false);
-              return;
-            }
-
-            sess.dlnaPollCount = (sess.dlnaPollCount || 0) + 1;
-            if (
-              (!sess.state.volumeSynced || sess.dlnaPollCount % 2 === 0) &&
-              Date.now() - (sess.lastVolumeSetAtMs || 0) >= 2500
-            ) {
-              await syncServerDlnaVolume(sess);
-            }
-          } catch {
-            // ignore transient poll hiccups
-          }
-        })();
-      }, 2000);
-
-      return { ...sess.state };
-    } catch (err) {
-      activeSession = null;
-      throw err;
+    } else {
+      await sendDlnaSoap(controlUrl, UPNP_AV_TRANSPORT_SERVICE, 'SetAVTransportURI', {
+        InstanceID: '0',
+        CurrentURI: urlToUse,
+        CurrentURIMetaData: '',
+      });
     }
   }
+}
 
-  // Chromecast / Android TV via Cast V2 TLS (port 8009)
-  sess.senderId = `sender-anisync-${Date.now() & 0xffff}`;
-  sess.reqSeq = 1;
-  sess.castBuffer = Buffer.alloc(0);
-  sess.lastPingMs = Date.now();
-
-  await new Promise<void>((resolve, reject) => {
+function attachChromecastTlsSocket(
+  sess: ActiveServerCastSession,
+  gen: number,
+  chosenUrl: string
+): Promise<tls.TLSSocket> {
+  return new Promise<tls.TLSSocket>((resolve, reject) => {
     let settled = false;
     const sock = tls.connect(
       {
-        host: device.host,
-        port: device.port || 8009,
+        host: sess.device.host,
+        port: sess.device.port || 8009,
         rejectUnauthorized: false,
       },
       () => {
+        try {
+          sock.setKeepAlive(true, 10_000);
+          sock.setNoDelay(true);
+        } catch {
+          // ignore
+        }
+        sess.lastPacketMs = Date.now();
+        sess.reconnectAttempts = 0;
         if (!settled) {
           settled = true;
-          resolve();
+          resolve(sock);
         }
       }
     );
@@ -1349,22 +1410,31 @@ export async function startServerTvCast(params: {
       if (!settled) {
         settled = true;
         sock.destroy();
-        reject(new Error(`Tempo esgotado ao conectar à TV ${device.name} (${device.host}).`));
+        reject(new Error(`Tempo esgotado ao conectar à TV ${sess.device.name} (${sess.device.host}).`));
       }
     });
+
+    const handleDisconnect = () => {
+      if (!settled) return;
+      if (activeSession?.gen !== gen || sess.tlsSocket !== sock) return;
+      scheduleChromecastReconnect(sess, gen, chosenUrl);
+    };
 
     sock.on('error', (err) => {
       if (!settled) {
         settled = true;
-        reject(new Error(`Falha ao conectar à TV ${device.name}: ${err.message}`));
-      } else if (activeSession?.gen === gen) {
-        sess.state.status = 'error';
-        sess.state.errorMessage = `Conexão perdida com ${device.name}.`;
+        reject(new Error(`Falha ao conectar à TV ${sess.device.name}: ${err.message}`));
+      } else {
+        handleDisconnect();
       }
     });
 
+    sock.on('close', handleDisconnect);
+
     sock.on('data', (chunk: Buffer) => {
-      if (activeSession?.gen !== gen) return;
+      if (activeSession?.gen !== gen || sess.tlsSocket !== sock) return;
+      sess.lastPacketMs = Date.now();
+      sess.reconnectAttempts = 0;
       sess.castBuffer = Buffer.concat([sess.castBuffer || Buffer.alloc(0), chunk]);
       while (sess.castBuffer.length >= 4) {
         const msgLen = sess.castBuffer.readUInt32BE(0);
@@ -1386,6 +1456,351 @@ export async function startServerTvCast(params: {
 
     sess.tlsSocket = sock;
   });
+}
+
+function scheduleChromecastReconnect(
+  sess: ActiveServerCastSession,
+  gen: number,
+  chosenUrl: string
+): void {
+  if (sess.reconnecting || activeSession?.gen !== gen || !sess.state.active) return;
+  const nextAttempt = (sess.reconnectAttempts || 0) + 1;
+  if (nextAttempt > 4) {
+    sess.state.status = 'error';
+    sess.state.errorMessage = `Conexão perdida com ${sess.device.name}.`;
+    return;
+  }
+  sess.reconnecting = true;
+  sess.reconnectAttempts = nextAttempt;
+  const delayMs = Math.min(3500, 700 * nextAttempt);
+
+  setTimeout(() => {
+    void (async () => {
+      try {
+        if (activeSession?.gen !== gen || !sess.state.active) return;
+        try {
+          sess.tlsSocket?.destroy();
+        } catch {
+          // ignore
+        }
+        sess.tlsSocket = undefined;
+        sess.castBuffer = Buffer.alloc(0);
+        sess.transportId = '';
+        sess.reattachPending = true;
+        const sock = await attachChromecastTlsSocket(sess, gen, chosenUrl);
+        sock.setTimeout(0);
+        sendCastJson(sess, 'receiver-0', CAST_NS_CONNECTION, { type: 'CONNECT', origin: {} });
+        sendCastJson(sess, 'receiver-0', CAST_NS_RECEIVER, {
+          type: 'GET_STATUS',
+          requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+        });
+      } catch {
+        sess.reconnecting = false;
+        scheduleChromecastReconnect(sess, gen, chosenUrl);
+        return;
+      }
+      sess.reconnecting = false;
+    })();
+  }, delayMs);
+}
+
+export async function startServerTvCast(params: {
+  device: TvCastDevice;
+  media: TvCastMediaPayload;
+  serverPort: number;
+  deliveryMode?: TvCastDeliveryPreference;
+}): Promise<TvCastStateSnapshot> {
+  const { device, media, serverPort } = params;
+  if (!device?.host || !media?.streamUrl || !isSupportedServerCastUrl(media.streamUrl)) {
+    throw new Error('Dispositivo de TV ou stream inválido.');
+  }
+
+  const prev = activeSession;
+  const preserveVolume = Boolean(prev && prev.device.id === device.id && prev.state.volumeSynced);
+  const prevVolume = preserveVolume && prev ? prev.state.volume : 0;
+  const prevMuted = preserveVolume && prev ? prev.state.muted : false;
+  activeSession = null;
+  teardownSession(prev, true);
+
+  const gen = ++sessionGenCounter;
+  const token = crypto.randomBytes(16).toString('hex');
+  const lanIp = selectLanIpForDeviceHost(device.host);
+  const lanBaseUrl = lanIp ? `http://${lanIp}:${serverPort}` : '';
+  const isOffline = media.streamUrl.startsWith(OFFLINE_URL_PREFIX);
+  const isHls = !isOffline && (media.streamFormat === 'hls' || M3U8_EXT_RE.test(media.streamUrl));
+  const mimeType = isHls ? 'application/x-mpegurl' : 'video/mp4';
+  const suffix = isHls ? 'playlist.m3u8' : 'stream.mp4';
+  const safeRef = isSafeExternalHttpUrl(media.referer) ? media.referer : 'https://topanimes.net/';
+  const lanStreamUrl = lanBaseUrl
+    ? isOffline
+      ? `${lanBaseUrl}/api/tv-cast/media/${token}/offline.mp4`
+      : `${lanBaseUrl}/api/tv-cast/media/${token}/${suffix}?url=${encodeURIComponent(
+          media.streamUrl
+        )}&referer=${encodeURIComponent(safeRef)}`
+    : '';
+  const hasActiveSub = !media.subtitleDisabled && Boolean(media.subtitleUrl);
+  const lanSubtitleUrl =
+    lanBaseUrl && hasActiveSub ? `${lanBaseUrl}/api/tv-cast/media/${token}/subtitle.vtt` : '';
+  const lanSubtitleSrtUrl =
+    lanBaseUrl && hasActiveSub ? `${lanBaseUrl}/api/tv-cast/media/${token}/subtitle.srt` : '';
+
+  const deliveryPref: TvCastDeliveryPreference = params.deliveryMode || 'auto';
+  let chosenUrl = '';
+  let chosenDelivery: 'direct' | 'background-proxy' = 'background-proxy';
+
+  const canTryDirect =
+    !isOffline &&
+    deliveryPref !== 'proxy' &&
+    !isHls &&
+    !hasActiveSub;
+
+  if (canTryDirect) {
+    if (deliveryPref === 'direct' || (device.protocol === 'chromecast' && (await probeDirectPlayable(media.streamUrl)))) {
+      chosenUrl = media.streamUrl;
+      chosenDelivery = 'direct';
+    }
+  }
+
+  if (!chosenUrl) {
+    if (lanStreamUrl) {
+      chosenUrl = lanStreamUrl;
+      chosenDelivery = 'background-proxy';
+    } else if (!isOffline && (await probeDirectPlayable(media.streamUrl))) {
+      chosenUrl = media.streamUrl;
+      chosenDelivery = 'direct';
+    } else {
+      throw new Error('Não foi possível identificar o IP Wi-Fi local para transmitir à TV.');
+    }
+  }
+
+  const sess: ActiveServerCastSession = {
+    gen,
+    token,
+    device,
+    media,
+    deliveryPreference: deliveryPref,
+    attemptedDirectFallback: false,
+    lanBaseUrl,
+    lanStreamUrl,
+    lanSubtitleUrl,
+    lanSubtitleSrtUrl,
+    state: {
+      active: true,
+      status: 'connecting',
+      deviceId: device.id,
+      deviceName: device.name,
+      deviceProtocol: device.protocol,
+      deliveryMode: chosenDelivery,
+      episodeUrl: media.episodeUrl || '',
+      episodeTitle: media.title || 'Anisync',
+      seriesTitle: media.seriesTitle || '',
+      seriesUrl: media.seriesUrl || '',
+      poster: media.poster || '',
+      streamUrl: media.streamUrl,
+      lanStreamUrl,
+      positionMs: Math.max(0, media.startPositionMs || 0),
+      durationMs: Math.max(0, media.durationMs || 0),
+      stateTimestampMs: Date.now(),
+      volume: 0,
+      muted: false,
+      volumeSynced: false,
+      hasPrev: Boolean(media.prevUrl),
+      hasNext: Boolean(media.nextUrl),
+      selectedServerNume: media.selectedServerNume || '',
+      qualityLabel: media.qualityLabel || '',
+      audioLabel: media.audioLabel || '',
+      subtitleUrl: hasActiveSub ? media.subtitleUrl || '' : '',
+      subtitleLabel: hasActiveSub ? media.subtitleLabel || '' : '',
+      mediaTracks: [],
+      activeTrackIds: [],
+      errorMessage: '',
+    },
+  };
+  if (preserveVolume) {
+    sess.state.volume = prevVolume;
+    sess.state.muted = prevMuted;
+    sess.state.volumeSynced = true;
+  }
+  activeSession = sess;
+
+  if (device.protocol === 'dlna') {
+    if (!device.avTransportControlUrl) {
+      activeSession = null;
+      throw new Error('URL de controle DLNA indisponível para esta TV.');
+    }
+    try {
+      // Sync the TV's real volume & mute BEFORE loading/starting playback so the UI never starts at 100%.
+      await syncServerDlnaVolume(sess);
+
+      await sendDlnaSoap(
+        device.avTransportControlUrl,
+        UPNP_AV_TRANSPORT_SERVICE,
+        'Stop',
+        { InstanceID: '0' },
+        2500,
+        1
+      ).catch(() => {});
+
+      const loadAndPlay = async (urlToUse: string) => {
+        await setDlnaTransportUri(sess, urlToUse, mimeType, lanSubtitleSrtUrl);
+        await sendDlnaSoap(device.avTransportControlUrl!, UPNP_AV_TRANSPORT_SERVICE, 'Play', {
+          InstanceID: '0',
+          Speed: '1',
+        });
+      };
+
+      try {
+        await loadAndPlay(chosenUrl);
+      } catch (err) {
+        if (chosenDelivery === 'direct' && lanStreamUrl) {
+          sess.attemptedDirectFallback = true;
+          sess.state.deliveryMode = 'background-proxy';
+          await loadAndPlay(lanStreamUrl);
+        } else {
+          throw err;
+        }
+      }
+
+      if (media.startPositionMs && media.startPositionMs > 2000) {
+        sess.lastSeekTargetMs = media.startPositionMs;
+        sess.lastSeekRequestedAtMs = Date.now();
+        setTimeout(() => {
+          if (activeSession?.gen !== gen || !device.avTransportControlUrl) return;
+          sess.lastSeekRequestedAtMs = Date.now();
+          const formatted = formatDlnaTime(media.startPositionMs!);
+          void sendDlnaSoap(device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
+            InstanceID: '0',
+            Unit: 'REL_TIME',
+            Target: formatted,
+          }).catch(() =>
+            sendDlnaSoap(device.avTransportControlUrl!, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
+              InstanceID: '0',
+              Unit: 'ABS_TIME',
+              Target: formatted,
+            }).catch(() => {})
+          );
+        }, 900);
+      }
+
+      sess.state.status = 'playing';
+      sess.state.stateTimestampMs = Date.now();
+      sess.pollTimer = setInterval(() => {
+        if (activeSession?.gen !== gen || !device.avTransportControlUrl) return;
+        void (async () => {
+          let tState = '';
+          let anyOk = false;
+          try {
+            const tXml = await sendDlnaSoap(
+              device.avTransportControlUrl!,
+              UPNP_AV_TRANSPORT_SERVICE,
+              'GetTransportInfo',
+              { InstanceID: '0' },
+              3000,
+              2
+            );
+            tState = extractXmlTagValue(tXml, 'CurrentTransportState').toUpperCase();
+            anyOk = true;
+          } catch {
+            // independent error handling
+          }
+
+          try {
+            const pXml = await sendDlnaSoap(
+              device.avTransportControlUrl!,
+              UPNP_AV_TRANSPORT_SERVICE,
+              'GetPositionInfo',
+              { InstanceID: '0' },
+              3000,
+              2
+            );
+            const relRaw = parseDlnaTimeMs(extractXmlTagValue(pXml, 'RelTime'));
+            const absRaw = parseDlnaTimeMs(extractXmlTagValue(pXml, 'AbsTime'));
+            const reportedPos = relRaw > 0 ? relRaw : absRaw > 0 ? absRaw : relRaw;
+            const dur = parseDlnaTimeMs(extractXmlTagValue(pXml, 'TrackDuration'));
+            const nowMs = Date.now();
+            const withinSeekGrace =
+              typeof sess.lastSeekTargetMs === 'number' &&
+              sess.lastSeekTargetMs >= 0 &&
+              nowMs - (sess.lastSeekRequestedAtMs || 0) < 8000;
+            const userSoughtNearStart =
+              typeof sess.lastSeekTargetMs === 'number' &&
+              sess.lastSeekTargetMs >= 0 &&
+              sess.lastSeekTargetMs <= 2000;
+            const ignoreZeroReset =
+              reportedPos <= 2000 &&
+              !userSoughtNearStart &&
+              sess.state.positionMs >= 8000 &&
+              (tState === 'TRANSITIONING' || tState === 'PLAYING' || withinSeekGrace);
+            const ignoreStaleSeekPoll =
+              withinSeekGrace &&
+              Math.abs(reportedPos - (sess.lastSeekTargetMs || 0)) > 12_000;
+            if (reportedPos >= 0 && !ignoreZeroReset && !ignoreStaleSeekPoll) {
+              sess.state.positionMs = reportedPos;
+              if (withinSeekGrace && Math.abs(reportedPos - (sess.lastSeekTargetMs || 0)) <= 8000) {
+                sess.lastSeekTargetMs = -1;
+              }
+            }
+            if (dur > 0) sess.state.durationMs = dur;
+            anyOk = true;
+          } catch {
+            // independent error handling
+          }
+
+          if (!anyOk) return;
+          sess.state.stateTimestampMs = Date.now();
+
+          if (tState === 'PLAYING') {
+            sess.dlnaSawPlaying = true;
+            sess.dlnaConsecutiveStoppedPolls = 0;
+            sess.state.status = 'playing';
+          } else if (tState === 'PAUSED_PLAYBACK') {
+            sess.dlnaConsecutiveStoppedPolls = 0;
+            sess.state.status = 'paused';
+          } else if (tState === 'TRANSITIONING') {
+            sess.dlnaConsecutiveStoppedPolls = 0;
+            sess.state.status = 'buffering';
+          } else if (tState === 'STOPPED' || tState === 'NO_MEDIA_PRESENT') {
+            sess.dlnaConsecutiveStoppedPolls = (sess.dlnaConsecutiveStoppedPolls || 0) + 1;
+            if (
+              isGenuineServerDlnaCompletion(
+                Boolean(sess.dlnaSawPlaying),
+                sess.state.positionMs,
+                sess.state.durationMs,
+                sess.dlnaConsecutiveStoppedPolls
+              )
+            ) {
+              sess.state.status = 'stopped';
+              sess.state.active = false;
+              teardownSession(sess, false);
+              return;
+            }
+          }
+
+          sess.dlnaPollCount = (sess.dlnaPollCount || 0) + 1;
+          if (
+            (!sess.state.volumeSynced || sess.dlnaPollCount % 4 === 0) &&
+            Date.now() - (sess.lastVolumeSetAtMs || 0) >= 2500
+          ) {
+            await syncServerDlnaVolume(sess);
+          }
+        })();
+      }, 1000);
+
+      return { ...sess.state };
+    } catch (err) {
+      activeSession = null;
+      throw err;
+    }
+  }
+
+  // Chromecast / Android TV via Cast V2 TLS (port 8009)
+  sess.senderId = `sender-anisync-${Date.now() & 0xffff}`;
+  sess.reqSeq = 1;
+  sess.castBuffer = Buffer.alloc(0);
+  sess.lastPingMs = Date.now();
+  sess.lastPacketMs = Date.now();
+
+  await attachChromecastTlsSocket(sess, gen, chosenUrl);
 
   sess.tlsSocket?.setTimeout(0);
   sendCastJson(sess, 'receiver-0', CAST_NS_CONNECTION, { type: 'CONNECT', origin: {} });
@@ -1423,19 +1838,27 @@ export async function startServerTvCast(params: {
   sess.state.status = 'buffering';
 
   sess.pollTimer = setInterval(() => {
-    if (activeSession?.gen !== gen || !sess.tlsSocket || sess.tlsSocket.destroyed) return;
+    if (activeSession?.gen !== gen || sess.reconnecting) return;
     const now = Date.now();
-    if (now - (sess.lastPingMs || 0) >= 4500) {
-      sess.lastPingMs = now;
-      sendCastJson(sess, 'receiver-0', CAST_NS_HEARTBEAT, { type: 'PING' });
+    if (!sess.tlsSocket || sess.tlsSocket.destroyed || (sess.lastPacketMs && now - sess.lastPacketMs > 15_000)) {
+      scheduleChromecastReconnect(sess, gen, chosenUrl);
+      return;
     }
-    if (sess.transportId) {
-      sendCastJson(sess, sess.transportId, CAST_NS_MEDIA, {
-        type: 'GET_STATUS',
-        requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
-      });
+    try {
+      if (now - (sess.lastPingMs || 0) >= 4500) {
+        sess.lastPingMs = now;
+        sendCastJson(sess, 'receiver-0', CAST_NS_HEARTBEAT, { type: 'PING' });
+      }
+      if (sess.transportId) {
+        sendCastJson(sess, sess.transportId, CAST_NS_MEDIA, {
+          type: 'GET_STATUS',
+          requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+        });
+      }
+    } catch {
+      scheduleChromecastReconnect(sess, gen, chosenUrl);
     }
-  }, 2000);
+  }, 1000);
 
   return { ...sess.state };
 }
@@ -1483,13 +1906,19 @@ function handleChromecastPacket(
         resolve();
       }
       const app = st.applications?.find((a) => a.appId === CHROMECAST_DEFAULT_APP_ID);
-      if (app?.transportId && app.transportId !== sess.transportId) {
+      if (app?.transportId && (app.transportId !== sess.transportId || sess.reattachPending)) {
         sess.transportId = app.transportId;
         sess.appSessionId = app.sessionId || '';
+        sess.reattachPending = false;
         sendCastJson(sess, sess.transportId, CAST_NS_CONNECTION, { type: 'CONNECT', origin: {} });
         if (!sess.mediaLoaded) {
           sess.mediaLoaded = true;
           sendChromecastLoad(sess, initialUrl);
+        } else {
+          sendCastJson(sess, sess.transportId, CAST_NS_MEDIA, {
+            type: 'GET_STATUS',
+            requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+          });
         }
       }
     }
@@ -1522,7 +1951,17 @@ function handleChromecastPacket(
             playerState?: string;
             idleReason?: string;
             currentTime?: number;
-            media?: { duration?: number };
+            activeTrackIds?: number[];
+            media?: {
+              duration?: number;
+              tracks?: Array<{
+                trackId?: number;
+                type?: string;
+                name?: string;
+                language?: string;
+                subtype?: string;
+              }>;
+            };
           }
         | undefined;
       if (!ms) return;
@@ -1533,6 +1972,24 @@ function handleChromecastPacket(
       if (typeof ms.media?.duration === 'number' && ms.media.duration > 0) {
         sess.state.durationMs = Math.round(ms.media.duration * 1000);
       }
+      if (Array.isArray(ms.media?.tracks)) {
+        const parsed: TvCastMediaTrack[] = ms.media.tracks
+          .filter((t) => typeof t?.trackId === 'number' && Boolean(t?.type))
+          .map((t) => ({
+            trackId: Number(t.trackId),
+            type: String(t.type || '').toUpperCase(),
+            name: String(t.name || ''),
+            language: String(t.language || ''),
+            subtype: t.subtype ? String(t.subtype) : undefined,
+          }));
+        sess.state.mediaTracks = parsed;
+      }
+      if (Array.isArray(ms.activeTrackIds)) {
+        sess.state.activeTrackIds = ms.activeTrackIds
+          .map((id) => Number(id))
+          .filter((id) => Number.isFinite(id) && id >= 0);
+      }
+      sess.state.stateTimestampMs = Date.now();
       if (ms.playerState === 'PLAYING') {
         sess.state.status = 'playing';
       } else if (ms.playerState === 'PAUSED') {
@@ -1566,10 +2023,14 @@ function handleChromecastPacket(
 }
 
 export async function controlServerTvCast(command: {
-  action: 'play' | 'pause' | 'toggle' | 'seek' | 'seekBy' | 'volume';
+  action: 'play' | 'pause' | 'toggle' | 'seek' | 'seekBy' | 'volume' | 'setTracks';
   positionMs?: number;
   deltaMs?: number;
   volume?: number;
+  activeTrackIds?: number[];
+  subtitleDisabled?: boolean;
+  subtitleUrl?: string;
+  subtitleLabel?: string;
 }): Promise<TvCastStateSnapshot> {
   const sess = activeSession;
   if (!sess || !sess.state.active) {
@@ -1610,6 +2071,7 @@ export async function controlServerTvCast(command: {
         requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
       });
       sess.state.positionMs = target;
+      sess.state.stateTimestampMs = Date.now();
     } else if (effectiveAction === 'volume') {
       const level = Math.max(0, Math.min(1, Number(command.volume ?? sess.state.volume)));
       sess.lastVolumeSetAtMs = Date.now();
@@ -1621,6 +2083,30 @@ export async function controlServerTvCast(command: {
       sess.state.volume = level;
       sess.state.muted = level <= 0.001;
       sess.state.volumeSynced = true;
+    } else if (effectiveAction === 'setTracks') {
+      if (typeof command.subtitleDisabled === 'boolean') {
+        sess.media.subtitleDisabled = command.subtitleDisabled;
+      }
+      if (typeof command.subtitleUrl === 'string') {
+        sess.media.subtitleUrl = command.subtitleDisabled ? '' : command.subtitleUrl;
+        sess.state.subtitleUrl = sess.media.subtitleUrl;
+      }
+      if (typeof command.subtitleLabel === 'string') {
+        sess.media.subtitleLabel = command.subtitleDisabled ? '' : command.subtitleLabel;
+        sess.state.subtitleLabel = sess.media.subtitleLabel;
+      }
+      if (Array.isArray(command.activeTrackIds) && sess.transportId && typeof sess.mediaSessionId === 'number') {
+        const cleanIds = command.activeTrackIds
+          .map((id) => Number(id))
+          .filter((id) => Number.isFinite(id) && id >= 0);
+        sendCastJson(sess, sess.transportId, CAST_NS_MEDIA, {
+          type: 'EDIT_TRACKS_INFO',
+          mediaSessionId: sess.mediaSessionId,
+          activeTrackIds: cleanIds,
+          requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+        });
+        sess.state.activeTrackIds = cleanIds;
+      }
     }
   } else if (sess.device.protocol === 'dlna' && sess.device.avTransportControlUrl) {
     if (effectiveAction === 'play') {
@@ -1639,6 +2125,8 @@ export async function controlServerTvCast(command: {
         effectiveAction === 'seekBy'
           ? Math.max(0, sess.state.positionMs + (command.deltaMs || 0))
           : Math.max(0, command.positionMs || 0);
+      sess.lastSeekTargetMs = target;
+      sess.lastSeekRequestedAtMs = Date.now();
       const formatted = formatDlnaTime(target);
       try {
         await sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
@@ -1658,6 +2146,7 @@ export async function controlServerTvCast(command: {
         }
       }
       sess.state.positionMs = target;
+      sess.state.stateTimestampMs = Date.now();
     } else if (effectiveAction === 'volume' && sess.device.renderingControlUrl) {
       const level = Math.max(0, Math.min(1, Number(command.volume ?? sess.state.volume)));
       const volInt = Math.round(level * 100);
@@ -1677,30 +2166,93 @@ export async function controlServerTvCast(command: {
       sess.state.volume = level;
       sess.state.muted = volInt === 0;
       sess.state.volumeSynced = true;
+    } else if (effectiveAction === 'setTracks') {
+      const disabled = Boolean(command.subtitleDisabled);
+      const nextSubUrl = disabled ? '' : (command.subtitleUrl || '').trim();
+      const nextSubLabel = disabled ? '' : (command.subtitleLabel || '').trim();
+      sess.media.subtitleDisabled = disabled;
+      sess.media.subtitleUrl = nextSubUrl;
+      sess.media.subtitleLabel = nextSubLabel;
+      sess.state.subtitleUrl = nextSubUrl;
+      sess.state.subtitleLabel = nextSubLabel;
+      const nextSrtUrl =
+        !disabled && nextSubUrl && sess.lanBaseUrl
+          ? `${sess.lanBaseUrl}/api/tv-cast/media/${sess.token}/subtitle.srt`
+          : '';
+      sess.lanSubtitleSrtUrl = nextSrtUrl;
+      const isHls = sess.media.streamFormat === 'hls' || M3U8_EXT_RE.test(sess.media.streamUrl);
+      const mimeType = isHls ? 'application/x-mpegurl' : 'video/mp4';
+      const resumePos = Math.max(0, sess.state.positionMs || 0);
+      await setDlnaTransportUri(sess, sess.lanStreamUrl || sess.media.streamUrl, mimeType, nextSrtUrl);
+      await sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Play', {
+        InstanceID: '0',
+        Speed: '1',
+      });
+      if (resumePos > 2000) {
+        sess.lastSeekTargetMs = resumePos;
+        sess.lastSeekRequestedAtMs = Date.now();
+        setTimeout(() => {
+          if (activeSession?.gen !== sess.gen || !sess.device.avTransportControlUrl) return;
+          void sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
+            InstanceID: '0',
+            Unit: 'REL_TIME',
+            Target: formatDlnaTime(resumePos),
+          }).catch(() => {});
+        }, 800);
+      }
     }
   }
 
   return { ...sess.state };
 }
 
-export function prepareServerLanLink(media: TvCastMediaPayload, serverPort: number): {
+export function prepareServerLanLink(
+  media: TvCastMediaPayload,
+  serverPort: number,
+  preserveActiveController = true
+): {
   streamUrl: string;
   lanStreamUrl: string;
   directUrl: string;
 } {
   const token = crypto.randomBytes(16).toString('hex');
   const lanIp = selectLanIpForDeviceHost();
-  const isHls = media.streamFormat === 'hls' || M3U8_EXT_RE.test(media.streamUrl);
-  const suffix = isHls ? 'playlist.m3u8' : 'stream.mp4';
+  const isOffline = media.streamUrl.startsWith(OFFLINE_URL_PREFIX);
+  const isHls = !isOffline && (media.streamFormat === 'hls' || M3U8_EXT_RE.test(media.streamUrl));
+  const suffix = isOffline ? 'offline.mp4' : isHls ? 'playlist.m3u8' : 'stream.mp4';
   const safeRef = isSafeExternalHttpUrl(media.referer) ? media.referer : 'https://topanimes.net/';
   const lanBaseUrl = lanIp ? `http://${lanIp}:${serverPort}` : '';
   const lanStreamUrl = lanBaseUrl
-    ? `${lanBaseUrl}/api/tv-cast/media/${token}/${suffix}?url=${encodeURIComponent(
-        media.streamUrl
-      )}&referer=${encodeURIComponent(safeRef)}`
+    ? isOffline
+      ? `${lanBaseUrl}/api/tv-cast/media/${token}/offline.mp4`
+      : `${lanBaseUrl}/api/tv-cast/media/${token}/${suffix}?url=${encodeURIComponent(
+          media.streamUrl
+        )}&referer=${encodeURIComponent(safeRef)}`
     : '';
 
   if (lanStreamUrl) {
+    // Keep any active DLNA/Chromecast remote session alive when copying/preparing a LAN link!
+    if (preserveActiveController && activeSession && hasRemoteTvControls(activeSession.state)) {
+      preparedLanLinks.set(token, {
+        streamUrl: media.streamUrl,
+        referer: safeRef,
+        subtitleUrl: media.subtitleDisabled ? '' : media.subtitleUrl || '',
+        subtitles: media.subtitles || [],
+        streamFormat: media.streamFormat || 'mp4',
+        createdAt: Date.now(),
+      });
+      // Bound map size to last 8 prepared links
+      if (preparedLanLinks.size > 8) {
+        const oldestKey = preparedLanLinks.keys().next().value;
+        if (oldestKey) preparedLanLinks.delete(oldestKey);
+      }
+      return {
+        streamUrl: lanStreamUrl,
+        lanStreamUrl,
+        directUrl: media.streamUrl,
+      };
+    }
+
     const prev = activeSession;
     activeSession = {
       gen: ++sessionGenCounter,
@@ -1718,6 +2270,7 @@ export function prepareServerLanLink(media: TvCastMediaPayload, serverPort: numb
       lanBaseUrl,
       lanStreamUrl,
       lanSubtitleUrl: media.subtitleUrl ? `${lanBaseUrl}/api/tv-cast/media/${token}/subtitle.vtt` : '',
+      lanSubtitleSrtUrl: media.subtitleUrl ? `${lanBaseUrl}/api/tv-cast/media/${token}/subtitle.srt` : '',
       state: {
         ...IDLE_TV_CAST_STATE,
         active: true,
@@ -1733,6 +2286,7 @@ export function prepareServerLanLink(media: TvCastMediaPayload, serverPort: numb
         poster: media.poster || '',
         streamUrl: media.streamUrl,
         lanStreamUrl,
+        stateTimestampMs: Date.now(),
       },
     };
     teardownSession(prev, true);

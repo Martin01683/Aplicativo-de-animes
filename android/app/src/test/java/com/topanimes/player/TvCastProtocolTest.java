@@ -243,4 +243,80 @@ public class TvCastProtocolTest {
         assertEquals(8009, dev.port);
         assertEquals("chromecast", dev.protocol);
     }
+
+    @Test
+    public void parsesLocalOfflineAssetsAndRewritesOfflineHlsForLanCast() {
+        String offlineMp4 = "http://127.0.0.1:41234/offline/dl_1111_2222/video.mp4";
+        TvCastProtocol.LocalOfflineAsset parsed = TvCastProtocol.parseLocalOfflineAsset(offlineMp4);
+        assertNotNull(parsed);
+        assertEquals("dl_1111_2222", parsed.downloadId);
+        assertEquals("video.mp4", parsed.fileName);
+        assertTrue(TvCastProtocol.isSupportedCastSourceUrl(offlineMp4));
+        assertFalse(TvCastProtocol.isSupportedCastSourceUrl("http://127.0.0.1:41234/secret/admin"));
+        assertFalse(TvCastProtocol.isSupportedCastSourceUrl("http://127.0.0.1:41234/offline/dl_1/../../etc/passwd"));
+
+        String lanUrl = TvCastProtocol.buildLanOfflineAssetUrl(
+            "http://192.168.1.50:49152",
+            "tok123",
+            "dl_1111_2222",
+            "playlist.m3u8"
+        );
+        assertEquals("http://192.168.1.50:49152/cast/tok123/offline/dl_1111_2222/playlist.m3u8", lanUrl);
+
+        String offlineM3u8 = "#EXTM3U\n"
+            + "#EXT-X-VERSION:3\n"
+            + "#EXT-X-KEY:METHOD=AES-128,URI=\"key_0.bin\"\n"
+            + "#EXT-X-MAP:URI=\"init_0.mp4\"\n"
+            + "#EXTINF:6.0,\n"
+            + "seg_00000.ts\n"
+            + "#EXTINF:6.0,\n"
+            + "seg_00001.ts\n";
+        String rewritten = TvCastProtocol.rewriteOfflineM3u8ForLanProxy(
+            offlineM3u8,
+            "http://192.168.1.50:49152",
+            "tok123",
+            "dl_1111_2222"
+        );
+        assertTrue(rewritten.contains("URI=\"http://192.168.1.50:49152/cast/tok123/offline/dl_1111_2222/key_0.bin\""));
+        assertTrue(rewritten.contains("URI=\"http://192.168.1.50:49152/cast/tok123/offline/dl_1111_2222/init_0.mp4\""));
+        assertTrue(rewritten.contains("\nhttp://192.168.1.50:49152/cast/tok123/offline/dl_1111_2222/seg_00000.ts\n"));
+        assertFalse(rewritten.contains("127.0.0.1"));
+    }
+
+    @Test
+    public void convertsVttToSrtAndEmitsDlnaSubtitleDidlLiteAndStabilityGuards() {
+        String vtt = "WEBVTT\n\n"
+            + "00:01.250 --> 00:04.500 align:center\n"
+            + "<i>Olá</i> TV!\n\n"
+            + "01:02:03.000 --> 01:02:06.500\n"
+            + "Segunda linha\n";
+        String srt = TvCastProtocol.convertVttToSrt(vtt);
+        assertTrue(srt.contains("1\n00:00:01,250 --> 00:00:04,500\nOlá TV!"));
+        assertTrue(srt.contains("2\n01:02:03,000 --> 01:02:06,500\nSegunda linha"));
+
+        String didlWithSub = TvCastProtocol.buildDidlLiteMetadata(
+            "Ep 1",
+            "Anime",
+            "",
+            "http://192.168.1.10:5000/cast/tok/stream.mp4",
+            "video/mp4",
+            "http://192.168.1.10:5000/cast/tok/subtitle.srt"
+        );
+        assertTrue(didlWithSub.contains("protocolInfo=\"http-get:*:text/srt:*\""));
+        assertTrue(didlWithSub.contains("<sec:CaptionInfoEx sec:type=\"srt\">http://192.168.1.10:5000/cast/tok/subtitle.srt</sec:CaptionInfoEx>"));
+        assertTrue(didlWithSub.contains("<sec:CaptionInfo sec:type=\"srt\">http://192.168.1.10:5000/cast/tok/subtitle.srt</sec:CaptionInfo>"));
+
+        // Bug #1 guard: Chromecast/DLNA always retain remote controls; pure lan-link does not
+        assertTrue(TvCastProtocol.hasRemotePlaybackControls("dlna", "background-proxy"));
+        assertTrue(TvCastProtocol.hasRemotePlaybackControls("chromecast", "direct"));
+        assertTrue(TvCastProtocol.hasRemotePlaybackControls("dlna", "lan-link"));
+        assertFalse(TvCastProtocol.hasRemotePlaybackControls("lan", "lan-link"));
+
+        // Bug #3 guard: short HLS segment duration or transient STOPPED poll must NEVER kill DLNA cast
+        assertFalse(TvCastProtocol.isGenuineDlnaCompletion(true, 0L, 15_000L, 5));
+        assertFalse(TvCastProtocol.isGenuineDlnaCompletion(true, 1_435_000L, 1_440_000L, 1));
+        assertFalse(TvCastProtocol.isGenuineDlnaCompletion(true, 1_435_000L, 1_440_000L, 2));
+        assertFalse(TvCastProtocol.isGenuineDlnaCompletion(true, 600_000L, 1_440_000L, 5));
+        assertTrue(TvCastProtocol.isGenuineDlnaCompletion(true, 1_432_000L, 1_440_000L, 3));
+    }
 }

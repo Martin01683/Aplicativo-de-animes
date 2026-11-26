@@ -57,6 +57,7 @@ import {
   buildOfflineResolvedEmbed,
   ensureOfflinePlaybackSource,
   OFFLINE_LOCAL_SERVER_NUME,
+  shouldAutoSelectCompletedOfflineOption,
   type OfflineDownloadInput,
   type OfflineDownloadRecord,
 } from '../lib/offlineDownloads';
@@ -98,6 +99,8 @@ import type {
   MediaKind,
   PlayerOption,
   ResolvedEmbed,
+  StreamQuality,
+  SubtitleTrack,
 } from '../lib/types';
 import { AnimePlayer } from './AnimePlayer';
 
@@ -149,6 +152,8 @@ interface EpisodeWorkspaceProps {
       pauseLocal?: () => void;
       canPromptWebRemote?: boolean;
       promptWebRemote?: () => Promise<void>;
+      availableStreams?: StreamQuality[];
+      availableSubtitles?: SubtitleTrack[];
     }
   ) => void;
   offlineDownload?: OfflineDownloadRecord;
@@ -289,6 +294,7 @@ export function EpisodeWorkspace({
     promptWebRemote: () => Promise<void>;
     getCurrentTimeMs: () => number;
     getDurationMs: () => number;
+    isLocallyPlaying?: () => boolean;
   } | null>(null);
   const handleRegisterCastHelpers = useCallback(
     (
@@ -298,6 +304,7 @@ export function EpisodeWorkspace({
         promptWebRemote: () => Promise<void>;
         getCurrentTimeMs: () => number;
         getDurationMs: () => number;
+        isLocallyPlaying?: () => boolean;
       } | null
     ) => {
       playerCastHelpersRef.current = helpers;
@@ -394,6 +401,10 @@ export function EpisodeWorkspace({
   }
 
   const lastResetEpisodeUrlRef = useRef(episode.url);
+  const prevOfflineReadyRef = useRef<{ episodeUrl: string; readyId: string | null }>({
+    episodeUrl: episode.url,
+    readyId: offlineReadyRecord?.id ?? null,
+  });
 
   // Reset selected server when switching episodes, while preserving playback when
   // background cross-server options arrive for the SAME episode.
@@ -445,6 +456,54 @@ export function EpisodeWorkspace({
       }
     }
   }, [episode.url, failoverExhaustedMsg, offlineReadyRecord, playableOptions]);
+
+  // Automatically select the downloaded version when a download finishes while the user
+  // is on the episode profile page (without interrupting active local playback or TV cast).
+  useEffect(() => {
+    const prev = prevOfflineReadyRef.current;
+    const currentReadyId = offlineReadyRecord?.id ?? null;
+    const isCastingThisEpisode = Boolean(
+      castState?.active &&
+        castState.episodeUrl &&
+        isSameEpisodeUrl(castState.episodeUrl, episode.url)
+    );
+    const isLocallyPlaying = Boolean(playerCastHelpersRef.current?.isLocallyPlaying?.());
+    const shouldSwitch = shouldAutoSelectCompletedOfflineOption({
+      previousEpisodeUrl: prev.episodeUrl,
+      currentEpisodeUrl: episode.url,
+      previousReadyId: prev.readyId,
+      currentReadyId,
+      currentSelectedNume: selectedOption?.nume,
+      isLocallyPlaying,
+      isCastingThisEpisode,
+    });
+    prevOfflineReadyRef.current = {
+      episodeUrl: episode.url,
+      readyId: currentReadyId,
+    };
+
+    if (shouldSwitch && offlineReadyRecord) {
+      const offlineOpt =
+        playableOptions.find((o) => o.nume === OFFLINE_LOCAL_SERVER_NUME) ||
+        buildOfflinePlayerOption(offlineReadyRecord);
+      setSelectedOption(offlineOpt);
+      setResolvedState({
+        episodeUrl: episode.url,
+        embedUrl: offlineOpt.embedUrl,
+        data: buildOfflineResolvedEmbed(offlineReadyRecord),
+      });
+      setFailoverExhaustedMsg('');
+      onToast('Download concluído — versão baixada selecionada automaticamente.');
+    }
+  }, [
+    castState?.active,
+    castState?.episodeUrl,
+    episode.url,
+    offlineReadyRecord,
+    onToast,
+    playableOptions,
+    selectedOption?.nume,
+  ]);
 
   // Fetch and cache the series episode list so in-fullscreen episode selection, TheTVDB IDs, genres & artwork are populated
   useEffect(() => {
@@ -2241,13 +2300,13 @@ export function EpisodeWorkspace({
                   disabled={!hasResolvedStreams && !castState?.active}
                   onClick={() => {
                     const liveHelpers = playerCastHelpersRef.current;
-                    const castHelpers = liveHelpers
+                    const baseCastHelpers = liveHelpers
                       ? {
                           pauseLocal: () => liveHelpers.pauseLocal(),
                           canPromptWebRemote: liveHelpers.canPromptWebRemote(),
                           promptWebRemote: () => liveHelpers.promptWebRemote(),
                         }
-                      : undefined;
+                      : {};
                     if (hasResolvedStreams && resolved) {
                       const bestStream =
                         [...resolved.streams].sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
@@ -2256,10 +2315,18 @@ export function EpisodeWorkspace({
                       const savedEntry = getEpisodeProgress(episode.url);
                       const livePosMs = liveHelpers?.getCurrentTimeMs() || 0;
                       const liveDurMs = liveHelpers?.getDurationMs() || 0;
+                      const audioLabel =
+                        selectedOption?.audioType === 'DUB'
+                          ? 'Dublado'
+                          : selectedOption?.audioType === 'LEG'
+                            ? 'Legendado'
+                            : selectedOption?.label || '';
                       const payload = bestStream
                         ? buildCastMediaPayload({
                             stream: bestStream,
                             subtitles: resolved.subtitles,
+                            qualityLabel: bestStream.label,
+                            audioLabel,
                             referer: resolved.referer || 'https://topanimes.net/',
                             preferDirect: resolved.preferDirect,
                             episodeUrl: episode.url,
@@ -2279,9 +2346,13 @@ export function EpisodeWorkspace({
                                 : Math.round((savedEntry?.durationSec || 0) * 1000),
                           })
                         : null;
-                      onOpenTvCast(payload, castHelpers);
+                      onOpenTvCast(payload, {
+                        ...baseCastHelpers,
+                        availableStreams: resolved.streams,
+                        availableSubtitles: resolved.subtitles,
+                      });
                     } else {
-                      onOpenTvCast(null, castHelpers);
+                      onOpenTvCast(null, liveHelpers ? baseCastHelpers : undefined);
                     }
                   }}
                   aria-label={

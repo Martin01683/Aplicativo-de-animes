@@ -274,6 +274,25 @@ export function pickBestOfflineStream(
   return ranked[0] || null;
 }
 
+export function shouldAutoSelectCompletedOfflineOption(params: {
+  previousEpisodeUrl: string;
+  currentEpisodeUrl: string;
+  previousReadyId: string | null;
+  currentReadyId: string | null;
+  currentSelectedNume?: string | null;
+  isLocallyPlaying?: boolean;
+  isCastingThisEpisode?: boolean;
+}): boolean {
+  if (!params.currentReadyId) return false;
+  if (params.currentSelectedNume === OFFLINE_LOCAL_SERVER_NUME) return false;
+  if (params.isLocallyPlaying) return false;
+  if (params.isCastingThisEpisode) return false;
+  const prevCanon = canonicalOfflineEpisodeUrl(params.previousEpisodeUrl);
+  const currCanon = canonicalOfflineEpisodeUrl(params.currentEpisodeUrl);
+  if (!prevCanon || prevCanon !== currCanon) return false;
+  return !params.previousReadyId;
+}
+
 export function buildOfflinePlayerOption(record: OfflineDownloadRecord): PlayerOption {
   const qualityTag = record.qualityLabel ? ` (${record.qualityLabel})` : '';
   return {

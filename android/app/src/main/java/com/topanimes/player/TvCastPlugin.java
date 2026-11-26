@@ -178,11 +178,14 @@ public class TvCastPlugin extends Plugin {
         String title = mediaObj.optString("title", "Anisync");
         String streamUrl = mediaObj.optString("streamUrl", "");
         String streamFormat = mediaObj.optString("streamFormat", "mp4");
+        boolean preserveActiveController = !openExternalApp || TvCastService.hasActiveRemoteController();
 
+        TvCastService.clearPreparedLanStreamUrl();
         Context ctx = getContext();
         Intent serviceIntent = new Intent(ctx, TvCastService.class);
         serviceIntent.setAction(TvCastService.ACTION_PREPARE_LAN_ONLY);
         serviceIntent.putExtra(TvCastService.EXTRA_MEDIA_JSON, mediaObj.toString());
+        serviceIntent.putExtra(TvCastService.EXTRA_PRESERVE_ACTIVE_CONTROLLER, preserveActiveController);
         ContextCompat.startForegroundService(ctx, serviceIntent);
 
         // Wait briefly (up to 1.5s) for the foreground service LAN server to expose the token-gated URL
@@ -190,7 +193,7 @@ public class TvCastPlugin extends Plugin {
             String lanUrl = "";
             long deadline = System.currentTimeMillis() + 1500L;
             while (System.currentTimeMillis() < deadline) {
-                lanUrl = TvCastService.getActiveLanStreamUrl();
+                lanUrl = TvCastService.getPreparedLanStreamUrl();
                 if (lanUrl != null && !lanUrl.isEmpty()) break;
                 try {
                     Thread.sleep(60L);
@@ -292,6 +295,20 @@ public class TvCastPlugin extends Plugin {
         Intent intent = new Intent(getContext(), TvCastService.class);
         intent.setAction(TvCastService.ACTION_SET_VOLUME);
         intent.putExtra(TvCastService.EXTRA_VOLUME, vol);
+        ContextCompat.startForegroundService(getContext(), intent);
+        call.resolve();
+    }
+
+    @PluginMethod
+    public void setTracks(PluginCall call) {
+        if (!TvCastService.isCastActive()) {
+            call.resolve();
+            return;
+        }
+        JSObject data = call.getData();
+        Intent intent = new Intent(getContext(), TvCastService.class);
+        intent.setAction(TvCastService.ACTION_SET_TRACKS);
+        intent.putExtra(TvCastService.EXTRA_TRACKS_JSON, data != null ? data.toString() : "{}");
         ContextCompat.startForegroundService(getContext(), intent);
         call.resolve();
     }

@@ -7,6 +7,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from 'react';
 import {
+  AudioLines,
   Cast,
   Check,
   Copy,
@@ -23,7 +24,9 @@ import {
   Server,
   SkipBack,
   SkipForward,
+  SlidersHorizontal,
   Square,
+  Subtitles,
   Tv,
   Volume2,
   VolumeX,
@@ -41,6 +44,7 @@ import {
   formatCastDurationMs,
   formatCastProtocolLabel,
   formatCastStatusLabel,
+  hasRemoteTvControls,
   isNativeAndroidCastSupported,
   prepareExternalTvCast,
   resolveCastDisplayedPositionMs,
@@ -61,6 +65,32 @@ import {
   type TvCastStateSnapshot,
 } from '../lib/tvCast';
 
+export interface TvCastQualityOption {
+  id: string;
+  label: string;
+  url: string;
+  format: 'hls' | 'mp4' | 'unknown';
+  height?: number;
+}
+
+export interface TvCastAudioOption {
+  id: string;
+  label: string;
+  badge?: string;
+  kind: 'chromecast-track' | 'server-option' | 'audio-version';
+  trackId?: number;
+  serverOption?: PlayerOption;
+  targetEpisodeUrl?: string;
+}
+
+export interface TvCastSubtitleChoice {
+  id: string;
+  label: string;
+  url: string;
+  trackId?: number;
+  disabled?: boolean;
+}
+
 interface TvCastModalProps {
   open: boolean;
   onClose: () => void;
@@ -73,6 +103,19 @@ interface TvCastModalProps {
   activeServerNume?: string;
   switchingServerNume?: string;
   onSelectCastServer?: (opt: PlayerOption, discoveredDevices: TvCastDevice[]) => Promise<void> | void;
+  qualityOptions?: TvCastQualityOption[];
+  activeQualityId?: string;
+  switchingQualityId?: string;
+  onSelectCastQuality?: (opt: TvCastQualityOption, discoveredDevices: TvCastDevice[]) => Promise<void> | void;
+  audioOptions?: TvCastAudioOption[];
+  activeAudioId?: string;
+  switchingAudioId?: string;
+  onSelectCastAudio?: (opt: TvCastAudioOption, discoveredDevices: TvCastDevice[]) => Promise<void> | void;
+  subtitleOptions?: TvCastSubtitleChoice[];
+  activeSubtitleId?: string;
+  switchingSubtitleId?: string;
+  onSelectCastSubtitle?: (opt: TvCastSubtitleChoice, discoveredDevices: TvCastDevice[]) => Promise<void> | void;
+  onRefreshCastState?: () => Promise<void> | void;
   onDeviceConnected?: (device: TvCastDevice) => void;
   onSeekCommitted?: (targetMs: number) => void;
   skipIntroSeconds?: number;
@@ -94,6 +137,19 @@ export function TvCastModal({
   activeServerNume = '',
   switchingServerNume = '',
   onSelectCastServer,
+  qualityOptions = [],
+  activeQualityId = '',
+  switchingQualityId = '',
+  onSelectCastQuality,
+  audioOptions = [],
+  activeAudioId = '',
+  switchingAudioId = '',
+  onSelectCastAudio,
+  subtitleOptions = [],
+  activeSubtitleId = '',
+  switchingSubtitleId = '',
+  onSelectCastSubtitle,
+  onRefreshCastState,
   onDeviceConnected,
   onSeekCommitted,
   skipIntroSeconds = 85,
@@ -239,6 +295,8 @@ export function TvCastModal({
     let active = true;
     let listenerHandle: { remove: () => Promise<void> } | null = null;
 
+    void onRefreshCastState?.();
+
     if (isNativeAndroid) {
       void addTvCastDevicesListener((ev) => {
         if (!active) return;
@@ -260,7 +318,7 @@ export function TvCastModal({
       void stopTvCastDiscovery();
       void listenerHandle?.remove();
     };
-  }, [isNativeAndroid, open, runDiscovery]);
+  }, [isNativeAndroid, onRefreshCastState, open, runDiscovery]);
 
   useEffect(() => {
     if (!open) return;
@@ -770,7 +828,7 @@ export function TvCastModal({
                 </span>
               </div>
 
-              {castState.deliveryMode !== 'lan-link' && (
+              {hasRemoteTvControls(castState) ? (
                 <>
                   {/* Remote Seekbar — press, hold, drag smoothly, and seek on release */}
                   <div className="space-y-1">
@@ -986,6 +1044,134 @@ export function TvCastModal({
                     </span>
                   </div>
                 </>
+              ) : (
+                <div className="space-y-2 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-[11px] text-amber-100">
+                  <p>
+                    Modo link externo ativo. Para controlar tempo, pausa e volume pelo app, conecte diretamente à TV na lista abaixo.
+                  </p>
+                  {devices.length > 0 && mediaPayload && (
+                    <button
+                      type="button"
+                      disabled={Boolean(connectingId)}
+                      onClick={() => void handleSelectDevice(devices[0])}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-[#f97316]/60 bg-[#f97316]/20 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c] hover:bg-[#f97316]/30 disabled:opacity-50"
+                    >
+                      <Tv className="h-3.5 w-3.5" />
+                      <span>Conectar controles em {devices[0].name}</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Quality, Audio & Subtitles selectors while casting */}
+              {((onSelectCastQuality && qualityOptions.length > 0) ||
+                (onSelectCastAudio && audioOptions.length > 0) ||
+                (onSelectCastSubtitle && subtitleOptions.length > 0)) && (
+                <div className="space-y-2.5 border-t border-white/10 pt-3">
+                  {onSelectCastQuality && qualityOptions.length > 0 && (
+                    <div data-cast-quality-selector="true" className="space-y-1.5">
+                      <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
+                        <SlidersHorizontal className="h-3.5 w-3.5 text-[#f97316]" />
+                        <span>Qualidade na TV</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {qualityOptions.map((opt) => {
+                          const isActive = activeQualityId === opt.id;
+                          const isSwitching = switchingQualityId === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              disabled={Boolean(switchingQualityId)}
+                              onClick={() => void onSelectCastQuality(opt, devices)}
+                              className={`inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+                                isActive
+                                  ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                  : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                              }`}
+                            >
+                              {isSwitching && (
+                                <Loader2 className="h-3 w-3 animate-spin text-[#fb923c]" />
+                              )}
+                              <span>{opt.label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {onSelectCastAudio && audioOptions.length > 0 && (
+                    <div data-cast-audio-selector="true" className="space-y-1.5">
+                      <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
+                        <AudioLines className="h-3.5 w-3.5 text-[#f97316]" />
+                        <span>Áudio na TV</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {audioOptions.map((opt) => {
+                          const isActive = activeAudioId === opt.id;
+                          const isSwitching = switchingAudioId === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              disabled={Boolean(switchingAudioId)}
+                              onClick={() => void onSelectCastAudio(opt, devices)}
+                              className={`inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+                                isActive
+                                  ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                  : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                              }`}
+                            >
+                              {isSwitching && (
+                                <Loader2 className="h-3 w-3 animate-spin text-[#fb923c]" />
+                              )}
+                              <span>{opt.label}</span>
+                              {opt.badge && (
+                                <span className="rounded bg-white/10 px-1 text-[9px] uppercase text-slate-300">
+                                  {opt.badge}
+                                </span>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {onSelectCastSubtitle && subtitleOptions.length > 0 && (
+                    <div data-cast-subtitle-selector="true" className="space-y-1.5">
+                      <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-300">
+                        <Subtitles className="h-3.5 w-3.5 text-[#f97316]" />
+                        <span>Legendas na TV</span>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        {subtitleOptions.map((opt) => {
+                          const isActive = activeSubtitleId === opt.id;
+                          const isSwitching = switchingSubtitleId === opt.id;
+                          return (
+                            <button
+                              key={opt.id}
+                              type="button"
+                              disabled={Boolean(switchingSubtitleId)}
+                              onClick={() => void onSelectCastSubtitle(opt, devices)}
+                              className={`inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+                                isActive
+                                  ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                  : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                              }`}
+                            >
+                              {isSwitching && (
+                                <Loader2 className="h-3 w-3 animate-spin text-[#fb923c]" />
+                              )}
+                              <span>{opt.label}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
 
               {/* Server Switcher right inside Active Remote Controller */}
@@ -1058,6 +1244,113 @@ export function TvCastModal({
               </div>
             </div>
           )}
+
+          {/* Pre-cast Quality, Audio & Subtitles Configuration */}
+          {!castState.active &&
+            mediaPayload &&
+            ((onSelectCastQuality && qualityOptions.length > 0) ||
+              (onSelectCastAudio && audioOptions.length > 0) ||
+              (onSelectCastSubtitle && subtitleOptions.length > 0)) && (
+              <div className="space-y-3 rounded-xl border border-white/10 bg-[#0d0f12] p-3.5">
+                <div className="text-xs font-semibold text-slate-200">
+                  Opções de transmissão (antes de enviar)
+                </div>
+
+                {onSelectCastQuality && qualityOptions.length > 0 && (
+                  <div data-cast-quality-selector="true" className="space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400">
+                      <SlidersHorizontal className="h-3.5 w-3.5 text-[#f97316]" />
+                      <span>Qualidade</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {qualityOptions.map((opt) => {
+                        const isActive = activeQualityId === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => void onSelectCastQuality(opt, devices)}
+                            className={`inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                              isActive
+                                ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                            }`}
+                          >
+                            <span>{opt.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {onSelectCastAudio && audioOptions.length > 0 && (
+                  <div data-cast-audio-selector="true" className="space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400">
+                      <AudioLines className="h-3.5 w-3.5 text-[#f97316]" />
+                      <span>Áudio</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {audioOptions.map((opt) => {
+                        const isActive = activeAudioId === opt.id;
+                        const isSwitching = switchingAudioId === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            disabled={Boolean(switchingAudioId)}
+                            onClick={() => void onSelectCastAudio(opt, devices)}
+                            className={`inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+                              isActive
+                                ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                            }`}
+                          >
+                            {isSwitching && (
+                              <Loader2 className="h-3 w-3 animate-spin text-[#fb923c]" />
+                            )}
+                            <span>{opt.label}</span>
+                            {opt.badge && (
+                              <span className="rounded bg-white/10 px-1 text-[9px] uppercase text-slate-300">
+                                {opt.badge}
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {onSelectCastSubtitle && subtitleOptions.length > 0 && (
+                  <div data-cast-subtitle-selector="true" className="space-y-1.5">
+                    <div className="flex items-center gap-1.5 text-[11px] font-semibold text-slate-400">
+                      <Subtitles className="h-3.5 w-3.5 text-[#f97316]" />
+                      <span>Legendas</span>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {subtitleOptions.map((opt) => {
+                        const isActive = activeSubtitleId === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => void onSelectCastSubtitle(opt, devices)}
+                            className={`inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                              isActive
+                                ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                            }`}
+                          >
+                            <span>{opt.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
 
           {/* Automatic Wi-Fi TV Discovery List (Android Native + Web Local Server) */}
           {canAutoDiscover && (

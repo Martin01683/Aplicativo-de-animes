@@ -26,6 +26,20 @@ export interface TvCastDevice {
   locationUrl?: string;
 }
 
+export interface TvCastSubtitleOption {
+  label: string;
+  url: string;
+  default?: boolean;
+}
+
+export interface TvCastMediaTrack {
+  trackId: number;
+  type: 'AUDIO' | 'TEXT' | 'VIDEO' | string;
+  name: string;
+  language: string;
+  subtype?: string;
+}
+
 export interface TvCastMediaPayload {
   streamUrl: string;
   streamFormat: 'hls' | 'mp4' | 'unknown';
@@ -39,6 +53,10 @@ export interface TvCastMediaPayload {
   isMovie?: boolean;
   subtitleUrl?: string;
   subtitleLabel?: string;
+  subtitles?: TvCastSubtitleOption[];
+  subtitleDisabled?: boolean;
+  qualityLabel?: string;
+  audioLabel?: string;
   selectedServerNume?: string;
   prevUrl?: string;
   nextUrl?: string;
@@ -63,11 +81,19 @@ export interface TvCastStateSnapshot {
   lanStreamUrl: string;
   positionMs: number;
   durationMs: number;
+  stateTimestampMs?: number;
   volume: number;
   muted: boolean;
   volumeSynced?: boolean;
   hasPrev: boolean;
   hasNext: boolean;
+  selectedServerNume?: string;
+  qualityLabel?: string;
+  audioLabel?: string;
+  subtitleUrl?: string;
+  subtitleLabel?: string;
+  mediaTracks?: TvCastMediaTrack[];
+  activeTrackIds?: number[];
   errorMessage: string;
 }
 
@@ -76,6 +102,13 @@ export interface PrepareExternalCastResult {
   lanStreamUrl: string;
   directUrl: string;
   opened: boolean;
+}
+
+export interface TvCastSetTracksOptions {
+  activeTrackIds?: number[];
+  subtitleDisabled?: boolean;
+  subtitleUrl?: string;
+  subtitleLabel?: string;
 }
 
 interface TvCastNativePlugin {
@@ -103,6 +136,7 @@ interface TvCastNativePlugin {
   seek(options: { positionMs: number }): Promise<void>;
   seekBy(options: { deltaMs: number }): Promise<void>;
   setVolume(options: { volume: number }): Promise<void>;
+  setTracks(options: TvCastSetTracksOptions): Promise<void>;
   nextEpisode(): Promise<void>;
   prevEpisode(): Promise<void>;
   stopCast(): Promise<void>;
@@ -135,13 +169,86 @@ export const IDLE_TV_CAST_STATE: TvCastStateSnapshot = {
   lanStreamUrl: '',
   positionMs: 0,
   durationMs: 0,
+  stateTimestampMs: 0,
   volume: 0,
   muted: false,
   volumeSynced: false,
   hasPrev: false,
   hasNext: false,
+  selectedServerNume: '',
+  qualityLabel: '',
+  audioLabel: '',
+  subtitleUrl: '',
+  subtitleLabel: '',
+  mediaTracks: [],
+  activeTrackIds: [],
   errorMessage: '',
 };
+
+export function hasRemoteTvControls(
+  state: Pick<TvCastStateSnapshot, 'active' | 'deviceProtocol' | 'deliveryMode'> | null | undefined
+): boolean {
+  if (!state?.active) return false;
+  if (state.deviceProtocol === 'chromecast' || state.deviceProtocol === 'dlna') {
+    return true;
+  }
+  return state.deliveryMode !== 'lan-link' && state.deviceProtocol !== 'lan';
+}
+
+export function parseHlsMasterVariants(manifest: string, baseUrl: string): StreamQuality[] {
+  if (!manifest || !manifest.includes('#EXT-X-STREAM-INF')) return [];
+  const lines = manifest.split(/\r?\n/);
+  const variants: StreamQuality[] = [];
+  const seenUrls = new Set<string>();
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) continue;
+
+    let nextUri = '';
+    for (let j = i + 1; j < lines.length; j++) {
+      const candidate = lines[j].trim();
+      if (!candidate) continue;
+      if (candidate.startsWith('#')) {
+        if (candidate.startsWith('#EXT-X-STREAM-INF:')) break;
+        continue;
+      }
+      nextUri = candidate;
+      i = j;
+      break;
+    }
+    if (!nextUri) continue;
+
+    let resolvedUrl = nextUri;
+    try {
+      resolvedUrl = new URL(nextUri, baseUrl).toString();
+    } catch {
+      if (!/^https?:\/\//i.test(nextUri)) continue;
+    }
+    if (seenUrls.has(resolvedUrl)) continue;
+    seenUrls.add(resolvedUrl);
+
+    const resMatch = line.match(/RESOLUTION=\s*(\d+)x(\d+)/i);
+    const bwMatch = line.match(/BANDWIDTH=\s*(\d+)/i);
+    const nameMatch = line.match(/NAME="([^"]+)"/i);
+    const height = resMatch ? Number.parseInt(resMatch[2], 10) : 0;
+    const bandwidth = bwMatch ? Number.parseInt(bwMatch[1], 10) : 0;
+    const label =
+      height > 0
+        ? `${height}p`
+        : nameMatch?.[1]?.trim() ||
+          (bandwidth > 0 ? `${Math.max(1, Math.round(bandwidth / 1000))} kbps` : `Qualidade ${variants.length + 1}`);
+
+    variants.push({
+      label,
+      height: Number.isFinite(height) ? height : 0,
+      url: resolvedUrl,
+      format: 'hls',
+    });
+  }
+
+  return variants.sort((a, b) => (b.height || 0) - (a.height || 0));
+}
 
 export function isNativeAndroidCastSupported(): boolean {
   try {
@@ -300,12 +407,18 @@ export function reconcileCastClock(
   if (!next.active) return null;
   const sessionKey = buildCastSessionKey(next);
   const reported = Math.max(0, Math.round(next.positionMs || 0));
+  const rawSampleTs = Number(next.stateTimestampMs || 0);
+  // Use the TV poll's exact timestamp when within ±2s of local clock to minimize bridge/network lag
+  const sampleNow =
+    Number.isFinite(rawSampleTs) && rawSampleTs > 0 && Math.abs(nowMs - rawSampleTs) <= 2000
+      ? rawSampleTs
+      : nowMs;
 
   if (!prev || prev.sessionKey !== sessionKey) {
     return {
       sessionKey,
       anchorPositionMs: reported,
-      anchorTimestampMs: nowMs,
+      anchorTimestampMs: sampleNow,
       status: next.status,
       lastReportedPositionMs: reported,
       seekPendingTargetMs: null,
@@ -356,7 +469,7 @@ export function reconcileCastClock(
       return {
         sessionKey,
         anchorPositionMs: reported,
-        anchorTimestampMs: nowMs,
+        anchorTimestampMs: sampleNow,
         status: next.status,
         lastReportedPositionMs: reported,
         seekPendingTargetMs: null,
@@ -380,7 +493,7 @@ export function reconcileCastClock(
       return {
         sessionKey,
         anchorPositionMs: reported,
-        anchorTimestampMs: nowMs,
+        anchorTimestampMs: sampleNow,
         status: next.status,
         lastReportedPositionMs: reported,
         seekPendingTargetMs: null,
@@ -397,13 +510,17 @@ export function reconcileCastClock(
     };
   }
 
-  // Rule C: Normal playback reconciliation.
+  // Rule C: Normal real-time playback reconciliation.
   const reportedChanged = reported !== prev.lastReportedPositionMs;
-  if (reported > 0 && (reportedChanged || next.status === 'paused')) {
+  const significantDrift = next.status === 'playing' && reported > 0 && Math.abs(reported - currentEstMs) >= 1500;
+  if (
+    (reported > 0 && (reportedChanged || significantDrift || next.status === 'paused')) ||
+    (reported === 0 && next.status === 'paused')
+  ) {
     return {
       sessionKey,
       anchorPositionMs: reported,
-      anchorTimestampMs: nowMs,
+      anchorTimestampMs: sampleNow,
       status: next.status,
       lastReportedPositionMs: reported,
       seekPendingTargetMs: null,
@@ -457,6 +574,9 @@ export function buildCastMediaPayload(params: {
   stream: StreamQuality;
   subtitles?: readonly SubtitleTrack[];
   activeSubtitleUrl?: string;
+  subtitleDisabled?: boolean;
+  qualityLabel?: string;
+  audioLabel?: string;
   referer?: string;
   preferDirect?: boolean;
   episodeUrl?: string;
@@ -473,12 +593,15 @@ export function buildCastMediaPayload(params: {
   durationMs?: number;
 }): TvCastMediaPayload {
   const subs = params.subtitles || [];
+  const explicitlyDisabled = params.subtitleDisabled === true || params.activeSubtitleUrl === '';
   let chosenSub: SubtitleTrack | undefined;
-  if (params.activeSubtitleUrl) {
-    chosenSub = subs.find((s) => s.url === params.activeSubtitleUrl);
-  }
-  if (!chosenSub && subs.length > 0) {
-    chosenSub = subs.find((s) => s.isDefault) || subs[0];
+  if (!explicitlyDisabled) {
+    if (params.activeSubtitleUrl) {
+      chosenSub = subs.find((s) => s.url === params.activeSubtitleUrl);
+    }
+    if (!chosenSub && subs.length > 0) {
+      chosenSub = subs.find((s) => s.isDefault) || subs[0];
+    }
   }
 
   return {
@@ -492,8 +615,18 @@ export function buildCastMediaPayload(params: {
     seriesUrl: params.seriesUrl || '',
     poster: params.poster || '',
     isMovie: Boolean(params.isMovie),
-    subtitleUrl: chosenSub?.url || '',
-    subtitleLabel: chosenSub?.label || '',
+    subtitleUrl: explicitlyDisabled ? '' : chosenSub?.url || '',
+    subtitleLabel: explicitlyDisabled ? '' : chosenSub?.label || '',
+    subtitles: subs
+      .filter((s) => Boolean(s?.url))
+      .map((s) => ({
+        label: s.label || 'Legenda',
+        url: s.url,
+        default: Boolean(s.isDefault),
+      })),
+    subtitleDisabled: explicitlyDisabled,
+    qualityLabel: params.qualityLabel || params.stream.label || '',
+    audioLabel: params.audioLabel || '',
     selectedServerNume: params.selectedServerNume || '',
     prevUrl: params.prevUrl || '',
     nextUrl: params.nextUrl || '',
@@ -505,6 +638,20 @@ export function buildCastMediaPayload(params: {
 
 export function sanitizeCastStateSnapshot(raw: Partial<TvCastStateSnapshot> | null | undefined): TvCastStateSnapshot {
   if (!raw || typeof raw !== 'object') return { ...IDLE_TV_CAST_STATE };
+  const rawTracks = Array.isArray(raw.mediaTracks) ? raw.mediaTracks : [];
+  const mediaTracks: TvCastMediaTrack[] = rawTracks
+    .filter((t): t is TvCastMediaTrack => Boolean(t && typeof t === 'object' && Number.isFinite(Number(t.trackId))))
+    .map((t) => ({
+      trackId: Number(t.trackId),
+      type: String(t.type || '').toUpperCase(),
+      name: String(t.name || ''),
+      language: String(t.language || ''),
+      subtype: t.subtype ? String(t.subtype) : undefined,
+    }));
+  const activeTrackIds = Array.isArray(raw.activeTrackIds)
+    ? raw.activeTrackIds.map((id) => Number(id)).filter((id) => Number.isFinite(id) && id >= 0)
+    : [];
+  const rawTs = Number(raw.stateTimestampMs);
   return {
     active: Boolean(raw.active),
     status: raw.status || 'idle',
@@ -521,11 +668,19 @@ export function sanitizeCastStateSnapshot(raw: Partial<TvCastStateSnapshot> | nu
     lanStreamUrl: raw.lanStreamUrl || '',
     positionMs: Math.max(0, Number(raw.positionMs) || 0),
     durationMs: Math.max(0, Number(raw.durationMs) || 0),
+    stateTimestampMs: Number.isFinite(rawTs) && rawTs > 0 ? Math.round(rawTs) : 0,
     volume: typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : 0,
     muted: Boolean(raw.muted),
     volumeSynced: Boolean(raw.volumeSynced),
     hasPrev: Boolean(raw.hasPrev),
     hasNext: Boolean(raw.hasNext),
+    selectedServerNume: raw.selectedServerNume || '',
+    qualityLabel: raw.qualityLabel || '',
+    audioLabel: raw.audioLabel || '',
+    subtitleUrl: raw.subtitleUrl || '',
+    subtitleLabel: raw.subtitleLabel || '',
+    mediaTracks,
+    activeTrackIds,
     errorMessage: raw.errorMessage || '',
   };
 }
@@ -593,7 +748,7 @@ function syncWebCastPolling(): void {
       .finally(() => {
         webStatePollInFlight = false;
       });
-  }, 2000);
+  }, 1000);
 }
 
 function notifyWebCastState(raw: Partial<TvCastStateSnapshot> | null | undefined): TvCastStateSnapshot {
@@ -753,6 +908,58 @@ export function resolveActiveTvCastDevice(
   return null;
 }
 
+async function uploadBlobToServerCast(blobUrl: string, kind: 'video' | 'subtitle'): Promise<string | null> {
+  if (!blobUrl || !blobUrl.startsWith('blob:') || typeof fetch !== 'function') return null;
+  try {
+    const blobRes = await fetch(blobUrl);
+    if (!blobRes.ok) return null;
+    const blob = await blobRes.blob();
+    const mime = blob.type || (kind === 'subtitle' ? 'text/vtt' : 'video/mp4');
+    const uploadRes = await fetch(`/api/tv-cast/upload-offline?kind=${kind}`, {
+      method: 'POST',
+      headers: { 'Content-Type': mime },
+      body: blob,
+    });
+    if (!uploadRes.ok) return null;
+    const data = (await uploadRes.json()) as { ok?: boolean; offlineUrl?: string };
+    return data?.ok && data.offlineUrl ? data.offlineUrl : null;
+  } catch {
+    return null;
+  }
+}
+
+async function prepareMediaPayloadForWebServerCast(media: TvCastMediaPayload): Promise<TvCastMediaPayload> {
+  let nextMedia = media;
+  if (media.streamUrl.startsWith('blob:')) {
+    const uploaded = await uploadBlobToServerCast(media.streamUrl, 'video');
+    if (!uploaded) {
+      throw new Error(
+        'Não foi possível preparar o vídeo baixado para transmissão na rede Wi-Fi.'
+      );
+    }
+    nextMedia = { ...nextMedia, streamUrl: uploaded, preferDirect: false };
+  }
+
+  if (nextMedia.subtitleUrl && nextMedia.subtitleUrl.startsWith('blob:')) {
+    const uploadedSub = await uploadBlobToServerCast(nextMedia.subtitleUrl, 'subtitle');
+    nextMedia = { ...nextMedia, subtitleUrl: uploadedSub || '' };
+  }
+
+  if (Array.isArray(nextMedia.subtitles) && nextMedia.subtitles.some((s) => s.url.startsWith('blob:'))) {
+    const mappedSubs = await Promise.all(
+      nextMedia.subtitles.map(async (s) => {
+        if (!s.url.startsWith('blob:')) return s;
+        const uploadedSub = await uploadBlobToServerCast(s.url, 'subtitle');
+        return uploadedSub ? { ...s, url: uploadedSub } : null;
+      })
+    );
+    const validSubs = mappedSubs.filter((s): s is TvCastSubtitleOption => Boolean(s));
+    nextMedia = { ...nextMedia, subtitles: validSubs };
+  }
+
+  return nextMedia;
+}
+
 export async function startNativeTvCast(
   device: TvCastDevice,
   media: TvCastMediaPayload,
@@ -764,6 +971,7 @@ export async function startNativeTvCast(
     return Boolean(res?.started);
   }
 
+  const preparedMedia = await prepareMediaPayloadForWebServerCast(media);
   const res = await fetchTvCastJson<{
     started?: boolean;
     state?: Partial<TvCastStateSnapshot>;
@@ -771,7 +979,7 @@ export async function startNativeTvCast(
   }>('/api/tv-cast/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ device, media, deliveryMode }),
+    body: JSON.stringify({ device, media: preparedMedia, deliveryMode }),
   });
 
   if (!res.ok || !res.data?.started) {
@@ -794,10 +1002,11 @@ export async function prepareExternalTvCast(
     return TvCastNative.prepareExternalCast({ media, openExternalApp });
   }
 
+  const preparedMedia = await prepareMediaPayloadForWebServerCast(media);
   const res = await fetchTvCastJson<PrepareExternalCastResult>('/api/tv-cast/prepare-link', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ media }),
+    body: JSON.stringify({ media: preparedMedia, preserveActiveController: true }),
   });
 
   if (!res.ok || !res.data) return null;
@@ -827,10 +1036,14 @@ export async function getNativeTvCastState(): Promise<TvCastStateSnapshot> {
 }
 
 async function sendWebCastControl(body: {
-  action: 'play' | 'pause' | 'toggle' | 'seek' | 'seekBy' | 'volume';
+  action: 'play' | 'pause' | 'toggle' | 'seek' | 'seekBy' | 'volume' | 'setTracks';
   positionMs?: number;
   deltaMs?: number;
   volume?: number;
+  activeTrackIds?: number[];
+  subtitleDisabled?: boolean;
+  subtitleUrl?: string;
+  subtitleLabel?: string;
 }): Promise<void> {
   const res = await fetchTvCastJson<{
     ok?: boolean;
@@ -894,6 +1107,24 @@ export async function tvCastSetVolume(volume: number): Promise<void> {
     return;
   }
   await TvCastNative.setVolume({ volume: clamped });
+}
+
+export async function tvCastSetTracks(options: TvCastSetTracksOptions): Promise<void> {
+  if (!isNativeAndroidCastSupported()) {
+    let resolvedSubUrl = options.subtitleUrl;
+    if (!options.subtitleDisabled && resolvedSubUrl && resolvedSubUrl.startsWith('blob:')) {
+      resolvedSubUrl = (await uploadBlobToServerCast(resolvedSubUrl, 'subtitle')) || '';
+    }
+    await sendWebCastControl({
+      action: 'setTracks',
+      activeTrackIds: options.activeTrackIds,
+      subtitleDisabled: options.subtitleDisabled,
+      subtitleUrl: resolvedSubUrl,
+      subtitleLabel: options.subtitleLabel,
+    });
+    return;
+  }
+  await TvCastNative.setTracks(options);
 }
 
 export async function tvCastNextEpisode(): Promise<void> {

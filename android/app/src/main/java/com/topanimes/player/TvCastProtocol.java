@@ -53,12 +53,27 @@ public final class TvCastProtocol {
     private static final Pattern SRT_TIMESTAMP_LINE = Pattern.compile(
         "(\\d{1,2}:\\d{2}:\\d{2}),(\\d{1,3})(\\s*-->\\s*)(\\d{1,2}:\\d{2}:\\d{2}),(\\d{1,3})"
     );
+    private static final Pattern VTT_TIMESTAMP_LINE = Pattern.compile(
+        "(?:(\\d{1,2}):)?(\\d{2}):(\\d{2})\\.(\\d{1,3})(\\s*-->\\s*)(?:(\\d{1,2}):)?(\\d{2}):(\\d{2})\\.(\\d{1,3})([^\\n]*)"
+    );
+    private static final Pattern OFFLINE_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{4,64}$");
+    private static final Pattern OFFLINE_FILE_PATTERN = Pattern.compile("^[a-zA-Z0-9._-]{1,80}$");
     private static final Pattern UPNP_SERVICE_BLOCK = Pattern.compile(
         "<(?:[\\w-]+:)?service\\b[^>]*>([\\s\\S]*?)</(?:[\\w-]+:)?service>",
         Pattern.CASE_INSENSITIVE
     );
 
     private TvCastProtocol() {
+    }
+
+    public static final class LocalOfflineAsset {
+        public final String downloadId;
+        public final String fileName;
+
+        public LocalOfflineAsset(String downloadId, String fileName) {
+            this.downloadId = safeStr(downloadId);
+            this.fileName = safeStr(fileName);
+        }
     }
 
     public static final class CastDevice {
@@ -405,15 +420,30 @@ public final class TvCastProtocol {
         String mediaUrl,
         String mimeType
     ) {
+        return buildDidlLiteMetadata(title, seriesTitle, posterUrl, mediaUrl, mimeType, "");
+    }
+
+    public static String buildDidlLiteMetadata(
+        String title,
+        String seriesTitle,
+        String posterUrl,
+        String mediaUrl,
+        String mimeType,
+        String subtitleUrl
+    ) {
         String safeTitle = escapeXml(safeStr(title).isEmpty() ? "Anisync" : title.trim());
         String safeSeries = escapeXml(safeStr(seriesTitle));
         String safeMime = safeStr(mimeType).isEmpty() ? "video/mp4" : mimeType.trim();
         String safeUrl = escapeXml(safeStr(mediaUrl));
-        StringBuilder sb = new StringBuilder(384);
+        String safeSubUrl = escapeXml(safeStr(subtitleUrl));
+        StringBuilder sb = new StringBuilder(512);
         sb.append("<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ")
             .append("xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ")
-            .append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">")
-            .append("<item id=\"0\" parentID=\"-1\" restricted=\"1\">")
+            .append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"");
+        if (!safeSubUrl.isEmpty()) {
+            sb.append(" xmlns:sec=\"http://www.sec.co.kr/\"");
+        }
+        sb.append("><item id=\"0\" parentID=\"-1\" restricted=\"1\">")
             .append("<dc:title>").append(safeTitle).append("</dc:title>");
         if (!safeSeries.isEmpty()) {
             sb.append("<upnp:seriesTitle>").append(safeSeries).append("</upnp:seriesTitle>");
@@ -426,8 +456,18 @@ public final class TvCastProtocol {
             .append("<res protocolInfo=\"http-get:*:").append(escapeXml(safeMime))
             .append(":DLNA.ORG_OP=").append(dlnaOp)
             .append(";DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\">")
-            .append(safeUrl).append("</res>")
-            .append("</item></DIDL-Lite>");
+            .append(safeUrl).append("</res>");
+        if (!safeSubUrl.isEmpty()) {
+            String subMime = safeSubUrl.toLowerCase(Locale.ROOT).endsWith(".vtt") ? "text/vtt" : "text/srt";
+            String secType = "text/vtt".equals(subMime) ? "vtt" : "srt";
+            sb.append("<res protocolInfo=\"http-get:*:").append(subMime).append(":*\">")
+                .append(safeSubUrl).append("</res>")
+                .append("<sec:CaptionInfoEx sec:type=\"").append(secType).append("\">")
+                .append(safeSubUrl).append("</sec:CaptionInfoEx>")
+                .append("<sec:CaptionInfo sec:type=\"").append(secType).append("\">")
+                .append(safeSubUrl).append("</sec:CaptionInfo>");
+        }
+        sb.append("</item></DIDL-Lite>");
         return sb.toString();
     }
 
@@ -569,6 +609,142 @@ public final class TvCastProtocol {
     }
 
     /**
+     * Parses a local offline media URL served by LocalProxyPlugin (e.g.
+     * http://127.0.0.1:<port>/offline/<downloadId>/<fileName>) with strict path validation
+     * so TvCastService can serve downloaded episodes directly to TVs over the LAN proxy.
+     */
+    public static LocalOfflineAsset parseLocalOfflineAsset(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return null;
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase(Locale.ROOT) : "";
+            if (!"http".equals(scheme)) return null;
+            String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            if (!"127.0.0.1".equals(host) && !"localhost".equals(host)) return null;
+            String path = uri.getPath();
+            if (path == null || !path.startsWith("/offline/")) return null;
+            String rel = path.substring("/offline/".length());
+            int slash = rel.indexOf('/');
+            if (slash <= 0 || slash >= rel.length() - 1) return null;
+            String downloadId = rel.substring(0, slash);
+            String fileName = rel.substring(slash + 1);
+            if (!isSafeOfflineAssetName(downloadId, fileName)) return null;
+            return new LocalOfflineAsset(downloadId, fileName);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static boolean isSafeOfflineAssetName(String downloadId, String fileName) {
+        if (downloadId == null || fileName == null) return false;
+        return OFFLINE_ID_PATTERN.matcher(downloadId).matches()
+            && OFFLINE_FILE_PATTERN.matcher(fileName).matches()
+            && !fileName.contains("..")
+            && !fileName.startsWith(".");
+    }
+
+    public static boolean isSupportedCastSourceUrl(String rawUrl) {
+        return isSafeExternalHttpUrl(rawUrl) || parseLocalOfflineAsset(rawUrl) != null;
+    }
+
+    public static String buildLanOfflineAssetUrl(
+        String lanBaseUrl,
+        String castToken,
+        String downloadId,
+        String fileName
+    ) {
+        String cleanBase = safeStr(lanBaseUrl).replaceAll("/+$", "");
+        if (cleanBase.isEmpty() || safeStr(castToken).isEmpty() || !isSafeOfflineAssetName(downloadId, fileName)) {
+            return "";
+        }
+        return cleanBase + "/cast/" + castToken + "/offline/" + downloadId + "/" + fileName;
+    }
+
+    public static String rewriteOfflineM3u8ForLanProxy(
+        String manifest,
+        String lanBaseUrl,
+        String castToken,
+        String downloadId
+    ) {
+        if (manifest == null || manifest.isEmpty()) return "";
+        String cleanBase = safeStr(lanBaseUrl).replaceAll("/+$", "");
+        String[] lines = manifest.split("\\r?\\n");
+        StringBuilder sb = new StringBuilder(manifest.length() + 512);
+
+        for (int i = 0; i < lines.length; i++) {
+            String line = lines[i];
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                sb.append(line);
+            } else if (trimmed.startsWith("#")) {
+                Matcher m = URI_ATTR_PATTERN.matcher(line);
+                StringBuffer replaced = new StringBuffer();
+                while (m.find()) {
+                    String rawUri = m.group(1);
+                    String replacement = m.group(0);
+                    String cleanName = rawUri != null ? rawUri.trim() : "";
+                    if (isSafeOfflineAssetName(downloadId, cleanName)) {
+                        replacement = "URI=\""
+                            + buildLanOfflineAssetUrl(cleanBase, castToken, downloadId, cleanName)
+                            + "\"";
+                    }
+                    m.appendReplacement(replaced, Matcher.quoteReplacement(replacement));
+                }
+                m.appendTail(replaced);
+                sb.append(replaced);
+            } else if (isSafeOfflineAssetName(downloadId, trimmed)) {
+                sb.append(buildLanOfflineAssetUrl(cleanBase, castToken, downloadId, trimmed));
+            } else {
+                sb.append(line);
+            }
+            if (i < lines.length - 1) {
+                sb.append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    public static String guessOfflineMimeType(String fileName) {
+        String lower = safeStr(fileName).toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".m3u8")) return "application/vnd.apple.mpegurl; charset=utf-8";
+        if (lower.endsWith(".ts")) return "video/mp2t";
+        if (lower.endsWith(".m4s")) return "video/iso.segment";
+        if (lower.endsWith(".vtt")) return "text/vtt; charset=utf-8";
+        if (lower.endsWith(".srt")) return "text/srt; charset=utf-8";
+        if (lower.endsWith(".ass") || lower.endsWith(".ssa")) return "text/plain; charset=utf-8";
+        if (lower.endsWith(".bin") || lower.endsWith(".key")) return "application/octet-stream";
+        return "video/mp4";
+    }
+
+    /**
+     * Remote playback controls (play/pause, seekbar, volume) must remain available whenever
+     * connected to a real TV protocol (DLNA or Chromecast), even if deliveryMode is transitional.
+     */
+    public static boolean hasRemotePlaybackControls(String deviceProtocol, String deliveryMode) {
+        if (PROTOCOL_DLNA.equalsIgnoreCase(safeStr(deviceProtocol))
+            || PROTOCOL_CHROMECAST.equalsIgnoreCase(safeStr(deviceProtocol))) {
+            return true;
+        }
+        return !"lan-link".equalsIgnoreCase(safeStr(deliveryMode));
+    }
+
+    /**
+     * Prevents transient DLNA STOPPED polls or short initial HLS segment durations from prematurely
+     * terminating an active TV cast session.
+     */
+    public static boolean isGenuineDlnaCompletion(
+        boolean sawPlaying,
+        long positionMs,
+        long durationMs,
+        int consecutiveStoppedPolls
+    ) {
+        if (!sawPlaying || consecutiveStoppedPolls < 3) return false;
+        if (durationMs < 30_000L || positionMs < 10_000L) return false;
+        long nearEndThresholdMs = Math.max(durationMs - 20_000L, Math.round(durationMs * 0.90));
+        return positionMs >= nearEndThresholdMs;
+    }
+
+    /**
      * Rewrites all nested playlist/segment/key URIs in an HLS manifest so a TV on the LAN fetches
      * them through the background foreground-service LAN proxy instead of 127.0.0.1.
      */
@@ -669,6 +845,78 @@ public final class TvCastProtocol {
         }
         String converted = SRT_TIMESTAMP_LINE.matcher(text).replaceAll("$1.$2$3$4.$5");
         return "WEBVTT\n\n" + converted + "\n";
+    }
+
+    public static String convertVttToSrt(String rawContent) {
+        if (rawContent == null) return "";
+        String text = rawContent;
+        if (text.startsWith("\uFEFF")) {
+            text = text.substring(1);
+        }
+        text = text.replace("\r\n", "\n").replace('\r', '\n').trim();
+        if (text.isEmpty()) return "";
+        if (!text.startsWith("WEBVTT")) {
+            return text + "\n";
+        }
+
+        String[] blocks = text.split("\\n\\n+");
+        StringBuilder out = new StringBuilder(text.length());
+        int cueIdx = 1;
+        for (String block : blocks) {
+            String trimmed = block.trim();
+            if (trimmed.isEmpty() || trimmed.startsWith("WEBVTT") || trimmed.startsWith("NOTE")
+                || trimmed.startsWith("STYLE") || trimmed.startsWith("REGION")) {
+                continue;
+            }
+            String[] lines = trimmed.split("\\n");
+            int timeLineIdx = -1;
+            for (int i = 0; i < lines.length; i++) {
+                if (lines[i].contains("-->")) {
+                    timeLineIdx = i;
+                    break;
+                }
+            }
+            if (timeLineIdx < 0) continue;
+
+            Matcher m = VTT_TIMESTAMP_LINE.matcher(lines[timeLineIdx].trim());
+            if (!m.find()) continue;
+            String h1 = padTwoDigits(m.group(1));
+            String m1 = m.group(2);
+            String s1 = m.group(3);
+            String ms1 = padThreeDigits(m.group(4));
+            String h2 = padTwoDigits(m.group(6));
+            String m2 = m.group(7);
+            String s2 = m.group(8);
+            String ms2 = padThreeDigits(m.group(9));
+
+            StringBuilder cueText = new StringBuilder();
+            for (int i = timeLineIdx + 1; i < lines.length; i++) {
+                if (cueText.length() > 0) cueText.append('\n');
+                cueText.append(lines[i].replaceAll("<[^>]+>", ""));
+            }
+            if (cueText.length() == 0) continue;
+
+            out.append(cueIdx++).append('\n')
+                .append(h1).append(':').append(m1).append(':').append(s1).append(',').append(ms1)
+                .append(" --> ")
+                .append(h2).append(':').append(m2).append(':').append(s2).append(',').append(ms2)
+                .append('\n')
+                .append(cueText)
+                .append("\n\n");
+        }
+        return out.toString();
+    }
+
+    private static String padTwoDigits(String raw) {
+        if (raw == null || raw.isEmpty()) return "00";
+        return raw.length() == 1 ? ("0" + raw) : raw;
+    }
+
+    private static String padThreeDigits(String raw) {
+        if (raw == null || raw.isEmpty()) return "000";
+        if (raw.length() == 1) return raw + "00";
+        if (raw.length() == 2) return raw + "0";
+        return raw.substring(0, 3);
     }
 
     public static boolean isChromecastVideoCapable(String capabilitiesRaw) {
