@@ -152,7 +152,6 @@ build_abi() {
       no-tests \
       no-ui-console \
       no-legacy \
-      no-docs \
       --prefix="$PREFIX" \
       --libdir=lib
     make -j"$CPU_COUNT" build_libs
