@@ -448,7 +448,7 @@ export function SettingsModal({
                 <div className="min-w-0 flex-1">
                   <span className="block text-sm font-medium text-slate-200">TheTVDB</span>
                   <span className="mt-0.5 block text-xs text-slate-400">
-                    Sinopses em PT-BR, estúdios, gêneros, temporadas e detalhes de animes.
+                    Sinopses, títulos de episódios, capas, estúdios, redes, classificação, gêneros, temporadas e datas oficiais.
                   </span>
                 </div>
                 <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
@@ -470,7 +470,7 @@ export function SettingsModal({
                 <div className="min-w-0 flex-1">
                   <span className="block text-sm font-medium text-slate-200">LiveChart.me</span>
                   <span className="mt-0.5 block text-xs text-slate-400">
-                    Calendário semanal com horários, contagem regressiva, Dub/Sub e plataformas oficiais.
+                    Calendário semanal, horários oficiais de estreia, contagem regressiva, Dub/Sub e plataformas de streaming.
                   </span>
                 </div>
                 <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
