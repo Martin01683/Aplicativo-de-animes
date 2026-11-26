@@ -322,3 +322,111 @@ test('parses non-API GitHub web fallback endpoints (latest JSON, expanded_assets
   assert.equal(release.tagName, 'v1.0.36');
   assert.equal(release.apkAsset?.digest, apk.digest);
 });
+
+test('extracts full 40-char commit SHA from GitHub Atom autolinked <a href=".../commit/..."> and never flags same semver as update', () => {
+  const liveStyleAtomXml = `<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>tag:github.com,2008:Repository/1465981220/v1.0.38</id>
+        <updated>2026-11-26T19:25:43Z</updated>
+        <link rel="alternate" type="text/html" href="https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.38"/>
+        <title>Anisync v1.0.38</title>
+        <content type="html">&lt;h2&gt;Changelog&lt;/h2&gt;&lt;p&gt;Build automático (&lt;a class=&quot;commit-link&quot; href=&quot;https://github.com/Martin01683/Aplicativo-de-animes/commit/564585c26eafacd80095b1d5c2d0322468825004&quot;&gt;&lt;tt&gt;564585c&lt;/tt&gt;&lt;/a&gt;).&lt;/p&gt;</content>
+      </entry>
+    </feed>`;
+
+  const atomEntry = parseGitHubReleasesAtom(liveStyleAtomXml, 'v1.0.38');
+  assert.ok(atomEntry);
+  assert.equal(atomEntry.commitSha, '564585c26eafacd80095b1d5c2d0322468825004');
+
+  // Even when a fallback release has NO commitSha and was published 25 minutes after the git commit,
+  // matching semantic version (1.0.38 === v1.0.38) MUST report up-to-date.
+  const sameSemverNoSha = evaluateUpdateStatus({
+    currentBuild: {
+      version: '1.0.38',
+      androidVersionName: '1.0.38',
+      commitSha: '564585c26eafacd80095b1d5c2d0322468825004',
+      builtAt: '2026-11-26T19:00:00Z',
+      repository: 'Martin01683/Aplicativo-de-animes',
+    },
+    remoteRelease: {
+      id: 459822195,
+      tagName: 'v1.0.38',
+      releaseName: 'Anisync v1.0.38',
+      htmlUrl: 'https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.38',
+      publishedAt: '2026-11-26T19:25:43Z',
+      updatedAt: '2026-11-26T19:25:43Z',
+      commitSha: '',
+      notes: 'Build (564585c).',
+      apkAsset: {
+        name: 'Anisync.apk',
+        sizeBytes: 125924516,
+        downloadUrl:
+          'https://github.com/Martin01683/Aplicativo-de-animes/releases/download/v1.0.38/Anisync.apk',
+        updatedAt: '2026-11-26T19:25:42Z',
+      },
+    },
+  });
+  assert.equal(sameSemverNoSha.hasUpdate, false);
+  assert.equal(sameSemverNoSha.reason, 'up-to-date');
+
+  // Matching androidVersionName overrides stale fallback bundle version.
+  const androidVersionMatches = evaluateUpdateStatus({
+    currentBuild: {
+      version: '1.0.0',
+      androidVersionName: '1.0.38',
+      commitSha: '',
+      builtAt: '',
+      repository: 'Martin01683/Aplicativo-de-animes',
+    },
+    remoteRelease: {
+      id: 459822195,
+      tagName: 'v1.0.38',
+      releaseName: 'Anisync v1.0.38',
+      htmlUrl: 'https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.38',
+      publishedAt: '2026-11-26T19:25:43Z',
+      updatedAt: '2026-11-26T19:25:43Z',
+      commitSha: '564585c26eafacd80095b1d5c2d0322468825004',
+      notes: '',
+      apkAsset: {
+        name: 'Anisync.apk',
+        sizeBytes: 125924516,
+        downloadUrl:
+          'https://github.com/Martin01683/Aplicativo-de-animes/releases/download/v1.0.38/Anisync.apk',
+        updatedAt: '2026-11-26T19:25:42Z',
+      },
+    },
+  });
+  assert.equal(androidVersionMatches.hasUpdate, false);
+  assert.equal(androidVersionMatches.reason, 'up-to-date');
+
+  // Older installed version MUST still detect a genuine newer semver release.
+  const genuineNewer = evaluateUpdateStatus({
+    currentBuild: {
+      version: '1.0.36',
+      androidVersionName: '1.0.36',
+      commitSha: '4dd8ae3087718a89d2b99b2715cbcc9cc62d0aa1',
+      builtAt: '2026-11-26T16:54:54Z',
+      repository: 'Martin01683/Aplicativo-de-animes',
+    },
+    remoteRelease: {
+      id: 459822195,
+      tagName: 'v1.0.38',
+      releaseName: 'Anisync v1.0.38',
+      htmlUrl: 'https://github.com/Martin01683/Aplicativo-de-animes/releases/tag/v1.0.38',
+      publishedAt: '2026-11-26T19:25:43Z',
+      updatedAt: '2026-11-26T19:25:43Z',
+      commitSha: '564585c26eafacd80095b1d5c2d0322468825004',
+      notes: '',
+      apkAsset: {
+        name: 'Anisync.apk',
+        sizeBytes: 125924516,
+        downloadUrl:
+          'https://github.com/Martin01683/Aplicativo-de-animes/releases/download/v1.0.38/Anisync.apk',
+        updatedAt: '2026-11-26T19:25:42Z',
+      },
+    },
+  });
+  assert.equal(genuineNewer.hasUpdate, true);
+  assert.equal(genuineNewer.reason, 'newer-version');
+});

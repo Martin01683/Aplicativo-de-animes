@@ -1135,6 +1135,19 @@ export default function App() {
       setCheckingAppUpdate(true);
       setAppUpdateError('');
       try {
+        if (isNativeAndroidApp() && !buildInfoRef.current.androidVersionName) {
+          const nativeInfo = await getNativeAppBuildInfo();
+          if (nativeInfo) {
+            const hydratedBuildInfo: AppBuildInfo = {
+              ...buildInfoRef.current,
+              androidVersionName: nativeInfo.versionName,
+              androidVersionCode: nativeInfo.versionCode,
+            };
+            buildInfoRef.current = hydratedBuildInfo;
+            setBuildInfo(hydratedBuildInfo);
+          }
+        }
+
         const res = await apiFetch('/api/app-update/check');
         const data = (await res.json()) as {
           checkedAt?: string;
@@ -1420,11 +1433,13 @@ export default function App() {
       if (isNativeAndroidApp()) {
         const nativeInfo = await getNativeAppBuildInfo();
         if (!cancelled && nativeInfo) {
-          setBuildInfo((prev) => ({
-            ...prev,
+          const updatedBuildInfo: AppBuildInfo = {
+            ...buildInfoRef.current,
             androidVersionName: nativeInfo.versionName,
             androidVersionCode: nativeInfo.versionCode,
-          }));
+          };
+          buildInfoRef.current = updatedBuildInfo;
+          setBuildInfo(updatedBuildInfo);
         }
       }
 

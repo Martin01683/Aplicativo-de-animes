@@ -33,7 +33,9 @@ function readBuildInfo() {
   }
 
   let builtAt = '';
-  if (commitSha) {
+  if (process.env.GITHUB_ACTIONS === 'true' || (process.env.APP_VERSION_NAME || '').trim()) {
+    builtAt = new Date().toISOString();
+  } else if (commitSha) {
     try {
       builtAt = execSync('git log -1 --format=%cI', { stdio: ['ignore', 'pipe', 'ignore'] })
         .toString()

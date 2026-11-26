@@ -328,7 +328,11 @@ export function parseGitHubReleasesAtom(
     const contentMatch = entry.match(/<content[^>]*>([\s\S]*?)<\/content>/i);
     const decodedContent = contentMatch?.[1] ? decodeHtmlXmlEntities(contentMatch[1]) : '';
     const notes = convertReleaseHtmlToMarkdown(decodedContent);
-    const commitSha = extractCommitShaFromNotes(notes);
+    const commitLinkMatch = decodedContent.match(/\/commit\/([0-9a-f]{40})\b/i);
+    const commitSha =
+      commitLinkMatch?.[1]?.toLowerCase() ||
+      extractCommitShaFromNotes(decodedContent) ||
+      extractCommitShaFromNotes(notes);
     const htmlUrl =
       rawHref && isAllowedGitHubDownloadUrl(rawHref)
         ? rawHref
@@ -497,7 +501,13 @@ export function evaluateUpdateStatus(params: {
     };
   }
 
-  // 1. Check semver tag if release uses semantic versioning (e.g. v1.2.0)
+  const localSha = currentBuild.commitSha.trim().toLowerCase();
+  const remoteSha = remoteRelease.commitSha.trim().toLowerCase();
+  const shasBothPresent = Boolean(localSha && remoteSha);
+  const shasMatch =
+    shasBothPresent && (localSha.startsWith(remoteSha) || remoteSha.startsWith(localSha));
+
+  // 1. Check semver tag if release uses semantic versioning (e.g. v1.0.38)
   if (parseSemverTuple(remoteRelease.tagName) && parseSemverTuple(currentVer)) {
     const cmp = compareSemver(remoteRelease.tagName, currentVer);
     if (cmp > 0) {
@@ -518,12 +528,22 @@ export function evaluateUpdateStatus(params: {
         latestRelease: remoteRelease,
       };
     }
+    // Exact same semantic version (e.g. installed 1.0.38 vs remote v1.0.38):
+    // treat as up-to-date unless BOTH commit SHAs are known and explicitly differ
+    // (prevents false positives when Atom fallback lacks a SHA or CI build took >2 min).
+    if (!shasBothPresent || shasMatch) {
+      return {
+        checkedAt,
+        hasUpdate: false,
+        reason: 'up-to-date',
+        currentBuild,
+        latestRelease: remoteRelease,
+      };
+    }
   }
 
   // 2. Compare commit SHA for rolling releases (e.g. tag_name = "latest-apk")
-  const localSha = currentBuild.commitSha.trim().toLowerCase();
-  const remoteSha = remoteRelease.commitSha.trim().toLowerCase();
-  if (localSha && remoteSha && (localSha.startsWith(remoteSha) || remoteSha.startsWith(localSha))) {
+  if (shasMatch) {
     return {
       checkedAt,
       hasUpdate: false,
