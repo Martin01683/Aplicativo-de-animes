@@ -1206,9 +1206,17 @@ export async function startServerTvCast(params: {
               'GetPositionInfo',
               { InstanceID: '0' }
             );
-            const rel = parseDlnaTimeMs(extractXmlTagValue(pXml, 'RelTime'));
+            const relRaw = parseDlnaTimeMs(extractXmlTagValue(pXml, 'RelTime'));
+            const absRaw = parseDlnaTimeMs(extractXmlTagValue(pXml, 'AbsTime'));
+            const reportedPos = relRaw > 0 ? relRaw : absRaw > 0 ? absRaw : relRaw;
             const dur = parseDlnaTimeMs(extractXmlTagValue(pXml, 'TrackDuration'));
-            if (rel >= 0) sess.state.positionMs = rel;
+            const ignoreZeroReset =
+              reportedPos <= 2000 &&
+              sess.state.positionMs >= 8000 &&
+              (tState === 'TRANSITIONING' || tState === 'PLAYING');
+            if (reportedPos >= 0 && !ignoreZeroReset) {
+              sess.state.positionMs = reportedPos;
+            }
             if (dur > 0) sess.state.durationMs = dur;
 
             if (tState === 'PLAYING') {

@@ -140,10 +140,12 @@ import {
   preloadAllRouteChunks,
   preloadRouteChunk,
   registerRouteChunkPreloaders,
+  resolveEmbedCachedGlobal,
   scheduleBackgroundPrefetch,
   setCachedEpisodeDetails,
   type MediaNavigationSeed,
 } from './lib/prefetchCache';
+import { formatServerLabel } from './lib/serverLabel';
 import {
   DEFAULT_APP_SETTINGS,
   getEpisodeCheckIntervalMs,
@@ -153,8 +155,19 @@ import {
 } from './lib/settings';
 import {
   addTvCastStateListener,
+  buildCastMediaPayload,
+  computeSyncedCastPositionMs,
+  discoverTvCastDevicesDetailed,
   getNativeTvCastState,
   IDLE_TV_CAST_STATE,
+  loadLastTvCastDevice,
+  markCastClockSeek,
+  reconcileCastClock,
+  resolveActiveTvCastDevice,
+  startNativeTvCast,
+  type CastClockState,
+  type TvCastDeliveryPreference,
+  type TvCastDevice,
   type TvCastMediaPayload,
   type TvCastStateSnapshot,
 } from './lib/tvCast';
@@ -202,6 +215,7 @@ import type {
   HomeCatalog,
   LiveChartScheduleMode,
   MediaKind,
+  PlayerOption,
   SearchResultItem,
   SliderMovieItem,
   WatchHistoryEntry,
@@ -289,10 +303,25 @@ export default function App() {
   const [tvCastState, setTvCastState] = useState<TvCastStateSnapshot>(() => ({
     ...IDLE_TV_CAST_STATE,
   }));
+  const [tvCastClock, setTvCastClock] = useState<CastClockState | null>(null);
+  const tvCastClockRef = useRef<CastClockState | null>(null);
+  tvCastClockRef.current = tvCastClock;
+  const [tvCastTickNow, setTvCastTickNow] = useState<number>(() => Date.now());
   const [tvCastModalOpen, setTvCastModalOpen] = useState(false);
   const [tvCastMediaPayload, setTvCastMediaPayload] = useState<TvCastMediaPayload | null>(null);
+  const [tvCastDeliveryPref, setTvCastDeliveryPref] = useState<TvCastDeliveryPreference>('auto');
+  const [activeTvCastDevice, setActiveTvCastDevice] = useState<TvCastDevice | null>(() =>
+    loadLastTvCastDevice()
+  );
+  const [activeCastServerNume, setActiveCastServerNume] = useState<string>('');
+  const [switchingCastServerNume, setSwitchingCastServerNume] = useState<string>('');
+  const [castEpisodeDetailsFallback, setCastEpisodeDetailsFallback] =
+    useState<EpisodeDetails | null>(null);
+  const [loadingCastEpisodeServers, setLoadingCastEpisodeServers] = useState(false);
   const tvCastModalOpenRef = useRef(false);
   tvCastModalOpenRef.current = tvCastModalOpen;
+  const tvCastStateRef = useRef<TvCastStateSnapshot>(tvCastState);
+  tvCastStateRef.current = tvCastState;
   const [tvCastWebHelpers, setTvCastWebHelpers] = useState<{
     pauseLocal?: () => void;
     canPromptWebRemote?: boolean;
@@ -2810,11 +2839,206 @@ export default function App() {
     ) => {
       if (payload) {
         setTvCastMediaPayload(payload);
+        if (payload.selectedServerNume) {
+          setActiveCastServerNume(payload.selectedServerNume);
+        }
       }
       setTvCastWebHelpers(helpers || {});
       setTvCastModalOpen(true);
     },
     []
+  );
+
+  const handleCastSeekCommitted = useCallback((targetMs: number) => {
+    const now = Date.now();
+    const curState = tvCastStateRef.current;
+    const nextClock = markCastClockSeek(tvCastClockRef.current, curState, targetMs, now);
+    tvCastClockRef.current = nextClock;
+    setTvCastClock(nextClock);
+    setTvCastTickNow(now);
+  }, []);
+
+  // Tick smoothly every 1s while playing on TV so ActiveCastBar & TvCastModal stay synchronized
+  useEffect(() => {
+    if (!tvCastState.active || tvCastState.status !== 'playing') return;
+    setTvCastTickNow(Date.now());
+    const id = window.setInterval(() => {
+      setTvCastTickNow(Date.now());
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [tvCastState.active, tvCastState.status]);
+
+  const syncedTvCastState: TvCastStateSnapshot = useMemo(() => {
+    if (!tvCastState.active || !tvCastClock) return tvCastState;
+    const syncedPosMs = computeSyncedCastPositionMs(
+      tvCastClock,
+      tvCastState.durationMs,
+      tvCastTickNow
+    );
+    if (syncedPosMs === tvCastState.positionMs) return tvCastState;
+    return { ...tvCastState, positionMs: syncedPosMs };
+  }, [tvCastClock, tvCastState, tvCastTickNow]);
+
+  const syncedTvCastStateRef = useRef<TvCastStateSnapshot>(syncedTvCastState);
+  syncedTvCastStateRef.current = syncedTvCastState;
+
+  // Load episode server options on demand when opening TV Cast controls away from the episode page
+  useEffect(() => {
+    if (!tvCastModalOpen || !tvCastState.active || !tvCastState.episodeUrl) return;
+    if (episodeDetails && isSameEpisodeUrl(episodeDetails.url, tvCastState.episodeUrl)) {
+      return;
+    }
+    if (
+      castEpisodeDetailsFallback &&
+      isSameEpisodeUrl(castEpisodeDetailsFallback.url, tvCastState.episodeUrl) &&
+      castEpisodeDetailsFallback.options.length > 0
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    setLoadingCastEpisodeServers(true);
+    void fetchEpisodeDetailsFast(tvCastState.episodeUrl)
+      .then((ep) => {
+        if (cancelled) return;
+        setCastEpisodeDetailsFallback(ep);
+      })
+      .catch(() => {
+        // ignore if offline or unreachable
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingCastEpisodeServers(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [castEpisodeDetailsFallback, episodeDetails, tvCastModalOpen, tvCastState.active, tvCastState.episodeUrl]);
+
+  const activeCastEpisodeDetails = useMemo(() => {
+    const targetUrl = tvCastState.episodeUrl || tvCastMediaPayload?.episodeUrl || '';
+    if (!targetUrl) return episodeDetails;
+    if (episodeDetails && isSameEpisodeUrl(episodeDetails.url, targetUrl)) {
+      return episodeDetails;
+    }
+    if (
+      castEpisodeDetailsFallback &&
+      isSameEpisodeUrl(castEpisodeDetailsFallback.url, targetUrl)
+    ) {
+      return castEpisodeDetailsFallback;
+    }
+    return null;
+  }, [castEpisodeDetailsFallback, episodeDetails, tvCastMediaPayload?.episodeUrl, tvCastState.episodeUrl]);
+
+  const castModalServerOptions = useMemo<PlayerOption[]>(() => {
+    const rawOpts = activeCastEpisodeDetails?.options || [];
+    return rawOpts
+      .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
+      .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) }));
+  }, [activeCastEpisodeDetails]);
+
+  const handleSwitchTvCastServer = useCallback(
+    async (opt: PlayerOption, discoveredDevices?: readonly TvCastDevice[]) => {
+      const curState = syncedTvCastStateRef.current;
+      if (!curState.active) return;
+
+      setSwitchingCastServerNume(opt.nume);
+      try {
+        let targetDevice = resolveActiveTvCastDevice(
+          curState,
+          discoveredDevices || [],
+          activeTvCastDevice || loadLastTvCastDevice(curState.deviceId)
+        );
+        if (!targetDevice) {
+          const discovered = await discoverTvCastDevicesDetailed(3500);
+          targetDevice = resolveActiveTvCastDevice(
+            curState,
+            discovered.devices,
+            activeTvCastDevice || loadLastTvCastDevice(curState.deviceId)
+          );
+        }
+        if (!targetDevice) {
+          showToast(
+            'Não foi possível reconectar à TV para trocar o servidor. Selecione a TV abaixo.'
+          );
+          return;
+        }
+
+        const resolved = await resolveEmbedCachedGlobal(opt);
+        if (resolved.status !== 'resolved' || resolved.streams.length === 0) {
+          showToast(`O servidor ${opt.label} não respondeu agora. Tente outro servidor.`);
+          return;
+        }
+
+        const bestStream =
+          [...resolved.streams].sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
+          resolved.streams[0];
+        if (!bestStream) {
+          showToast(`Nenhum stream disponível em ${opt.label}.`);
+          return;
+        }
+
+        const livePositionMs = syncedTvCastStateRef.current.positionMs;
+        const liveDurationMs = syncedTvCastStateRef.current.durationMs;
+        const ep = activeCastEpisodeDetails;
+        const nextPayload = buildCastMediaPayload({
+          stream: bestStream,
+          subtitles: resolved.subtitles,
+          referer: resolved.referer || 'https://topanimes.net/',
+          preferDirect: resolved.preferDirect,
+          episodeUrl: ep?.url || curState.episodeUrl || tvCastMediaPayload?.episodeUrl,
+          title: ep?.title || curState.episodeTitle || tvCastMediaPayload?.title || 'Episódio',
+          seriesTitle: ep?.seriesTitle || curState.seriesTitle || tvCastMediaPayload?.seriesTitle,
+          seriesUrl: ep?.seriesUrl || curState.seriesUrl || tvCastMediaPayload?.seriesUrl,
+          poster:
+            ep?.backdrop ||
+            ep?.poster ||
+            curState.poster ||
+            tvCastMediaPayload?.poster ||
+            '',
+          isMovie: ep?.isMovie ?? tvCastMediaPayload?.isMovie,
+          selectedServerNume: opt.nume,
+          prevUrl: ep?.prevUrl || tvCastMediaPayload?.prevUrl,
+          nextUrl: ep?.nextUrl || tvCastMediaPayload?.nextUrl,
+          autoPlayNextEpisode: settingsRef.current.autoPlayNextEpisode,
+          startPositionMs: livePositionMs,
+          durationMs: liveDurationMs || tvCastMediaPayload?.durationMs || 0,
+        });
+
+        setTvCastMediaPayload(nextPayload);
+        setActiveTvCastDevice(targetDevice);
+        await startNativeTvCast(targetDevice, nextPayload, tvCastDeliveryPref);
+        setActiveCastServerNume(opt.nume);
+
+        const now = Date.now();
+        const nextClock = markCastClockSeek(
+          tvCastClockRef.current,
+          curState,
+          livePositionMs,
+          now
+        );
+        tvCastClockRef.current = nextClock;
+        setTvCastClock(nextClock);
+        setTvCastTickNow(now);
+
+        showToast(`Servidor alterado na TV para ${opt.label}.`);
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : `Não foi possível trocar para ${opt.label} na TV.`;
+        showToast(msg);
+      } finally {
+        setSwitchingCastServerNume('');
+      }
+    },
+    [
+      activeCastEpisodeDetails,
+      activeTvCastDevice,
+      showToast,
+      tvCastDeliveryPref,
+      tvCastMediaPayload,
+    ]
   );
 
   // Sync live native background TV Cast state and persist watch progress even after reopening the app
@@ -2824,9 +3048,19 @@ export default function App() {
 
     const applyCastState = (next: TvCastStateSnapshot) => {
       if (cancelled) return;
+      const now = Date.now();
+      const nextClock = reconcileCastClock(tvCastClockRef.current, next, now);
+      tvCastClockRef.current = nextClock;
+      setTvCastClock(nextClock);
+      setTvCastTickNow(now);
       setTvCastState(next);
-      if (next.episodeUrl && (next.positionMs >= 2000 || next.status === 'stopped')) {
-        const posSec = Math.max(0, Math.floor(next.positionMs / 1000));
+
+      const effectivePosMs = nextClock
+        ? computeSyncedCastPositionMs(nextClock, next.durationMs, now)
+        : next.positionMs;
+
+      if (next.episodeUrl && (effectivePosMs >= 2000 || next.status === 'stopped')) {
+        const posSec = Math.max(0, Math.floor(effectivePosMs / 1000));
         const durSec = Math.max(0, Math.floor(next.durationMs / 1000));
         const completed =
           next.status === 'stopped' && durSec > 10 && posSec >= Math.max(5, durSec - 20);
@@ -2868,15 +3102,20 @@ export default function App() {
       }
     });
 
+    const refreshLiveCastState = () => {
+      void getNativeTvCastState().then(applyCastState);
+    };
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
-        void getNativeTvCastState().then(applyCastState);
+        refreshLiveCastState();
       }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('focus', refreshLiveCastState);
     return () => {
       cancelled = true;
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('focus', refreshLiveCastState);
       void listenerHandle?.remove();
     };
   }, [refreshProgressState]);
@@ -3134,6 +3373,9 @@ export default function App() {
         hasAppUpdate={Boolean(appUpdateResult?.hasUpdate)}
         latestRelease={appUpdateResult?.latestRelease || null}
         onOpenSettings={() => openSettingsModal('general')}
+        castActive={syncedTvCastState.active}
+        castDeviceName={syncedTvCastState.deviceName}
+        onOpenTvCastControls={() => setTvCastModalOpen(true)}
       />
 
       {!isOnline && (
@@ -3145,7 +3387,10 @@ export default function App() {
         </div>
       )}
 
-      <main ref={mainRef} className="pb-24 md:pb-16">
+      <main
+        ref={mainRef}
+        className={syncedTvCastState.active ? 'pb-40 md:pb-24' : 'pb-24 md:pb-16'}
+      >
         <div className={route.view === 'catalog' ? '' : 'hidden'} aria-hidden={route.view !== 'catalog'}>
           <CatalogView
             catalog={catalog}
@@ -3472,6 +3717,14 @@ export default function App() {
                       poster: episodeDetails.backdrop || episodeDetails.poster,
                       isMovie: episodeDetails.isMovie,
                     });
+                    void getNativeTvCastState().then((liveCast) => {
+                      const now = Date.now();
+                      const nextClock = reconcileCastClock(tvCastClockRef.current, liveCast, now);
+                      tvCastClockRef.current = nextClock;
+                      setTvCastClock(nextClock);
+                      setTvCastTickNow(now);
+                      setTvCastState(liveCast);
+                    });
                     if (
                       result.episodeUrl &&
                       !isSameEpisodeUrl(result.episodeUrl, episodeDetails.url)
@@ -3489,7 +3742,10 @@ export default function App() {
                   autoPlayNextEpisode={settings.autoPlayNextEpisode}
                   videoScale={settings.videoScale}
                   onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
-                  castState={tvCastState}
+                  castState={syncedTvCastState}
+                  activeCastServerNume={activeCastServerNume}
+                  switchingCastServerNume={switchingCastServerNume}
+                  onSwitchTvCastServer={(opt) => handleSwitchTvCastServer(opt)}
                   onOpenTvCast={handleOpenTvCast}
                   onLoadingStateChange={setEpisodeViewLoading}
                 />
@@ -3502,7 +3758,7 @@ export default function App() {
       </main>
 
       <ActiveCastBar
-        castState={tvCastState}
+        castState={syncedTvCastState}
         onOpenControls={() => setTvCastModalOpen(true)}
         onStop={() => showToast('Transmissão encerrada na TV.')}
       />
@@ -3517,8 +3773,22 @@ export default function App() {
       <TvCastModal
         open={tvCastModalOpen}
         onClose={() => setTvCastModalOpen(false)}
-        castState={tvCastState}
+        castState={syncedTvCastState}
         mediaPayload={tvCastMediaPayload}
+        deliveryPref={tvCastDeliveryPref}
+        onChangeDeliveryPref={setTvCastDeliveryPref}
+        serverOptions={castModalServerOptions}
+        loadingServers={loadingCastEpisodeServers}
+        activeServerNume={activeCastServerNume}
+        switchingServerNume={switchingCastServerNume}
+        onSelectCastServer={handleSwitchTvCastServer}
+        onDeviceConnected={(device) => {
+          setActiveTvCastDevice(device);
+          if (tvCastMediaPayload?.selectedServerNume) {
+            setActiveCastServerNume(tvCastMediaPayload.selectedServerNume);
+          }
+        }}
+        onSeekCommitted={handleCastSeekCommitted}
         skipIntroSeconds={settings.skipIntroSeconds}
         canPromptWebRemote={Boolean(tvCastWebHelpers.canPromptWebRemote)}
         onPromptWebRemote={tvCastWebHelpers.promptWebRemote}

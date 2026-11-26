@@ -124,6 +124,9 @@ interface EpisodeWorkspaceProps {
   videoScale?: VideoScaleMode;
   onChangeVideoScale?: (scale: VideoScaleMode) => void;
   castState?: TvCastStateSnapshot;
+  activeCastServerNume?: string;
+  switchingCastServerNume?: string;
+  onSwitchTvCastServer?: (opt: PlayerOption) => Promise<void> | void;
   onOpenTvCast?: (
     payload: TvCastMediaPayload | null,
     helpers?: {
@@ -185,6 +188,9 @@ export function EpisodeWorkspace({
   videoScale,
   onChangeVideoScale,
   castState,
+  activeCastServerNume,
+  switchingCastServerNume,
+  onSwitchTvCastServer,
   onOpenTvCast,
   onLoadingStateChange,
 }: EpisodeWorkspaceProps) {
@@ -1102,6 +1108,18 @@ export function EpisodeWorkspace({
     [episode.url, findBestAvailableServer, onToast, playableOptions]
   );
 
+  const isCastingThisEpisode = Boolean(
+    castState?.active && castState.episodeUrl && isSameEpisodeUrl(castState.episodeUrl, episode.url)
+  );
+
+  // Keep EpisodeWorkspace highlighted server synced when switched from inside TvCastModal
+  useEffect(() => {
+    if (!isCastingThisEpisode || !activeCastServerNume) return;
+    const match = playableOptions.find((o) => o.nume === activeCastServerNume);
+    if (!match) return;
+    setSelectedOption((current) => (current?.nume === match.nume ? current : { ...match }));
+  }, [activeCastServerNume, isCastingThisEpisode, playableOptions]);
+
   const handleManualServerSelect = useCallback(
     (opt: PlayerOption) => {
       const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
@@ -1112,8 +1130,13 @@ export function EpisodeWorkspace({
       }
       setFailoverExhaustedMsg('');
       setSelectedOption({ ...opt });
+
+      if (isCastingThisEpisode && onSwitchTvCastServer) {
+        playerCastHelpersRef.current?.pauseLocal();
+        void onSwitchTvCastServer(opt);
+      }
     },
-    [episode.url]
+    [episode.url, isCastingThisEpisode, onSwitchTvCastServer]
   );
 
   const handleRetryAllServers = useCallback(() => {
@@ -1926,6 +1949,11 @@ export function EpisodeWorkspace({
               <span className="inline-flex items-center gap-2">
                 <Server className="h-3.5 w-3.5 text-[#f97316]" />
                 <span>Servidores dos Provedores ({playableOptions.length})</span>
+                {isCastingThisEpisode && (
+                  <span className="rounded-full border border-[#f97316]/40 bg-[#f97316]/12 px-2 py-0.5 text-[10px] font-semibold text-[#fb923c]">
+                    Troca direto na TV
+                  </span>
+                )}
               </span>
               {onRefreshSources && (
                 <button
@@ -1993,18 +2021,24 @@ export function EpisodeWorkspace({
               <div className="flex flex-wrap gap-2">
                 {playableOptions.map((opt) => {
                   const active = selectedOption?.nume === opt.nume;
+                  const switchingOnTv =
+                    isCastingThisEpisode && switchingCastServerNume === opt.nume;
                   return (
                     <button
                       key={opt.nume}
                       type="button"
+                      disabled={Boolean(isCastingThisEpisode && switchingCastServerNume)}
                       onClick={() => handleManualServerSelect(opt)}
-                      className={`min-h-[40px] rounded-lg border px-3.5 py-2 text-xs font-medium transition-colors sm:text-sm ${
+                      className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border px-3.5 py-2 text-xs font-medium transition-colors disabled:opacity-60 sm:text-sm ${
                         active
                           ? 'border-[#f97316] bg-[#f97316]/15 text-white'
                           : 'border-white/10 bg-[#0d0f12] text-slate-300 hover:border-white/25 hover:text-white'
                       }`}
                     >
-                      {opt.label}
+                      {switchingOnTv && (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-[#fb923c]" />
+                      )}
+                      <span>{opt.label}</span>
                     </button>
                   );
                 })}

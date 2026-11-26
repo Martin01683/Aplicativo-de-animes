@@ -228,6 +228,189 @@ export function resolveCastDisplayedPositionMs(params: {
   return clamp(Number.isFinite(params.livePositionMs) ? params.livePositionMs : 0);
 }
 
+export interface CastClockState {
+  sessionKey: string;
+  anchorPositionMs: number;
+  anchorTimestampMs: number;
+  status: TvCastStatus;
+  lastReportedPositionMs: number;
+  seekPendingTargetMs: number | null;
+  seekRequestedAtMs: number;
+}
+
+export function buildCastSessionKey(
+  state: Pick<TvCastStateSnapshot, 'deviceId' | 'episodeUrl' | 'streamUrl' | 'episodeTitle'>
+): string {
+  return `${state.deviceId}|${state.episodeUrl || state.streamUrl || state.episodeTitle}`;
+}
+
+export function computeSyncedCastPositionMs(
+  clock: CastClockState | null,
+  durationMs: number,
+  nowMs: number
+): number {
+  if (!clock) return 0;
+  const elapsed =
+    clock.status === 'playing' ? Math.max(0, nowMs - clock.anchorTimestampMs) : 0;
+  const raw = Math.max(0, Math.round(clock.anchorPositionMs + elapsed));
+  if (Number.isFinite(durationMs) && durationMs > 0) {
+    return Math.min(Math.round(durationMs), raw);
+  }
+  return raw;
+}
+
+export function markCastClockSeek(
+  prev: CastClockState | null,
+  state: Pick<TvCastStateSnapshot, 'deviceId' | 'episodeUrl' | 'streamUrl' | 'episodeTitle' | 'status'>,
+  targetMs: number,
+  nowMs: number
+): CastClockState {
+  const clamped = Math.max(0, Math.round(targetMs));
+  const sessionKey = buildCastSessionKey(state);
+  return {
+    sessionKey,
+    anchorPositionMs: clamped,
+    anchorTimestampMs: nowMs,
+    status: prev && prev.sessionKey === sessionKey ? prev.status : state.status,
+    lastReportedPositionMs: prev && prev.sessionKey === sessionKey ? prev.lastReportedPositionMs : clamped,
+    seekPendingTargetMs: clamped,
+    seekRequestedAtMs: nowMs,
+  };
+}
+
+/**
+ * Reconciles polled TV state with the local synchronized playback clock.
+ * Prevents DLNA Smart TVs (such as LG webOS) that briefly or continuously emit
+ * `RelTime = 00:00:00` during/after a `Seek` from resetting the app timeline back to `0:00`.
+ */
+export function reconcileCastClock(
+  prev: CastClockState | null,
+  next: TvCastStateSnapshot,
+  nowMs: number
+): CastClockState | null {
+  if (!next.active) return null;
+  const sessionKey = buildCastSessionKey(next);
+  const reported = Math.max(0, Math.round(next.positionMs || 0));
+
+  if (!prev || prev.sessionKey !== sessionKey) {
+    return {
+      sessionKey,
+      anchorPositionMs: reported,
+      anchorTimestampMs: nowMs,
+      status: next.status,
+      lastReportedPositionMs: reported,
+      seekPendingTargetMs: null,
+      seekRequestedAtMs: 0,
+    };
+  }
+
+  const currentEstMs = computeSyncedCastPositionMs(prev, next.durationMs, nowMs);
+  const isTransitioning = next.status === 'buffering' || next.status === 'connecting';
+
+  // Rule A: Ignore bogus reset-to-zero reports during playback/buffering when clock is already ahead,
+  // unless the user explicitly sought near the start (<= 2s).
+  const userSoughtNearStart = prev.seekPendingTargetMs !== null && prev.seekPendingTargetMs <= 2000;
+  if (
+    reported <= 2000 &&
+    !userSoughtNearStart &&
+    currentEstMs >= 8000 &&
+    (isTransitioning || next.status === 'playing' || prev.seekPendingTargetMs !== null)
+  ) {
+    return {
+      ...prev,
+      anchorPositionMs: currentEstMs,
+      anchorTimestampMs: nowMs,
+      status: next.status,
+      lastReportedPositionMs: reported,
+    };
+  }
+
+  // Rule B: While settling an explicit user seek, ignore immediate optimistic echoes
+  // and stale pre-seek polls until the TV reports a genuine post-seek position.
+  if (prev.seekPendingTargetMs !== null) {
+    const elapsedSinceSeek = Math.max(0, nowMs - prev.seekRequestedAtMs);
+    const withinGrace = elapsedSinceSeek < 12_000;
+    const expectedFromSeekMs =
+      next.status === 'playing'
+        ? prev.seekPendingTargetMs + elapsedSinceSeek
+        : prev.seekPendingTargetMs;
+    const nearTarget = Math.abs(reported - expectedFromSeekMs) <= 12_000;
+    const actuallyMovedAfterEcho =
+      reported !== prev.lastReportedPositionMs && reported !== prev.seekPendingTargetMs;
+    const pastEchoWindow = elapsedSinceSeek >= 2000;
+
+    if (
+      nearTarget &&
+      (actuallyMovedAfterEcho ||
+        (pastEchoWindow && !isTransitioning && (reported > 2000 || userSoughtNearStart)))
+    ) {
+      return {
+        sessionKey,
+        anchorPositionMs: reported,
+        anchorTimestampMs: nowMs,
+        status: next.status,
+        lastReportedPositionMs: reported,
+        seekPendingTargetMs: null,
+        seekRequestedAtMs: 0,
+      };
+    }
+
+    if (withinGrace) {
+      return {
+        ...prev,
+        anchorPositionMs: currentEstMs,
+        anchorTimestampMs: nowMs,
+        status: next.status,
+        lastReportedPositionMs: reported,
+      };
+    }
+
+    // Past grace window: accept if TV is reporting a genuinely advancing non-zero time;
+    // otherwise keep ticking smoothly from our synchronized anchor rather than jumping to 0.
+    if (reported > 2000 && reported !== prev.lastReportedPositionMs) {
+      return {
+        sessionKey,
+        anchorPositionMs: reported,
+        anchorTimestampMs: nowMs,
+        status: next.status,
+        lastReportedPositionMs: reported,
+        seekPendingTargetMs: null,
+        seekRequestedAtMs: 0,
+      };
+    }
+
+    return {
+      ...prev,
+      anchorPositionMs: currentEstMs,
+      anchorTimestampMs: nowMs,
+      status: next.status,
+      lastReportedPositionMs: reported,
+    };
+  }
+
+  // Rule C: Normal playback reconciliation.
+  const reportedChanged = reported !== prev.lastReportedPositionMs;
+  if (reported > 0 && (reportedChanged || next.status === 'paused')) {
+    return {
+      sessionKey,
+      anchorPositionMs: reported,
+      anchorTimestampMs: nowMs,
+      status: next.status,
+      lastReportedPositionMs: reported,
+      seekPendingTargetMs: null,
+      seekRequestedAtMs: 0,
+    };
+  }
+
+  return {
+    ...prev,
+    anchorPositionMs: currentEstMs,
+    anchorTimestampMs: nowMs,
+    status: next.status,
+    lastReportedPositionMs: reported,
+  };
+}
+
 export function formatCastProtocolLabel(protocol: TvCastProtocolKind | ''): string {
   if (protocol === 'chromecast') return 'Chromecast / Android TV';
   if (protocol === 'dlna') return 'Smart TV (DLNA)';
@@ -497,11 +680,75 @@ export async function addManualTvCastDevice(options: {
   };
 }
 
+const LAST_TV_CAST_DEVICE_STORAGE_KEY = 'anisync_last_tv_cast_device_v1';
+
+export function saveLastTvCastDevice(device: TvCastDevice | null | undefined): void {
+  if (!device || !device.host || typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(LAST_TV_CAST_DEVICE_STORAGE_KEY, JSON.stringify(device));
+  } catch {
+    // ignore storage quota/privacy errors
+  }
+}
+
+export function loadLastTvCastDevice(expectedDeviceId?: string): TvCastDevice | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(LAST_TV_CAST_DEVICE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<TvCastDevice> | null;
+    if (!parsed || typeof parsed.host !== 'string' || !parsed.host.trim()) return null;
+    if (expectedDeviceId && parsed.id && parsed.id !== expectedDeviceId) return null;
+    return {
+      id: parsed.id || `${parsed.protocol || 'chromecast'}:${parsed.host}:${parsed.port || 8009}`,
+      name: parsed.name || parsed.host,
+      manufacturer: parsed.manufacturer || '',
+      model: parsed.model || '',
+      host: parsed.host,
+      port: typeof parsed.port === 'number' && Number.isFinite(parsed.port) ? parsed.port : 8009,
+      protocol:
+        parsed.protocol === 'dlna' || parsed.protocol === 'lan' ? parsed.protocol : 'chromecast',
+      avTransportControlUrl: parsed.avTransportControlUrl || '',
+      renderingControlUrl: parsed.renderingControlUrl || '',
+      locationUrl: parsed.locationUrl || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function resolveActiveTvCastDevice(
+  castState: Pick<TvCastStateSnapshot, 'active' | 'deviceId' | 'deviceName'>,
+  discoveredDevices: readonly TvCastDevice[],
+  savedDevice?: TvCastDevice | null
+): TvCastDevice | null {
+  if (!castState.active) return null;
+  if (castState.deviceId) {
+    const byId = discoveredDevices.find((d) => d.id === castState.deviceId);
+    if (byId) return byId;
+  }
+  if (savedDevice && savedDevice.host) {
+    if (!castState.deviceId || savedDevice.id === castState.deviceId) {
+      return savedDevice;
+    }
+  }
+  if (castState.deviceName) {
+    const targetName = castState.deviceName.trim().toLowerCase();
+    const byName = discoveredDevices.find((d) => d.name.trim().toLowerCase() === targetName);
+    if (byName) return byName;
+  }
+  if (savedDevice && savedDevice.host) {
+    return savedDevice;
+  }
+  return null;
+}
+
 export async function startNativeTvCast(
   device: TvCastDevice,
   media: TvCastMediaPayload,
   deliveryMode: TvCastDeliveryPreference = 'auto'
 ): Promise<boolean> {
+  saveLastTvCastDevice(device);
   if (isNativeAndroidCastSupported()) {
     const res = await TvCastNative.startCast({ device, media, deliveryMode });
     return Boolean(res?.started);

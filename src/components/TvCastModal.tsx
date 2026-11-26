@@ -19,6 +19,7 @@ import {
   RefreshCw,
   RotateCcw,
   RotateCw,
+  Server,
   SkipBack,
   SkipForward,
   Square,
@@ -27,6 +28,7 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
+import type { PlayerOption } from '../lib/types';
 import {
   addManualTvCastDevice,
   addTvCastDevicesListener,
@@ -61,6 +63,15 @@ interface TvCastModalProps {
   onClose: () => void;
   castState: TvCastStateSnapshot;
   mediaPayload: TvCastMediaPayload | null;
+  deliveryPref?: TvCastDeliveryPreference;
+  onChangeDeliveryPref?: (pref: TvCastDeliveryPreference) => void;
+  serverOptions?: PlayerOption[];
+  loadingServers?: boolean;
+  activeServerNume?: string;
+  switchingServerNume?: string;
+  onSelectCastServer?: (opt: PlayerOption, discoveredDevices: TvCastDevice[]) => Promise<void> | void;
+  onDeviceConnected?: (device: TvCastDevice) => void;
+  onSeekCommitted?: (targetMs: number) => void;
   skipIntroSeconds?: number;
   canPromptWebRemote?: boolean;
   onPromptWebRemote?: () => Promise<void>;
@@ -73,6 +84,15 @@ export function TvCastModal({
   onClose,
   castState,
   mediaPayload,
+  deliveryPref: controlledDeliveryPref,
+  onChangeDeliveryPref,
+  serverOptions = [],
+  loadingServers = false,
+  activeServerNume = '',
+  switchingServerNume = '',
+  onSelectCastServer,
+  onDeviceConnected,
+  onSeekCommitted,
   skipIntroSeconds = 85,
   canPromptWebRemote = false,
   onPromptWebRemote,
@@ -85,7 +105,13 @@ export function TvCastModal({
   const [lanDiscoverySupported, setLanDiscoverySupported] = useState(true);
   const [discoveryError, setDiscoveryError] = useState('');
   const [connectingId, setConnectingId] = useState('');
-  const [deliveryPref, setDeliveryPref] = useState<TvCastDeliveryPreference>('auto');
+  const [internalDeliveryPref, setInternalDeliveryPref] =
+    useState<TvCastDeliveryPreference>('auto');
+  const deliveryPref = controlledDeliveryPref ?? internalDeliveryPref;
+  const setDeliveryPref = (nextPref: TvCastDeliveryPreference) => {
+    setInternalDeliveryPref(nextPref);
+    onChangeDeliveryPref?.(nextPref);
+  };
   const [showManualForm, setShowManualForm] = useState(false);
   const [manualHost, setManualHost] = useState('');
   const [manualName, setManualName] = useState('');
@@ -249,16 +275,17 @@ export function TvCastModal({
 
   const commitSeekPosition = (targetMs: number) => {
     const clamped = Math.max(0, Math.min(seekMaxMs, Math.round(targetMs)));
+    onSeekCommitted?.(clamped);
     setPendingSeek({
       targetMs: clamped,
       episodeKey: castEpisodeKey,
-      expiresAt: Date.now() + 4500,
+      expiresAt: Date.now() + 2500,
     });
     void tvCastSeek(clamped);
   };
 
   const handleRelativeSeek = (deltaMs: number) => {
-    if (castState.durationMs > 0) {
+    if (castState.durationMs > 0 || displayedPositionMs > 0) {
       commitSeekPosition(displayedPositionMs + deltaMs);
     } else {
       setPendingSeek(null);
@@ -444,6 +471,7 @@ export function TvCastModal({
     try {
       onPauseLocalPlayback?.();
       await startNativeTvCast(device, mediaPayload, deliveryPref);
+      onDeviceConnected?.(device);
       onToast(
         isNativeAndroid
           ? `Transmitindo em ${device.name} — você pode sair do app.`
@@ -802,6 +830,53 @@ export function TvCastModal({
                     </span>
                   </div>
                 </>
+              )}
+
+              {/* Server Switcher right inside Active Remote Controller */}
+              {onSelectCastServer && (serverOptions.length > 0 || loadingServers) && (
+                <div
+                  data-cast-server-switcher="true"
+                  className="space-y-2 border-t border-white/10 pt-3"
+                >
+                  <div className="flex items-center justify-between gap-2 text-[11px] font-semibold text-slate-300">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Server className="h-3.5 w-3.5 text-[#f97316]" />
+                      <span>Trocar servidor na TV</span>
+                    </span>
+                    {loadingServers && (
+                      <span className="inline-flex items-center gap-1 text-[10px] font-medium text-[#fb923c]">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        <span>Carregando...</span>
+                      </span>
+                    )}
+                  </div>
+                  {serverOptions.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5">
+                      {serverOptions.map((opt) => {
+                        const isActiveServer = activeServerNume === opt.nume;
+                        const isSwitching = switchingServerNume === opt.nume;
+                        return (
+                          <button
+                            key={opt.nume}
+                            type="button"
+                            disabled={Boolean(switchingServerNume)}
+                            onClick={() => void onSelectCastServer(opt, devices)}
+                            className={`inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors disabled:opacity-60 ${
+                              isActiveServer
+                                ? 'border-[#f97316] bg-[#f97316]/18 text-[#fb923c]'
+                                : 'border-white/10 bg-[#151921] text-slate-300 hover:border-[#f97316]/50 hover:text-white'
+                            }`}
+                          >
+                            {isSwitching && (
+                              <Loader2 className="h-3 w-3 animate-spin text-[#fb923c]" />
+                            )}
+                            <span>{opt.label}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
               )}
 
               {/* Active Session Actions */}

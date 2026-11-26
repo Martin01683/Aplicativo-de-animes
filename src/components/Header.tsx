@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bell, BellRing, Settings } from 'lucide-react';
+import { Bell, BellRing, Cast, Settings } from 'lucide-react';
 import type { RemoteAppRelease } from '../lib/appUpdater';
 import type { NotificationPermissionStatus } from '../lib/notifications';
 import type { FavoriteAlertEntry } from '../lib/types';
@@ -35,6 +35,9 @@ interface HeaderProps {
   hasAppUpdate: boolean;
   latestRelease: RemoteAppRelease | null;
   onOpenSettings: () => void;
+  castActive?: boolean;
+  castDeviceName?: string;
+  onOpenTvCastControls?: () => void;
 }
 
 const NAV_ITEMS: Array<{ id: NavSection; label: string }> = [
@@ -72,6 +75,9 @@ export function Header({
   hasAppUpdate,
   latestRelease,
   onOpenSettings,
+  castActive = false,
+  castDeviceName = '',
+  onOpenTvCastControls,
 }: HeaderProps) {
   const [openPopover, setOpenPopover] = useState(false);
   const popoverRef = useRef<HTMLDivElement>(null);
@@ -152,6 +158,37 @@ export function Header({
         </nav>
 
         <div className="flex shrink-0 items-center gap-2">
+          {castActive && onOpenTvCastControls && (
+            <button
+              type="button"
+              data-header-cast-btn="true"
+              onClick={() => {
+                setOpenPopover(false);
+                onOpenTvCastControls();
+              }}
+              aria-label={
+                castDeviceName
+                  ? `Abrir controles da TV (${castDeviceName})`
+                  : 'Abrir controles da transmissão na TV'
+              }
+              title={
+                castDeviceName
+                  ? `Transmitindo em ${castDeviceName} — abrir controles`
+                  : 'Abrir controles da TV'
+              }
+              className="relative inline-flex h-10 items-center gap-1.5 rounded-lg border border-[#f97316]/60 bg-[#f97316]/15 px-2.5 text-xs font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/25 hover:text-white"
+            >
+              <Cast className="h-4 w-4 shrink-0" />
+              <span className="hidden sm:inline">Na TV</span>
+              <span
+                aria-hidden="true"
+                className="absolute -right-1 -top-1 flex h-2.5 w-2.5"
+              >
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[#f97316] opacity-75" />
+                <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-[#f97316]" />
+              </span>
+            </button>
+          )}
           <div ref={popoverRef} className="relative">
             <button
               type="button"

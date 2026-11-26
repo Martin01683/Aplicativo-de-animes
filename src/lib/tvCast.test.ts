@@ -8,15 +8,20 @@ import {
   buildCastMediaPayload,
   computeCastSeekPositionMs,
   computeCastVolumeLevel,
+  computeSyncedCastPositionMs,
   dedupeCastDevices,
   formatCastDeliveryLabel,
   formatCastDurationMs,
   formatCastProtocolLabel,
   formatCastStatusLabel,
   IDLE_TV_CAST_STATE,
+  markCastClockSeek,
+  reconcileCastClock,
+  resolveActiveTvCastDevice,
   resolveCastDisplayedPositionMs,
   sanitizeCastStateSnapshot,
   type TvCastDevice,
+  type TvCastStateSnapshot,
 } from './tvCast.ts';
 import {
   buildDidlLiteMetadata,
@@ -149,6 +154,87 @@ describe('tvCast helpers', () => {
       602_000
     );
   });
+
+  it('keeps cast clock synchronized after seek even when DLNA TV emits 0:00 during buffering or playback', () => {
+    const baseState: TvCastStateSnapshot = {
+      ...IDLE_TV_CAST_STATE,
+      active: true,
+      status: 'playing',
+      deviceId: 'dlna:lg-webos',
+      deviceName: '[LG] webOS TV',
+      deviceProtocol: 'dlna',
+      deliveryMode: 'background-proxy',
+      episodeUrl: 'https://topanimes.net/episodio/anime-1/',
+      episodeTitle: 'Episódio 1',
+      positionMs: 15_000,
+      durationMs: 1_419_000,
+    };
+
+    // Initial lock
+    let clock = reconcileCastClock(null, baseState, 10_000);
+    assert.ok(clock);
+    assert.equal(computeSyncedCastPositionMs(clock, baseState.durationMs, 10_000), 15_000);
+
+    // User drags to 12:00 (720_000 ms) and releases at t=20_000
+    clock = markCastClockSeek(clock, baseState, 720_000, 20_000);
+    assert.equal(computeSyncedCastPositionMs(clock, baseState.durationMs, 20_000), 720_000);
+
+    // Immediate optimistic echo from TvCastService at t=20_100 must NOT disarm seek protection
+    clock = reconcileCastClock(clock, { ...baseState, positionMs: 720_000 }, 20_100);
+    assert.ok(clock);
+    assert.equal(clock.seekPendingTargetMs, 720_000);
+
+    // 1.5s later, LG TV transitions/buffers and reports RelTime = 00:00:00 -> MUST NOT reset to 0:00!
+    clock = reconcileCastClock(
+      clock,
+      { ...baseState, status: 'buffering', positionMs: 0 },
+      21_500
+    );
+    assert.ok(clock);
+    assert.ok(computeSyncedCastPositionMs(clock, baseState.durationMs, 22_000) >= 720_000);
+
+    // Even if LG TV reports playing with RelTime stuck at 00:00:00, clock continues advancing smoothly
+    clock = reconcileCastClock(
+      clock,
+      { ...baseState, status: 'playing', positionMs: 0 },
+      23_000
+    );
+    assert.ok(clock);
+    const estPlaying = computeSyncedCastPositionMs(clock, baseState.durationMs, 25_000);
+    assert.ok(estPlaying >= 723_000 && estPlaying <= 726_000);
+
+    // Once LG TV reports genuine advancing RelTime near target (725_000 ms at t=25_000), lock onto it
+    clock = reconcileCastClock(
+      clock,
+      { ...baseState, status: 'playing', positionMs: 725_000 },
+      25_000
+    );
+    assert.ok(clock);
+    assert.equal(clock.seekPendingTargetMs, null);
+    assert.equal(computeSyncedCastPositionMs(clock, baseState.durationMs, 25_000), 725_000);
+
+    // Intentional seek back to 0:00 MUST be respected
+    clock = markCastClockSeek(clock, baseState, 0, 30_000);
+    clock = reconcileCastClock(clock, { ...baseState, status: 'playing', positionMs: 0 }, 30_200);
+    assert.ok(clock);
+    assert.equal(computeSyncedCastPositionMs(clock, baseState.durationMs, 30_200), 200);
+
+    // Active device resolver matches by id, saved fallback, and name
+    const lgDev: TvCastDevice = {
+      id: 'dlna:lg-webos',
+      name: '[LG] webOS TV',
+      host: '192.168.1.40',
+      port: 1581,
+      protocol: 'dlna',
+      avTransportControlUrl: 'http://192.168.1.40:1581/AVTransport/control',
+    };
+    assert.equal(resolveActiveTvCastDevice(baseState, [lgDev], null)?.id, 'dlna:lg-webos');
+    assert.equal(resolveActiveTvCastDevice(baseState, [], lgDev)?.id, 'dlna:lg-webos');
+    assert.equal(
+      resolveActiveTvCastDevice({ ...baseState, deviceId: '' }, [lgDev], null)?.id,
+      'dlna:lg-webos'
+    );
+  });
 });
 
 describe('Android background TV Cast architecture & UI wiring guards', () => {
@@ -267,6 +353,17 @@ describe('Android background TV Cast architecture & UI wiring guards', () => {
     assert.match(modalTsx, /setPointerCapture/);
     assert.match(modalTsx, /onPointerUp=\{handleSeekPointerUp\}/);
     assert.doesNotMatch(modalTsx, /onChange=\{\(e\) => void tvCastSeek/);
+
+    // Remote controls must stay reachable when leaving TvCastModal and allow switching video server on TV
+    const activeBarTsx = readRepoFile('src/components/ActiveCastBar.tsx');
+    const headerTsx = readRepoFile('src/components/Header.tsx');
+    const episodeWorkspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
+    assert.match(activeBarTsx, /z-\[45\]/);
+    assert.match(activeBarTsx, /safe-area-inset-bottom/);
+    assert.match(activeBarTsx, /data-active-cast-open-controls="true"/);
+    assert.match(headerTsx, /data-header-cast-btn="true"/);
+    assert.match(modalTsx, /data-cast-server-switcher="true"/);
+    assert.match(episodeWorkspaceTsx, /onSwitchTvCastServer/);
   });
 });
 
