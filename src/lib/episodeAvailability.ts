@@ -64,6 +64,215 @@ const MONTH_NAME_MAP: Record<string, number> = {
 
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
 
+/**
+ * Rejects series-wide fanart / background banners mistakenly surfaced as episode screenshots
+ * (blocks `-940.` fanart thumbnails and series background/poster paths).
+ */
+export function isEpisodeFanartPlaceholderUrl(url?: string): boolean {
+  if (!url) return false;
+  const clean = url.trim();
+  if (!clean) return false;
+  return /-940\.[a-z0-9]+(?:\?|$)/i.test(clean) || /\/banners\/.*\/(?:backgrounds|fanart|posters)\//i.test(clean);
+}
+
+/**
+ * Formats a concise PT-BR badge for season/series finale episodes.
+ */
+export function formatEpisodeFinaleBadge(
+  finaleType?: AnimeEpisodeLink['finaleType']
+): string | null {
+  if (finaleType === 'series') return 'Final da série';
+  if (finaleType === 'season') return 'Final da temporada';
+  if (finaleType === 'midseason') return 'Final de parte';
+  return null;
+}
+
+/**
+ * Staggers air times for multi-episode same-day premieres (2–3 episodes on the same calendar day,
+ * e.g. double anime premieres) by adding `runtime * index` minutes, while leaving >3-episode
+ * batch drops untouched.
+ */
+export function adjustMultiEpisodeAirTimes(
+  episodes: readonly AnimeEpisodeLink[],
+  averageRuntimeMinutes = 24
+): AnimeEpisodeLink[] {
+  if (episodes.length < 2) return episodes as AnimeEpisodeLink[];
+  const runtimeSec = Math.max(1, Math.round(averageRuntimeMinutes || 24)) * 60;
+
+  const groups = new Map<string, number[]>();
+  episodes.forEach((ep, idx) => {
+    const s = ep.seasonNumber || 1;
+    if (s <= 0 || !ep.airingAt || !Number.isFinite(ep.airingAt)) return;
+    const dayKey = ep.date && /^\d{4}-\d{2}-\d{2}$/.test(ep.date.trim())
+      ? ep.date.trim()
+      : formatIsoDateFromSec(ep.airingAt);
+    const key = `${s}::${dayKey}`;
+    const list = groups.get(key) || [];
+    list.push(idx);
+    groups.set(key, list);
+  });
+
+  let changed = false;
+  const next = [...episodes];
+
+  for (const indices of groups.values()) {
+    if (indices.length < 2 || indices.length > 3) continue;
+    const sortedIndices = [...indices].sort(
+      (a, b) => (next[a].episodeNumber || 0) - (next[b].episodeNumber || 0)
+    );
+    const baseAirAt = next[sortedIndices[0]].airingAt!;
+    // Only stagger if episodes share the exact same timestamp
+    const allSameTimestamp = sortedIndices.every((idx) => next[idx].airingAt === baseAirAt);
+    if (!allSameTimestamp) continue;
+
+    sortedIndices.forEach((idx, order) => {
+      if (order === 0) return;
+      changed = true;
+      next[idx] = {
+        ...next[idx],
+        airingAt: baseAirAt + order * runtimeSec,
+      };
+    });
+  }
+
+  return changed ? next : (episodes as AnimeEpisodeLink[]);
+}
+
+/**
+ * For completed/ended batch-released series (e.g. Netflix/ONA) where TheTVDB lists no per-episode
+ * air dates at all, inherits the series `firstAirDate` so episodes do not show "A ser anunciada".
+ */
+export function adjustBatchReleaseAirDates(
+  episodes: readonly AnimeEpisodeLink[],
+  seriesStatus?: string,
+  firstAirDate?: string
+): AnimeEpisodeLink[] {
+  if (episodes.length === 0 || !firstAirDate) return episodes as AnimeEpisodeLink[];
+  const isEnded = /^(?:finalizado|ended|released|lançado)$/i.test((seriesStatus || '').trim());
+  if (!isEnded) return episodes as AnimeEpisodeLink[];
+
+  const hasAnyDate = episodes.some((ep) => Boolean(ep.airingAt || parseEpisodeDateToTimestampSec(ep.date)));
+  if (hasAnyDate) return episodes as AnimeEpisodeLink[];
+
+  const seriesTs = parseEpisodeDateToTimestampSec(firstAirDate);
+  if (!seriesTs) return episodes as AnimeEpisodeLink[];
+  const isoDate = formatIsoDateFromSec(seriesTs);
+
+  return episodes.map((ep) => ({
+    ...ep,
+    date: isoDate,
+    airingAt: seriesTs,
+  }));
+}
+
+/**
+ * Infers `finaleType: 'series'` on the final episode of a completed (`Finalizado`/`Ended`) series
+ * when TheTVDB omitted explicit finale metadata.
+ */
+export function inferSeriesFinaleType(
+  episodes: readonly AnimeEpisodeLink[],
+  seriesStatus?: string
+): AnimeEpisodeLink[] {
+  if (episodes.length < 2) return episodes as AnimeEpisodeLink[];
+  const isEnded = /^(?:finalizado|ended)$/i.test((seriesStatus || '').trim());
+  if (!isEnded) return episodes as AnimeEpisodeLink[];
+
+  let latestSeason = 0;
+  for (const ep of episodes) {
+    const s = ep.seasonNumber || 1;
+    if (s > latestSeason) latestSeason = s;
+  }
+  if (latestSeason <= 0) return episodes as AnimeEpisodeLink[];
+
+  const latestSeasonIndices: number[] = [];
+  let hasExplicitFinale = false;
+  let maxEpIdx = -1;
+  let maxEpNum = 0;
+
+  episodes.forEach((ep, idx) => {
+    if ((ep.seasonNumber || 1) !== latestSeason) return;
+    latestSeasonIndices.push(idx);
+    if (ep.finaleType) hasExplicitFinale = true;
+    const epNum = ep.episodeNumber || 0;
+    if (epNum > maxEpNum) {
+      maxEpNum = epNum;
+      maxEpIdx = idx;
+    }
+  });
+
+  if (hasExplicitFinale || maxEpIdx < 0 || maxEpNum <= 1 || latestSeasonIndices.length <= 1) {
+    return episodes as AnimeEpisodeLink[];
+  }
+
+  const next = [...episodes];
+  next[maxEpIdx] = {
+    ...next[maxEpIdx],
+    finaleType: 'series',
+  };
+  return next;
+}
+
+const CACHE_TTL_TBA_EPISODE_MS = 3 * 60 * 1000;
+const CACHE_TTL_ONGOING_MS = 10 * 60 * 1000;
+const CACHE_TTL_RECENTLY_ENDED_MS = 30 * 60 * 1000;
+const CACHE_TTL_LONG_ENDED_MS = 60 * 60 * 1000;
+const THIRTY_DAYS_SEC = 30 * 24 * 60 * 60;
+
+/**
+ * Computes an adaptive cache TTL for anime/series metadata based on airing freshness:
+ * - Short TTL (3 min) when an already-aired episode still has a generic/TBA title
+ * - Moderate TTL (10 min) for continuing/upcoming series
+ * - Medium TTL (30 min) for recently ended series (last aired < 30 days ago)
+ * - Long TTL (60 min) for completed series whose last episode aired > 30 days ago
+ */
+export function computeAdaptiveMediaCacheTtlMs(
+  details: {
+    status?: string;
+    lastAirDate?: string;
+    firstAirDate?: string;
+    episodes?: readonly AnimeEpisodeLink[];
+  },
+  nowMs = Date.now()
+): number {
+  const nowSec = Math.floor(nowMs / 1000);
+  const episodes = details.episodes || [];
+
+  const hasAiredEpisodeWithoutTitle = episodes.some((ep) => {
+    if ((ep.seasonNumber || 1) <= 0) return false;
+    const airTs = ep.airingAt ?? parseEpisodeDateToTimestampSec(ep.date);
+    if (!airTs || airTs >= nowSec) return false;
+    const clean = (ep.title || '').trim();
+    return !clean || /^(?:tba|tbd)$/i.test(clean) || isGenericEpisodeTitle(clean);
+  });
+
+  if (hasAiredEpisodeWithoutTitle) {
+    return CACHE_TTL_TBA_EPISODE_MS;
+  }
+
+  const isEnded = /^(?:finalizado|ended|released|lançado)$/i.test((details.status || '').trim());
+  if (!isEnded) {
+    return CACHE_TTL_ONGOING_MS;
+  }
+
+  let latestAirTs = 0;
+  for (const ep of episodes) {
+    const ts = ep.airingAt ?? parseEpisodeDateToTimestampSec(ep.date) ?? 0;
+    if (ts > latestAirTs) latestAirTs = ts;
+  }
+  if (!latestAirTs) {
+    latestAirTs =
+      parseEpisodeDateToTimestampSec(details.lastAirDate) ??
+      parseEpisodeDateToTimestampSec(details.firstAirDate) ??
+      0;
+  }
+
+  if (latestAirTs > 0 && nowSec - latestAirTs < THIRTY_DAYS_SEC) {
+    return CACHE_TTL_RECENTLY_ENDED_MS;
+  }
+
+  return CACHE_TTL_LONG_ENDED_MS;
+}
+
 export function isEpisodeAvailableOnServer(
   ep: Pick<AnimeEpisodeLink, 'availableOnServer'> | null | undefined
 ): boolean {
@@ -507,9 +716,15 @@ export function mergeServerAndCatalogEpisodes(params: {
         : null;
 
   if (targetSingleSeason && serverIsSingleFlatSeason) {
-    const matchingSeasonCatalog = scopedCatalog.filter(
+    let matchingSeasonCatalog = scopedCatalog.filter(
       (ep) => ep.seasonNumber === targetSingleSeason
     );
+    // Support TheXEM scene-split seasons (e.g. server Season 2 = TVDB Season 1 second cour)
+    if (matchingSeasonCatalog.length === 0) {
+      matchingSeasonCatalog = scopedCatalog.filter(
+        (ep) => ep.sceneSeasonNumber === targetSingleSeason
+      );
+    }
     if (matchingSeasonCatalog.length > 0) {
       if (!unifyAllSeasons) {
         scopedCatalog = matchingSeasonCatalog;
@@ -694,14 +909,44 @@ export function mergeServerAndCatalogEpisodes(params: {
   sortedCatalog.forEach((catEp, absIdx) => {
     const sNum = catEp.seasonNumber || 1;
     const eNum = catEp.episodeNumber;
-    const absNum = absIdx + 1;
+    const absNum =
+      catEp.absoluteNumber && catEp.absoluteNumber > 0 ? catEp.absoluteNumber : absIdx + 1;
 
     let matchedServer: AnimeEpisodeLink | undefined;
+    // 1. Exact TVDB (season, episode) match
     if (eNum !== null) {
-      matchedServer = serverBySeasonEp.get(`${sNum}:${eNum}`);
+      const candidate = serverBySeasonEp.get(`${sNum}:${eNum}`);
+      if (candidate && !consumedServerUrls.has(candidate.url)) {
+        matchedServer = candidate;
+      }
     }
+    // 2. TheXEM scene (season, episode) mapping (handles split-cour & scene-renumbered anime)
+    if (
+      !matchedServer &&
+      catEp.sceneSeasonNumber &&
+      catEp.sceneSeasonNumber > 0 &&
+      catEp.sceneEpisodeNumber &&
+      catEp.sceneEpisodeNumber > 0
+    ) {
+      const candidate = serverBySeasonEp.get(
+        `${catEp.sceneSeasonNumber}:${catEp.sceneEpisodeNumber}`
+      );
+      if (candidate && !consumedServerUrls.has(candidate.url)) {
+        matchedServer = candidate;
+      }
+    }
+    // 3. Continuous absolute episode numbering (via TVDB absoluteNumber, XEM sceneAbsolute, or sequential index)
     if (!matchedServer && usesContinuousAbsoluteNumbering) {
-      matchedServer = serverByFlatEp.get(absNum);
+      const absCandidates = [catEp.sceneAbsoluteEpisodeNumber, catEp.absoluteNumber, absNum].filter(
+        (n): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0
+      );
+      for (const targetAbs of absCandidates) {
+        const candidate = serverByFlatEp.get(targetAbs);
+        if (candidate && !consumedServerUrls.has(candidate.url)) {
+          matchedServer = candidate;
+          break;
+        }
+      }
     }
 
     if (matchedServer) {

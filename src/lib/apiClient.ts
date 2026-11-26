@@ -5,6 +5,7 @@ import {
   type ApkDownloadProgressState,
 } from './appUpdater.ts';
 import type { HttpFetchOptions, HttpFetchResult, HttpFetcher } from './httpTypes.ts';
+import { createResilientHttpFetcher } from './hostResilience.ts';
 import { loadAppSettings } from './storage.ts';
 import type { CatalogPreferences, MediaKind } from './types.ts';
 import type { NotificationPermissionStatus } from './notifications.ts';
@@ -45,6 +46,10 @@ export interface LocalProxyPlugin {
     expectedSha256?: string;
   }): Promise<{ started: boolean; cancelled?: boolean; needsPermission?: boolean; message?: string }>;
   cancelApkDownload(): Promise<{ cancelled: boolean }>;
+  exportBackupFile(options: {
+    filename: string;
+    content: string;
+  }): Promise<{ saved: boolean; shared?: boolean; path?: string; message?: string }>;
   addListener(
     eventName: 'apkDownloadProgress',
     listenerFunc: (event: ApkDownloadProgressEvent) => void
@@ -284,7 +289,7 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
-const nativePageFetcher: PageFetcher = async (url, options = {}) => {
+const rawNativePageFetcher: PageFetcher = async (url, options = {}) => {
   if (!isSafeExternalHttpUrl(url)) {
     throw new Error('URL externa inválida ou bloqueada por segurança.');
   }
@@ -299,6 +304,44 @@ const nativePageFetcher: PageFetcher = async (url, options = {}) => {
     headers: options.headers,
   });
 };
+
+const nativePageFetcher: PageFetcher = createResilientHttpFetcher(rawNativePageFetcher);
+
+export async function exportBackupJsonFile(
+  filename: string,
+  content: string
+): Promise<{ mode: 'native' | 'browser'; message: string }> {
+  if (isNativeAndroidApp()) {
+    try {
+      const res = await LocalProxy.exportBackupFile({ filename, content });
+      if (res?.saved || res?.shared) {
+        return {
+          mode: 'native',
+          message:
+            res.message ||
+            (res.path ? `Backup salvo em ${res.path}.` : 'Backup exportado com sucesso.'),
+        };
+      }
+    } catch {
+      // Fall back to Web Share / browser download below
+    }
+  }
+
+  const blob = new Blob([content], { type: 'application/json;charset=utf-8' });
+  const blobUrl = URL.createObjectURL(blob);
+  try {
+    const anchor = document.createElement('a');
+    anchor.href = blobUrl;
+    anchor.download = filename;
+    anchor.rel = 'noopener noreferrer';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 2000);
+  }
+  return { mode: 'browser', message: `Backup ${filename} baixado.` };
+}
 
 function getStoredRuntimePreferences(): {
   catalogPrefs?: CatalogPreferences;

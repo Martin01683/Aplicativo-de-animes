@@ -1,5 +1,6 @@
 import { apiFetch, clearNativeApiCaches } from './apiClient.ts';
 import { inferMediaKindFromTarget, isAnisyncUri } from './catalog/idCodec.ts';
+import { computeAdaptiveMediaCacheTtlMs } from './episodeAvailability.ts';
 import {
   createEmbedCacheEntry,
   isEmbedCacheEntryValid,
@@ -137,6 +138,7 @@ class ClientCoalescedCache<T> {
     options: {
       forceRefresh?: boolean;
       shouldCache?: (value: T) => boolean;
+      getTtlMs?: (value: T) => number;
     } = {}
   ): Promise<T> {
     if (!options.forceRefresh) {
@@ -156,7 +158,7 @@ class ClientCoalescedCache<T> {
         ? options.shouldCache(value)
         : value !== undefined && value !== null;
       if (canCache) {
-        this.set(key, value);
+        this.set(key, value, options.getTtlMs?.(value));
       }
       return value;
     } finally {
@@ -538,11 +540,12 @@ export function getCachedAnimeDetailsFull(url: string): AnimeDetails | undefined
 export function setCachedAnimeDetailsFull(url: string, details: AnimeDetails): void {
   const key = normalizeMediaCacheKey(url);
   if (!key) return;
-  animeDetailsFullCache.set(key, details);
+  const adaptiveTtlMs = computeAdaptiveMediaCacheTtlMs(details);
+  animeDetailsFullCache.set(key, details, adaptiveTtlMs);
   // Also index by canonical details.url if redirected/normalized differently
   const canonKey = normalizeMediaCacheKey(details.url);
   if (canonKey && canonKey !== key) {
-    animeDetailsFullCache.set(canonKey, details);
+    animeDetailsFullCache.set(canonKey, details, adaptiveTtlMs);
   }
 }
 
@@ -611,11 +614,14 @@ export async function fetchAnimeDetailsFull(
       if (!res.ok) throw new Error(data.error || 'Erro ao carregar detalhes do título');
       const canonKey = normalizeMediaCacheKey(data.url);
       if (canonKey && canonKey !== key) {
-        animeDetailsFullCache.set(canonKey, data);
+        animeDetailsFullCache.set(canonKey, data, computeAdaptiveMediaCacheTtlMs(data));
       }
       return data;
     },
-    { forceRefresh: options.forceRefresh }
+    {
+      forceRefresh: options.forceRefresh,
+      getTtlMs: (details) => computeAdaptiveMediaCacheTtlMs(details),
+    }
   );
 }
 

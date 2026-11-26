@@ -8,6 +8,16 @@ import android.util.Log;
 
 import androidx.core.content.IntentCompat;
 
+/**
+ * Receives Android PackageInstaller session broadcasts for Anisync self-updates.
+ *
+ * Resilient session-install lifecycle:
+ * - Handles background confirmation hand-off (posts notification + re-prompts on foreground resume
+ *   instead of silently failing when Android blocks background activity starts).
+ * - Detects OEM silent-update refusal (aborted before any confirmation UI was shown) and retries
+ *   automatically with USER_ACTION_REQUIRED.
+ * - Falls back to ACTION_INSTALL_PACKAGE when a system component kills the PackageInstaller session.
+ */
 public class ApkInstallReceiver extends BroadcastReceiver {
     private static final String TAG = "TopAnimesApkInstall";
 
@@ -15,6 +25,7 @@ public class ApkInstallReceiver extends BroadcastReceiver {
     public void onReceive(Context context, Intent intent) {
         if (intent == null) return;
 
+        int sessionId = intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1);
         int status = intent.getIntExtra(
             PackageInstaller.EXTRA_STATUS,
             PackageInstaller.STATUS_FAILURE
@@ -27,40 +38,21 @@ public class ApkInstallReceiver extends BroadcastReceiver {
                 Intent.EXTRA_INTENT,
                 Intent.class
             );
-
-            if (confirmIntent != null) {
-                confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                try {
-                    context.startActivity(confirmIntent);
-                } catch (Exception e) {
-                    Log.e(TAG, "Failed launching system installer confirmation", e);
-                    LocalProxyPlugin.notifyInstallStage(
-                        "error",
-                        0,
-                        "Não foi possível abrir a confirmação de instalação do sistema."
-                    );
-                }
-            }
+            LocalProxyPlugin.onInstallUserActionRequired(context, sessionId, confirmIntent);
             return;
         }
 
         if (status == PackageInstaller.STATUS_SUCCESS) {
-            LocalProxyPlugin.notifyInstallStage("installed", 100, null);
+            LocalProxyPlugin.onInstallSucceeded(context, sessionId);
             return;
         }
 
         if (status == PackageInstaller.STATUS_FAILURE_ABORTED) {
-            LocalProxyPlugin.notifyInstallStage("cancelled", 0, "Instalação cancelada pelo usuário.");
+            LocalProxyPlugin.onInstallAborted(context, sessionId, message);
             return;
         }
 
-        Log.w(TAG, "PackageInstaller status=" + status + " message=" + message);
-        LocalProxyPlugin.notifyInstallStage(
-            "error",
-            0,
-            (message != null && !message.isEmpty())
-                ? ("Falha ao instalar atualização: " + message)
-                : "Falha ao instalar atualização no sistema."
-        );
+        Log.w(TAG, "PackageInstaller sessionId=" + sessionId + " status=" + status + " message=" + message);
+        LocalProxyPlugin.onInstallFailed(context, sessionId, status, message);
     }
 }

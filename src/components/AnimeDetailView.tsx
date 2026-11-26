@@ -25,6 +25,7 @@ import {
   RefreshCw,
   Search,
   Server,
+  Shield,
   SkipForward,
   Star,
   Tv,
@@ -33,6 +34,7 @@ import {
 import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
 import {
   buildAnimeInfoMetaItems,
+  formatSeasonDisplayHeading,
   isSynopsisTextOverflowing,
   resolveAnimeHeroAudioBadges,
   resolveVisibleGenres,
@@ -41,6 +43,7 @@ import {
   formatEpisodeCardBadge,
   formatEpisodeCardTitle,
   formatEpisodeCountdown,
+  formatEpisodeFinaleBadge,
   formatEpisodePlayCtaLabel,
   formatEpisodeReleaseDate,
   isEpisodeAvailableOnServer,
@@ -216,6 +219,7 @@ export function AnimeDetailView({
     const alreadyLocalizedFromTvdb =
       Boolean(anime.synopsis && anime.synopsis.trim()) &&
       (anime.synopsisSource === 'thetvdb-pt-br' ||
+        anime.synopsisSource === 'thetvdb-deepl' ||
         anime.synopsisSource === 'thetvdb-google-translate');
 
     if (alreadyLocalizedFromTvdb) {
@@ -621,6 +625,7 @@ export function AnimeDetailView({
   const alreadyLocalizedSynopsis =
     Boolean(anime.synopsis && anime.synopsis.trim()) &&
     (anime.synopsisSource === 'thetvdb-pt-br' ||
+      anime.synopsisSource === 'thetvdb-deepl' ||
       anime.synopsisSource === 'thetvdb-google-translate');
   const alreadyResolvedByTvdb =
     alreadyLocalizedSynopsis ||
@@ -814,10 +819,13 @@ export function AnimeDetailView({
 
   const extraMetaItems = useMemo(() => buildAnimeInfoMetaItems(anime), [anime]);
 
-  // Only show TheTVDB and LiveChart.me links
+  // Show TheTVDB, MyAnimeList, and LiveChart.me links
   const externalLinks = useMemo(() => {
     return (anime.externalLinks || []).filter(
-      (link) => link.source === 'thetvdb' || link.source === 'livechart'
+      (link) =>
+        link.source === 'thetvdb' ||
+        link.source === 'myanimelist' ||
+        link.source === 'livechart'
     );
   }, [anime.externalLinks]);
 
@@ -854,11 +862,13 @@ export function AnimeDetailView({
   const synopsisSourceCaption =
     activeSynopsisSource === 'thetvdb-pt-br'
       ? 'TheTVDB · PT-BR'
-      : activeSynopsisSource === 'thetvdb-google-translate'
-        ? 'TheTVDB · Traduzido via Google Tradutor'
-        : activeSynopsisSource === 'thetvdb-en'
-          ? 'TheTVDB · Original (EN)'
-          : null;
+      : activeSynopsisSource === 'thetvdb-deepl'
+        ? 'TheTVDB · Traduzido via DeepL'
+        : activeSynopsisSource === 'thetvdb-google-translate'
+          ? 'TheTVDB · Traduzido via Google Tradutor'
+          : activeSynopsisSource === 'thetvdb-en'
+            ? 'TheTVDB · Original (EN)'
+            : null;
   const awaitingSynopsis =
     (scopedSynopsis.loading || loadingStage === 'seed' || loadingStage === 'quick') &&
     !displaySynopsis;
@@ -1114,8 +1124,7 @@ export function AnimeDetailView({
                 {extraMetaItems.length > 0 && (
                   <dl className="grid grid-cols-2 gap-x-4 gap-y-3 px-3.5 py-3 text-xs sm:grid-cols-3 xl:grid-cols-4">
                     {extraMetaItems.map((meta) => {
-                      const isMultiProvider =
-                        meta.kind === 'server' && Boolean(meta.items && meta.items.length > 1);
+                      const isMultiItemCategory = Boolean(meta.items && meta.items.length > 1);
                       return (
                         <div
                           key={meta.id}
@@ -1138,6 +1147,9 @@ export function AnimeDetailView({
                             {meta.kind === 'rating' && (
                               <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" />
                             )}
+                            {meta.kind === 'shield' && (
+                              <Shield className="h-3 w-3 shrink-0 text-slate-400" />
+                            )}
                             {meta.kind === 'date' && <Calendar className="h-3 w-3 shrink-0 text-slate-400" />}
                             {meta.kind === 'clock' && <Clock className="h-3 w-3 shrink-0 text-slate-400" />}
                             {meta.kind === 'layers' && <Layers className="h-3 w-3 shrink-0 text-slate-400" />}
@@ -1145,34 +1157,42 @@ export function AnimeDetailView({
                             {meta.kind === 'network' && <Radio className="h-3 w-3 shrink-0 text-slate-400" />}
                             {meta.kind === 'globe' && <Globe className="h-3 w-3 shrink-0 text-slate-400" />}
                             {meta.kind === 'server' && <Server className="h-3 w-3 shrink-0 text-slate-400" />}
-                            <span className="truncate">{meta.label}</span>
+                            <span className="leading-tight">{meta.label}</span>
                           </dt>
-                          {isMultiProvider && meta.items ? (
+                          {isMultiItemCategory && meta.items ? (
                             <dd
                               title={meta.value}
                               className="mt-1.5 flex flex-wrap items-center gap-1.5"
                             >
-                              {meta.items.map((provider) => (
+                              {meta.items.map((entry) => (
                                 <span
-                                  key={provider}
-                                  data-anime-provider-chip="true"
-                                  className="inline-flex items-center rounded-md border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-semibold leading-snug text-slate-200"
+                                  key={entry}
+                                  data-anime-meta-chip={meta.id}
+                                  data-anime-provider-chip={meta.kind === 'server' ? 'true' : undefined}
+                                  className="inline-flex max-w-full items-center break-words rounded-md border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-semibold leading-snug text-slate-200"
                                 >
-                                  {provider}
+                                  {entry}
                                 </span>
                               ))}
+                            </dd>
+                          ) : meta.kind === 'rating' ? (
+                            <dd
+                              title={
+                                anime.ratingSource === 'myanimelist'
+                                  ? `${meta.value} (MyAnimeList)`
+                                  : `${meta.value} (Provedor)`
+                              }
+                              className="mt-0.5 break-words font-bold leading-snug tabular-nums text-amber-400"
+                            >
+                              {meta.value}
                             </dd>
                           ) : (
                             <dd
                               title={meta.value}
-                              className={`mt-0.5 font-semibold tabular-nums ${
-                                meta.kind === 'server'
-                                  ? 'break-words leading-snug text-slate-200'
-                                  : meta.kind === 'rating'
-                                    ? 'truncate font-bold text-amber-400'
-                                    : meta.highlight
-                                      ? 'truncate text-emerald-300'
-                                      : 'truncate text-slate-200'
+                              className={`mt-0.5 break-words font-semibold leading-snug tabular-nums ${
+                                meta.highlight
+                                  ? 'text-emerald-300'
+                                  : 'text-slate-200'
                               }`}
                             >
                               {meta.value}
@@ -1667,6 +1687,12 @@ export function AnimeDetailView({
               const seasonPanelId = `season-panel-${group.seasonNumber}`;
               const canCollapseSeason =
                 !isMovie && !hasActiveEpisodeSearch && activeSeasonTab === 'all';
+              const seasonCustomName = !isMovie
+                ? anime.seasonNames?.[group.seasonNumber]?.trim() || ''
+                : '';
+              const seasonDisplayTitle = isMovie
+                ? group.label
+                : formatSeasonDisplayHeading(group.seasonNumber, group.label, anime.seasonNames);
 
               return (
                 <div
@@ -1688,11 +1714,21 @@ export function AnimeDetailView({
                         aria-expanded={seasonExpanded}
                         aria-controls={seasonPanelId}
                         onClick={() => toggleSeasonExpanded(group.seasonNumber)}
+                        title={seasonDisplayTitle}
                         className="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left"
                       >
                         <span className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-white sm:text-sm sm:normal-case sm:tracking-normal">
                           {group.label}
                         </span>
+                        {seasonCustomName &&
+                          seasonCustomName.toLowerCase() !== group.label.toLowerCase() && (
+                            <span
+                              data-season-arc-name={group.seasonNumber}
+                              className="truncate text-xs font-medium text-slate-400 sm:text-[13px]"
+                            >
+                              · {seasonCustomName}
+                            </span>
+                          )}
                         <span
                           data-season-badge={group.seasonNumber}
                           className={`inline-flex shrink-0 items-center rounded-md border px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${seasonBadgeClass}`}
@@ -1707,10 +1743,22 @@ export function AnimeDetailView({
                         )}
                       </button>
                     ) : (
-                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                      <div
+                        title={seasonDisplayTitle}
+                        className="flex min-w-0 flex-1 items-center gap-2"
+                      >
                         <span className="shrink-0 whitespace-nowrap text-xs font-semibold uppercase tracking-wide text-white sm:text-sm sm:normal-case sm:tracking-normal">
                           {group.label}
                         </span>
+                        {seasonCustomName &&
+                          seasonCustomName.toLowerCase() !== group.label.toLowerCase() && (
+                            <span
+                              data-season-arc-name={group.seasonNumber}
+                              className="truncate text-xs font-medium text-slate-400 sm:text-[13px]"
+                            >
+                              · {seasonCustomName}
+                            </span>
+                          )}
                         <span
                           data-season-badge={group.seasonNumber}
                           className={`inline-flex shrink-0 items-center rounded-md border px-2 py-0.5 font-mono text-[11px] font-semibold tabular-nums ${seasonBadgeClass}`}
@@ -1841,6 +1889,7 @@ export function AnimeDetailView({
                       const epTitleLoading = isEpisodeTitleLoading(ep);
                       const epDisplayTitle = hydratedTitle || formatEpisodeCardTitle(ep, isMovie);
                       const uncensored = isEpisodeUncensored(ep);
+                      const finaleBadge = !isMovie ? formatEpisodeFinaleBadge(ep.finaleType) : null;
 
                       if (!available) {
                         const countdown = formatEpisodeCountdown(ep.airingAt, nowMs, ep.date);
@@ -1886,6 +1935,14 @@ export function AnimeDetailView({
                                         className="inline-flex shrink-0 items-center rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-rose-300"
                                       >
                                         Sem censura
+                                      </span>
+                                    )}
+                                    {finaleBadge && (
+                                      <span
+                                        data-episode-finale={ep.finaleType}
+                                        className="inline-flex shrink-0 items-center rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-amber-300"
+                                      >
+                                        {finaleBadge}
                                       </span>
                                     )}
                                   </div>
@@ -2034,6 +2091,14 @@ export function AnimeDetailView({
                                       className="inline-flex shrink-0 items-center rounded border border-rose-500/40 bg-rose-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-rose-300"
                                     >
                                       Sem censura
+                                    </span>
+                                  )}
+                                  {finaleBadge && (
+                                    <span
+                                      data-episode-finale={ep.finaleType}
+                                      className="inline-flex shrink-0 items-center rounded border border-amber-500/40 bg-amber-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-amber-300"
+                                    >
+                                      {finaleBadge}
                                     </span>
                                   )}
                                 </div>

@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   Bell,
   BellOff,
+  Cast,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -63,6 +64,12 @@ import {
 } from '../lib/prefetchCache';
 import { pickBestFailoverServer } from '../lib/serverFailover';
 import { formatServerLabel } from '../lib/serverLabel';
+import { getEpisodeProgress, getEpisodeResumeSeconds } from '../lib/storage';
+import {
+  buildCastMediaPayload,
+  type TvCastMediaPayload,
+  type TvCastStateSnapshot,
+} from '../lib/tvCast';
 import type {
   AnimeEpisodeLink,
   AnimeSynopsisResult,
@@ -116,6 +123,15 @@ interface EpisodeWorkspaceProps {
   autoPlayNextEpisode?: boolean;
   videoScale?: VideoScaleMode;
   onChangeVideoScale?: (scale: VideoScaleMode) => void;
+  castState?: TvCastStateSnapshot;
+  onOpenTvCast?: (
+    payload: TvCastMediaPayload | null,
+    helpers?: {
+      pauseLocal?: () => void;
+      canPromptWebRemote?: boolean;
+      promptWebRemote?: () => Promise<void>;
+    }
+  ) => void;
   onLoadingStateChange?: (loading: boolean) => void;
 }
 
@@ -168,6 +184,8 @@ export function EpisodeWorkspace({
   autoPlayNextEpisode = false,
   videoScale,
   onChangeVideoScale,
+  castState,
+  onOpenTvCast,
   onLoadingStateChange,
 }: EpisodeWorkspaceProps) {
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
@@ -201,6 +219,27 @@ export function EpisodeWorkspace({
   const failedServersByEpisodeRef = useRef<Map<string, Set<string>>>(new Map());
   const activeEpisodeUrlRef = useRef(episode.url);
   activeEpisodeUrlRef.current = episode.url;
+  const playerCastHelpersRef = useRef<{
+    pauseLocal: () => void;
+    canPromptWebRemote: () => boolean;
+    promptWebRemote: () => Promise<void>;
+    getCurrentTimeMs: () => number;
+    getDurationMs: () => number;
+  } | null>(null);
+  const handleRegisterCastHelpers = useCallback(
+    (
+      helpers: {
+        pauseLocal: () => void;
+        canPromptWebRemote: () => boolean;
+        promptWebRemote: () => Promise<void>;
+        getCurrentTimeMs: () => number;
+        getDurationMs: () => number;
+      } | null
+    ) => {
+      playerCastHelpersRef.current = helpers;
+    },
+    []
+  );
 
   const seriesExternalIdsCacheRef = useRef<Map<string, ExternalMediaIds>>(new Map());
   const seriesArtworkCacheRef = useRef<Map<string, { poster?: string; backdrop?: string }>>(
@@ -737,7 +776,7 @@ export function EpisodeWorkspace({
     );
   }, [episode.episodeLabel, episode.episodeNumber, episode.seasonNumber, episode.title, episode.url, localizedSeriesEpisodes]);
 
-  // Fetch TheTVDB episode/movie synopsis & artwork (PT-BR -> Google Translate -> EN fallback) asynchronously
+  // Fetch TheTVDB episode/movie synopsis & artwork (PT-BR -> DeepL -> Google Translate -> EN fallback) asynchronously
   useEffect(() => {
     const cachedSynopsis = getCachedEpisodeSynopsis(episode.url);
     if (cachedSynopsis.hit) {
@@ -1211,11 +1250,13 @@ export function EpisodeWorkspace({
   const synopsisSourceCaption =
     tvdbSynopsis?.source === 'thetvdb-pt-br'
       ? 'TheTVDB · PT-BR'
-      : tvdbSynopsis?.source === 'thetvdb-google-translate'
-        ? 'TheTVDB · Traduzido via Google Tradutor'
-        : tvdbSynopsis?.source === 'thetvdb-en'
-          ? 'TheTVDB · Original (EN)'
-          : null;
+      : tvdbSynopsis?.source === 'thetvdb-deepl'
+        ? 'TheTVDB · Traduzido via DeepL'
+        : tvdbSynopsis?.source === 'thetvdb-google-translate'
+          ? 'TheTVDB · Traduzido via Google Tradutor'
+          : tvdbSynopsis?.source === 'thetvdb-en'
+            ? 'TheTVDB · Original (EN)'
+            : null;
 
   const effectiveEpisodePoster =
     tvdbSynopsis?.episodeImage ||
@@ -1547,6 +1588,9 @@ export function EpisodeWorkspace({
             onServerPlaybackFailed={handleServerPlaybackFailed}
             onRetryEpisodePlayback={handleRetryAllServers}
             onNativeSessionSync={onNativeSessionSync}
+            castState={castState}
+            onOpenTvCast={onOpenTvCast}
+            onRegisterCastHelpers={handleRegisterCastHelpers}
             onToast={onToast}
           />
         ) : isTransitioning ? (
@@ -1584,21 +1628,9 @@ export function EpisodeWorkspace({
         <section className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
           <div className="space-y-3.5 border-b border-white/8 pb-4">
             <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-lg font-bold text-white sm:text-2xl">
-                  {episode.title}
-                </h1>
-                {(isEpisodeUncensored(matchedSeriesEpisode) ||
-                  isUncensoredEpisodeTitle(episode.title) ||
-                  isUncensoredEpisodeTitle(episode.episodeLabel)) && (
-                  <span
-                    data-episode-uncensored="true"
-                    className="inline-flex shrink-0 items-center rounded border border-rose-500/40 bg-rose-500/15 px-2 py-0.5 text-[11px] font-semibold leading-tight text-rose-300"
-                  >
-                    Sem censura
-                  </span>
-                )}
-              </div>
+              <h1 className="text-lg font-bold text-white sm:text-2xl">
+                {episode.title}
+              </h1>
               <div
                 data-episode-badges="true"
                 data-episode-genres="true"
@@ -1634,6 +1666,16 @@ export function EpisodeWorkspace({
                     {audioBadge === 'DUB' ? 'Dublado' : 'Legendado'}
                   </span>
                 ))}
+                {(isEpisodeUncensored(matchedSeriesEpisode) ||
+                  isUncensoredEpisodeTitle(episode.title) ||
+                  isUncensoredEpisodeTitle(episode.episodeLabel)) && (
+                  <span
+                    data-episode-uncensored="true"
+                    className="inline-flex items-center rounded-full border border-rose-500/35 bg-rose-500/12 px-2.5 py-0.5 text-[11px] font-semibold text-rose-300 sm:text-xs"
+                  >
+                    Sem censura
+                  </span>
+                )}
                 {visibleGenres.map((genre) => (
                   <span
                     key={genre}
@@ -1646,7 +1688,7 @@ export function EpisodeWorkspace({
               </div>
             </div>
 
-            {/* Episode Synopsis (TheTVDB PT-BR -> Google Translate -> EN fallback) */}
+            {/* Episode Synopsis (TheTVDB PT-BR -> DeepL -> Google Translate -> EN fallback) */}
             {scopedSynopsis.loading && !tvdbSynopsis ? (
               <div
                 data-episode-synopsis-loading="true"
@@ -1798,6 +1840,81 @@ export function EpisodeWorkspace({
                   <span className="hidden sm:inline">
                     {isMuted ? 'Avisos silenciados' : 'Avisos ativos'}
                   </span>
+                </button>
+              )}
+
+              {onOpenTvCast && (
+                <button
+                  type="button"
+                  data-episode-cast-btn="true"
+                  disabled={!hasResolvedStreams && !castState?.active}
+                  onClick={() => {
+                    const liveHelpers = playerCastHelpersRef.current;
+                    const castHelpers = liveHelpers
+                      ? {
+                          pauseLocal: () => liveHelpers.pauseLocal(),
+                          canPromptWebRemote: liveHelpers.canPromptWebRemote(),
+                          promptWebRemote: () => liveHelpers.promptWebRemote(),
+                        }
+                      : undefined;
+                    if (hasResolvedStreams && resolved) {
+                      const bestStream =
+                        [...resolved.streams].sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
+                        resolved.streams[0];
+                      const savedResumeSec = getEpisodeResumeSeconds(episode.url);
+                      const savedEntry = getEpisodeProgress(episode.url);
+                      const livePosMs = liveHelpers?.getCurrentTimeMs() || 0;
+                      const liveDurMs = liveHelpers?.getDurationMs() || 0;
+                      const payload = bestStream
+                        ? buildCastMediaPayload({
+                            stream: bestStream,
+                            subtitles: resolved.subtitles,
+                            referer: resolved.referer || 'https://topanimes.net/',
+                            preferDirect: resolved.preferDirect,
+                            episodeUrl: episode.url,
+                            title: episode.title,
+                            seriesTitle: episode.seriesTitle,
+                            seriesUrl: episode.seriesUrl,
+                            poster: effectiveEpisodePoster,
+                            isMovie: episode.isMovie,
+                            selectedServerNume: selectedOption?.nume,
+                            prevUrl: effectivePrevUrl,
+                            nextUrl: effectiveNextUrl,
+                            autoPlayNextEpisode,
+                            startPositionMs: livePosMs > 0 ? livePosMs : Math.round(savedResumeSec * 1000),
+                            durationMs:
+                              liveDurMs > 0
+                                ? liveDurMs
+                                : Math.round((savedEntry?.durationSec || 0) * 1000),
+                          })
+                        : null;
+                      onOpenTvCast(payload, castHelpers);
+                    } else {
+                      onOpenTvCast(null, castHelpers);
+                    }
+                  }}
+                  aria-label={
+                    castState?.active
+                      ? `Transmitindo em ${castState.deviceName}`
+                      : 'Transmitir para TV'
+                  }
+                  title={
+                    castState?.active
+                      ? `Transmitindo em ${castState.deviceName}`
+                      : 'Transmitir para TV sem precisar ficar com o aplicativo aberto'
+                  }
+                  className={`inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl border px-3.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 sm:px-4 sm:text-sm ${
+                    castState?.active
+                      ? 'border-[#f97316]/50 bg-[#f97316]/15 text-[#fb923c] hover:bg-[#f97316]/20'
+                      : 'border-white/15 bg-[#0d0f12] text-slate-200 hover:border-[#f97316]/50 hover:text-white'
+                  }`}
+                >
+                  <Cast
+                    className={`h-[18px] w-[18px] shrink-0 sm:h-4 sm:w-4 ${
+                      castState?.active ? 'text-[#fb923c]' : 'text-[#f97316]'
+                    }`}
+                  />
+                  <span>{castState?.active ? 'Na TV' : 'Transmitir TV'}</span>
                 </button>
               )}
             </div>

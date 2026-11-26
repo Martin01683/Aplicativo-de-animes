@@ -22,6 +22,9 @@ export interface ExternalMediaIds {
   tvdbSlug?: string;
   livechartId?: number;
   imdbId?: string;
+  tmdbId?: number;
+  malId?: number;
+  aniListId?: number;
 }
 
 export interface CatalogSourceCredentials {
@@ -175,6 +178,11 @@ export interface AnimeEpisodeLink {
   episodeNumber: number | null;
   seasonNumber?: number;
   seasonLabel?: string;
+  absoluteNumber?: number;
+  sceneSeasonNumber?: number;
+  sceneEpisodeNumber?: number;
+  sceneAbsoluteEpisodeNumber?: number;
+  finaleType?: 'season' | 'series' | 'midseason';
   title: string;
   url: string;
   audioType?: AudioType;
@@ -200,10 +208,12 @@ export interface AnimeAudioTrackData {
 }
 
 export interface ExternalDatabaseLinkItem {
-  source: CatalogSourceId;
+  source: CatalogSourceId | 'myanimelist';
   label: string;
   url: string;
 }
+
+export type MediaRatingSource = 'myanimelist' | 'provider' | 'thetvdb';
 
 export interface AnimeDetails {
   title: string;
@@ -226,6 +236,7 @@ export interface AnimeDetails {
   synopsisLanguage?: 'pt-BR' | 'en';
   year?: string;
   rating?: string;
+  ratingSource?: MediaRatingSource;
   tmdbRating?: string;
   tmdbVotes?: string;
   firstAirDate?: string;
@@ -234,6 +245,9 @@ export interface AnimeDetails {
   episodesTotalCount?: string;
   averageDuration?: string;
   status?: string;
+  contentRating?: string;
+  airsTime?: string;
+  seasonNames?: Record<number, string>;
   studio?: string;
   network?: string;
   originalCountry?: string;
@@ -342,6 +356,7 @@ export interface EpisodeDetails {
 
 export type EpisodeSynopsisSource =
   | 'thetvdb-pt-br'
+  | 'thetvdb-deepl'
   | 'thetvdb-google-translate'
   | 'thetvdb-en';
 

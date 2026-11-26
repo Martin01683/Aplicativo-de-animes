@@ -1,3 +1,4 @@
+import type { AnisyncBackupData } from './backup';
 import {
   buildWatchedProgressMap,
   canonicalEpisodeProgressKey,
@@ -613,5 +614,24 @@ export function saveActiveRouteSession(session: PersistedRouteSession): void {
   } catch {
     // ignore
   }
+}
+
+export function collectUserBackupData(): AnisyncBackupData {
+  return {
+    favorites: loadFavorites(),
+    history: loadHistory(),
+    progressMap: loadEpisodeProgressMap(),
+    mutedFavoriteUrls: loadMutedFavoriteUrls(),
+    settings: loadAppSettings(),
+  };
+}
+
+export function persistUserBackupData(data: AnisyncBackupData): AnisyncBackupData {
+  saveFavorites(data.favorites);
+  saveEpisodeProgressMap(data.progressMap);
+  persistHistoryList(data.history);
+  saveMutedFavoriteUrls(data.mutedFavoriteUrls);
+  saveAppSettings(data.settings);
+  return collectUserBackupData();
 }
 

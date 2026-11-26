@@ -28,6 +28,7 @@ import {
   preloadTheTvdbProfileFromHints,
   resolveLocalizedEpisodeTitlesByIds,
 } from './catalog/providers/thetvdbProvider.ts';
+import { enrichDetailsWithMyAnimeListRating } from './catalog/providers/malProvider.ts';
 import type { SnapshotAssetReader } from './catalog/serverCatalog.ts';
 import {
   extractEpisodeNumber,
@@ -280,11 +281,14 @@ async function getCachedMediaDetails(
 ): Promise<AnimeDetails | null> {
   return mediaDetailsCache.getOrLoad(
     uri,
-    () =>
-      getAggregatedMediaDetails(fetchHttp, uri, prefs, {
+    async () => {
+      const details = await getAggregatedMediaDetails(fetchHttp, uri, prefs, {
         skipEpisodePageHydration,
         ...hints,
-      }),
+      });
+      if (!details) return null;
+      return enrichDetailsWithMyAnimeListRating(fetchHttp, details).catch(() => details);
+    },
     {
       useCache,
       shouldCache: (val) => Boolean(val),
@@ -994,7 +998,7 @@ export async function dispatchAnisyncApiRequest(
             tvdbPreloadPromise,
           ]);
 
-          return enrichServerDetailsWithTheTvdb(
+          const tvdbEnriched = await enrichServerDetailsWithTheTvdb(
             fetchHttp,
             baseDetails,
             catalogPrefs?.credentials,
@@ -1003,6 +1007,10 @@ export async function dispatchAnisyncApiRequest(
               preloadedTvdb,
             }
           ).catch(() => baseDetails);
+
+          return enrichDetailsWithMyAnimeListRating(fetchHttp, tvdbEnriched).catch(
+            () => tvdbEnriched
+          );
         },
         {
           useCache,

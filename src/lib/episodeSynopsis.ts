@@ -17,6 +17,11 @@ import {
   translateEnglishToPtBr,
   translateTextToPtBr,
 } from './googleTranslate.ts';
+import {
+  synopsisSourceForEngine,
+  translateSynopsisToPtBr,
+  translateTitleToPtBr,
+} from './translation.ts';
 
 export { parseGoogleTranslateResponse, splitTextForTranslation, translateEnglishToPtBr, translateTextToPtBr };
 
@@ -87,8 +92,9 @@ function writeCacheEntry<T>(
 /**
  * Resolves the episode synopsis & artwork from TheTVDB.com following strict localization priority:
  * 1. Native PT-BR synopsis from TheTVDB.com (`data-language="pt"` / v4 `/translations/pt`)
- * 2. English synopsis from TheTVDB.com translated to PT-BR via Google Translate
- * 3. Original English synopsis from TheTVDB.com if Google Translate fails
+ * 2. English synopsis from TheTVDB.com translated to PT-BR via DeepL (web endpoint, no API key)
+ * 3. Same English synopsis translated via Google Translate if DeepL fails
+ * 4. Original English synopsis from TheTVDB.com if both translators fail
  */
 export async function resolveLocalizedEpisodeSynopsis(
   fetchHttp: HttpFetcher,
@@ -131,7 +137,7 @@ export async function resolveLocalizedEpisodeSynopsis(
   const resolveEpisodeTitle = async (): Promise<string | undefined> => {
     if (translations.ptBrTitle) return translations.ptBrTitle;
     if (translations.engTitle) {
-      const translatedTitle = await translateTextToPtBr(
+      const translatedTitle = await translateTitleToPtBr(
         fetchHttp,
         translations.engTitle,
         'en',
@@ -141,7 +147,7 @@ export async function resolveLocalizedEpisodeSynopsis(
       return translatedTitle || translations.engTitle;
     }
     if (translations.originalTitle) {
-      const translatedTitle = await translateTextToPtBr(
+      const translatedTitle = await translateTitleToPtBr(
         fetchHttp,
         translations.originalTitle,
         'auto',
@@ -170,22 +176,22 @@ export async function resolveLocalizedEpisodeSynopsis(
     return result;
   }
 
-  // 2. English synopsis from TheTVDB.com -> translate via Google Translate
+  // 2. English synopsis from TheTVDB.com -> translate via DeepL, then Google Translate
   const eng = cleanSynopsisWhitespace(translations.engOverview || '');
   if (!eng) {
     if (useCache) writeCacheEntry(synopsisCache, cacheKey, null);
     return null;
   }
 
-  const [translatedPtBr, episodeTitle] = await Promise.all([
-    translateEnglishToPtBr(fetchHttp, eng),
+  const [translated, episodeTitle] = await Promise.all([
+    translateSynopsisToPtBr(fetchHttp, eng),
     resolveEpisodeTitle(),
   ]);
-  if (translatedPtBr) {
+  if (translated) {
     const result: EpisodeSynopsisResult = {
-      synopsis: translatedPtBr,
+      synopsis: translated.text,
       language: 'pt-BR',
-      source: 'thetvdb-google-translate',
+      source: synopsisSourceForEngine(translated.engine),
       episodeTitle,
       ...imageFields,
       tvdbEpisodeId: translations.tvdbEpisodeId,
@@ -195,7 +201,7 @@ export async function resolveLocalizedEpisodeSynopsis(
     return result;
   }
 
-  // 3. Fallback to original English synopsis if Google Translate failed
+  // 3. Fallback to original English synopsis if both translators failed
   const fallbackResult: EpisodeSynopsisResult = {
     synopsis: eng,
     language: 'en',
@@ -238,8 +244,9 @@ function buildAnimeSynopsisCacheKey(input: ResolveAnimeSynopsisInput): string {
 /**
  * Resolves the anime/series/movie synopsis & artwork from TheTVDB.com following strict localization priority:
  * 1. Native PT-BR synopsis from TheTVDB.com (`data-language="pt"` / v4 `/translations/pt`)
- * 2. English synopsis from TheTVDB.com translated to PT-BR via Google Translate
- * 3. Original English synopsis from TheTVDB.com if Google Translate fails
+ * 2. English synopsis from TheTVDB.com translated to PT-BR via DeepL (web endpoint, no API key)
+ * 3. Same English synopsis translated via Google Translate if DeepL fails
+ * 4. Original English synopsis from TheTVDB.com if both translators fail
  */
 export async function resolveLocalizedAnimeSynopsis(
   fetchHttp: HttpFetcher,
@@ -291,19 +298,19 @@ export async function resolveLocalizedAnimeSynopsis(
     return result;
   }
 
-  // 2. English synopsis from TheTVDB.com -> translate via Google Translate
+  // 2. English synopsis from TheTVDB.com -> translate via DeepL, then Google Translate
   const eng = cleanSynopsisWhitespace(translations.engOverview || '');
   if (!eng) {
     if (useCache) writeCacheEntry(animeSynopsisCache, cacheKey, null);
     return null;
   }
 
-  const translatedPtBr = await translateEnglishToPtBr(fetchHttp, eng);
-  if (translatedPtBr) {
+  const translated = await translateSynopsisToPtBr(fetchHttp, eng);
+  if (translated) {
     const result: AnimeSynopsisResult = {
-      synopsis: translatedPtBr,
+      synopsis: translated.text,
       language: 'pt-BR',
-      source: 'thetvdb-google-translate',
+      source: synopsisSourceForEngine(translated.engine),
       ...artworkFields,
       tvdbId: translations.tvdbId,
       tvdbSlug: translations.tvdbSlug,
@@ -312,7 +319,7 @@ export async function resolveLocalizedAnimeSynopsis(
     return result;
   }
 
-  // 3. Fallback to original English synopsis if Google Translate failed
+  // 3. Fallback to original English synopsis if both translators failed
   const fallbackResult: AnimeSynopsisResult = {
     synopsis: eng,
     language: 'en',

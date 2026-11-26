@@ -58,7 +58,8 @@ export function detectAndroidSdkDir({
     if (exists(candidate)) return candidate;
   }
 
-  const localPropertiesPath = path.join(androidDir, 'local.properties');
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const localPropertiesPath = pathApi.join(androidDir, 'local.properties');
   if (exists(localPropertiesPath)) {
     try {
       const sdkDir = parseLocalPropertiesSdkDir(readFile(localPropertiesPath));
@@ -71,13 +72,13 @@ export function detectAndroidSdkDir({
   const defaultCandidates =
     platform === 'win32'
       ? [
-          env.LOCALAPPDATA ? path.join(env.LOCALAPPDATA, 'Android', 'Sdk') : '',
-          path.join(homeDir, 'AppData', 'Local', 'Android', 'Sdk'),
+          env.LOCALAPPDATA ? pathApi.join(env.LOCALAPPDATA, 'Android', 'Sdk') : '',
+          pathApi.join(homeDir, 'AppData', 'Local', 'Android', 'Sdk'),
         ]
       : platform === 'darwin'
-        ? [path.join(homeDir, 'Library', 'Android', 'sdk'), path.join(homeDir, 'Android', 'Sdk')]
+        ? [pathApi.join(homeDir, 'Library', 'Android', 'sdk'), pathApi.join(homeDir, 'Android', 'Sdk')]
         : [
-            path.join(homeDir, 'Android', 'Sdk'),
+            pathApi.join(homeDir, 'Android', 'Sdk'),
             '/usr/local/lib/android/sdk',
             '/opt/android-sdk',
           ];

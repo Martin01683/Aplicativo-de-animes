@@ -4,6 +4,7 @@ import type { AnimeDetails, AudioType, MediaKind } from './types';
 export type AnimeMetaKind =
   | 'status'
   | 'rating'
+  | 'shield'
   | 'date'
   | 'clock'
   | 'layers'
@@ -20,6 +21,27 @@ export interface AnimeInfoMetaItem {
   kind: AnimeMetaKind;
   highlight?: boolean;
   fullWidth?: boolean;
+}
+
+/**
+ * Splits a multi-value metadata string (such as studios, networks, languages, or countries)
+ * into deduplicated items without breaking legal company suffixes like `Warner Bros., Inc.`.
+ */
+export function parseMetaValueList(raw?: string): string[] {
+  if (!raw || !raw.trim()) return [];
+  const parts = raw
+    .split(/\s*(?:,(?!\s*(?:inc|ltd|co|llc|corp|s\.?a)\.?(?:\b|$))|;|·|•|\|)\s*/i)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of parts) {
+    const key = part.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(part);
+  }
+  return out;
 }
 
 export function parseProviderNames(raw?: string): string[] {
@@ -84,11 +106,22 @@ export function extractAnimeProviders(anime: Pick<
   return providers;
 }
 
+const LONG_SINGLE_META_THRESHOLD = 22;
+
 export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[] {
-  const items: AnimeInfoMetaItem[] = [];
+  const compactItems: AnimeInfoMetaItem[] = [];
+  const fullWidthItems: AnimeInfoMetaItem[] = [];
+
+  const pushMeta = (item: AnimeInfoMetaItem) => {
+    if (item.fullWidth) {
+      fullWidthItems.push(item);
+    } else {
+      compactItems.push(item);
+    }
+  };
 
   if (anime.status) {
-    items.push({
+    pushMeta({
       id: 'status',
       label: 'Status',
       value: anime.status,
@@ -99,7 +132,7 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
 
   const parsedRating = anime.rating ? Number.parseFloat(anime.rating) : Number.NaN;
   if (anime.rating && Number.isFinite(parsedRating) && parsedRating > 0) {
-    items.push({
+    pushMeta({
       id: 'rating',
       label: 'Nota',
       value: anime.rating.trim(),
@@ -107,27 +140,30 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
     });
   }
 
-  if (anime.studio) {
-    items.push({ id: 'studio', label: 'Estúdio', value: anime.studio, kind: 'studio' });
-  }
-
-  if (anime.network) {
-    items.push({ id: 'network', label: 'Rede', value: anime.network, kind: 'network' });
+  if (anime.contentRating && anime.contentRating.trim()) {
+    const ratingText = anime.contentRating.trim();
+    pushMeta({
+      id: 'contentRating',
+      label: 'Classificação',
+      value: ratingText,
+      kind: 'shield',
+      ...(ratingText.length > LONG_SINGLE_META_THRESHOLD ? { fullWidth: true } : {}),
+    });
   }
 
   if (anime.firstAirDate) {
-    items.push({
+    pushMeta({
       id: 'firstAirDate',
       label: 'Estreia',
       value: formatEpisodeReleaseDate(anime.firstAirDate) || anime.firstAirDate,
       kind: 'date',
     });
   } else if (anime.year) {
-    items.push({ id: 'year', label: 'Ano', value: anime.year, kind: 'date' });
+    pushMeta({ id: 'year', label: 'Ano', value: anime.year, kind: 'date' });
   }
 
   if (anime.lastAirDate) {
-    items.push({
+    pushMeta({
       id: 'lastAirDate',
       label: 'Recente',
       value: formatEpisodeReleaseDate(anime.lastAirDate) || anime.lastAirDate,
@@ -136,7 +172,7 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
   }
 
   if (anime.averageDuration) {
-    items.push({
+    pushMeta({
       id: 'duration',
       label: 'Duração',
       value: anime.averageDuration,
@@ -145,7 +181,7 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
   }
 
   if (anime.seasonsCount) {
-    items.push({
+    pushMeta({
       id: 'seasons',
       label: 'Temporadas',
       value: anime.seasonsCount,
@@ -153,27 +189,65 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
     });
   }
 
-  if (anime.originalLanguage) {
-    items.push({
+  const languages = parseMetaValueList(anime.originalLanguage);
+  if (languages.length > 0) {
+    const isMulti = languages.length > 1;
+    const joined = languages.join(', ');
+    pushMeta({
       id: 'language',
-      label: 'Idioma',
-      value: anime.originalLanguage,
+      label: isMulti ? 'Idiomas originais' : 'Idioma original',
+      value: joined,
+      items: languages,
       kind: 'globe',
+      fullWidth: isMulti || joined.length > LONG_SINGLE_META_THRESHOLD,
     });
   }
 
-  if (anime.originalCountry) {
-    items.push({
+  const countries = parseMetaValueList(anime.originalCountry);
+  if (countries.length > 0) {
+    const isMulti = countries.length > 1;
+    const joined = countries.join(', ');
+    pushMeta({
       id: 'country',
-      label: 'País',
-      value: anime.originalCountry,
+      label: isMulti ? 'Países' : 'País',
+      value: joined,
+      items: countries,
       kind: 'globe',
+      fullWidth: isMulti || joined.length > LONG_SINGLE_META_THRESHOLD,
+    });
+  }
+
+  const studios = parseMetaValueList(anime.studio);
+  if (studios.length > 0) {
+    const isMulti = studios.length > 1;
+    const joined = studios.join(', ');
+    pushMeta({
+      id: 'studio',
+      label: isMulti ? 'Estúdios' : 'Estúdio',
+      value: joined,
+      items: studios,
+      kind: 'studio',
+      fullWidth: isMulti || joined.length > LONG_SINGLE_META_THRESHOLD,
+    });
+  }
+
+  const networks = parseMetaValueList(anime.network);
+  if (networks.length > 0) {
+    const isMulti = networks.length > 1;
+    const joined = networks.join(', ');
+    pushMeta({
+      id: 'network',
+      label: isMulti ? 'Redes' : 'Rede',
+      value: joined,
+      items: networks,
+      kind: 'network',
+      fullWidth: isMulti || joined.length > LONG_SINGLE_META_THRESHOLD,
     });
   }
 
   const providers = extractAnimeProviders(anime);
   if (providers.length > 0) {
-    items.push({
+    pushMeta({
       id: 'providers',
       label: providers.length > 1 ? 'Provedores' : 'Provedor',
       value: providers.join(' · '),
@@ -183,7 +257,7 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
     });
   }
 
-  return items;
+  return [...compactItems, ...fullWidthItems];
 }
 
 export type HeroAudioBadge = 'DUB' | 'LEG';
@@ -354,6 +428,23 @@ export function isSynopsisTextOverflowing(params: {
     return params.scrollHeight > params.lineHeight * maxLines + 2;
   }
   return true;
+}
+
+/**
+ * Formats a season header label, appending an optional custom TheTVDB arc/season name
+ * (e.g. `Temporada 2 · Distrito do Entretenimento`) while skipping redundant generic names.
+ */
+export function formatSeasonDisplayHeading(
+  seasonNumber: number,
+  fallbackLabel: string,
+  seasonNames?: Readonly<Record<number, string>>
+): string {
+  const custom = seasonNames?.[seasonNumber]?.trim();
+  if (!custom) return fallbackLabel;
+  if (custom.toLowerCase() === fallbackLabel.trim().toLowerCase()) {
+    return fallbackLabel;
+  }
+  return `${fallbackLabel} · ${custom}`;
 }
 
 

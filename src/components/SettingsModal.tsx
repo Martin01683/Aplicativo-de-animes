@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import {
   Bell,
   BellOff,
@@ -15,6 +15,7 @@ import {
   Send,
   Server,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 import { apiFetch, type ApkDownloadProgressEvent } from '../lib/apiClient';
@@ -25,6 +26,13 @@ import {
   type AppBuildInfo,
   type AppUpdateCheckResult,
 } from '../lib/appUpdater';
+import {
+  parseAnisyncBackupJson,
+  type AnisyncBackupPayload,
+  type BackupImportMode,
+  type BackupImportSummary,
+} from '../lib/backup';
+import { parseReleaseChangelog } from '../lib/changelogParser';
 import type { NotificationPermissionStatus } from '../lib/notifications';
 import {
   VIDEO_SCALE_OPTIONS,
@@ -80,6 +88,8 @@ interface SettingsModalProps {
   alertsCount: number;
   onClearHistory: () => void;
   onClearAlerts: () => void;
+  onExportBackup: () => Promise<void> | void;
+  onImportBackup: (payload: AnisyncBackupPayload, mode: BackupImportMode) => void;
 }
 
 interface ToggleSwitchProps {
@@ -148,13 +158,70 @@ export function SettingsModal({
   alertsCount,
   onClearHistory,
   onClearAlerts,
+  onExportBackup,
+  onImportBackup,
 }: SettingsModalProps) {
   const sourcesSectionRef = useRef<HTMLElement>(null);
   const notificationsSectionRef = useRef<HTMLElement>(null);
   const updatesPanelRef = useRef<HTMLDivElement>(null);
+  const backupFileInputRef = useRef<HTMLInputElement>(null);
   const [showCredsPanel, setShowCredsPanel] = useState(false);
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
+  const [exportingBackup, setExportingBackup] = useState(false);
+  const [backupError, setBackupError] = useState('');
+  const [pendingBackupImport, setPendingBackupImport] = useState<{
+    filename: string;
+    payload: AnisyncBackupPayload;
+    summary: BackupImportSummary;
+  } | null>(null);
+
+  const parsedChangelogSections = useMemo(
+    () => parseReleaseChangelog(appUpdateResult?.latestRelease?.notes),
+    [appUpdateResult?.latestRelease?.notes]
+  );
+
+  const handleBackupFileSelected = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setBackupError('');
+    try {
+      const text = await file.text();
+      const parsed = parseAnisyncBackupJson(text);
+      if (!parsed.ok) {
+        setPendingBackupImport(null);
+        setBackupError(parsed.error);
+        return;
+      }
+      setPendingBackupImport({
+        filename: file.name,
+        payload: parsed.payload,
+        summary: parsed.summary,
+      });
+    } catch {
+      setPendingBackupImport(null);
+      setBackupError('Não foi possível ler o arquivo selecionado.');
+    }
+  };
+
+  const handleExportBackupClick = async () => {
+    if (exportingBackup) return;
+    setBackupError('');
+    setExportingBackup(true);
+    try {
+      await onExportBackup();
+    } finally {
+      setExportingBackup(false);
+    }
+  };
+
+  const handleConfirmBackupImport = (mode: BackupImportMode) => {
+    if (!pendingBackupImport) return;
+    onImportBackup(pendingBackupImport.payload, mode);
+    setPendingBackupImport(null);
+    setBackupError('');
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -261,7 +328,7 @@ export function SettingsModal({
               Configurações do Anisync
             </h2>
             <p className="mt-0.5 text-xs text-slate-400">
-              Provedores de episódios, metadados TheTVDB, calendário LiveChart.me e player
+              Provedores de episódios, metadados TheTVDB, notas MyAnimeList, calendário LiveChart.me e player
             </p>
           </div>
           <button
@@ -382,6 +449,17 @@ export function SettingsModal({
                   <span className="block text-sm font-medium text-slate-200">TheTVDB</span>
                   <span className="mt-0.5 block text-xs text-slate-400">
                     Sinopses em PT-BR, estúdios, gêneros, temporadas e detalhes de animes.
+                  </span>
+                </div>
+                <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
+                  Ativo
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-4 px-4 py-3">
+                <div className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-slate-200">MyAnimeList</span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Notas e avaliações da comunidade para os animes.
                   </span>
                 </div>
                 <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
@@ -817,8 +895,49 @@ export function SettingsModal({
                       </div>
 
                       {latestRelease.notes && (
-                        <div className="max-h-40 overflow-y-auto whitespace-pre-line break-words rounded-lg border border-white/8 bg-[#151921]/80 px-3 py-2.5 text-xs leading-relaxed text-slate-300">
-                          {latestRelease.notes}
+                        <div
+                          data-release-changelog="true"
+                          className="max-h-48 overflow-y-auto rounded-lg border border-white/8 bg-[#151921]/80 px-3 py-2.5 text-xs leading-relaxed text-slate-300"
+                        >
+                          {parsedChangelogSections.length > 0 ? (
+                            <div className="space-y-2.5">
+                              {parsedChangelogSections.map((section) => (
+                                <div key={section.title} className="space-y-1">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wide text-[#fb923c]">
+                                    {section.title}
+                                  </p>
+                                  <ul className="space-y-1">
+                                    {section.items.map((item, idx) => (
+                                      <li
+                                        key={`${section.title}-${idx}`}
+                                        className={item.isBullet ? 'flex items-start gap-1.5' : 'text-slate-300'}
+                                      >
+                                        {item.isBullet && (
+                                          <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-slate-500" />
+                                        )}
+                                        <span className="min-w-0 break-words">
+                                          {item.scope ? (
+                                            <>
+                                              <span className="font-semibold text-slate-100">
+                                                {item.scope}:
+                                              </span>{' '}
+                                              {item.text}
+                                            </>
+                                          ) : (
+                                            item.text
+                                          )}
+                                        </span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <div className="whitespace-pre-line break-words">
+                              {latestRelease.notes}
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -1063,6 +1182,101 @@ export function SettingsModal({
                   label="Avançar automaticamente para o próximo episódio"
                 />
               </div>
+            </div>
+
+            {/* Backup & Restore (JSON) */}
+            <div
+              data-backup-section="true"
+              className="space-y-2.5 rounded-xl border border-white/10 bg-[#0d0f12]/70 p-3.5"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2.5">
+                <div className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-slate-200">
+                    Backup de dados locais
+                  </span>
+                  <span className="mt-0.5 block text-xs text-slate-400">
+                    Exporte ou restaure Minha Lista, histórico, episódios assistidos e configurações em JSON.
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={exportingBackup}
+                    onClick={() => void handleExportBackupClick()}
+                    className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white disabled:opacity-50"
+                  >
+                    {exportingBackup ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                    ) : (
+                      <Download className="h-3.5 w-3.5 text-[#f97316]" />
+                    )}
+                    <span>Exportar backup</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => backupFileInputRef.current?.click()}
+                    className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+                  >
+                    <Upload className="h-3.5 w-3.5 text-[#f97316]" />
+                    <span>Importar backup</span>
+                  </button>
+                  <input
+                    ref={backupFileInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    onChange={(e) => void handleBackupFileSelected(e)}
+                    className="hidden"
+                    aria-label="Selecionar arquivo de backup JSON"
+                  />
+                </div>
+              </div>
+
+              {backupError && (
+                <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+                  {backupError}
+                </div>
+              )}
+
+              {pendingBackupImport && (
+                <div className="space-y-2.5 rounded-lg border border-[#f97316]/30 bg-[#151921] p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-xs font-semibold text-white">
+                        Restaurar {pendingBackupImport.filename}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-slate-400">
+                        {pendingBackupImport.summary.favoritesCount} favoritos ·{' '}
+                        {pendingBackupImport.summary.historyCount} no histórico ·{' '}
+                        {pendingBackupImport.summary.progressCount} episódios com progresso
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setPendingBackupImport(null)}
+                      aria-label="Cancelar importação"
+                      className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-white/10 bg-[#0d0f12] text-slate-400 hover:text-white"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmBackupImport('merge')}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-[#f97316] px-3 py-1.5 text-xs font-semibold text-[#0d0f12] transition-colors hover:bg-[#fb923c]"
+                    >
+                      Mesclar com dados atuais
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmBackupImport('replace')}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/12 px-3 py-1.5 text-xs font-medium text-rose-200 transition-colors hover:border-rose-400 hover:text-white"
+                    >
+                      Substituir tudo
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Maintenance / Local Storage Actions */}

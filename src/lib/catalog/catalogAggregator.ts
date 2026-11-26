@@ -17,6 +17,7 @@ import {
   buildExternalDatabaseLinks,
   isAnisyncUri,
   parseAnisyncUri,
+  parseDirectTvdbIdQuery,
   parseLiveChartExternalId,
   type CanonicalMediaType,
 } from './idCodec.ts';
@@ -29,6 +30,7 @@ import {
   enrichServerDetailsWithTheTvdb,
   fetchTheTvdbDetails,
   findBestTheTvdbMatch,
+  searchTheTvdb,
 } from './providers/thetvdbProvider.ts';
 import {
   findServerAnimePageForTitles,
@@ -117,17 +119,27 @@ export async function getAggregatedGlossary(
 }
 
 /**
- * Autocomplete Search Suggestions strictly from the integrated server.
+ * Autocomplete Search Suggestions strictly from the integrated server
+ * (with direct `tvdb:<id>` lookup shortcut).
  */
 export async function getAggregatedSearchSuggest(
   fetchHttp: HttpFetcher,
   query: string
 ): Promise<SearchSuggestResponse> {
+  if (parseDirectTvdbIdQuery(query)) {
+    const results = await searchTheTvdb(fetchHttp, query).catch(() => []);
+    return {
+      query,
+      results,
+      sourceMode: 'live',
+    };
+  }
   return getServerSearchSuggest(fetchHttp, query);
 }
 
 /**
- * Full Paginated Search strictly from the integrated server.
+ * Full Paginated Search strictly from the integrated server
+ * (with direct `tvdb:<id>` lookup shortcut).
  */
 export async function getAggregatedSearch(
   fetchHttp: HttpFetcher,
@@ -136,6 +148,16 @@ export async function getAggregatedSearch(
     page?: number;
   } = {}
 ): Promise<PaginatedSearchResponse> {
+  if (parseDirectTvdbIdQuery(query)) {
+    const results = await searchTheTvdb(fetchHttp, query).catch(() => []);
+    return {
+      query,
+      results,
+      currentPage: 1,
+      totalPages: 1,
+      sourceMode: 'live',
+    };
+  }
   return getServerSearch(fetchHttp, query, options.page || 1);
 }
 

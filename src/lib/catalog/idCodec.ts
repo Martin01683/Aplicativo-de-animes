@@ -168,7 +168,7 @@ export function canonicalMediaKey(raw: string): string {
 }
 
 export interface ExternalDatabaseLink {
-  source: CatalogSourceId;
+  source: CatalogSourceId | 'myanimelist';
   label: string;
   url: string;
 }
@@ -192,6 +192,14 @@ export function buildExternalDatabaseLinks(
     });
   }
 
+  if (ids.malId && ids.malId > 0) {
+    links.push({
+      source: 'myanimelist',
+      label: 'MyAnimeList',
+      url: `https://myanimelist.net/anime/${ids.malId}`,
+    });
+  }
+
   if (ids.livechartId) {
     links.push({
       source: 'livechart',
@@ -203,8 +211,74 @@ export function buildExternalDatabaseLinks(
   return links;
 }
 
+const LEADING_ARTICLE_RE = /^(?:a|an|the)\s+/i;
+const TRAILING_COUNTRY_YEAR_RE = /(?<=.+)(?:\s+\([A-Z]{2}\)|\s+\((?:19|20)\d{2}\)|\s+\([A-Z]{2}\)\s+\((?:19|20)\d{2}\))$/;
+const QUERY_TRAILING_YEAR_RE = /^(.+?)\s+(?:\(((?:19|20)\d{2})\)|((?:19|20)\d{2}))$/;
+const DIRECT_TVDB_QUERY_RE = /^tvdb(?:id)?\s*:\s*0*(\d+)$/i;
+
+/**
+ * Parses a direct TheTVDB lookup token from the search bar (e.g. `tvdb:389597` or `tvdbid:389597`).
+ */
+export function parseDirectTvdbIdQuery(raw: string): number | null {
+  const m = (raw || '').trim().match(DIRECT_TVDB_QUERY_RE);
+  if (!m?.[1]) return null;
+  const id = Number.parseInt(m[1], 10);
+  return Number.isFinite(id) && id > 0 ? id : null;
+}
+
+/**
+ * Extracts a trailing release year from a search query (e.g. `"Hunter x Hunter 2011"` or
+ * `"Fruits Basket (2019)"` -> `{ cleanQuery: 'Hunter x Hunter', year: '2011' }`), while keeping
+ * standalone numeric titles like `"1984"` intact.
+ */
+export function extractQueryYear(raw: string): { cleanQuery: string; year?: string } {
+  const trimmed = (raw || '').trim();
+  if (!trimmed || /^\d+$/.test(trimmed)) return { cleanQuery: trimmed };
+  const m = trimmed.match(QUERY_TRAILING_YEAR_RE);
+  if (!m) return { cleanQuery: trimmed };
+  const base = m[1].trim();
+  const year = m[2] || m[3];
+  if (base.length < 2 || !year) return { cleanQuery: trimmed };
+  return { cleanQuery: base, year };
+}
+
+/**
+ * Computes Levenshtein edit distance between two strings using O(min(m, n)) memory.
+ */
+export function levenshteinDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const short = m <= n ? a : b;
+  const long = m <= n ? b : a;
+  const sLen = short.length;
+  const lLen = long.length;
+
+  let prev = new Array<number>(sLen + 1);
+  let curr = new Array<number>(sLen + 1);
+  for (let j = 0; j <= sLen; j++) prev[j] = j;
+
+  for (let i = 1; i <= lLen; i++) {
+    curr[0] = i;
+    const lc = long.charCodeAt(i - 1);
+    for (let j = 1; j <= sLen; j++) {
+      const cost = lc === short.charCodeAt(j - 1) ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+    }
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
+  }
+  return prev[sLen];
+}
+
 export function normalizeTitleForMatch(raw: string): string {
   return (raw || '')
+    .replace(TRAILING_COUNTRY_YEAR_RE, '')
+    .replace(/%/g, ' percent ')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
@@ -249,8 +323,20 @@ export function scoreTitleSimilarity(query: string, candidate: string): number {
   if (!a || !b) return 0;
   if (a === b) return 1;
 
-  const aTokens = a.split(' ').filter(Boolean);
-  const bTokens = b.split(' ').filter(Boolean);
+  // Penalize season number mismatch (e.g. "Frieren" vs "Frieren s2")
+  const aSeason = a.match(/\bs(\d+)\b/)?.[1] || a.match(/\b([2-9])$/)?.[1] || '';
+  const bSeason = b.match(/\bs(\d+)\b/)?.[1] || b.match(/\b([2-9])$/)?.[1] || '';
+  const seasonPenalty = aSeason !== bSeason ? -0.18 : 0;
+
+  // Article-stripped exact match (e.g. "The Eminence in Shadow" vs "Eminence in Shadow")
+  const aNoArt = a.replace(LEADING_ARTICLE_RE, '').trim();
+  const bNoArt = b.replace(LEADING_ARTICLE_RE, '').trim();
+  if (aNoArt && bNoArt && aNoArt === bNoArt) {
+    return Math.max(0, Math.min(0.99, 0.98 + seasonPenalty));
+  }
+
+  const aTokens = aNoArt.split(' ').filter(Boolean);
+  const bTokens = bNoArt.split(' ').filter(Boolean);
   if (!aTokens.length || !bTokens.length) return 0;
 
   const aSet = new Set(aTokens);
@@ -262,14 +348,24 @@ export function scoreTitleSimilarity(query: string, candidate: string): number {
 
   const jaccard = overlap / (aSet.size + bSet.size - overlap);
   const containment = overlap / Math.min(aSet.size, bSet.size);
-  const prefixBonus = b.startsWith(a) || a.startsWith(b) ? 0.15 : 0;
+  const prefixBonus = bNoArt.startsWith(aNoArt) || aNoArt.startsWith(bNoArt) ? 0.15 : 0;
+  let baseScore = jaccard * 0.55 + containment * 0.35 + prefixBonus;
 
-  // Penalize season number mismatch (e.g. "Frieren" vs "Frieren s2")
-  const aSeason = a.match(/\bs(\d+)\b/)?.[1] || a.match(/\b([2-9])$/)?.[1] || '';
-  const bSeason = b.match(/\bs(\d+)\b/)?.[1] || b.match(/\b([2-9])$/)?.[1] || '';
-  const seasonPenalty = aSeason !== bSeason ? -0.18 : 0;
+  // Levenshtein typo tolerance: handles 1–2 char typos like "Frierem"
+  const minLen = Math.min(aNoArt.length, bNoArt.length);
+  const maxLen = Math.max(aNoArt.length, bNoArt.length);
+  if (minLen >= 4 && maxLen - minLen <= 3) {
+    const dist = levenshteinDistance(aNoArt, bNoArt);
+    const maxAllowed = Math.max(2, Math.floor(maxLen * 0.25));
+    if (dist <= maxAllowed) {
+      const editScore = (1 - dist / maxLen) * 0.92;
+      if (editScore > baseScore) {
+        baseScore = editScore;
+      }
+    }
+  }
 
-  return Math.max(0, Math.min(0.99, jaccard * 0.55 + containment * 0.35 + prefixBonus + seasonPenalty));
+  return Math.max(0, Math.min(0.99, baseScore + seasonPenalty));
 }
 
 /**

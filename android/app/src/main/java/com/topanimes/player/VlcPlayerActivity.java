@@ -7,6 +7,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
+import android.content.res.ColorStateList;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
@@ -48,6 +49,7 @@ import androidx.activity.OnBackPressedCallback;
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
@@ -242,6 +244,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private ImageButton btnTracks;
     private ImageButton btnSettings;
     private ImageButton btnFullscreen;
+    private ImageButton btnCast;
     private TextView seekBadge;
     private TextView holdSpeedBadge;
     private TextView gestureBadge;
@@ -438,6 +441,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
     private MediaSession mediaSession;
     private boolean becomingNoisyReceiverRegistered = false;
     private boolean pendingPauseFromNoisyAudio = false;
+    private TvCastDiscovery castDiscovery = null;
+    private final List<TvCastProtocol.CastDevice> discoveredCastDevices = new ArrayList<>();
+    private boolean castScanning = false;
+    private final TvCastService.StateListener castStateListener = snap -> uiHandler.post(() -> {
+        if (isFinishing() || isDestroyed()) return;
+        updateCastButtonVisual();
+        if (settingsOverlay != null && settingsOverlay.getVisibility() == View.VISIBLE && "cast".equals(settingsTab)) {
+            renderSettingsTab("cast");
+        }
+    });
     private final BroadcastReceiver becomingNoisyReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
@@ -590,6 +603,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
         setupMediaSession();
         initLibVlc();
         setupInteractions();
+        TvCastService.addStateListener(castStateListener);
+        updateCastButtonVisual();
         adjustResponsiveHud();
         updateEpisodeNavButtons();
         maybeFetchSeriesEpisodesInBackground();
@@ -626,6 +641,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
         btnTracks = findViewById(R.id.vlc_btn_tracks);
         btnSettings = findViewById(R.id.vlc_btn_settings);
         btnFullscreen = findViewById(R.id.vlc_btn_fullscreen);
+        btnCast = findViewById(R.id.vlc_btn_cast);
         seekBadge = findViewById(R.id.vlc_seek_badge);
         holdSpeedBadge = findViewById(R.id.vlc_hold_speed_badge);
         gestureBadge = findViewById(R.id.vlc_gesture_badge);
@@ -2216,12 +2232,15 @@ public class VlcPlayerActivity extends AppCompatActivity {
         btnQuality.setOnClickListener(v -> openSettingsMenu("quality"));
         btnTracks.setOnClickListener(v -> openSettingsMenu("subs"));
         btnSettings.setOnClickListener(v -> openSettingsMenu("main"));
+        if (btnCast != null) {
+            btnCast.setOnClickListener(v -> openCastMenu());
+        }
         settingsOverlay.setOnClickListener(v -> closeSettingsMenu());
         findViewById(R.id.vlc_settings_card).setOnClickListener(v -> {
             // Consume clicks inside card
         });
         settingsHeader.setOnClickListener(v -> {
-            if ("quality".equals(settingsTab) || "subs".equals(settingsTab)) {
+            if ("quality".equals(settingsTab) || "subs".equals(settingsTab) || "cast".equals(settingsTab)) {
                 closeSettingsMenu();
             } else {
                 renderSettingsTab("main");
@@ -3165,8 +3184,177 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void closeSettingsMenu() {
+        stopCastDiscoveryIfRunning();
         settingsOverlay.setVisibility(View.GONE);
         scheduleControlsAutoHide();
+    }
+
+    private void updateCastButtonVisual() {
+        if (btnCast == null) return;
+        boolean casting = TvCastService.isCastActive();
+        btnCast.setImageTintList(
+            ColorStateList.valueOf(Color.parseColor(casting ? "#F97316" : "#FFFFFF"))
+        );
+    }
+
+    private void openCastMenu() {
+        openSettingsMenu("cast");
+        startCastDiscovery();
+    }
+
+    private void startCastDiscovery() {
+        if (castDiscovery == null) {
+            castDiscovery = new TvCastDiscovery(this);
+        }
+        castScanning = true;
+        discoveredCastDevices.clear();
+        if ("cast".equals(settingsTab) && settingsOverlay.getVisibility() == View.VISIBLE) {
+            renderSettingsTab("cast");
+        }
+        castDiscovery.startDiscovery(5500L, new TvCastDiscovery.Listener() {
+            @Override
+            public void onDevicesChanged(List<TvCastProtocol.CastDevice> devices) {
+                if (isFinishing() || isDestroyed()) return;
+                discoveredCastDevices.clear();
+                discoveredCastDevices.addAll(devices);
+                if ("cast".equals(settingsTab) && settingsOverlay.getVisibility() == View.VISIBLE) {
+                    renderSettingsTab("cast");
+                }
+            }
+
+            @Override
+            public void onDiscoveryFinished(List<TvCastProtocol.CastDevice> devices) {
+                if (isFinishing() || isDestroyed()) return;
+                castScanning = false;
+                discoveredCastDevices.clear();
+                discoveredCastDevices.addAll(devices);
+                if ("cast".equals(settingsTab) && settingsOverlay.getVisibility() == View.VISIBLE) {
+                    renderSettingsTab("cast");
+                }
+            }
+        });
+    }
+
+    private void stopCastDiscoveryIfRunning() {
+        castScanning = false;
+        if (castDiscovery != null) {
+            castDiscovery.stopDiscovery();
+        }
+    }
+
+    private JSONObject buildCurrentCastMediaJson() {
+        JSONObject media = new JSONObject();
+        try {
+            StreamItem activeStream = (!streams.isEmpty() && currentStreamIdx >= 0 && currentStreamIdx < streams.size())
+                ? streams.get(currentStreamIdx)
+                : (!streams.isEmpty() ? streams.get(0) : null);
+            String activeUrl = activeStream != null ? activeStream.url : "";
+            String format = TvCastProtocol.isHlsStreamUrl(activeUrl, "") ? "hls" : "mp4";
+            media.put("streamUrl", activeUrl);
+            media.put("streamFormat", format);
+            media.put("referer", referer != null ? referer : "https://topanimes.net/");
+            media.put("preferDirect", preferDirect);
+            media.put("episodeUrl", episodeUrl != null ? episodeUrl : "");
+            media.put("title", episodeTitle != null ? episodeTitle : "Episódio");
+            media.put("seriesTitle", seriesTitle != null ? seriesTitle : "");
+            media.put("seriesUrl", seriesUrl != null ? seriesUrl : "");
+            media.put("poster", posterUrl != null ? posterUrl : "");
+            media.put("isMovie", isMovieFlag);
+            media.put("selectedServerNume", selectedServerNume != null ? selectedServerNume : "");
+            media.put("prevUrl", prevUrl != null ? prevUrl : "");
+            media.put("nextUrl", nextUrl != null ? nextUrl : "");
+            media.put("autoPlayNextEpisode", autoPlayNextEpisode);
+            media.put("startPositionMs", Math.max(0L, captureCurrentPositionMs()));
+            media.put("durationMs", Math.max(0L, lastKnownDurationMs));
+            if (!userDisabledSubtitles && !subtitles.isEmpty()) {
+                SubtitleItem chosen = subtitles.get(0);
+                for (SubtitleItem s : subtitles) {
+                    if (s.isDefault) {
+                        chosen = s;
+                        break;
+                    }
+                }
+                media.put("subtitleUrl", chosen.url);
+                media.put("subtitleLabel", chosen.label);
+            }
+        } catch (Exception ignored) {
+        }
+        return media;
+    }
+
+    private void startCastToDevice(TvCastProtocol.CastDevice device) {
+        if (device == null || streams.isEmpty()) {
+            Toast.makeText(this, "Nenhum vídeo carregado para transmitir.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONObject media = buildCurrentCastMediaJson();
+        if (media.optString("streamUrl", "").isEmpty()) {
+            Toast.makeText(this, "Stream inválido para transmissão.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        pausePlaybackForAudioRouteOrControl();
+        saveCurrentEpisodeProgress(false);
+
+        Intent intent = new Intent(this, TvCastService.class);
+        intent.setAction(TvCastService.ACTION_START_CAST);
+        intent.putExtra(TvCastService.EXTRA_DEVICE_JSON, TvCastPlugin.deviceToJsObject(device).toString());
+        intent.putExtra(TvCastService.EXTRA_MEDIA_JSON, media.toString());
+        intent.putExtra(TvCastService.EXTRA_DELIVERY_MODE, "auto");
+        ContextCompat.startForegroundService(this, intent);
+
+        Toast.makeText(
+            this,
+            "Transmitindo em " + device.name + " — você pode sair do app.",
+            Toast.LENGTH_LONG
+        ).show();
+        updateCastButtonVisual();
+        renderSettingsTab("cast");
+    }
+
+    private void launchExternalTvAppCast() {
+        if (streams.isEmpty()) {
+            Toast.makeText(this, "Nenhum vídeo carregado para transmitir.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        JSONObject media = buildCurrentCastMediaJson();
+        String fallbackUrl = media.optString("streamUrl", "");
+        String format = media.optString("streamFormat", "mp4");
+        pausePlaybackForAudioRouteOrControl();
+        saveCurrentEpisodeProgress(false);
+
+        Intent serviceIntent = new Intent(this, TvCastService.class);
+        serviceIntent.setAction(TvCastService.ACTION_PREPARE_LAN_ONLY);
+        serviceIntent.putExtra(TvCastService.EXTRA_MEDIA_JSON, media.toString());
+        ContextCompat.startForegroundService(this, serviceIntent);
+
+        bgExecutor.execute(() -> {
+            String lanUrl = "";
+            long deadline = System.currentTimeMillis() + 1500L;
+            while (System.currentTimeMillis() < deadline) {
+                lanUrl = TvCastService.getActiveLanStreamUrl();
+                if (lanUrl != null && !lanUrl.isEmpty()) break;
+                try {
+                    Thread.sleep(60L);
+                } catch (InterruptedException ignored) {
+                    break;
+                }
+            }
+            final String targetUrl = (lanUrl != null && !lanUrl.isEmpty()) ? lanUrl : fallbackUrl;
+            uiHandler.post(() -> {
+                if (isFinishing() || isDestroyed() || targetUrl.isEmpty()) return;
+                try {
+                    Intent viewIntent = new Intent(Intent.ACTION_VIEW);
+                    String mime = TvCastProtocol.isHlsStreamUrl(targetUrl, format)
+                        ? "application/x-mpegurl"
+                        : "video/*";
+                    viewIntent.setDataAndType(Uri.parse(targetUrl), mime);
+                    viewIntent.putExtra("title", episodeTitle);
+                    startActivity(Intent.createChooser(viewIntent, "Transmitir ou abrir com..."));
+                } catch (Exception e) {
+                    Toast.makeText(this, "Nenhum app externo de TV encontrado.", Toast.LENGTH_SHORT).show();
+                }
+            });
+        });
     }
 
     private void renderSettingsTab(String tab) {
@@ -3214,6 +3402,110 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
         settingsHeader.setVisibility(View.VISIBLE);
         settingsHeaderDivider.setVisibility(View.VISIBLE);
+
+        if ("cast".equals(tab)) {
+            settingsHeaderTitle.setText("Transmitir para TV");
+
+            TextView hint = new TextView(this);
+            hint.setText("Continua na TV mesmo saindo do app ou bloqueando a tela (controles na notificação).");
+            hint.setTextColor(Color.parseColor("#94A3B8"));
+            hint.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+            LinearLayout.LayoutParams hlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            hlp.leftMargin = dp(4);
+            hlp.rightMargin = dp(4);
+            hlp.bottomMargin = dp(8);
+            hint.setLayoutParams(hlp);
+            settingsItems.addView(hint);
+
+            if (TvCastService.isCastActive()) {
+                JSONObject st = TvCastService.getCurrentStateJson();
+                String devName = st.optString("deviceName", "TV");
+                String stCode = st.optString("status", "playing");
+                boolean isPlayingOnTv = "playing".equals(stCode) || "buffering".equals(stCode);
+                String statusText = "playing".equals(stCode)
+                    ? "Reproduzindo"
+                    : "paused".equals(stCode)
+                        ? "Pausado"
+                        : "Conectando...";
+
+                addSettingsRow(devName, statusText, true, v -> {});
+                if (!"lan-link".equals(st.optString("deliveryMode", ""))) {
+                    addSettingsRow(
+                        isPlayingOnTv ? "Pausar na TV" : "Reproduzir na TV",
+                        "",
+                        false,
+                        v -> {
+                            Intent ci = new Intent(this, TvCastService.class);
+                            ci.setAction(TvCastService.ACTION_TOGGLE_PLAY_PAUSE);
+                            ContextCompat.startForegroundService(this, ci);
+                        }
+                    );
+                }
+                addSettingsRow(
+                    "Continuar em 2º plano (sair do player)",
+                    "",
+                    false,
+                    v -> {
+                        closeSettingsMenu();
+                        finishWithAction("closed");
+                    }
+                );
+                addSettingsRow(
+                    "Parar transmissão na TV",
+                    "",
+                    false,
+                    v -> {
+                        Intent stopI = new Intent(this, TvCastService.class);
+                        stopI.setAction(TvCastService.ACTION_STOP_CAST);
+                        try {
+                            startService(stopI);
+                        } catch (Exception ignored) {
+                        }
+                        updateCastButtonVisual();
+                        renderSettingsTab("cast");
+                    }
+                );
+
+                View sep = new View(this);
+                LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    dp(1)
+                );
+                slp.topMargin = dp(4);
+                slp.bottomMargin = dp(6);
+                sep.setLayoutParams(slp);
+                sep.setBackgroundColor(Color.parseColor("#1AFFFFFF"));
+                settingsItems.addView(sep);
+            }
+
+            if (discoveredCastDevices.isEmpty()) {
+                addSettingsRow(
+                    castScanning ? "Buscando TVs no Wi-Fi..." : "Nenhuma TV encontrada no Wi-Fi",
+                    "",
+                    false,
+                    v -> {}
+                );
+            } else {
+                for (TvCastProtocol.CastDevice dev : discoveredCastDevices) {
+                    String protoLabel = TvCastProtocol.PROTOCOL_DLNA.equals(dev.protocol)
+                        ? "Smart TV"
+                        : "Chromecast";
+                    addSettingsRow(dev.name, protoLabel, false, v -> startCastToDevice(dev));
+                }
+            }
+
+            if (!castScanning) {
+                addSettingsRow("Buscar TVs novamente", "", false, v -> startCastDiscovery());
+            }
+            addSettingsRow("Abrir em app de TV externo", "", false, v -> {
+                closeSettingsMenu();
+                launchExternalTvAppCast();
+            });
+            return;
+        }
 
         if ("quality".equals(tab)) {
             settingsHeaderTitle.setText("Qualidade");
@@ -4202,6 +4494,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        TvCastService.removeStateListener(castStateListener);
+        if (castDiscovery != null) {
+            castDiscovery.shutdown();
+            castDiscovery = null;
+        }
         LocalProxyPlugin.clearBufferProgressListener(activeBufferSessionId);
         activeBufferSessionId = 0L;
         isActivityStarted = false;
@@ -4772,6 +5069,77 @@ public class VlcPlayerActivity extends AppCompatActivity {
             return SCALE_IDS[idx];
         }
         return SCALE_IDS[0];
+    }
+
+    public static void saveCastEpisodeProgress(
+        Context ctx,
+        String url,
+        String title,
+        String seriesTitleVal,
+        String seriesUrlVal,
+        String posterVal,
+        boolean isMovieVal,
+        long posMs,
+        long durMs,
+        boolean ended
+    ) {
+        if (ctx == null || url == null || url.trim().isEmpty()) return;
+        String canonicalKey = canonicalProgressKey(url);
+        if (canonicalKey.isEmpty()) return;
+
+        boolean completed = isEpisodeCompletedMs(posMs, durMs, ended);
+        long storedPosMs = completed ? 0L : Math.max(0L, posMs);
+        if (!completed && storedPosMs < MIN_RESUME_MS) return;
+
+        try {
+            SharedPreferences prefs = ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+            String raw = prefs.getString(PREF_EPISODE_PROGRESS_JSON, "{}");
+            JSONObject root = raw != null && !raw.isEmpty() ? new JSONObject(raw) : new JSONObject();
+
+            JSONObject entry = new JSONObject();
+            entry.put("url", normalizeUrlKey(url));
+            entry.put("positionMs", storedPosMs);
+            entry.put("durationMs", Math.max(0L, durMs));
+            entry.put("completed", completed);
+            entry.put("updatedAt", System.currentTimeMillis());
+            root.put(canonicalKey, entry);
+
+            if (root.length() > 200) {
+                pruneProgressEntries(root, 200);
+            }
+
+            JSONObject visitedObj = new JSONObject();
+            visitedObj.put("url", normalizeUrlKey(url));
+            visitedObj.put("title", formatEpisodeTitleWithSeries(seriesTitleVal, title));
+            visitedObj.put("seriesTitle", seriesTitleVal != null ? seriesTitleVal : "");
+            visitedObj.put("seriesUrl", seriesUrlVal != null ? seriesUrlVal : "");
+            visitedObj.put("poster", posterVal != null ? posterVal : "");
+            visitedObj.put("isMovie", isMovieVal);
+            visitedObj.put("positionMs", storedPosMs);
+            visitedObj.put("durationMs", Math.max(0L, durMs));
+            visitedObj.put("completed", completed);
+            visitedObj.put("watchedAtMs", System.currentTimeMillis());
+
+            JSONArray visitedArr = new JSONArray();
+            visitedArr.put(visitedObj);
+
+            JSONObject session = new JSONObject();
+            session.put("action", "closed");
+            session.put("episodeUrl", normalizeUrlKey(url));
+            session.put("positionMs", storedPosMs);
+            session.put("durationMs", Math.max(0L, durMs));
+            session.put("completed", completed);
+            session.put("streamIndex", 0);
+            session.put("visitedEpisodes", visitedArr);
+            session.put("updatedAt", System.currentTimeMillis());
+
+            prefs.edit()
+                .putString(PREF_EPISODE_PROGRESS_JSON, root.toString())
+                .putString(PREF_PENDING_SESSION_JSON, session.toString())
+                .apply();
+        } catch (Exception e) {
+            Log.w(TAG, "Failed saving background cast episode progress", e);
+        }
     }
 
     public static void saveVideoScalePreference(Context ctx, String scaleId) {

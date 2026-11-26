@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.InstallSourceInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
@@ -13,6 +14,7 @@ import android.content.pm.Signature;
 import android.content.pm.SigningInfo;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Process;
 import android.provider.Settings;
 import android.util.Log;
 
@@ -20,6 +22,7 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.app.PendingIntentCompat;
 import androidx.core.content.ContextCompat;
+import androidx.core.content.FileProvider;
 import androidx.core.content.pm.PackageInfoCompat;
 
 import com.getcapacitor.JSObject;
@@ -30,6 +33,9 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
@@ -55,6 +61,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutorService;
@@ -73,6 +80,14 @@ public class LocalProxyPlugin extends Plugin {
     private static final String TAG = "TopAnimesLocalProxy";
     private static final String CHANNEL_EPISODES_ID = "anisync_episodes";
     private static final String CHANNEL_UPDATES_ID = "anisync_updates";
+    private static final String CHANNEL_INSTALL_CONFIRM_ID = "anisync_install_confirm";
+    private static final int NOTIFICATION_ID_INSTALL_CONFIRM = 4092;
+    private static final long SESSION_WATCH_POLL_MS = 2000L;
+    private static final long SESSION_GONE_GRACE_MS = 5000L;
+    private static final int APK_DOWNLOAD_MAX_ATTEMPTS = 4;
+    private static final long APK_RETRY_INITIAL_DELAY_MS = 800L;
+    private static final long APK_RETRY_MAX_DELAY_MS = 6000L;
+    private static final Random RETRY_RANDOM = new Random();
     private static final String DEFAULT_UA =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     private static final Pattern DIRECT_HOSTS_PATTERN = Pattern.compile(
@@ -148,10 +163,164 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
     private static volatile WeakReference<LocalProxyPlugin> activeInstanceRef = new WeakReference<>(null);
+    private static volatile Intent pendingInstallConfirmIntent = null;
+    private static volatile int pendingInstallConfirmSessionId = -1;
+    private static volatile boolean silentUpdatesRefused = false;
+    private static volatile boolean activeSessionRequestedSilent = false;
+    private static volatile boolean activeSessionUserActionShown = false;
+    private static volatile File activeVerifiedStagingApk = null;
+    private static volatile long activeInstallDownloadId = 0L;
     private static ServerSocket sharedServerSocket;
     private static volatile int sharedProxyPort = -1;
     private static volatile boolean sharedProxyRunning = false;
     private static ExecutorService sharedProxyExecutor;
+
+    private static void clearPendingInstallConfirmation(Context ctx) {
+        pendingInstallConfirmIntent = null;
+        pendingInstallConfirmSessionId = -1;
+        if (ctx != null) {
+            try {
+                NotificationManagerCompat.from(ctx).cancel(NOTIFICATION_ID_INSTALL_CONFIRM);
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private static void cleanupVerifiedStagingApk() {
+        File staging = activeVerifiedStagingApk;
+        activeVerifiedStagingApk = null;
+        if (staging != null && staging.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            staging.delete();
+        }
+    }
+
+    public static void flushPendingInstallConfirmation(Context ctx) {
+        if (ctx == null) return;
+        Intent confirm = pendingInstallConfirmIntent;
+        if (confirm == null) return;
+        clearPendingInstallConfirmation(ctx);
+        try {
+            confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(confirm);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed launching queued install confirmation on resume", e);
+        }
+    }
+
+    private static void postInstallConfirmationNotification(Context ctx, int sessionId, Intent confirmIntent) {
+        if (ctx == null || confirmIntent == null) return;
+        try {
+            ensureNotificationChannelsStatic(ctx);
+            PendingIntent pendingIntent = PendingIntentCompat.getActivity(
+                ctx,
+                NOTIFICATION_ID_INSTALL_CONFIRM + Math.max(0, sessionId % 100),
+                confirmIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT,
+                false
+            );
+            NotificationCompat.Builder builder = new NotificationCompat.Builder(ctx, CHANNEL_INSTALL_CONFIRM_ID)
+                .setSmallIcon(R.drawable.ic_stat_anisync)
+                .setColor(0xFFF97316)
+                .setContentTitle("Confirmar atualização do Anisync")
+                .setContentText("Toque para concluir a instalação da nova versão.")
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_STATUS)
+                .setAutoCancel(true);
+            if (pendingIntent != null) {
+                builder.setContentIntent(pendingIntent);
+            }
+            NotificationManagerCompat.from(ctx).notify(NOTIFICATION_ID_INSTALL_CONFIRM, builder.build());
+        } catch (Exception e) {
+            Log.w(TAG, "Failed posting background install confirmation notification", e);
+        }
+    }
+
+    public static void onInstallUserActionRequired(Context ctx, int sessionId, Intent confirmIntent) {
+        activeSessionUserActionShown = true;
+        if (confirmIntent == null || ctx == null) return;
+        confirmIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        if (MainActivity.isInForeground()) {
+            try {
+                ctx.startActivity(confirmIntent);
+                return;
+            } catch (Exception e) {
+                Log.w(TAG, "Direct confirmation activity launch failed; handing off via notification", e);
+            }
+        }
+
+        // App is in background (or OEM blocked direct start): store for resume + show clickable notification
+        pendingInstallConfirmIntent = confirmIntent;
+        pendingInstallConfirmSessionId = sessionId;
+        postInstallConfirmationNotification(ctx, sessionId, confirmIntent);
+    }
+
+    public static void onInstallSucceeded(Context ctx, int sessionId) {
+        clearPendingInstallConfirmation(ctx);
+        cleanupVerifiedStagingApk();
+        notifyInstallStage("installed", 100, null);
+    }
+
+    public static void onInstallAborted(Context ctx, int sessionId, String message) {
+        clearPendingInstallConfirmation(ctx);
+        // OEM builds (e.g. HyperOS/MIUI) refuse silent updates by aborting the session before showing UI
+        if (activeSessionRequestedSilent && !activeSessionUserActionShown) {
+            silentUpdatesRefused = true;
+            LocalProxyPlugin instance = activeInstanceRef.get();
+            File staging = activeVerifiedStagingApk;
+            long downloadId = activeInstallDownloadId;
+            if (instance != null && ctx != null && staging != null && staging.exists()) {
+                Log.w(TAG, "Silent self-update refused by platform (" + message + "); retrying with user confirmation");
+                instance.retryInstallWithUserAction(ctx.getApplicationContext(), staging, downloadId);
+                return;
+            }
+        }
+        cleanupVerifiedStagingApk();
+        notifyInstallStage("cancelled", 0, "Instalação cancelada pelo usuário.");
+    }
+
+    public static void onInstallFailed(Context ctx, int sessionId, int status, String message) {
+        clearPendingInstallConfirmation(ctx);
+        boolean sessionKilled = message != null && (
+            message.toLowerCase(Locale.ROOT).contains("dead")
+                || message.toLowerCase(Locale.ROOT).contains("abandoned")
+        );
+        File staging = activeVerifiedStagingApk;
+        if (sessionKilled && ctx != null && staging != null && staging.exists()) {
+            Log.w(TAG, "PackageInstaller session " + sessionId + " died; falling back to ACTION_INSTALL_PACKAGE");
+            if (launchLegacyApkInstallFallback(ctx, staging)) {
+                LocalProxyPlugin instance = activeInstanceRef.get();
+                if (instance != null) {
+                    instance.activeApkSessionId = -1;
+                }
+                return;
+            }
+        }
+        cleanupVerifiedStagingApk();
+        String errMsg = (message != null && !message.isEmpty())
+            ? ("Falha ao instalar atualização: " + message)
+            : "Falha ao instalar atualização no sistema.";
+        notifyInstallStage("error", 0, errMsg);
+    }
+
+    @SuppressWarnings("deprecation")
+    private static boolean launchLegacyApkInstallFallback(Context ctx, File apkFile) {
+        try {
+            Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", apkFile);
+            Intent installIntent = new Intent(Intent.ACTION_INSTALL_PACKAGE);
+            installIntent.setDataAndType(uri, "application/vnd.android.package-archive");
+            installIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            installIntent.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
+            installIntent.putExtra(Intent.EXTRA_RETURN_RESULT, false);
+            installIntent.putExtra(Intent.EXTRA_INSTALLER_PACKAGE_NAME, ctx.getPackageName());
+            ctx.startActivity(installIntent);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Legacy ACTION_INSTALL_PACKAGE fallback failed", e);
+            return false;
+        }
+    }
 
     public static void notifyInstallStage(String stage, int percent, String message) {
         LocalProxyPlugin instance = activeInstanceRef.get();
@@ -330,6 +499,10 @@ public class LocalProxyPlugin extends Plugin {
                 ret.put("ok", status >= 200 && status < 300);
                 ret.put("finalUrl", res.finalUrl);
                 ret.put("body", body);
+                String retryAfter = conn.getHeaderField("Retry-After");
+                if (retryAfter != null && !retryAfter.trim().isEmpty()) {
+                    ret.put("retryAfter", retryAfter.trim());
+                }
                 call.resolve(ret);
             } catch (Exception e) {
                 shouldDisconnect = true;
@@ -398,6 +571,10 @@ public class LocalProxyPlugin extends Plugin {
     }
 
     private void ensureNotificationChannels(Context ctx) {
+        ensureNotificationChannelsStatic(ctx);
+    }
+
+    private static void ensureNotificationChannelsStatic(Context ctx) {
         NotificationManager manager = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
         if (manager == null) return;
 
@@ -416,6 +593,14 @@ public class LocalProxyPlugin extends Plugin {
         );
         updatesChannel.setDescription("Avisos quando uma nova versão do aplicativo está disponível.");
         manager.createNotificationChannel(updatesChannel);
+
+        NotificationChannel installConfirmChannel = new NotificationChannel(
+            CHANNEL_INSTALL_CONFIRM_ID,
+            "Confirmação de Instalação",
+            NotificationManager.IMPORTANCE_HIGH
+        );
+        installConfirmChannel.setDescription("Exibe o atalho para confirmar a instalação de atualizações baixadas em segundo plano.");
+        manager.createNotificationChannel(installConfirmChannel);
     }
 
     @PluginMethod
@@ -540,6 +725,48 @@ public class LocalProxyPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void exportBackupFile(PluginCall call) {
+        Context ctx = getContext();
+        String rawName = call.getString("filename", "anisync-backup.json");
+        String content = call.getString("content", "");
+        if (ctx == null || content == null || content.isEmpty()) {
+            call.reject("Conteúdo de backup inválido.");
+            return;
+        }
+        String safeName = rawName != null ? rawName.replaceAll("[^a-zA-Z0-9._-]", "_") : "anisync-backup.json";
+        if (!safeName.endsWith(".json")) {
+            safeName = safeName + ".json";
+        }
+        try {
+            File outFile = new File(ctx.getCacheDir(), safeName);
+            try (FileOutputStream fos = new FileOutputStream(outFile, false)) {
+                fos.write(content.getBytes(StandardCharsets.UTF_8));
+                fos.getFD().sync();
+            }
+            Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", outFile);
+            Intent shareIntent = new Intent(Intent.ACTION_SEND);
+            shareIntent.setType("application/json");
+            shareIntent.putExtra(Intent.EXTRA_STREAM, uri);
+            shareIntent.putExtra(Intent.EXTRA_SUBJECT, safeName);
+            shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+            Intent chooser = Intent.createChooser(shareIntent, "Salvar ou compartilhar backup do Anisync");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(chooser);
+
+            JSObject ret = new JSObject();
+            ret.put("saved", true);
+            ret.put("shared", true);
+            ret.put("path", safeName);
+            ret.put("message", "Escolha onde salvar ou enviar o backup (" + safeName + ").");
+            call.resolve(ret);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed exporting backup file", e);
+            call.reject("Não foi possível exportar o arquivo de backup.");
+        }
+    }
+
+    @PluginMethod
     public void cancelApkDownload(PluginCall call) {
         boolean cancelled = cancelActiveApkDownloadInternal();
         emitDownloadProgress(0L, 0L, 0, "cancelled", "Atualização cancelada.");
@@ -551,6 +778,10 @@ public class LocalProxyPlugin extends Plugin {
     private synchronized boolean cancelActiveApkDownloadInternal() {
         boolean hadActive = activeApkConnection != null || activeApkSession != null || activeApkSessionId >= 0;
         activeApkDownloadId.incrementAndGet();
+        clearPendingInstallConfirmation(getContext());
+        cleanupVerifiedStagingApk();
+        activeSessionRequestedSilent = false;
+        activeSessionUserActionShown = false;
 
         final HttpURLConnection conn = activeApkConnection;
         activeApkConnection = null;
@@ -602,6 +833,446 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
+    private long getCurrentInstalledVersionCode(Context ctx) {
+        try {
+            PackageInfo info = ctx.getPackageManager().getPackageInfo(ctx.getPackageName(), 0);
+            return PackageInfoCompat.getLongVersionCode(info);
+        } catch (Exception e) {
+            return -1L;
+        }
+    }
+
+    private boolean canUpdateSelfSilently(Context ctx) {
+        if (silentUpdatesRefused || Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return false;
+        }
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            String pkgName = ctx.getPackageName();
+            PackageInfo installed = pm.getPackageInfo(pkgName, 0);
+            if (installed == null || installed.applicationInfo == null
+                || installed.applicationInfo.targetSdkVersion < Build.VERSION_CODES.S) {
+                return false;
+            }
+            InstallSourceInfo source = pm.getInstallSourceInfo(pkgName);
+            if (source == null) return false;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                String owner = source.getUpdateOwnerPackageName();
+                if (owner != null && !owner.isEmpty()) {
+                    return pkgName.equals(owner);
+                }
+            }
+            return pkgName.equals(source.getInstallingPackageName());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private void retryInstallWithUserAction(Context appCtx, File stagingApk, long downloadId) {
+        if (executor == null || executor.isShutdown()) {
+            startProxyServer();
+        }
+        executor.execute(() -> {
+            try {
+                ensureApkDownloadActive(downloadId);
+                commitApkSession(appCtx, stagingApk, downloadId, true);
+            } catch (CancellationException ce) {
+                cleanupVerifiedStagingApk();
+                emitDownloadProgress(0L, 0L, 0, "cancelled", "Atualização cancelada.");
+            } catch (Exception e) {
+                Log.e(TAG, "Retry install with user action failed", e);
+                if (!launchLegacyApkInstallFallback(appCtx, stagingApk)) {
+                    cleanupVerifiedStagingApk();
+                    emitDownloadProgress(0L, 0L, 0, "error", "Falha ao abrir instalador do sistema.");
+                }
+            }
+        });
+    }
+
+    private void commitApkSession(Context ctx, File stagingApk, long downloadId, boolean forceUserAction) throws IOException {
+        ensureApkDownloadActive(downloadId);
+        String pkgName = ctx.getPackageName();
+        long initialVersionCode = getCurrentInstalledVersionCode(ctx);
+        boolean requestSilent = !forceUserAction && canUpdateSelfSilently(ctx);
+        activeSessionRequestedSilent = requestSilent;
+        activeSessionUserActionShown = !requestSilent;
+
+        PackageInstaller installer = ctx.getPackageManager().getPackageInstaller();
+        PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+            PackageInstaller.SessionParams.MODE_FULL_INSTALL
+        );
+        params.setOriginatingUid(Process.myUid());
+        params.setAppPackageName(pkgName);
+        params.setSize(stagingApk.length());
+        params.setInstallReason(PackageManager.INSTALL_REASON_USER);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            params.setPackageSource(PackageInstaller.PACKAGE_SOURCE_LOCAL_FILE);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            params.setRequestUpdateOwnership(true);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            params.setRequireUserAction(
+                requestSilent
+                    ? PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED
+                    : PackageInstaller.SessionParams.USER_ACTION_REQUIRED
+            );
+        }
+
+        int sessionId = installer.createSession(params);
+        activeApkSessionId = sessionId;
+        PackageInstaller.Session session = null;
+        try {
+            session = installer.openSession(sessionId);
+            activeApkSession = session;
+
+            byte[] buf = new byte[32768];
+            try (InputStream apkIn = new BufferedInputStream(new FileInputStream(stagingApk));
+                 OutputStream sessionOut = session.openWrite("TopAnimes.apk", 0L, stagingApk.length())) {
+                int read;
+                while ((read = apkIn.read(buf)) != -1) {
+                    ensureApkDownloadActive(downloadId);
+                    sessionOut.write(buf, 0, read);
+                }
+                session.fsync(sessionOut);
+            }
+
+            ensureApkDownloadActive(downloadId);
+
+            Intent callbackIntent = new Intent(ctx, ApkInstallReceiver.class);
+            callbackIntent.putExtra(PackageInstaller.EXTRA_SESSION_ID, sessionId);
+            PendingIntent pendingIntent = PendingIntentCompat.getBroadcast(
+                ctx,
+                sessionId,
+                callbackIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT,
+                true
+            );
+            if (pendingIntent == null) {
+                throw new IOException("Não foi possível criar PendingIntent de instalação.");
+            }
+            session.commit(pendingIntent.getIntentSender());
+            session.close();
+            if (activeApkSession == session) {
+                activeApkSession = null;
+            }
+            session = null;
+
+            startSessionWatchdog(ctx.getApplicationContext(), sessionId, downloadId, initialVersionCode);
+        } catch (IOException | RuntimeException e) {
+            if (session != null) {
+                try {
+                    session.abandon();
+                } catch (Exception ignored) {
+                }
+            }
+            if (activeApkSession == session) {
+                activeApkSession = null;
+            }
+            if (activeApkSessionId == sessionId) {
+                activeApkSessionId = -1;
+            }
+            throw e;
+        }
+    }
+
+    private void startSessionWatchdog(Context appCtx, int sessionId, long downloadId, long initialVersionCode) {
+        if (executor == null || executor.isShutdown()) return;
+        executor.execute(() -> {
+            try {
+                PackageInstaller installer = appCtx.getPackageManager().getPackageInstaller();
+                while (activeApkSessionId == sessionId && activeApkDownloadId.get() == downloadId) {
+                    if (installer.getSessionInfo(sessionId) == null) {
+                        Thread.sleep(SESSION_GONE_GRACE_MS);
+                        if (activeApkSessionId == sessionId && activeApkDownloadId.get() == downloadId) {
+                            long currentVersionCode = getCurrentInstalledVersionCode(appCtx);
+                            clearPendingInstallConfirmation(appCtx);
+                            cleanupVerifiedStagingApk();
+                            if (initialVersionCode > 0L && currentVersionCode > initialVersionCode) {
+                                notifyInstallStage("installed", 100, null);
+                            } else {
+                                Log.w(TAG, "PackageInstaller session " + sessionId + " ended without status broadcast");
+                                notifyInstallStage("cancelled", 0, "Instalação encerrada pelo sistema.");
+                            }
+                        }
+                        return;
+                    }
+                    Thread.sleep(SESSION_WATCH_POLL_MS);
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                Log.w(TAG, "Session watchdog exited: " + e.getMessage());
+            }
+        });
+    }
+
+    private long[] downloadApkWithResume(String initialUrl, File stagingApk, long downloadId) throws IOException {
+        long downloaded = 0L;
+        long totalBytes = -1L;
+        long retryDelayMs = APK_RETRY_INITIAL_DELAY_MS;
+        IOException lastError = null;
+
+        for (int attempt = 1; attempt <= APK_DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+            ensureApkDownloadActive(downloadId);
+            HttpURLConnection conn = null;
+            try {
+                String currentUrl = initialUrl;
+                for (int hop = 0; hop <= 6; hop++) {
+                    ensureApkDownloadActive(downloadId);
+                    if (!isAllowedGitHubCdnUrl(currentUrl)) {
+                        throw new IOException("Redirecionamento fora dos domínios oficiais do GitHub.");
+                    }
+                    URL parsed = new URL(currentUrl);
+                    conn = (HttpURLConnection) parsed.openConnection();
+                    activeApkConnection = conn;
+                    ensureApkDownloadActive(downloadId);
+                    conn.setInstanceFollowRedirects(false);
+                    conn.setConnectTimeout(15000);
+                    conn.setReadTimeout(30000);
+                    conn.setRequestMethod("GET");
+                    conn.setRequestProperty("User-Agent", DEFAULT_UA);
+                    conn.setRequestProperty("Accept", "application/vnd.android.package-archive,application/octet-stream,*/*");
+                    if (downloaded > 0L) {
+                        conn.setRequestProperty("Range", "bytes=" + downloaded + "-");
+                    }
+
+                    int code = conn.getResponseCode();
+                    if (code >= 300 && code < 400) {
+                        String loc = conn.getHeaderField("Location");
+                        conn.disconnect();
+                        if (activeApkConnection == conn) activeApkConnection = null;
+                        conn = null;
+                        if (loc == null || loc.isEmpty()) {
+                            throw new IOException("Redirecionamento vazio ao baixar APK.");
+                        }
+                        currentUrl = new URL(parsed, loc).toString();
+                        continue;
+                    }
+                    if (code == 416 && totalBytes > 0L && downloaded >= totalBytes && stagingApk.length() == totalBytes) {
+                        return new long[] { downloaded, totalBytes };
+                    }
+                    if (code < 200 || code >= 300) {
+                        boolean deterministic = code >= 400 && code < 500 && code != 408 && code != 429;
+                        IOException httpErr = new IOException("GitHub retornou HTTP " + code + " ao baixar APK.");
+                        if (deterministic) {
+                            throw httpErr;
+                        }
+                        throw new RetryableDownloadException(httpErr.getMessage(), httpErr);
+                    }
+                    break;
+                }
+
+                if (conn == null) {
+                    throw new IOException("Excesso de redirecionamentos ao baixar APK.");
+                }
+
+                int responseCode = conn.getResponseCode();
+                boolean appendMode = false;
+                if (responseCode == 206 && downloaded > 0L) {
+                    String contentRange = conn.getHeaderField("Content-Range");
+                    long rangeStart = parseContentRangeStart(contentRange);
+                    long rangeTotal = parseContentRangeTotal(contentRange);
+                    if (rangeStart == downloaded) {
+                        appendMode = true;
+                        if (rangeTotal > 0L) totalBytes = rangeTotal;
+                    } else {
+                        downloaded = 0L;
+                    }
+                } else {
+                    downloaded = 0L;
+                    try {
+                        String cl = conn.getHeaderField("Content-Length");
+                        if (cl != null) totalBytes = Long.parseLong(cl.trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+
+                long lastEmitAt = 0L;
+                byte[] buf = new byte[32768];
+                try (InputStream in = new BufferedInputStream(conn.getInputStream());
+                     FileOutputStream fos = new FileOutputStream(stagingApk, appendMode)) {
+                    int n;
+                    while ((n = in.read(buf)) != -1) {
+                        ensureApkDownloadActive(downloadId);
+                        fos.write(buf, 0, n);
+                        downloaded += n;
+                        long now = System.currentTimeMillis();
+                        if (now - lastEmitAt >= 120L) {
+                            lastEmitAt = now;
+                            int pct = totalBytes > 0L
+                                ? (int) Math.min(99L, (downloaded * 100L) / totalBytes)
+                                : 0;
+                            emitDownloadProgress(downloaded, totalBytes, pct, "downloading", null);
+                        }
+                    }
+                    fos.getFD().sync();
+                }
+
+                if (totalBytes > 0L && downloaded < totalBytes) {
+                    throw new RetryableDownloadException(
+                        "Download interrompido em " + downloaded + "/" + totalBytes + " bytes.",
+                        null
+                    );
+                }
+
+                return new long[] { downloaded, totalBytes };
+            } catch (CancellationException ce) {
+                throw ce;
+            } catch (IOException e) {
+                lastError = e;
+                boolean canRetry = (e instanceof RetryableDownloadException)
+                    || !(e.getMessage() != null && e.getMessage().contains("HTTP 40"));
+                if (!canRetry || attempt >= APK_DOWNLOAD_MAX_ATTEMPTS) {
+                    throw e;
+                }
+                long jitter = RETRY_RANDOM.nextInt((int) Math.max(1L, retryDelayMs / 2L) + 1);
+                long sleepMs = Math.min(APK_RETRY_MAX_DELAY_MS, retryDelayMs + jitter);
+                Log.w(TAG, "APK download attempt " + attempt + " interrupted at " + downloaded + " bytes; retrying in " + sleepMs + "ms");
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new CancellationException("Atualização cancelada.");
+                }
+                retryDelayMs = Math.min(APK_RETRY_MAX_DELAY_MS, retryDelayMs * 2L);
+            } finally {
+                if (conn != null) {
+                    try {
+                        conn.disconnect();
+                    } catch (Exception ignored) {
+                    }
+                    if (activeApkConnection == conn) {
+                        activeApkConnection = null;
+                    }
+                }
+            }
+        }
+        throw lastError != null ? lastError : new IOException("Falha ao baixar APK.");
+    }
+
+    private String resolveGitHubAssetViaApi(String directDownloadUrl, long downloadId) {
+        try {
+            ensureApkDownloadActive(downloadId);
+            URI uri = URI.create(directDownloadUrl.trim());
+            String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            if (!"github.com".equals(host) && !"www.github.com".equals(host)) return null;
+            String path = uri.getPath() != null ? uri.getPath() : "";
+            String[] parts = path.replaceFirst("^/", "").split("/");
+            if (parts.length < 6 || !"releases".equals(parts[2]) || !"download".equals(parts[3])) {
+                return null;
+            }
+            String owner = parts[0];
+            String repo = parts[1];
+            String tag = parts[4];
+            String fileName = parts[parts.length - 1];
+            String decodedName = URLDecoder.decode(fileName, "UTF-8");
+
+            String tagApiUrl = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/tags/" + tag;
+            HttpURLConnection apiConn = (HttpURLConnection) new URL(tagApiUrl).openConnection();
+            apiConn.setConnectTimeout(10000);
+            apiConn.setReadTimeout(12000);
+            apiConn.setRequestMethod("GET");
+            apiConn.setRequestProperty("User-Agent", DEFAULT_UA);
+            apiConn.setRequestProperty("Accept", "application/vnd.github+json");
+            String assetApiUrl = null;
+            try {
+                if (apiConn.getResponseCode() < 200 || apiConn.getResponseCode() >= 300) {
+                    return null;
+                }
+                String jsonStr = readStreamAsString(apiConn.getInputStream());
+                JSONObject releaseObj = new JSONObject(jsonStr);
+                JSONArray assets = releaseObj.optJSONArray("assets");
+                if (assets != null) {
+                    for (int i = 0; i < assets.length(); i++) {
+                        JSONObject asset = assets.optJSONObject(i);
+                        if (asset == null) continue;
+                        String name = asset.optString("name", "");
+                        if (name.equalsIgnoreCase(fileName) || name.equalsIgnoreCase(decodedName)) {
+                            assetApiUrl = asset.optString("url", null);
+                            break;
+                        }
+                    }
+                }
+            } finally {
+                apiConn.disconnect();
+            }
+
+            if (assetApiUrl == null || !isAllowedGitHubCdnUrl(assetApiUrl)) return null;
+            ensureApkDownloadActive(downloadId);
+
+            HttpURLConnection redirConn = (HttpURLConnection) new URL(assetApiUrl).openConnection();
+            redirConn.setInstanceFollowRedirects(false);
+            redirConn.setConnectTimeout(10000);
+            redirConn.setReadTimeout(12000);
+            redirConn.setRequestMethod("GET");
+            redirConn.setRequestProperty("User-Agent", DEFAULT_UA);
+            redirConn.setRequestProperty("Accept", "application/octet-stream");
+            try {
+                int code = redirConn.getResponseCode();
+                if (code >= 300 && code < 400) {
+                    String loc = redirConn.getHeaderField("Location");
+                    if (loc != null && isAllowedGitHubCdnUrl(loc)) {
+                        return loc;
+                    }
+                }
+            } finally {
+                redirConn.disconnect();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "GitHub API asset fallback lookup failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private static long parseContentRangeStart(String header) {
+        if (header == null) return -1L;
+        Matcher m = CONTENT_RANGE_PATTERN.matcher(header.trim());
+        if (!m.matches()) return -1L;
+        try {
+            return Long.parseLong(m.group(1));
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    private static long parseContentRangeTotal(String header) {
+        if (header == null) return -1L;
+        Matcher m = CONTENT_RANGE_PATTERN.matcher(header.trim());
+        if (!m.matches()) return -1L;
+        String total = m.group(3);
+        if (total == null || "*".equals(total)) return -1L;
+        try {
+            return Long.parseLong(total);
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    private static String computeFileSha256(File file) throws IOException {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] buf = new byte[32768];
+            try (InputStream in = new BufferedInputStream(new FileInputStream(file))) {
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    md.update(buf, 0, n);
+                }
+            }
+            return bytesToHex(md.digest());
+        } catch (IOException ioe) {
+            throw ioe;
+        } catch (Exception e) {
+            throw new IOException("Não foi possível calcular SHA-256 do APK.", e);
+        }
+    }
+
+    private static final class RetryableDownloadException extends IOException {
+        RetryableDownloadException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+
     @PluginMethod
     public void downloadAndInstallApk(PluginCall call) {
         String rawUrl = call.getString("url", "");
@@ -641,90 +1312,39 @@ public class LocalProxyPlugin extends Plugin {
 
         executor.execute(() -> {
             File stagingApk = new File(ctx.getCacheDir(), "topanimes_update_staging.apk");
-            HttpURLConnection conn = null;
-            PackageInstaller.Session session = null;
+            if (stagingApk.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                stagingApk.delete();
+            }
             try {
                 ensureApkDownloadActive(downloadId);
                 emitDownloadProgress(0L, 0L, 0, "downloading", null);
 
-                String currentUrl = rawUrl.trim();
-                for (int hop = 0; hop <= 6; hop++) {
-                    ensureApkDownloadActive(downloadId);
-                    if (!isAllowedGitHubCdnUrl(currentUrl)) {
-                        throw new IOException("Redirecionamento fora dos domínios oficiais do GitHub.");
-                    }
-                    URL parsed = new URL(currentUrl);
-                    conn = (HttpURLConnection) parsed.openConnection();
-                    activeApkConnection = conn;
-                    ensureApkDownloadActive(downloadId);
-                    conn.setInstanceFollowRedirects(false);
-                    conn.setConnectTimeout(15000);
-                    conn.setReadTimeout(30000);
-                    conn.setRequestMethod("GET");
-                    conn.setRequestProperty("User-Agent", DEFAULT_UA);
-                    conn.setRequestProperty("Accept", "application/vnd.android.package-archive,application/octet-stream,*/*");
-
-                    int code = conn.getResponseCode();
-                    if (code >= 300 && code < 400) {
-                        String loc = conn.getHeaderField("Location");
-                        conn.disconnect();
-                        if (activeApkConnection == conn) {
-                            activeApkConnection = null;
-                        }
-                        conn = null;
-                        if (loc == null || loc.isEmpty()) {
-                            throw new IOException("Redirecionamento vazio ao baixar APK.");
-                        }
-                        currentUrl = new URL(parsed, loc).toString();
-                        continue;
-                    }
-                    if (code < 200 || code >= 300) {
-                        throw new IOException("GitHub retornou HTTP " + code + " ao baixar APK.");
-                    }
-                    break;
-                }
-
-                if (conn == null) {
-                    throw new IOException("Excesso de redirecionamentos ao baixar APK.");
-                }
-
-                long totalBytes = -1L;
+                long[] stats;
                 try {
-                    String cl = conn.getHeaderField("Content-Length");
-                    if (cl != null) totalBytes = Long.parseLong(cl.trim());
-                } catch (NumberFormatException ignored) {
-                }
-
-                MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
-                long downloaded = 0L;
-                long lastEmitAt = 0L;
-                byte[] buf = new byte[32768];
-
-                try (InputStream in = new BufferedInputStream(conn.getInputStream());
-                     FileOutputStream fos = new FileOutputStream(stagingApk)) {
-                    int n;
-                    while ((n = in.read(buf)) != -1) {
-                        ensureApkDownloadActive(downloadId);
-                        fos.write(buf, 0, n);
-                        sha256.update(buf, 0, n);
-                        downloaded += n;
-                        long now = System.currentTimeMillis();
-                        if (now - lastEmitAt >= 120L) {
-                            lastEmitAt = now;
-                            int pct = totalBytes > 0L
-                                ? (int) Math.min(99L, (downloaded * 100L) / totalBytes)
-                                : 0;
-                            emitDownloadProgress(downloaded, totalBytes, pct, "downloading", null);
-                        }
+                    stats = downloadApkWithResume(rawUrl.trim(), stagingApk, downloadId);
+                } catch (IOException directErr) {
+                    ensureApkDownloadActive(downloadId);
+                    String apiSignedUrl = resolveGitHubAssetViaApi(rawUrl.trim(), downloadId);
+                    if (apiSignedUrl == null) {
+                        throw directErr;
                     }
-                    fos.getFD().sync();
+                    Log.i(TAG, "Retrying APK download via GitHub API pre-signed asset URL");
+                    if (stagingApk.exists()) {
+                        //noinspection ResultOfMethodCallIgnored
+                        stagingApk.delete();
+                    }
+                    stats = downloadApkWithResume(apiSignedUrl, stagingApk, downloadId);
                 }
+
+                long downloaded = stats[0];
+                long totalBytes = stats[1];
 
                 ensureApkDownloadActive(downloadId);
                 emitDownloadProgress(downloaded, totalBytes, 100, "verifying", null);
 
                 if (!expectedSha256.isEmpty()) {
-                    String actualSha256 = bytesToHex(sha256.digest());
+                    String actualSha256 = computeFileSha256(stagingApk);
                     if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
                         throw new IOException("Falha na verificação SHA-256 do APK baixado.");
                     }
@@ -735,55 +1355,9 @@ public class LocalProxyPlugin extends Plugin {
                 ensureApkDownloadActive(downloadId);
                 emitDownloadProgress(downloaded, totalBytes, 100, "installing", null);
 
-                PackageInstaller installer = ctx.getPackageManager().getPackageInstaller();
-                PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
-                    PackageInstaller.SessionParams.MODE_FULL_INSTALL
-                );
-                params.setAppPackageName(pkgName);
-                params.setSize(stagingApk.length());
-                params.setInstallReason(PackageManager.INSTALL_REASON_USER);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_REQUIRED);
-                }
-
-                int sessionId = installer.createSession(params);
-                activeApkSessionId = sessionId;
-                session = installer.openSession(sessionId);
-                activeApkSession = session;
-
-                try (InputStream apkIn = new BufferedInputStream(new FileInputStream(stagingApk));
-                     OutputStream sessionOut = session.openWrite("TopAnimes.apk", 0L, stagingApk.length())) {
-                    int read;
-                    while ((read = apkIn.read(buf)) != -1) {
-                        ensureApkDownloadActive(downloadId);
-                        sessionOut.write(buf, 0, read);
-                    }
-                    session.fsync(sessionOut);
-                }
-
-                ensureApkDownloadActive(downloadId);
-
-                // Remove temporary file right away once copied into PackageManager's session
-                //noinspection ResultOfMethodCallIgnored
-                stagingApk.delete();
-
-                Intent callbackIntent = new Intent(ctx, ApkInstallReceiver.class);
-                PendingIntent pendingIntent = PendingIntentCompat.getBroadcast(
-                    ctx,
-                    sessionId,
-                    callbackIntent,
-                    PendingIntent.FLAG_UPDATE_CURRENT,
-                    true
-                );
-                if (pendingIntent == null) {
-                    throw new IOException("Não foi possível criar PendingIntent de instalação.");
-                }
-                session.commit(pendingIntent.getIntentSender());
-                session.close();
-                if (activeApkSession == session) {
-                    activeApkSession = null;
-                }
-                session = null;
+                activeVerifiedStagingApk = stagingApk;
+                activeInstallDownloadId = downloadId;
+                commitApkSession(ctx, stagingApk, downloadId, false);
 
                 JSObject ret = new JSObject();
                 ret.put("started", true);
@@ -791,12 +1365,8 @@ public class LocalProxyPlugin extends Plugin {
                 call.resolve(ret);
             } catch (CancellationException ce) {
                 Log.i(TAG, "Self-update cancelled by user");
-                if (session != null) {
-                    try {
-                        session.abandon();
-                    } catch (Exception ignored) {
-                    }
-                }
+                cleanupVerifiedStagingApk();
+                clearPendingInstallConfirmation(ctx);
                 activeApkSession = null;
                 activeApkSessionId = -1;
                 emitDownloadProgress(0L, 0L, 0, "cancelled", "Atualização cancelada.");
@@ -807,12 +1377,8 @@ public class LocalProxyPlugin extends Plugin {
                 ret.put("message", "Atualização cancelada.");
                 call.resolve(ret);
             } catch (Exception e) {
-                if (session != null) {
-                    try {
-                        session.abandon();
-                    } catch (Exception ignored) {
-                    }
-                }
+                cleanupVerifiedStagingApk();
+                clearPendingInstallConfirmation(ctx);
                 activeApkSession = null;
                 activeApkSessionId = -1;
                 if (activeApkDownloadId.get() != downloadId || Thread.currentThread().isInterrupted()) {
@@ -831,16 +1397,7 @@ public class LocalProxyPlugin extends Plugin {
                     call.reject(msg);
                 }
             } finally {
-                if (conn != null) {
-                    try {
-                        conn.disconnect();
-                    } catch (Exception ignored) {
-                    }
-                    if (activeApkConnection == conn) {
-                        activeApkConnection = null;
-                    }
-                }
-                if (stagingApk.exists()) {
+                if (activeVerifiedStagingApk != stagingApk && stagingApk.exists()) {
                     //noinspection ResultOfMethodCallIgnored
                     stagingApk.delete();
                 }
@@ -1247,7 +1804,7 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private static class RedirectResult {
+    static class RedirectResult {
         final HttpURLConnection connection;
         final String finalUrl;
 
@@ -1257,7 +1814,7 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private static RedirectResult openWithRedirects(
+    static RedirectResult openWithRedirects(
         String rawUrl,
         String referer,
         String accept,
@@ -1265,6 +1822,18 @@ public class LocalProxyPlugin extends Plugin {
         int timeoutMs
     ) throws IOException {
         return openWithRedirects(rawUrl, referer, accept, rangeHeader, timeoutMs, "GET", null, null, null);
+    }
+
+    /**
+     * Identity headers that are forwarded ONLY to DeepL's own hosts (used by the web client in
+     * src/lib/deeplTranslate.ts). Keep in sync with src/lib/forwardedHeaders.ts.
+     */
+    private static boolean isDeeplIdentityHeader(String lowerKey) {
+        return "user-agent".equals(lowerKey)
+            || "accept-language".equals(lowerKey)
+            || "x-app-os-version".equals(lowerKey)
+            || "x-app-instance-id".equals(lowerKey)
+            || "x-app-session-id".equals(lowerKey);
     }
 
     private static RedirectResult openWithRedirects(
@@ -1302,6 +1871,7 @@ public class LocalProxyPlugin extends Plugin {
             String host = parsed.getHost() != null ? parsed.getHost().toLowerCase(Locale.ROOT) : "";
             boolean isFileVideo = host.contains("filevideo1.com");
             boolean isTikTokCdn = host.equals("tiktokcdn.com") || host.endsWith(".tiktokcdn.com");
+            boolean isDeepl = host.equals("deepl.com") || host.endsWith(".deepl.com");
             if (referer != null
                 && !referer.isEmpty()
                 && isSafeHttpUrl(referer)
@@ -1320,7 +1890,8 @@ public class LocalProxyPlugin extends Plugin {
                     String lowerKey = key.toLowerCase(Locale.ROOT);
                     if ("authorization".equals(lowerKey)
                         || "origin".equals(lowerKey)
-                        || "cookie".equals(lowerKey)) {
+                        || "cookie".equals(lowerKey)
+                        || (isDeepl && isDeeplIdentityHeader(lowerKey))) {
                         conn.setRequestProperty(key, val);
                     }
                 }
@@ -1543,16 +2114,16 @@ public class LocalProxyPlugin extends Plugin {
         return path != null && DISGUISED_SEGMENT_PATH_PATTERN.matcher(path).find();
     }
 
-    private static boolean isDisguisedContentType(String contentType) {
+    static boolean isDisguisedContentType(String contentType) {
         return contentType != null && DISGUISED_CONTENT_TYPE_PATTERN.matcher(contentType.trim()).find();
     }
 
-    private static boolean isStartAtZeroRange(String rangeHeader) {
+    static boolean isStartAtZeroRange(String rangeHeader) {
         if (rangeHeader == null || rangeHeader.trim().isEmpty()) return true;
         return ZERO_RANGE_PATTERN.matcher(rangeHeader.trim()).matches();
     }
 
-    private static int readUpTo(InputStream in, byte[] buf) throws IOException {
+    static int readUpTo(InputStream in, byte[] buf) throws IOException {
         int total = 0;
         while (total < buf.length) {
             int n = in.read(buf, total, buf.length - total);
@@ -1562,7 +2133,7 @@ public class LocalProxyPlugin extends Plugin {
         return total;
     }
 
-    private static boolean looksLikeM3u8Manifest(byte[] buf, int len) {
+    static boolean looksLikeM3u8Manifest(byte[] buf, int len) {
         int i = 0;
         if (len >= 3
             && (buf[0] & 0xFF) == 0xEF
@@ -1655,7 +2226,7 @@ public class LocalProxyPlugin extends Plugin {
         return -1;
     }
 
-    private static int findMpegTsSyncOffset(byte[] buf, int len, boolean reachedEof) {
+    static int findMpegTsSyncOffset(byte[] buf, int len, boolean reachedEof) {
         if (len < MPEG_TS_PACKET_SIZE * 2) return -1;
         if (isValidMpegTsStart(buf, len, 0, reachedEof, true)) {
             return 0;
@@ -1674,7 +2245,7 @@ public class LocalProxyPlugin extends Plugin {
         return -1;
     }
 
-    private static String adjustContentRangeForStrip(String contentRange, int stripBytes) {
+    static String adjustContentRangeForStrip(String contentRange, int stripBytes) {
         if (contentRange == null || stripBytes <= 0) return null;
         Matcher m = CONTENT_RANGE_PATTERN.matcher(contentRange.trim());
         if (!m.matches()) return null;
@@ -1695,7 +2266,7 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private static boolean isSafeHttpUrl(String rawUrl) {
+    static boolean isSafeHttpUrl(String rawUrl) {
         if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
         try {
             URI uri = URI.create(rawUrl.trim());
@@ -1709,7 +2280,7 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
-    private static Map<String, String> parseQuery(String target) {
+    static Map<String, String> parseQuery(String target) {
         Map<String, String> map = new HashMap<>();
         int qIdx = target.indexOf('?');
         if (qIdx < 0 || qIdx + 1 >= target.length()) return map;
@@ -1728,7 +2299,7 @@ public class LocalProxyPlugin extends Plugin {
         return map;
     }
 
-    private static String readLine(InputStream in) throws IOException {
+    static String readLine(InputStream in) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         int b;
         while ((b = in.read()) != -1) {
@@ -1739,7 +2310,7 @@ public class LocalProxyPlugin extends Plugin {
         return buf.toString(StandardCharsets.UTF_8.name());
     }
 
-    private static String readStreamAsString(InputStream in) throws IOException {
+    static String readStreamAsString(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buf = new byte[8192];
         int n;

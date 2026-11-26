@@ -11,6 +11,7 @@ import type Hls from 'hls.js';
 import {
   Calendar,
   Camera,
+  Cast,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -98,6 +99,13 @@ import {
   resolvePlayerHudMode,
   SEEK_STREAK_TIMEOUT_MS,
 } from '../lib/playerDoubleTapSeek';
+import {
+  buildCastMediaPayload,
+  isWebRemotePlaybackSupported,
+  promptWebRemotePlayback,
+  type TvCastMediaPayload,
+  type TvCastStateSnapshot,
+} from '../lib/tvCast';
 import { MediaPoster } from './MediaPoster';
 
 interface AnimePlayerProps {
@@ -137,6 +145,24 @@ interface AnimePlayerProps {
   onServerPlaybackFailed?: (failedNume: string, resumeTimeSec: number) => void;
   onRetryEpisodePlayback?: () => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
+  castState?: TvCastStateSnapshot;
+  onOpenTvCast?: (
+    payload: TvCastMediaPayload | null,
+    helpers?: {
+      pauseLocal?: () => void;
+      canPromptWebRemote?: boolean;
+      promptWebRemote?: () => Promise<void>;
+    }
+  ) => void;
+  onRegisterCastHelpers?: (
+    helpers: {
+      pauseLocal: () => void;
+      canPromptWebRemote: () => boolean;
+      promptWebRemote: () => Promise<void>;
+      getCurrentTimeMs: () => number;
+      getDurationMs: () => number;
+    } | null
+  ) => void;
   onToast: (message: string) => void;
 }
 
@@ -259,6 +285,9 @@ export function AnimePlayer({
   onServerPlaybackFailed,
   onRetryEpisodePlayback,
   onNativeSessionSync,
+  castState,
+  onOpenTvCast,
+  onRegisterCastHelpers,
   onToast,
 }: AnimePlayerProps) {
   const initialPrefs = useMemo(() => loadPrefs(), []);
@@ -1461,6 +1490,133 @@ export function AnimePlayer({
       }
     }
   }, [launchNativeVlc, useNativeVlc]);
+
+  const castRuntimeRef = useRef({
+    currentTime: 0,
+    duration: 0,
+    nativeResumeMs: 0,
+    nativeDurationMs: 0,
+    useNativeVlc,
+  });
+  castRuntimeRef.current = {
+    currentTime,
+    duration,
+    nativeResumeMs,
+    nativeDurationMs,
+    useNativeVlc,
+  };
+
+  useEffect(() => {
+    if (!onRegisterCastHelpers) return;
+    onRegisterCastHelpers({
+      pauseLocal: () => {
+        if (videoRef.current && !videoRef.current.paused) {
+          videoRef.current.pause();
+        }
+      },
+      canPromptWebRemote: () =>
+        !castRuntimeRef.current.useNativeVlc && isWebRemotePlaybackSupported(videoRef.current),
+      promptWebRemote: async () => {
+        try {
+          const ok = await promptWebRemotePlayback(videoRef.current);
+          if (!ok) {
+            onToast('Transmissão nativa do navegador indisponível. Use a lista de TVs Wi-Fi acima.');
+          }
+        } catch {
+          onToast('Não foi possível abrir o seletor de TV do navegador.');
+        }
+      },
+      getCurrentTimeMs: () => {
+        const snap = castRuntimeRef.current;
+        if (snap.useNativeVlc) return snap.nativeResumeMs;
+        const t = videoRef.current?.currentTime ?? snap.currentTime ?? 0;
+        return Math.max(0, Math.round(t * 1000));
+      },
+      getDurationMs: () => {
+        const snap = castRuntimeRef.current;
+        if (snap.useNativeVlc) return snap.nativeDurationMs;
+        const vDur = videoRef.current?.duration;
+        const d = Number.isFinite(vDur) && vDur && vDur > 0 ? vDur : snap.duration || 0;
+        return Math.max(0, Math.round(d * 1000));
+      },
+    });
+    return () => {
+      onRegisterCastHelpers(null);
+    };
+  }, [onRegisterCastHelpers, onToast]);
+
+  const handleOpenTvCast = useCallback(() => {
+    if (!onOpenTvCast) return;
+    setMenuOpen(false);
+    setEpisodesOpen(false);
+    const activeSubEntry =
+      activeSubId !== 'off' ? subEntries.find((s) => s.id === activeSubId) : undefined;
+    const payload = activeStream
+      ? buildCastMediaPayload({
+          stream: activeStream,
+          subtitles,
+          activeSubtitleUrl: activeSubEntry?.url,
+          referer: referer || 'https://topanimes.net/',
+          preferDirect,
+          episodeUrl,
+          title,
+          seriesTitle,
+          seriesUrl,
+          poster,
+          isMovie,
+          selectedServerNume,
+          prevUrl,
+          nextUrl,
+          autoPlayNextEpisode,
+          startPositionMs: useNativeVlc ? nativeResumeMs : Math.round(currentTime * 1000),
+          durationMs: useNativeVlc ? nativeDurationMs : Math.round(duration * 1000),
+        })
+      : null;
+
+    const videoEl = videoRef.current;
+    onOpenTvCast(payload, {
+      pauseLocal: () => {
+        if (videoRef.current && !videoRef.current.paused) {
+          videoRef.current.pause();
+        }
+      },
+      canPromptWebRemote: !useNativeVlc && isWebRemotePlaybackSupported(videoEl),
+      promptWebRemote: async () => {
+        try {
+          const ok = await promptWebRemotePlayback(videoRef.current);
+          if (!ok) {
+            onToast('Transmissão nativa do navegador indisponível. Use o link do stream abaixo.');
+          }
+        } catch {
+          onToast('Não foi possível abrir o seletor de TV do navegador.');
+        }
+      },
+    });
+  }, [
+    activeStream,
+    activeSubId,
+    autoPlayNextEpisode,
+    currentTime,
+    duration,
+    episodeUrl,
+    isMovie,
+    nativeDurationMs,
+    nativeResumeMs,
+    nextUrl,
+    onOpenTvCast,
+    onToast,
+    poster,
+    preferDirect,
+    prevUrl,
+    referer,
+    selectedServerNume,
+    seriesTitle,
+    seriesUrl,
+    subEntries,
+    subtitles,
+    title,
+    useNativeVlc,
+  ]);
 
   const togglePip = useCallback(async () => {
     const video = videoRef.current;
@@ -2690,6 +2846,25 @@ export function AnimePlayer({
               <Subtitles className="h-4 w-4" />
             </button>
 
+            {onOpenTvCast && (
+              <button
+                type="button"
+                data-player-cast-btn="true"
+                onClick={handleOpenTvCast}
+                aria-label="Transmitir para TV"
+                title={
+                  castState?.active
+                    ? `Transmitindo em ${castState.deviceName}`
+                    : 'Transmitir para TV (sem precisar deixar o app aberto)'
+                }
+                className={`flex h-7 w-7 items-center justify-center rounded-lg hover:bg-white/10 sm:h-9 sm:w-9 ${
+                  castState?.active ? 'text-[#f97316]' : 'text-white'
+                }`}
+              >
+                <Cast className="h-4 w-4" />
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => {
@@ -2873,6 +3048,28 @@ export function AnimePlayer({
                             <span>Salvar quadro (PNG)</span>
                           </button>
                         </>
+                      )}
+
+                      {onOpenTvCast && (
+                        <button
+                          type="button"
+                          onClick={handleOpenTvCast}
+                          className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left hover:bg-white/10"
+                        >
+                          <span className="inline-flex items-center gap-2">
+                            <Cast
+                              className={`h-3.5 w-3.5 ${
+                                castState?.active ? 'text-[#f97316]' : 'text-slate-400'
+                              }`}
+                            />
+                            <span>Transmitir para TV</span>
+                          </span>
+                          {castState?.active && (
+                            <span className="max-w-[110px] truncate text-[10px] font-semibold text-[#fb923c]">
+                              {castState.deviceName}
+                            </span>
+                          )}
+                        </button>
                       )}
 
                       <button

@@ -10,11 +10,13 @@ import {
   type ReactNode,
 } from 'react';
 import { ArrowLeft, Trash2, WifiOff } from 'lucide-react';
+import { ActiveCastBar } from './components/ActiveCastBar';
 import type { AnimeDetailLoadingStage } from './components/AnimeDetailView';
 import { CatalogView } from './components/CatalogView';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
 import { NotificationToastStack } from './components/NotificationToastStack';
+import { TvCastModal } from './components/TvCastModal';
 
 const loadAnimeDetailView = () =>
   import('./components/AnimeDetailView').then((m) => ({ default: m.AnimeDetailView }));
@@ -37,6 +39,7 @@ import {
   cancelAppUpdateDownload,
   consumePendingNotificationTarget,
   downloadAppUpdateApk,
+  exportBackupJsonFile,
   getDeviceNotificationPermission,
   getNativeAppBuildInfo,
   isNativeAndroidApp,
@@ -53,6 +56,14 @@ import {
   type AppUpdateCheckResult,
   type RemoteAppRelease,
 } from './lib/appUpdater';
+import {
+  buildAnisyncBackupPayload,
+  buildBackupFilename,
+  mergeAnisyncBackupData,
+  serializeAnisyncBackup,
+  type AnisyncBackupPayload,
+  type BackupImportMode,
+} from './lib/backup';
 import { inferMediaKindFromTarget, isAnisyncUri, parseAnisyncUri } from './lib/catalog/idCodec';
 import {
   advanceBaselineWithWatchedEpisodes,
@@ -141,9 +152,17 @@ import {
   type AppSettingsMeta,
 } from './lib/settings';
 import {
+  addTvCastStateListener,
+  getNativeTvCastState,
+  IDLE_TV_CAST_STATE,
+  type TvCastMediaPayload,
+  type TvCastStateSnapshot,
+} from './lib/tvCast';
+import {
   clearAllEpisodeProgress,
   clearFavoriteAlerts,
   clearHistory,
+  collectUserBackupData,
   loadAcknowledgedReleaseKey,
   loadActiveRouteSession,
   loadAppSettings,
@@ -154,6 +173,7 @@ import {
   loadFavorites,
   loadHistory,
   loadMutedFavoriteUrls,
+  persistUserBackupData,
   pushHistoryEntry,
   removeHistoryAnime,
   removeHistoryEpisode,
@@ -266,6 +286,23 @@ export default function App() {
   const [settingsFocusSection, setSettingsFocusSection] = useState<
     'sources' | 'catalog' | 'notifications' | 'updates' | 'general'
   >('general');
+  const [tvCastState, setTvCastState] = useState<TvCastStateSnapshot>(() => ({
+    ...IDLE_TV_CAST_STATE,
+  }));
+  const [tvCastModalOpen, setTvCastModalOpen] = useState(false);
+  const [tvCastMediaPayload, setTvCastMediaPayload] = useState<TvCastMediaPayload | null>(null);
+  const tvCastModalOpenRef = useRef(false);
+  tvCastModalOpenRef.current = tvCastModalOpen;
+  const [tvCastWebHelpers, setTvCastWebHelpers] = useState<{
+    pauseLocal?: () => void;
+    canPromptWebRemote?: boolean;
+    promptWebRemote?: () => Promise<void>;
+  }>({});
+  const lastCastSyncedRef = useRef<{ url: string; sec: number; completed: boolean }>({
+    url: '',
+    sec: 0,
+    completed: false,
+  });
 
   const initialRouteSession = useMemo(() => loadActiveRouteSession(), []);
   const [routeStack, setRouteStack] = useState<ActiveRoute[]>(() =>
@@ -574,6 +611,41 @@ export default function App() {
     void setNativeVlcVideoScale(defaults.videoScale);
     showToast('Configurações restauradas para o padrão.');
   }, [showToast]);
+
+  const handleExportBackup = useCallback(async () => {
+    try {
+      const data = collectUserBackupData();
+      const payload = buildAnisyncBackupPayload(data, {
+        appVersion: buildInfo.androidVersionName || buildInfo.version,
+      });
+      const filename = buildBackupFilename();
+      const res = await exportBackupJsonFile(filename, serializeAnisyncBackup(payload));
+      showToast(res.message);
+    } catch {
+      showToast('Não foi possível exportar o backup.');
+    }
+  }, [buildInfo.androidVersionName, buildInfo.version, showToast]);
+
+  const handleImportBackup = useCallback(
+    (payload: AnisyncBackupPayload, mode: BackupImportMode) => {
+      const current = collectUserBackupData();
+      const nextData = mergeAnisyncBackupData(current, payload.data, mode);
+      const persisted = persistUserBackupData(nextData);
+      clearPrefetchCaches('catalog');
+      setFavorites(persisted.favorites);
+      setHistory(persisted.history);
+      setProgressMap(persisted.progressMap);
+      setMutedFavoriteUrls(persisted.mutedFavoriteUrls);
+      setSettings(persisted.settings);
+      void setNativeVlcVideoScale(persisted.settings.videoScale);
+      showToast(
+        mode === 'replace'
+          ? `Backup restaurado (${persisted.favorites.length} favoritos · ${persisted.history.length} no histórico).`
+          : `Backup mesclado (${persisted.favorites.length} favoritos · ${persisted.history.length} no histórico).`
+      );
+    },
+    [showToast]
+  );
 
   const openNotificationTargetRef = useRef<(url: string, kind?: string) => void>(() => undefined);
 
@@ -2725,9 +2797,97 @@ export default function App() {
   const navigateBackStepRef = useRef(navigateBackStep);
   navigateBackStepRef.current = navigateBackStep;
 
+  const handleOpenTvCast = useCallback(
+    (
+      payload: TvCastMediaPayload | null,
+      helpers?: {
+        pauseLocal?: () => void;
+        canPromptWebRemote?: boolean;
+        promptWebRemote?: () => Promise<void>;
+      }
+    ) => {
+      if (payload) {
+        setTvCastMediaPayload(payload);
+      }
+      setTvCastWebHelpers(helpers || {});
+      setTvCastModalOpen(true);
+    },
+    []
+  );
+
+  // Sync live native background TV Cast state and persist watch progress even after reopening the app
+  useEffect(() => {
+    let cancelled = false;
+    let listenerHandle: { remove: () => Promise<void> } | null = null;
+
+    const applyCastState = (next: TvCastStateSnapshot) => {
+      if (cancelled) return;
+      setTvCastState(next);
+      if (next.episodeUrl && (next.positionMs >= 2000 || next.status === 'stopped')) {
+        const posSec = Math.max(0, Math.floor(next.positionMs / 1000));
+        const durSec = Math.max(0, Math.floor(next.durationMs / 1000));
+        const completed =
+          next.status === 'stopped' && durSec > 10 && posSec >= Math.max(5, durSec - 20);
+        const prev = lastCastSyncedRef.current;
+        if (
+          prev.url !== next.episodeUrl ||
+          Math.abs(posSec - prev.sec) >= 5 ||
+          completed !== prev.completed
+        ) {
+          lastCastSyncedRef.current = { url: next.episodeUrl, sec: posSec, completed };
+          saveEpisodeProgress({
+            url: next.episodeUrl,
+            positionSec: posSec,
+            durationSec: durSec,
+            ended: completed,
+            meta: next.episodeTitle
+              ? {
+                  title: next.episodeTitle,
+                  seriesTitle: next.seriesTitle || undefined,
+                  seriesUrl: next.seriesUrl || undefined,
+                  poster: next.poster || '',
+                  kind: 'episode',
+                  watchedAt: new Date().toISOString(),
+                  promoteInHistory: true,
+                }
+              : undefined,
+          });
+          refreshProgressState();
+        }
+      }
+    };
+
+    void getNativeTvCastState().then(applyCastState);
+    void addTvCastStateListener(applyCastState).then((h) => {
+      if (cancelled) {
+        void h?.remove();
+      } else {
+        listenerHandle = h;
+      }
+    });
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void getNativeTvCastState().then(applyCastState);
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      void listenerHandle?.remove();
+    };
+  }, [refreshProgressState]);
+
   // Expose Android native back handler and sync browser popstate on Web
   useEffect(() => {
-    window.__topAnimesHandleAndroidBack = () => navigateBackStepRef.current();
+    window.__topAnimesHandleAndroidBack = () => {
+      if (tvCastModalOpenRef.current) {
+        setTvCastModalOpen(false);
+        return true;
+      }
+      return navigateBackStepRef.current();
+    };
 
     const onPopState = () => {
       if (isNativeAndroidApp()) return;
@@ -3327,6 +3487,8 @@ export default function App() {
                   autoPlayNextEpisode={settings.autoPlayNextEpisode}
                   videoScale={settings.videoScale}
                   onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
+                  castState={tvCastState}
+                  onOpenTvCast={handleOpenTvCast}
                   onLoadingStateChange={setEpisodeViewLoading}
                 />
                   );
@@ -3337,11 +3499,29 @@ export default function App() {
         )}
       </main>
 
+      <ActiveCastBar
+        castState={tvCastState}
+        onOpenControls={() => setTvCastModalOpen(true)}
+        onStop={() => showToast('Transmissão encerrada na TV.')}
+      />
+
       <MobileTabBar
         activeSection={activeSection}
         unreadCount={unreadAlertCount}
         onSelectSection={handleSelectSection}
         onPrefetchSection={handlePrefetchSection}
+      />
+
+      <TvCastModal
+        open={tvCastModalOpen}
+        onClose={() => setTvCastModalOpen(false)}
+        castState={tvCastState}
+        mediaPayload={tvCastMediaPayload}
+        skipIntroSeconds={settings.skipIntroSeconds}
+        canPromptWebRemote={Boolean(tvCastWebHelpers.canPromptWebRemote)}
+        onPromptWebRemote={tvCastWebHelpers.promptWebRemote}
+        onPauseLocalPlayback={tvCastWebHelpers.pauseLocal}
+        onToast={showToast}
       />
 
       {settingsOpen && (
@@ -3386,6 +3566,8 @@ export default function App() {
               setAlerts([]);
               showToast('Avisos limpos.');
             }}
+            onExportBackup={handleExportBackup}
+            onImportBackup={handleImportBackup}
           />
         </Suspense>
       )}

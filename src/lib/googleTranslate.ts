@@ -1,6 +1,93 @@
 import type { HttpFetcher } from './httpTypes.ts';
 
-const GOOGLE_TRANSLATE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
+export const GOOGLE_TRANSLATE_ENDPOINT = 'https://translate.googleapis.com/translate_a/single';
+export const GOOGLE_DICT_TRANSLATE_ENDPOINT = 'https://clients5.google.com/translate_a/t';
+
+type GoogleTranslateEndpointKey = 'gtx' | 'dict';
+
+const GOOGLE_ENDPOINT_REST_MS = 5 * 60 * 1000;
+const googleEndpointRestingUntil = new Map<GoogleTranslateEndpointKey, number>();
+
+export function resetGoogleTranslateState(): void {
+  googleEndpointRestingUntil.clear();
+}
+
+export function isGoogleEndpointResting(
+  endpoint: GoogleTranslateEndpointKey,
+  nowMs = Date.now()
+): boolean {
+  const until = googleEndpointRestingUntil.get(endpoint) ?? 0;
+  if (until > nowMs) return true;
+  if (until > 0) googleEndpointRestingUntil.delete(endpoint);
+  return false;
+}
+
+function markGoogleEndpointRateLimited(
+  endpoint: GoogleTranslateEndpointKey,
+  nowMs = Date.now()
+): void {
+  googleEndpointRestingUntil.set(endpoint, nowMs + GOOGLE_ENDPOINT_REST_MS);
+}
+
+/**
+ * Parses JSON returned by `clients5.google.com/translate_a/t?client=dict-chrome-ex`.
+ * Depending on whether `sl` is explicit (`en`/`ja`) or `auto`, each array element is either
+ * a plain translated string or `[translatedText, detectedSourceLang]`.
+ */
+export function parseGoogleDictBatchResponse(
+  rawJson: string,
+  expectedCount: number
+): string[] | null {
+  if (!rawJson || !rawJson.trim() || expectedCount <= 0) return null;
+  try {
+    const parsed = JSON.parse(rawJson) as unknown;
+    if (!Array.isArray(parsed)) return null;
+    if (parsed.length !== expectedCount) return null;
+    const out: string[] = [];
+    for (const item of parsed) {
+      let text = '';
+      if (typeof item === 'string') {
+        text = item;
+      } else if (Array.isArray(item) && typeof item[0] === 'string') {
+        text = item[0];
+      }
+      const trimmed = text.replace(/\r\n/g, '\n').trim();
+      if (!trimmed) return null;
+      out.push(trimmed);
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+async function translateTextsViaGoogleDict(
+  fetchHttp: HttpFetcher,
+  texts: string[],
+  sourceLang: 'auto' | 'en' | 'ja',
+  timeoutMs: number
+): Promise<string[] | null> {
+  if (texts.length === 0 || isGoogleEndpointResting('dict')) return null;
+  const queryUrl = `${GOOGLE_DICT_TRANSLATE_ENDPOINT}?client=dict-chrome-ex&sl=${sourceLang}&tl=pt-BR`;
+  const formBody = texts.map((text) => `q=${encodeURIComponent(text)}`).join('&');
+  try {
+    const res = await fetchHttp(queryUrl, {
+      method: 'POST',
+      contentType: 'application/x-www-form-urlencoded; charset=UTF-8',
+      body: formBody,
+      accept: 'application/json, text/plain, */*',
+      timeoutMs,
+    });
+    if (res.status === 429) {
+      markGoogleEndpointRateLimited('dict');
+      return null;
+    }
+    if (!res.ok) return null;
+    return parseGoogleDictBatchResponse(res.body, texts.length);
+  } catch {
+    return null;
+  }
+}
 
 export function cleanSynopsisWhitespace(text: string): string {
   return text
@@ -198,9 +285,10 @@ export function cleanTranslatedTitle(raw: string): string {
 }
 
 /**
- * Translates English text to Brazilian Portuguese via Google Translate.
- * Returns `null` if any request fails or yields an empty translation so callers
- * can safely fall back to the original English text.
+ * Translates English text to Brazilian Portuguese via Google Translate,
+ * failing over between `translate.googleapis.com/translate_a/single` (gtx) and
+ * `clients5.google.com/translate_a/t` (dict-chrome-ex) with per-endpoint HTTP 429 cooldowns.
+ * Returns `null` if both endpoints fail or yield empty output so callers keep original English.
  */
 export async function translateEnglishToPtBr(
   fetchHttp: HttpFetcher,
@@ -211,20 +299,35 @@ export async function translateEnglishToPtBr(
 
   const translatedChunks: string[] = [];
   for (const chunk of chunks) {
-    const queryUrl =
-      `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=en&tl=pt-BR&dt=t&q=${encodeURIComponent(chunk)}`;
-    try {
-      const res = await fetchHttp(queryUrl, {
-        accept: 'application/json, text/plain, */*',
-        timeoutMs: 6000,
-      });
-      if (!res.ok) return null;
-      const translated = parseGoogleTranslateResponse(res.body);
-      if (!translated) return null;
-      translatedChunks.push(translated);
-    } catch {
-      return null;
+    let translated = '';
+
+    if (!isGoogleEndpointResting('gtx')) {
+      const queryUrl =
+        `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=en&tl=pt-BR&dt=t&q=${encodeURIComponent(chunk)}`;
+      try {
+        const res = await fetchHttp(queryUrl, {
+          accept: 'application/json, text/plain, */*',
+          timeoutMs: 6000,
+        });
+        if (res.status === 429) {
+          markGoogleEndpointRateLimited('gtx');
+        } else if (res.ok) {
+          translated = parseGoogleTranslateResponse(res.body);
+        }
+      } catch {
+        // Fall through to secondary Google endpoint
+      }
     }
+
+    if (!translated) {
+      const viaDict = await translateTextsViaGoogleDict(fetchHttp, [chunk], 'en', 6000);
+      if (viaDict?.[0]) {
+        translated = cleanSynopsisWhitespace(viaDict[0]);
+      }
+    }
+
+    if (!translated) return null;
+    translatedChunks.push(translated);
   }
 
   const joined = cleanSynopsisWhitespace(translatedChunks.join('\n\n'));
@@ -233,25 +336,112 @@ export async function translateEnglishToPtBr(
 
 const TITLE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const TITLE_CACHE_MAX_ENTRIES = 1500;
+const TITLE_CACHE_STORAGE_KEY = 'anisync:title_translations:v1';
+const TITLE_CACHE_PERSIST_MAX_ENTRIES = 400;
+const TITLE_CACHE_PERSIST_DEBOUNCE_MS = 400;
+
 const titleTranslationCache = new Map<string, { value: string; expiresAt: number }>();
+let titleCacheHydratedFromStorage = false;
+let titleCachePersistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function hydrateTitleCacheFromStorage(): void {
+  if (titleCacheHydratedFromStorage) return;
+  titleCacheHydratedFromStorage = true;
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const raw = localStorage.getItem(TITLE_CACHE_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return;
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!key || !entry || typeof entry !== 'object') continue;
+      const val = (entry as { v?: unknown }).v;
+      const exp = (entry as { e?: unknown }).e;
+      if (typeof val === 'string' && val && typeof exp === 'number' && exp > now) {
+        if (!titleTranslationCache.has(key)) {
+          titleTranslationCache.set(key, { value: val, expiresAt: exp });
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed persisted translation cache
+  }
+}
+
+function flushTitleCacheToStorageNow(): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const now = Date.now();
+    const validEntries: Array<[string, { v: string; e: number }]> = [];
+    for (const [key, entry] of titleTranslationCache.entries()) {
+      if (entry.expiresAt > now) {
+        validEntries.push([key, { v: entry.value, e: entry.expiresAt }]);
+      }
+    }
+    const recent = validEntries.slice(-TITLE_CACHE_PERSIST_MAX_ENTRIES);
+    if (recent.length === 0) {
+      localStorage.removeItem(TITLE_CACHE_STORAGE_KEY);
+      return;
+    }
+    const serialized: Record<string, { v: string; e: number }> = {};
+    for (const [k, v] of recent) {
+      serialized[k] = v;
+    }
+    localStorage.setItem(TITLE_CACHE_STORAGE_KEY, JSON.stringify(serialized));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+function scheduleTitleCachePersist(): void {
+  if (typeof localStorage === 'undefined') return;
+  if (titleCachePersistTimer !== null) {
+    clearTimeout(titleCachePersistTimer);
+  }
+  titleCachePersistTimer = setTimeout(() => {
+    titleCachePersistTimer = null;
+    flushTitleCacheToStorageNow();
+  }, TITLE_CACHE_PERSIST_DEBOUNCE_MS);
+}
 
 export function clearTitleTranslationCache(): void {
   titleTranslationCache.clear();
+  googleEndpointRestingUntil.clear();
+  titleCacheHydratedFromStorage = false;
+  if (titleCachePersistTimer !== null) {
+    clearTimeout(titleCachePersistTimer);
+    titleCachePersistTimer = null;
+  }
+  if (typeof localStorage !== 'undefined') {
+    try {
+      localStorage.removeItem(TITLE_CACHE_STORAGE_KEY);
+    } catch {
+      // Ignore storage errors
+    }
+  }
 }
 
-function readTitleCache(key: string): string | null {
+export function readTitleCache(key: string): string | null {
+  hydrateTitleCacheFromStorage();
   const hit = titleTranslationCache.get(key);
   if (!hit) return null;
   if (hit.expiresAt <= Date.now()) {
     titleTranslationCache.delete(key);
     return null;
   }
+  // Refresh LRU recency order
+  titleTranslationCache.delete(key);
+  titleTranslationCache.set(key, hit);
   return hit.value;
 }
 
-function writeTitleCache(key: string, value: string): void {
+export function writeTitleCache(key: string, value: string): void {
   if (!key || !value) return;
-  if (titleTranslationCache.size >= TITLE_CACHE_MAX_ENTRIES) {
+  hydrateTitleCacheFromStorage();
+  if (titleTranslationCache.has(key)) {
+    titleTranslationCache.delete(key);
+  } else if (titleTranslationCache.size >= TITLE_CACHE_MAX_ENTRIES) {
     const oldest = titleTranslationCache.keys().next().value;
     if (oldest) titleTranslationCache.delete(oldest);
   }
@@ -259,11 +449,13 @@ function writeTitleCache(key: string, value: string): void {
     value,
     expiresAt: Date.now() + TITLE_CACHE_TTL_MS,
   });
+  scheduleTitleCachePersist();
 }
 
 /**
  * Translates a single short text (such as an episode title) from `sourceLang` (`en`, `ja`, or `auto`)
- * into Brazilian Portuguese via Google Translate, reusing the shared title translation cache.
+ * into Brazilian Portuguese via Google Translate (with gtx -> dict-chrome-ex failover),
+ * reusing the shared persistent title translation cache.
  */
 export async function translateTextToPtBr(
   fetchHttp: HttpFetcher,
@@ -284,27 +476,47 @@ export async function translateTextToPtBr(
 
   const resolvedSourceLang =
     sourceLang === 'auto' && hasJapaneseKana(normalized) ? 'ja' : sourceLang;
-  const queryUrl =
-    `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=${resolvedSourceLang}&tl=pt-BR&dt=t&q=${encodeURIComponent(normalized)}`;
-  try {
-    const res = await fetchHttp(queryUrl, {
-      accept: 'application/json, text/plain, */*',
-      timeoutMs,
-    });
-    if (!res.ok) return null;
-    const translated = cleanTranslatedTitle(parseGoogleTranslateResponse(res.body));
-    if (!translated) return null;
-    if (useCache) {
-      writeTitleCache(raw, translated);
-      if (normalized !== raw) writeTitleCache(normalized, translated);
+  let translated = '';
+
+  if (!isGoogleEndpointResting('gtx')) {
+    const queryUrl =
+      `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=${resolvedSourceLang}&tl=pt-BR&dt=t&q=${encodeURIComponent(normalized)}`;
+    try {
+      const res = await fetchHttp(queryUrl, {
+        accept: 'application/json, text/plain, */*',
+        timeoutMs,
+      });
+      if (res.status === 429) {
+        markGoogleEndpointRateLimited('gtx');
+      } else if (res.ok) {
+        translated = cleanTranslatedTitle(parseGoogleTranslateResponse(res.body));
+      }
+    } catch {
+      // Fall through to secondary Google endpoint
     }
-    return translated;
-  } catch {
-    return null;
   }
+
+  if (!translated) {
+    const viaDict = await translateTextsViaGoogleDict(
+      fetchHttp,
+      [normalized],
+      resolvedSourceLang,
+      timeoutMs
+    );
+    if (viaDict?.[0]) {
+      translated = cleanTranslatedTitle(viaDict[0]);
+    }
+  }
+
+  if (!translated) return null;
+  if (useCache) {
+    writeTitleCache(raw, translated);
+    if (normalized !== raw) writeTitleCache(normalized, translated);
+  }
+  return translated;
 }
 
-interface TitleBatchItem {
+export interface TitleBatchItem {
   raw: string;
   normalized: string;
 }
@@ -339,19 +551,28 @@ function buildTitleBatches(
   return batches;
 }
 
+export interface TitleBatchJob {
+  /** Source-language hint for the engine: `ja` for kana titles, `auto` for everything else. */
+  sl: 'ja' | 'auto';
+  batch: TitleBatchItem[];
+}
+
+/** Maximum number of title batches translated concurrently. */
+export const TITLE_BATCH_CONCURRENCY = 3;
+
 /**
- * Batch-translates episode titles into PT-BR via Google Translate while keeping scripts separated
- * (`ja` vs `cjk` vs `auto`/Latin), validating 1-to-1 line alignment, and caching results in memory.
- * Never throws: any failed batch gracefully omits its entries so callers keep original titles.
+ * Engine-agnostic preparation for batch title translation: dedupes titles, skips placeholders
+ * (`TBA`, `TBD`, bare numbers), serves cache hits straight into `result`, normalizes the rest,
+ * limits very long series to their first/last `maxTitles`, and groups titles by script
+ * (`ja` vs CJK vs Latin) so mixed payloads never confuse language detection.
+ * `jobs` is empty when nothing is left to translate.
  */
-export async function translateTitlesBatchToPtBr(
-  fetchHttp: HttpFetcher,
+export function prepareTitleBatchJobs(
   rawTitles: string[],
-  options: { useCache?: boolean; maxTitles?: number; timeoutMs?: number } = {}
-): Promise<Map<string, string>> {
+  options: { useCache?: boolean; maxTitles?: number } = {}
+): { result: Map<string, string>; jobs: TitleBatchJob[] } {
   const useCache = options.useCache !== false;
   const maxTitles = options.maxTitles ?? 120;
-  const timeoutMs = options.timeoutMs ?? 5000;
   const result = new Map<string, string>();
   const pendingUnique: TitleBatchItem[] = [];
   const seenRaw = new Set<string>();
@@ -376,7 +597,7 @@ export async function translateTitlesBatchToPtBr(
     pendingUnique.push({ raw, normalized });
   }
 
-  if (pendingUnique.length === 0) return result;
+  if (pendingUnique.length === 0) return { result, jobs: [] };
 
   // For massive multi-hundred-episode series, cover both the beginning and latest episodes
   let scopedPending = pendingUnique;
@@ -388,7 +609,7 @@ export async function translateTitlesBatchToPtBr(
     ];
   }
 
-  // Separate Japanese/CJK from Latin scripts so Google Translate doesn't misdetect mixed payloads
+  // Separate Japanese/CJK from Latin scripts so the engine doesn't misdetect mixed payloads
   const jaItems: TitleBatchItem[] = [];
   const cjkItems: TitleBatchItem[] = [];
   const latinItems: TitleBatchItem[] = [];
@@ -402,13 +623,30 @@ export async function translateTitlesBatchToPtBr(
     }
   }
 
-  const jobs: Array<{ sl: 'ja' | 'auto'; batch: TitleBatchItem[] }> = [
+  const jobs: TitleBatchJob[] = [
     ...buildTitleBatches(jaItems).map((batch) => ({ sl: 'ja' as const, batch })),
     ...buildTitleBatches(cjkItems).map((batch) => ({ sl: 'auto' as const, batch })),
     ...buildTitleBatches(latinItems).map((batch) => ({ sl: 'auto' as const, batch })),
   ];
+  return { result, jobs };
+}
 
-  const runBatchJob = async (job: { sl: 'ja' | 'auto'; batch: TitleBatchItem[] }): Promise<void> => {
+/**
+ * Translates one title batch through Google Translate: tries `gtx` (newline-joined with strict
+ * 1-to-1 line alignment validation) and falls back to `clients5.google.com/translate_a/t`
+ * (positional multi-`q` POST where each title maps 1-to-1 without newline merges), writing
+ * results into `result` and the shared persistent cache.
+ */
+export async function runGoogleTitleBatchJob(
+  fetchHttp: HttpFetcher,
+  job: TitleBatchJob,
+  result: Map<string, string>,
+  options: { useCache: boolean; timeoutMs: number }
+): Promise<void> {
+  const { useCache, timeoutMs } = options;
+  let gtxHandled = false;
+
+  if (!isGoogleEndpointResting('gtx')) {
     const joined = job.batch.map((item) => item.normalized).join('\n');
     const queryUrl =
       `${GOOGLE_TRANSLATE_ENDPOINT}?client=gtx&sl=${job.sl}&tl=pt-BR&dt=t&q=${encodeURIComponent(joined)}`;
@@ -417,53 +655,93 @@ export async function translateTitlesBatchToPtBr(
         accept: 'application/json, text/plain, */*',
         timeoutMs,
       });
-      if (!res.ok) return;
+      if (res.status === 429) {
+        markGoogleEndpointRateLimited('gtx');
+      } else if (res.ok) {
+        const rawTranslated = parseGoogleTranslateRawResponse(res.body);
+        if (rawTranslated) {
+          const lines = rawTranslated
+            .split('\n')
+            .map((line) => cleanTranslatedTitle(line))
+            .filter((line) => line.length > 0);
 
-      const rawTranslated = parseGoogleTranslateRawResponse(res.body);
-      if (!rawTranslated) return;
-
-      const lines = rawTranslated
-        .split('\n')
-        .map((line) => cleanTranslatedTitle(line))
-        .filter((line) => line.length > 0);
-
-      if (lines.length === job.batch.length) {
-        for (let i = 0; i < job.batch.length; i++) {
-          const translated = lines[i];
-          if (!translated) continue;
-          result.set(job.batch[i].raw, translated);
-          if (useCache) writeTitleCache(job.batch[i].raw, translated);
-        }
-        return;
-      }
-
-      // Alignment mismatch safety fallback: translate individually for small batches
-      if (job.batch.length > 1 && job.batch.length <= 12) {
-        const CONCURRENCY = 4;
-        for (let idx = 0; idx < job.batch.length; idx += CONCURRENCY) {
-          const slice = job.batch.slice(idx, idx + CONCURRENCY);
-          await Promise.all(
-            slice.map(async (item) => {
-              const single = await translateTextToPtBr(fetchHttp, item.raw, job.sl, timeoutMs);
-              if (single) {
-                result.set(item.raw, single);
-                if (useCache) writeTitleCache(item.raw, single);
-              }
-            })
-          );
+          if (lines.length === job.batch.length) {
+            for (let i = 0; i < job.batch.length; i++) {
+              const translated = lines[i];
+              if (!translated) continue;
+              result.set(job.batch[i].raw, translated);
+              if (useCache) writeTitleCache(job.batch[i].raw, translated);
+            }
+            gtxHandled = true;
+          }
         }
       }
     } catch {
-      // Non-fatal: caller preserves original episode titles
+      // Fall through to secondary endpoint
     }
-  };
+  }
 
-  // Run up to 3 batches concurrently for fast page enrichment
-  const MAX_CONCURRENT_BATCHES = 3;
-  for (let i = 0; i < jobs.length; i += MAX_CONCURRENT_BATCHES) {
-    await Promise.all(jobs.slice(i, i + MAX_CONCURRENT_BATCHES).map(runBatchJob));
+  if (gtxHandled) return;
+
+  // Secondary endpoint: positional multi-q POST (exact 1-to-1 alignment, immune to newline merging)
+  const viaDict = await translateTextsViaGoogleDict(
+    fetchHttp,
+    job.batch.map((item) => item.normalized),
+    job.sl,
+    timeoutMs
+  );
+  if (viaDict && viaDict.length === job.batch.length) {
+    let anyStored = false;
+    for (let i = 0; i < job.batch.length; i++) {
+      const translated = cleanTranslatedTitle(viaDict[i]);
+      if (!translated) continue;
+      result.set(job.batch[i].raw, translated);
+      if (useCache) writeTitleCache(job.batch[i].raw, translated);
+      anyStored = true;
+    }
+    if (anyStored) return;
+  }
+
+  // Alignment mismatch safety fallback: translate individually for small batches
+  if (job.batch.length > 1 && job.batch.length <= 12) {
+    const CONCURRENCY = 4;
+    for (let idx = 0; idx < job.batch.length; idx += CONCURRENCY) {
+      const slice = job.batch.slice(idx, idx + CONCURRENCY);
+      await Promise.all(
+        slice.map(async (item) => {
+          const single = await translateTextToPtBr(fetchHttp, item.raw, job.sl, timeoutMs, useCache);
+          if (single) {
+            result.set(item.raw, single);
+            if (useCache) writeTitleCache(item.raw, single);
+          }
+        })
+      );
+    }
+  }
+}
+
+/**
+ * Batch-translates episode titles into PT-BR via Google Translate while keeping scripts separated
+ * (`ja` vs `cjk` vs `auto`/Latin), validating 1-to-1 line alignment, and caching results in memory.
+ * Never throws: any failed batch gracefully omits its entries so callers keep original titles.
+ */
+export async function translateTitlesBatchToPtBr(
+  fetchHttp: HttpFetcher,
+  rawTitles: string[],
+  options: { useCache?: boolean; maxTitles?: number; timeoutMs?: number } = {}
+): Promise<Map<string, string>> {
+  const useCache = options.useCache !== false;
+  const timeoutMs = options.timeoutMs ?? 5000;
+  const { result, jobs } = prepareTitleBatchJobs(rawTitles, options);
+
+  // Run a few batches concurrently for fast page enrichment
+  for (let i = 0; i < jobs.length; i += TITLE_BATCH_CONCURRENCY) {
+    await Promise.all(
+      jobs
+        .slice(i, i + TITLE_BATCH_CONCURRENCY)
+        .map((job) => runGoogleTitleBatchJob(fetchHttp, job, result, { useCache, timeoutMs }))
+    );
   }
 
   return result;
 }
-

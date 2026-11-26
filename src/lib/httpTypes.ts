@@ -13,6 +13,7 @@ export interface HttpFetchResult {
   ok: boolean;
   finalUrl: string;
   body: string;
+  retryAfter?: string;
 }
 
 export type HttpFetcher = (url: string, options?: HttpFetchOptions) => Promise<HttpFetchResult>;

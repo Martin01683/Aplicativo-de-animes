@@ -20,7 +20,12 @@ public class MainActivity extends BridgeActivity {
     private static final Object PENDING_LOCK = new Object();
     private static String pendingNotificationUrl = null;
     private static String pendingNotificationKind = null;
+    private static volatile boolean inForeground = false;
     private long lastRootBackPressMs = 0L;
+
+    public static boolean isInForeground() {
+        return inForeground;
+    }
 
     public static String[] consumePendingNotificationTarget() {
         synchronized (PENDING_LOCK) {
@@ -38,6 +43,7 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(LocalProxyPlugin.class);
         registerPlugin(NativeVlcPlayerPlugin.class);
+        registerPlugin(TvCastPlugin.class);
         super.onCreate(savedInstanceState);
 
         captureNotificationIntent(getIntent(), false);
@@ -75,6 +81,19 @@ public class MainActivity extends BridgeActivity {
             return hit == null || hit.getType() != WebView.HitTestResult.EDIT_TEXT_TYPE;
         });
         webView.setLongClickable(false);
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        inForeground = true;
+        LocalProxyPlugin.flushPendingInstallConfirmation(this);
+    }
+
+    @Override
+    public void onPause() {
+        inForeground = false;
+        super.onPause();
     }
 
     @Override
