@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildAnimeInfoMetaItems,
   extractAnimeProviders,
+  isSynopsisTextOverflowing,
   parseProviderNames,
   resolveAnimeHeroAudioBadges,
   resolveEpisodeAudioBadges,
@@ -216,6 +217,53 @@ test('resolveEpisodeAudioBadges identifies Dublado or Legendado for episodes ope
     ['DUB']
   );
 });
+
+test('isSynopsisTextOverflowing shows toggle only when synopsis actually exceeds clamped height', () => {
+  // Fits completely in <= 4 lines when collapsed (even if > 260 chars on wide desktop)
+  assert.equal(
+    isSynopsisTextOverflowing({
+      scrollHeight: 91,
+      clientHeight: 91,
+      lineHeight: 22.75,
+      isExpanded: false,
+    }),
+    false
+  );
+
+  // Overflows 4 lines when collapsed
+  assert.equal(
+    isSynopsisTextOverflowing({
+      scrollHeight: 136,
+      clientHeight: 91,
+      lineHeight: 22.75,
+      isExpanded: false,
+    }),
+    true
+  );
+
+  // Remains expandable/collapsible while expanded if full height > 4 lines
+  assert.equal(
+    isSynopsisTextOverflowing({
+      scrollHeight: 136,
+      clientHeight: 136,
+      lineHeight: 22.75,
+      isExpanded: true,
+    }),
+    true
+  );
+
+  // Hides button if resized wider while expanded so it fits within 4 lines
+  assert.equal(
+    isSynopsisTextOverflowing({
+      scrollHeight: 68,
+      clientHeight: 68,
+      lineHeight: 22.75,
+      isExpanded: true,
+    }),
+    false
+  );
+});
+
 
 
 

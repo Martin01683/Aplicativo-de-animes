@@ -337,5 +337,25 @@ export function resolveEpisodeAudioBadges(params: {
   return [];
 }
 
+export function isSynopsisTextOverflowing(params: {
+  scrollHeight: number;
+  clientHeight: number;
+  lineHeight: number;
+  isExpanded: boolean;
+  maxLines?: number;
+}): boolean {
+  const maxLines = params.maxLines ?? 4;
+  if (params.scrollHeight <= 0) return false;
+  if (!params.isExpanded) {
+    if (params.clientHeight <= 0) return false;
+    return params.scrollHeight > params.clientHeight + 1;
+  }
+  if (Number.isFinite(params.lineHeight) && params.lineHeight > 0) {
+    return params.scrollHeight > params.lineHeight * maxLines + 2;
+  }
+  return true;
+}
+
+
 
 

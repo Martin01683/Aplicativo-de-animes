@@ -33,6 +33,7 @@ import {
 import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
 import {
   buildAnimeInfoMetaItems,
+  isSynopsisTextOverflowing,
   resolveAnimeHeroAudioBadges,
   resolveVisibleGenres,
 } from '../lib/animeInfoMeta';
@@ -848,6 +849,66 @@ export function AnimeDetailView({
   };
 
   const isSynopsisExpanded = synopsisExpandedUrl === anime.url;
+  const displaySynopsis = tvdbAnimeSynopsis?.synopsis || anime.synopsis;
+  const activeSynopsisSource = tvdbAnimeSynopsis?.source || anime.synopsisSource;
+  const synopsisSourceCaption =
+    activeSynopsisSource === 'thetvdb-pt-br'
+      ? 'TheTVDB · PT-BR'
+      : activeSynopsisSource === 'thetvdb-google-translate'
+        ? 'TheTVDB · Traduzido via Google Tradutor'
+        : activeSynopsisSource === 'thetvdb-en'
+          ? 'TheTVDB · Original (EN)'
+          : null;
+  const awaitingSynopsis =
+    (scopedSynopsis.loading || loadingStage === 'seed' || loadingStage === 'quick') &&
+    !displaySynopsis;
+  const synopsisParagraphRef = useRef<HTMLParagraphElement | null>(null);
+  const synopsisMeasureKey = `${anime.url}::${displaySynopsis || ''}`;
+  const [synopsisOverflowState, setSynopsisOverflowState] = useState<{
+    key: string;
+    overflowing: boolean;
+  }>({ key: '', overflowing: false });
+
+  useLayoutEffect(() => {
+    if (awaitingSynopsis || !displaySynopsis) {
+      setSynopsisOverflowState({ key: synopsisMeasureKey, overflowing: false });
+      return;
+    }
+    const el = synopsisParagraphRef.current;
+    if (!el) return;
+
+    const measure = () => {
+      const computedLineHeight = Number.parseFloat(window.getComputedStyle(el).lineHeight);
+      const nextOverflowing = isSynopsisTextOverflowing({
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+        lineHeight: computedLineHeight,
+        isExpanded: isSynopsisExpanded,
+        maxLines: 4,
+      });
+      setSynopsisOverflowState((prev) =>
+        prev.key === synopsisMeasureKey && prev.overflowing === nextOverflowing
+          ? prev
+          : { key: synopsisMeasureKey, overflowing: nextOverflowing }
+      );
+    };
+
+    measure();
+    if (typeof ResizeObserver !== 'undefined') {
+      const observer = new ResizeObserver(() => measure());
+      observer.observe(el);
+      return () => observer.disconnect();
+    }
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [awaitingSynopsis, displaySynopsis, isSynopsisExpanded, synopsisMeasureKey]);
+
+  const canExpandSynopsis = Boolean(
+    displaySynopsis &&
+      synopsisOverflowState.key === synopsisMeasureKey &&
+      synopsisOverflowState.overflowing
+  );
+
   const firstEpisodeSeed = useMemo(
     () => (firstEpisode ? buildSeedFromAnimeEpisode(anime, firstEpisode, activeEpisodes) : undefined),
     [activeEpisodes, anime, firstEpisode]
@@ -971,87 +1032,67 @@ export function AnimeDetailView({
             </div>
 
             {/* Synopsis right below genres */}
-            {(() => {
-              const displaySynopsis = tvdbAnimeSynopsis?.synopsis || anime.synopsis;
-              const activeSource = tvdbAnimeSynopsis?.source || anime.synopsisSource;
-              const sourceCaption =
-                activeSource === 'thetvdb-pt-br'
-                  ? 'TheTVDB · PT-BR'
-                  : activeSource === 'thetvdb-google-translate'
-                    ? 'TheTVDB · Traduzido via Google Tradutor'
-                    : activeSource === 'thetvdb-en'
-                      ? 'TheTVDB · Original (EN)'
-                      : null;
-              const canExpandSynopsis = Boolean(displaySynopsis && displaySynopsis.length > 260);
-              const awaitingSynopsis =
-                (scopedSynopsis.loading || loadingStage === 'seed' || loadingStage === 'quick') &&
-                !displaySynopsis;
-
-              if (awaitingSynopsis) {
-                return (
-                  <div
-                    data-anime-synopsis-loading="true"
-                    className="max-w-3xl space-y-2 border-t border-white/10 pt-3.5"
-                    aria-label="Carregando sinopse do anime"
-                  >
-                    <div className="flex items-center justify-between">
-                      <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                        Sinopse
-                      </span>
-                      <span className="text-[11px] font-medium text-slate-500">
-                        {loadingStage === 'seed'
-                          ? 'Carregando detalhes...'
-                          : 'Buscando sinopse no TheTVDB...'}
-                      </span>
-                    </div>
-                    <div className="anisync-shimmer h-3.5 w-3/4 rounded" />
-                    <div className="anisync-shimmer h-3.5 w-full rounded" />
-                    <div className="anisync-shimmer h-3.5 w-5/6 rounded" />
-                  </div>
-                );
-              }
-
-              return (
-                <div
-                  data-anime-synopsis="true"
-                  data-synopsis-source={activeSource || 'fallback'}
-                  className="max-w-3xl space-y-1.5 border-t border-white/10 pt-3.5"
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
-                      Sinopse
-                    </span>
-                    {scopedSynopsis.loading ? (
-                      <span className="text-[11px] font-medium text-slate-500">
-                        Buscando sinopse no TheTVDB...
-                      </span>
-                    ) : sourceCaption ? (
-                      <span className="text-[11px] font-medium text-slate-500">
-                        {sourceCaption}
-                      </span>
-                    ) : null}
-                  </div>
-                  <p
-                    className={`whitespace-pre-line text-[13.5px] leading-relaxed text-slate-300 sm:text-sm ${
-                      canExpandSynopsis && !isSynopsisExpanded ? 'line-clamp-4' : ''
-                    }`}
-                  >
-                    {displaySynopsis || 'Sinopse não disponível para este título no TheTVDB.'}
-                  </p>
-                  {canExpandSynopsis && (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setSynopsisExpandedUrl((prev) => (prev === anime.url ? '' : anime.url))
-                      }
-                      className="text-xs font-semibold text-[#fb923c] transition-colors hover:text-[#fdba74]"
-                    >
-                      {isSynopsisExpanded ? 'Recolher sinopse' : 'Ler sinopse completa'}
-                    </button>
-                  )}
+            {awaitingSynopsis ? (
+              <div
+                data-anime-synopsis-loading="true"
+                className="max-w-3xl space-y-2 border-t border-white/10 pt-3.5"
+                aria-label="Carregando sinopse do anime"
+              >
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                    Sinopse
+                  </span>
+                  <span className="text-[11px] font-medium text-slate-500">
+                    {loadingStage === 'seed'
+                      ? 'Carregando detalhes...'
+                      : 'Buscando sinopse no TheTVDB...'}
+                  </span>
                 </div>
-              );
-            })()}
+                <div className="anisync-shimmer h-3.5 w-3/4 rounded" />
+                <div className="anisync-shimmer h-3.5 w-full rounded" />
+                <div className="anisync-shimmer h-3.5 w-5/6 rounded" />
+              </div>
+            ) : (
+              <div
+                data-anime-synopsis="true"
+                data-synopsis-source={activeSynopsisSource || 'fallback'}
+                className="max-w-3xl space-y-1.5 border-t border-white/10 pt-3.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                    Sinopse
+                  </span>
+                  {scopedSynopsis.loading ? (
+                    <span className="text-[11px] font-medium text-slate-500">
+                      Buscando sinopse no TheTVDB...
+                    </span>
+                  ) : synopsisSourceCaption ? (
+                    <span className="text-[11px] font-medium text-slate-500">
+                      {synopsisSourceCaption}
+                    </span>
+                  ) : null}
+                </div>
+                <p
+                  ref={synopsisParagraphRef}
+                  className={`whitespace-pre-line text-[13.5px] leading-relaxed text-slate-300 sm:text-sm ${
+                    !isSynopsisExpanded ? 'line-clamp-4' : ''
+                  }`}
+                >
+                  {displaySynopsis || 'Sinopse não disponível para este título no TheTVDB.'}
+                </p>
+                {canExpandSynopsis && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSynopsisExpandedUrl((prev) => (prev === anime.url ? '' : anime.url))
+                    }
+                    className="text-xs font-semibold text-[#fb923c] transition-colors hover:text-[#fdba74]"
+                  >
+                    {isSynopsisExpanded ? 'Recolher sinopse' : 'Ler sinopse completa'}
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* Complete Anime Info Panel + External Sources */}
             {(extraMetaItems.length > 0 || externalLinks.length > 0) && (
