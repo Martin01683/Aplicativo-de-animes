@@ -2,6 +2,19 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.38] — 2026-11-26
+
+### Novidades
+- Adiciona downloads offline em fila com aria2c em velocidade máxima e yt-dlp sempre atualizados (`f1b3bc7`)
+- Adiciona suporte nativo ao servidor Aniplay/Abyss no Web e Android (`0db5e66`)
+- Switch TV cast skip to 5s, add 1% hold volume buttons, and save JSON backups to Android Downloads (`eb5d979`)
+
+### Correções
+- Remove flag no-docs incompatível com OpenSSL 3.0 ao compilar aria2c para Android (`564585c`)
+- Sincroniza volume real da TV antes de iniciar e corrige bug de seek voltando ao 0:00 no Android (`e449838`)
+- Adiciona fallback anti-403/429 no verificador de atualizações e corrige posição do rodapé do changelog (`a9b3ffb`)
+- Keep TV cast controls accessible, support live server switching, and prevent DLNA clock reset after seek (`8426d71`)
+
 ## [v1.0.36] — 2026-11-26
 
 ### Novidades
