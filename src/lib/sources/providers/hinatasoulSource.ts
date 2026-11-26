@@ -8,7 +8,12 @@ import {
   parseHinataSoulSearchHtml,
   type HinataSoulR2Candidate,
 } from '../../hinatasoulParser.ts';
-import { scoreTitleSimilarity, stripSeasonFromTitle } from '../../catalog/idCodec.ts';
+import {
+  expandTitleVariantsForMatch,
+  scoreTitleSimilarity,
+  splitAlternativeTitleString,
+  stripSeasonFromTitle,
+} from '../../catalog/idCodec.ts';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
@@ -369,16 +374,31 @@ function scoreHinataSoulCandidate(
   candTitle: string
 ): { score: number; baseSimilarity: number } {
   const candSeason = extractHinataSoulSeasonNumber(candTitle);
-  const candBase = stripSeasonFromTitle(candTitle) || candTitle;
+  const candVariants = expandTitleVariantsForMatch(candTitle);
+  const candBaseVariants = Array.from(
+    new Set(candVariants.map((v) => stripSeasonFromTitle(v) || v))
+  );
 
   let bestFull = 0;
   let bestBase = 0;
+  let matchedSeasonSpecificRef = false;
+
   for (const ref of refTitles) {
-    const full = scoreTitleSimilarity(ref, candTitle);
     const refBase = stripSeasonFromTitle(ref) || ref;
-    const base = scoreTitleSimilarity(refBase, candBase);
-    if (full > bestFull) bestFull = full;
-    if (base > bestBase) bestBase = base;
+    const refSeason = extractHinataSoulSeasonNumber(ref);
+    for (const cv of candVariants) {
+      const full = scoreTitleSimilarity(ref, cv);
+      if (full > bestFull) {
+        bestFull = full;
+        if (targetSeason > 1 && refSeason === targetSeason && full >= 0.8) {
+          matchedSeasonSpecificRef = true;
+        }
+      }
+    }
+    for (const cb of candBaseVariants) {
+      const base = scoreTitleSimilarity(refBase, cb);
+      if (base > bestBase) bestBase = base;
+    }
   }
 
   const baseSimilarity = Math.max(bestFull, bestBase);
@@ -388,7 +408,7 @@ function scoreHinataSoulCandidate(
 
   let score = baseSimilarity;
   if (targetSeason > 1) {
-    if (candSeason === targetSeason) {
+    if (candSeason === targetSeason || matchedSeasonSpecificRef) {
       score += 0.3;
     } else if (candSeason === 1) {
       score -= 0.25;
@@ -438,19 +458,23 @@ export async function resolveFromHinataSoulSource(
     };
   }
 
-  const rawTerms = [
-    query.title,
-    query.originalTitle,
-    ...(query.alternativeTitles || []),
-  ]
-    .map((t) => (t || '').trim())
-    .filter((t) => t.length >= 2 && /[a-z0-9]/i.test(t));
+  const rawTermSet = new Set<string>();
+  const rawTerms: string[] = [];
+  for (const rawInput of [query.title, query.originalTitle, ...(query.alternativeTitles || [])]) {
+    for (const part of splitAlternativeTitleString(rawInput)) {
+      if (part.length < 2 || !/[a-z0-9]/i.test(part)) continue;
+      const key = part.toLowerCase();
+      if (rawTermSet.has(key)) continue;
+      rawTermSet.add(key);
+      rawTerms.push(part);
+    }
+  }
 
   if (!rawTerms.length) return { options: [] };
 
-  const titleSeason = Math.max(...rawTerms.map((t) => extractHinataSoulSeasonNumber(t)));
+  const primaryTitleSeason = extractHinataSoulSeasonNumber(query.title || '');
   const targetSeason =
-    query.seasonNumber && query.seasonNumber > 1 ? query.seasonNumber : titleSeason;
+    query.seasonNumber && query.seasonNumber > 1 ? query.seasonNumber : primaryTitleSeason;
 
   const searchTerms: string[] = [];
   const pushTerm = (candidate: string) => {
@@ -460,7 +484,22 @@ export async function resolveFromHinataSoulSource(
     searchTerms.push(clean);
   };
 
-  for (const term of rawTerms) {
+  // Prioritize base/season-appropriate aliases before mismatched later-season aliases
+  const prioritizedTerms = [...rawTerms].sort((a, b) => {
+    const aSeason = extractHinataSoulSeasonNumber(a);
+    const bSeason = extractHinataSoulSeasonNumber(b);
+    const aMatch = aSeason === targetSeason ? 0 : 1;
+    const bMatch = bSeason === targetSeason ? 0 : 1;
+    return aMatch - bMatch;
+  });
+
+  for (const term of prioritizedTerms) {
+    const termSeason = extractHinataSoulSeasonNumber(term);
+    if (targetSeason === 1 && termSeason > 1) {
+      const stripped = stripSeasonFromTitle(term);
+      if (stripped && stripped.length >= 2) pushTerm(stripped);
+      continue;
+    }
     pushTerm(term);
     const stripped = stripSeasonFromTitle(term);
     if (stripped && stripped.toLowerCase() !== term.toLowerCase()) {
@@ -470,7 +509,7 @@ export async function resolveFromHinataSoulSource(
       const short = term.split(':')[0].trim();
       if (short.length >= 3) pushTerm(short);
     }
-    if (searchTerms.length >= 4) break;
+    if (searchTerms.length >= 5) break;
   }
 
   const candidateMap = new Map<
@@ -512,7 +551,7 @@ export async function resolveFromHinataSoulSource(
     }
   };
 
-  const limitedTerms = searchTerms.slice(0, 3);
+  const limitedTerms = searchTerms.slice(0, 4);
   if (limitedTerms.length > 0) {
     ingestFound(await searchHinataSoulCandidates(fetchHttp, origin, limitedTerms[0]));
     const hasStrongMatch = Array.from(candidateMap.values()).some((c) => c.score >= 1.05);

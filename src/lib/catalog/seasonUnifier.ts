@@ -17,7 +17,11 @@ import {
   normalizeHinataSoulUrl,
   normalizeTopAnimesUrl,
 } from '../urlSafety.ts';
-import { normalizeTitleForMatch, stripSeasonFromTitle } from './idCodec.ts';
+import {
+  normalizeTitleForMatch,
+  splitAlternativeTitleString,
+  stripSeasonFromTitle,
+} from './idCodec.ts';
 import { getServerSearch, getServerSearchSuggest } from './serverCatalog.ts';
 
 export interface ParsedSeasonTitleInfo {
@@ -474,7 +478,9 @@ function buildReferenceNormalizedBases(
   referenceTitles: readonly string[]
 ): string[] {
   const out = new Set<string>();
-  for (const t of [primaryTitle, ...referenceTitles]) {
+  const expandedRefs = referenceTitles.flatMap((t) => splitAlternativeTitleString(t));
+  const expandedRefSet = new Set(expandedRefs);
+  for (const t of [...splitAlternativeTitleString(primaryTitle), ...expandedRefs]) {
     if (!t || !t.trim()) continue;
     const info = extractSeasonAndPartInfo(t);
     if (info.normalizedBase.length >= 2) out.add(info.normalizedBase);
@@ -493,7 +499,7 @@ function buildReferenceNormalizedBases(
       !info.isFinalSeason &&
       info.normalizedSubtitle.length >= 8 &&
       info.normalizedSubtitle.split(' ').length >= 2 &&
-      referenceTitles.includes(t) &&
+      expandedRefSet.has(t) &&
       !hasSpinOffMarker(info.normalizedSubtitle)
     ) {
       out.add(info.normalizedSubtitle);
@@ -612,10 +618,11 @@ function computeCandidateGroupKey(
 
 function buildExternalReferenceNormalizedBases(referenceTitles: readonly string[]): string[] {
   const out = new Set<string>();
-  for (const t of referenceTitles) {
-    if (!t || !t.trim()) continue;
-    const info = extractSeasonAndPartInfo(t);
-    if (info.normalizedBase.length >= 2) out.add(info.normalizedBase);
+  for (const raw of referenceTitles) {
+    for (const t of splitAlternativeTitleString(raw)) {
+      const info = extractSeasonAndPartInfo(t);
+      if (info.normalizedBase.length >= 2) out.add(info.normalizedBase);
+    }
   }
   return Array.from(out);
 }
@@ -1434,26 +1441,27 @@ function buildSearchQueries(
   }
   rawCandidates.push(primaryInfo.baseTitle);
 
-  for (const ref of extraReferenceTitles) {
-    if (!ref || !ref.trim()) continue;
-    const info = extractSeasonAndPartInfo(ref);
-    if (
-      info.hasColonSubtitle &&
-      info.prefixBeforeSubtitle.length >= 4 &&
-      (info.normalizedPrefixBeforeSubtitle.length >= 8 ||
-        info.normalizedPrefixBeforeSubtitle.split(' ').length >= 2)
-    ) {
-      rawCandidates.push(info.prefixBeforeSubtitle);
-    }
-    rawCandidates.push(info.baseTitle);
-    // Bilingual title second half (e.g. "Demon Slayer: Kimetsu no Yaiba" -> "Kimetsu no Yaiba")
-    if (
-      info.hasColonSubtitle &&
-      info.subtitle.length >= 6 &&
-      info.normalizedSubtitle.split(' ').length >= 2 &&
-      !hasSpinOffMarker(info.normalizedSubtitle)
-    ) {
-      rawCandidates.push(info.subtitle);
+  for (const rawRef of extraReferenceTitles) {
+    for (const ref of splitAlternativeTitleString(rawRef)) {
+      const info = extractSeasonAndPartInfo(ref);
+      if (
+        info.hasColonSubtitle &&
+        info.prefixBeforeSubtitle.length >= 4 &&
+        (info.normalizedPrefixBeforeSubtitle.length >= 8 ||
+          info.normalizedPrefixBeforeSubtitle.split(' ').length >= 2)
+      ) {
+        rawCandidates.push(info.prefixBeforeSubtitle);
+      }
+      rawCandidates.push(info.baseTitle);
+      // Bilingual title second half (e.g. "Demon Slayer: Kimetsu no Yaiba" -> "Kimetsu no Yaiba")
+      if (
+        info.hasColonSubtitle &&
+        info.subtitle.length >= 6 &&
+        info.normalizedSubtitle.split(' ').length >= 2 &&
+        !hasSpinOffMarker(info.normalizedSubtitle)
+      ) {
+        rawCandidates.push(info.subtitle);
+      }
     }
   }
 
@@ -1471,7 +1479,7 @@ function buildSearchQueries(
     else other.push(cleaned);
   }
 
-  return [...latin, ...other].slice(0, 3);
+  return [...latin, ...other].slice(0, 4);
 }
 
 interface PrimaryTrackContext {
@@ -2254,18 +2262,16 @@ export async function unifyServerSeasonsWithCatalog(
     }
   }
 
-  // Third fallback query if still missing seasons (e.g. bilingual subtitle query)
-  if (
-    needsMoreCandidates(matchedPrimarySiblings, matchedAlternateSiblings) &&
-    searchQueries.length > 2
-  ) {
-    const thirdQuery = searchQueries[2];
-    const [fullThird, suggestThird] = await Promise.all([
-      getServerSearch(fetchHttp, thirdQuery, 1).catch(() => null),
-      getServerSearchSuggest(fetchHttp, thirdQuery).catch(() => null),
+  // Additional fallback queries (e.g. romaji / bilingual aliases) if still missing seasons
+  for (let qi = 2; qi < searchQueries.length; qi += 1) {
+    if (!needsMoreCandidates(matchedPrimarySiblings, matchedAlternateSiblings)) break;
+    const fallbackQuery = searchQueries[qi];
+    const [fullExtra, suggestExtra] = await Promise.all([
+      getServerSearch(fetchHttp, fallbackQuery, 1).catch(() => null),
+      getServerSearchSuggest(fetchHttp, fallbackQuery).catch(() => null),
     ]);
-    if (fullThird?.results?.length) addResults(fullThird.results);
-    if (suggestThird?.results?.length) addResults(suggestThird.results);
+    if (fullExtra?.results?.length) addResults(fullExtra.results);
+    if (suggestExtra?.results?.length) addResults(suggestExtra.results);
     matchedPrimarySiblings = runPrimaryCandidateMatch();
     matchedAlternateSiblings = runAlternateCandidateMatch();
   }

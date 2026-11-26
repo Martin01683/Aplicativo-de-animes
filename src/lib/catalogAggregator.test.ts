@@ -494,4 +494,180 @@ test('enrichServerDetailsWithTheTvdb translates English-only TheTVDB synopsis vi
     enriched.episodes[0].thumb,
     'https://artworks.thetvdb.com/banners/v4/episode/5001/screencap/ep1.jpg'
   );
+  assert.equal(
+    enriched.fallbackPoster,
+    'https://topanimes.net/wp-content/uploads/server-poster.jpg'
+  );
+  assert.equal(
+    enriched.fallbackBackdrop,
+    'https://topanimes.net/wp-content/uploads/server-bg.jpg'
+  );
+  assert.equal(
+    enriched.episodes[0].fallbackThumb,
+    'https://topanimes.net/wp-content/uploads/server-ep1.jpg'
+  );
 });
+
+test('getAggregatedMediaDetails recovers TheTVDB URI via JSON search when /dereferrer fails and resolves legacy anisync:// favorites', async () => {
+  const nintamaHtml = `
+    <html><body>
+      <h1 id="series_title">Nintama Rantarou</h1>
+      <img class="img-responsive" src="https://artworks.thetvdb.com/banners/v4/series/286895/posters/672caa37ec50e.jpg" />
+      <div class="change_translation_text" data-language="eng" data-title="Nintama Rantarou">
+        <p>When Rantaro and his crew start in the hard art of the ninja.</p>
+      </div>
+      <ul id="series_basic_info">
+        <li><strong>TheTVDB.com Series ID</strong><span>286895</span></li>
+        <li><strong>Genres</strong><span><a>Anime</a><a>Comedy</a></span></li>
+        <li><strong>Original Country</strong><span>Japan</span></li>
+        <li><strong>Original Language</strong><span>Japanese</span></li>
+      </ul>
+    </body></html>`;
+
+  const nintamaAllSeasonsHtml = `
+    <ul>
+      <li class="list-group-item">
+        <h4><span class="episode-label">S01E01</span><a href="/series/nintama-rantarou/episodes/5040100">Enter the Ninja Academy</a></h4>
+        <div class="list-group-item-text"><p>Rantaro arrives at school.</p></div>
+      </li>
+    </ul>`;
+
+  const mockFetcher: HttpFetcher = async (url) => {
+    // Simulate /dereferrer/series/286895 failing with 503
+    if (url.includes('/dereferrer/series/286895')) {
+      return { status: 503, ok: false, finalUrl: url, body: '' };
+    }
+    if (url.includes('api4.thetvdb.com/web/search/queries')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: JSON.stringify({
+          results: [
+            {
+              hits: [
+                {
+                  id: 286895,
+                  type: 'series',
+                  name: 'Nintama Rantarou',
+                  slug: 'nintama-rantarou',
+                  country: 'jpn',
+                  primary_language: 'jpn',
+                  year: '1993',
+                  poster: '/banners/v4/series/286895/posters/672caa37ec50e.jpg',
+                  translations: { eng: 'Nintama Rantarou', jpn: '忍たま乱太郎' },
+                  overviews: { eng: 'When Rantaro and his crew start in the hard art of the ninja.' },
+                  genres: ['Anime', 'Comedy'],
+                },
+              ],
+            },
+          ],
+        }),
+      };
+    }
+    if (url.includes('/series/nintama-rantarou/allseasons/official')) {
+      return { status: 200, ok: true, finalUrl: url, body: nintamaAllSeasonsHtml };
+    }
+    if (url.includes('/series/nintama-rantarou')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: 'https://www.thetvdb.com/series/nintama-rantarou',
+        body: nintamaHtml,
+      };
+    }
+    return { status: 404, ok: false, finalUrl: url, body: '' };
+  };
+
+  // 1. Direct TheTVDB URI recovers via search API + slug page when dereferrer fails
+  const recovered = await getAggregatedMediaDetails(
+    mockFetcher,
+    'anisync://anime/thetvdb/286895',
+    undefined,
+    { hintTitle: 'Nintama Rantarou', skipEpisodePageHydration: true }
+  );
+  assert.ok(recovered);
+  assert.equal(recovered.title, 'Nintama Rantarou');
+  assert.equal(recovered.externalIds?.tvdbId, 286895);
+  assert.equal(recovered.episodes.length, 1);
+
+  // 2. Legacy favorite URI (e.g. anilist) resolves via TheTVDB using hintTitle
+  const legacyFav = await getAggregatedMediaDetails(
+    mockFetcher,
+    'anisync://anime/anilist/9317',
+    undefined,
+    { hintTitle: 'Nintama Rantarou', skipEpisodePageHydration: true }
+  );
+  assert.ok(legacyFav);
+  assert.equal(legacyFav.title, 'Nintama Rantarou');
+  assert.equal(legacyFav.externalIds?.tvdbId, 286895);
+  assert.equal(legacyFav.episodes.length, 1);
+});
+
+test('getAggregatedMediaDetails falls back to streaming provider when TheTVDB is unreachable', async () => {
+  const providerSearchHtml = `
+    <div class="search-page">
+      <div class="result-item">
+        <article>
+          <div class="thumbnail"><a href="https://topanimes.net/animes/nintama-rantarou/"><img src="https://topanimes.net/nintama.jpg" /></a></div>
+          <div class="details"><div class="title"><a href="https://topanimes.net/animes/nintama-rantarou/">Nintama Rantarou</a></div></div>
+        </article>
+      </div>
+    </div>`;
+
+  const providerAnimeHtml = `
+    <html><body>
+      <div class="sheader">
+        <div class="poster"><img src="https://topanimes.net/nintama.jpg" /></div>
+        <div class="data"><h1>Nintama Rantarou</h1><div class="extra"><span class="date">1993</span></div></div>
+      </div>
+      <div class="wp-content"><p>Sinopse do provedor para Nintama Rantarou.</p></div>
+      <div id="seasons">
+        <div class="se-c">
+          <div class="se-q"><span class="se-t">1</span></div>
+          <div class="se-a">
+            <ul class="episodios">
+              <li>
+                <div class="numerando">1 - 1</div>
+                <div class="episodiotitle"><a href="https://topanimes.net/episodio/nintama-rantarou-episodio-1/">Episódio 1</a></div>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </body></html>`;
+
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url.includes('thetvdb.com')) {
+      return { status: 503, ok: false, finalUrl: url, body: '' };
+    }
+    if (url.includes('topanimes.net/?s=')) {
+      return { status: 200, ok: true, finalUrl: url, body: providerSearchHtml };
+    }
+    if (url.includes('topanimes.net/animes/nintama-rantarou')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: 'https://topanimes.net/animes/nintama-rantarou/',
+        body: providerAnimeHtml,
+      };
+    }
+    return { status: 404, ok: false, finalUrl: url, body: '' };
+  };
+
+  const fallbackResult = await getAggregatedMediaDetails(
+    mockFetcher,
+    'anisync://anime/thetvdb/286895',
+    undefined,
+    { hintTitle: 'Nintama Rantarou', skipEpisodePageHydration: true }
+  );
+  assert.ok(fallbackResult);
+  assert.equal(fallbackResult.title, 'Nintama Rantarou');
+  assert.equal(fallbackResult.poster, 'https://topanimes.net/nintama.jpg');
+  assert.equal(fallbackResult.episodes.length, 1);
+  assert.equal(
+    fallbackResult.episodes[0].url,
+    'https://topanimes.net/episodio/nintama-rantarou-episodio-1/'
+  );
+});
+

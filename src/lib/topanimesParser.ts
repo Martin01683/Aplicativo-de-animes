@@ -20,6 +20,10 @@ import type {
 } from './types.ts';
 import { isSafeExternalHttpUrl, normalizeTopAnimesUrl, unwrapAvisoUrl } from './urlSafety.ts';
 import { isUncensoredEpisodeTitle } from './episodeAvailability.ts';
+import { splitAlternativeTitleString } from './catalog/idCodec.ts';
+import { formatServerLabel } from './serverLabel.ts';
+
+export { formatServerLabel };
 
 const NAMED_HEIGHTS: Record<string, number> = {
   uhd: 2160,
@@ -58,12 +62,6 @@ const AD_HOST_RE =
 
 function cleanText(val: string | undefined): string {
   return String(val || '').replace(/\s+/g, ' ').trim();
-}
-
-export function formatServerLabel(raw: string | undefined, fallback = 'Servidor'): string {
-  const cleaned = cleanText(raw);
-  if (!cleaned) return fallback;
-  return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
 export function inferAudioType(text: string): AudioType {
@@ -949,13 +947,61 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
     containerSeasonNum: number | null,
     containerSeasonTitle: string
   ) => {
-    const href = normalizeTopAnimesUrl(li.find('.episodiotitle a').attr('href') || '');
+    const titleAnchor = li.find('.episodiotitle a').first();
+    const fallbackAnchor =
+      titleAnchor.length > 0
+        ? titleAnchor
+        : li.find('a[href*="/episodio/"]').first().length > 0
+          ? li.find('a[href*="/episodio/"]').first()
+          : li.find('a[href]').first();
+
+    const href = normalizeTopAnimesUrl(fallbackAnchor.attr('href') || '');
     if (!href || seenEpisodeUrls.has(href)) return;
     seenEpisodeUrls.add(href);
-    const epTitle = cleanText(li.find('.episodiotitle a').text()) || 'Episódio';
+
     const numberLabel = cleanText(li.find('.numerando').text());
     const epNumText = cleanText(li.find('.epnumber').text());
-    const parsedNum = Number.parseInt(epNumText, 10);
+    const anchorText = cleanText(fallbackAnchor.text());
+    const anchorTitleAttr = cleanText(fallbackAnchor.attr('title'));
+
+    const parseEpisodeFloat = (raw: string): number | null => {
+      const normalized = raw.trim().replace(',', '.');
+      if (!/^\d+(?:\.\d+)?$/.test(normalized)) return null;
+      const n = Number.parseFloat(normalized);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+
+    let parsedNum: number | null = parseEpisodeFloat(epNumText);
+    if (parsedNum === null && numberLabel) {
+      const numMatch =
+        numberLabel.match(/\d+\s*[-–—xX·]\s*(\d+(?:[.,]\d+)?)/) ||
+        numberLabel.match(/\b(\d+(?:[.,]\d+)?)\b/);
+      if (numMatch?.[1]) parsedNum = parseEpisodeFloat(numMatch[1]);
+    }
+    if (parsedNum === null) {
+      parsedNum = parseEpisodeFloat(anchorText);
+    }
+    if (parsedNum === null) {
+      const slugMatch = href.match(/episodio-(\d+)(?:-(\d))?(?:\/|$|\?|-)/i);
+      if (slugMatch?.[1]) {
+        const combined = slugMatch[2] ? `${slugMatch[1]}.${slugMatch[2]}` : slugMatch[1];
+        parsedNum = parseEpisodeFloat(combined);
+      }
+    }
+
+    let epTitle = cleanText(titleAnchor.text());
+    if (!epTitle) {
+      if (anchorText && !/^\d+(?:[.,]\d+)?$/.test(anchorText)) {
+        epTitle = anchorText;
+      } else if (parsedNum !== null && parsedNum > 0) {
+        epTitle = `Episódio ${parsedNum}`;
+      } else if (anchorTitleAttr) {
+        epTitle = anchorTitleAttr.replace(/\s+Online\s*$/i, '').trim() || 'Episódio';
+      } else {
+        epTitle = 'Episódio';
+      }
+    }
+
     const date = cleanText(li.find('.episodiotitle .date').text());
     const thumb = upgradeImageUrl(li.find('.imagen img').attr('src') || li.find('.imagen img').attr('data-src'));
 
@@ -966,11 +1012,14 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
         ? containerSeasonTitle
         : `Temporada ${seasonNumber}`;
 
-    const uncensored = isUncensoredEpisodeTitle(epTitle) || isUncensoredEpisodeTitle(numberLabel);
+    const uncensored =
+      isUncensoredEpisodeTitle(epTitle) ||
+      isUncensoredEpisodeTitle(numberLabel) ||
+      isUncensoredEpisodeTitle(anchorTitleAttr);
 
     episodes.push({
-      numberLabel: numberLabel || (Number.isFinite(parsedNum) ? String(parsedNum) : ''),
-      episodeNumber: Number.isFinite(parsedNum) ? parsedNum : null,
+      numberLabel: numberLabel || (parsedNum !== null ? String(parsedNum) : ''),
+      episodeNumber: parsedNum,
       seasonNumber,
       seasonLabel,
       title: epTitle,
@@ -998,9 +1047,14 @@ export function parseAnimePageHtml(html: string, pageUrl: string): AnimeDetails 
     });
   }
 
+  const parsedAlternativeTitles = alternativeTitle
+    ? splitAlternativeTitleString(alternativeTitle)
+    : [];
+
   return {
     title,
     alternativeTitle,
+    ...(parsedAlternativeTitles.length > 0 ? { alternativeTitles: parsedAlternativeTitles } : {}),
     originalTitle,
     url: canonicalUrl,
     poster,
@@ -1230,6 +1284,80 @@ function tryParseLooseJsArray(raw: string): unknown[] | null {
   }
 }
 
+const MIXDROP_HOST_RE =
+  /(?:^|\.)(?:mixdrop|m1xdrop|mixdroop|mdy48tn97|mdfx9dc8n|mdzsmutpcvykb|mdbekjwqa)\./i;
+
+const PACKER_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+
+function parsePackerTokenIndex(token: string, radix: number): number {
+  if (!token || radix < 2 || radix > 62) return -1;
+  if (radix <= 36) {
+    for (let i = 0; i < token.length; i += 1) {
+      const code = token.charCodeAt(i);
+      const digit =
+        code >= 48 && code <= 57
+          ? code - 48
+          : code >= 97 && code <= 122
+            ? code - 87
+            : code >= 65 && code <= 90
+              ? code - 55
+              : -1;
+      if (digit < 0 || digit >= radix) return -1;
+    }
+    return Number.parseInt(token, radix);
+  }
+  let acc = 0;
+  for (let i = 0; i < token.length; i += 1) {
+    const idx = PACKER_ALPHABET.indexOf(token[i]);
+    if (idx < 0 || idx >= radix) return -1;
+    acc = acc * radix + idx;
+  }
+  return acc;
+}
+
+function unescapePackerString(raw: string, quoteChar: string): string {
+  return raw
+    .replace(new RegExp(`\\\\${quoteChar}`, 'g'), quoteChar)
+    .replace(/\\n/g, '\n')
+    .replace(/\\r/g, '\r')
+    .replace(/\\t/g, '\t')
+    .replace(/\\\\/g, '\\');
+}
+
+/**
+ * Pure, safe Dean Edwards `eval(function(p,a,c,k,e,d){...}(...))` unpacker (no `eval`/`new Function`).
+ */
+export function unpackDeanEdwardsPackedScripts(body: string): string[] {
+  if (!body || !body.includes('eval(function(p,a,c,k,e,')) return [];
+  const results: string[] = [];
+  const re =
+    /eval\(function\(p,a,c,k,e,[dr]\)\{[\s\S]*?\}\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(['"])((?:\\.|(?!\5)[^\\])*)\5\.split\(\s*['"]\|['"]\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    const payload = unescapePackerString(m[2], m[1]);
+    const radix = Number.parseInt(m[3], 10);
+    const dict = unescapePackerString(m[6], m[5]).split('|');
+    if (!payload || !Number.isFinite(radix) || radix < 2 || radix > 62 || !dict.length) continue;
+    const unpacked = payload.replace(/\b([0-9a-zA-Z]+)\b/g, (tok) => {
+      const idx = parsePackerTokenIndex(tok, radix);
+      if (idx >= 0 && idx < dict.length && dict[idx]) {
+        return dict[idx];
+      }
+      return tok;
+    });
+    if (unpacked) results.push(unpacked);
+  }
+  return results;
+}
+
+export function isMixDropEmbedUrl(rawUrl: string): boolean {
+  try {
+    return MIXDROP_HOST_RE.test(new URL(rawUrl).hostname);
+  } catch {
+    return false;
+  }
+}
+
 export function extractStreamsFromEmbed(
   embedUrl: string,
   body: string
@@ -1291,8 +1419,68 @@ export function extractStreamsFromEmbed(
     }
   }
 
+  // Unpack any Dean Edwards packed scripts (used by MixDrop, Filemoon, StreamWish, etc.)
+  const unpackedScripts = unpackDeanEdwardsPackedScripts(body);
+  const scanBody = unpackedScripts.length > 0 ? `${body}\n${unpackedScripts.join('\n')}` : body;
+
+  // 1b. MixDrop (`MDCore.wurl` / `MDCore.furl` / `MDCore.poster` inside packed script)
+  if (isMixDropEmbedUrl(embedUrl) || /\bMDCore\.(?:wurl|furl|vurl)\b/.test(scanBody)) {
+    const mdPosterMatch = scanBody.match(/\bMDCore\.poster\s*=\s*(['"])([^'"]+)\1/);
+    if (mdPosterMatch?.[2]?.trim()) {
+      try {
+        const absPoster = new URL(mdPosterMatch[2].trim(), embedUrl).href;
+        if (isSafeExternalHttpUrl(absPoster)) poster = absPoster;
+      } catch {
+        // ignore invalid poster
+      }
+    }
+
+    const mdUrlRe = /\bMDCore\.(?:wurl|furl|vurl)\s*=\s*(['"])([^'"]+)\1/g;
+    let mdMatch: RegExpExecArray | null;
+    while ((mdMatch = mdUrlRe.exec(scanBody)) !== null) {
+      const rawCandidate = mdMatch[2].trim();
+      if (!rawCandidate || rawCandidate.length < 6) continue;
+      if (!/(?:^https?:\/\/|^\/\/)/i.test(rawCandidate)) continue;
+      try {
+        const abs = new URL(rawCandidate, embedUrl).href;
+        if (!isSafeExternalHttpUrl(abs) || AD_HOST_RE.test(abs)) continue;
+        const format = guessStreamFormat(abs);
+        const height = labelToHeight('', abs);
+        streams.push({
+          label: formatQualityLabel('', height, format),
+          height,
+          url: abs,
+          format,
+        });
+      } catch {
+        // skip malformed URL
+      }
+    }
+
+    const mdSubMatch = scanBody.match(/\bMDCore\.remotesub\s*=\s*(['"])([^'"]+)\1/);
+    if (mdSubMatch?.[2]?.trim()) {
+      try {
+        const absSub = new URL(mdSubMatch[2].trim(), embedUrl).href;
+        if (isSafeExternalHttpUrl(absSub)) {
+          subtitles.push({ label: 'Legenda', url: absSub, isDefault: true });
+        }
+      } catch {
+        // ignore invalid subtitle
+      }
+    }
+
+    if (streams.length) {
+      return {
+        streams: dedupeAndSortStreams(streams),
+        subtitles: dedupeSubtitles(subtitles),
+        poster,
+        provider: 'MixDrop',
+      };
+    }
+  }
+
   // 2. Playerjs (`new Playerjs({ ... })` or `Playerjs({ ... })`) - scan all blocks (mobile/desktop branches)
-  for (const pjsMatch of body.matchAll(/Playerjs\s*\(\s*(\{[\s\S]*?\})\s*\)/gi)) {
+  for (const pjsMatch of scanBody.matchAll(/Playerjs\s*\(\s*(\{[\s\S]*?\})\s*\)/gi)) {
     const block = pjsMatch[1];
     const fileMatch = block.match(/file\s*:\s*(['"])([\s\S]*?)\1/);
     const subMatch = block.match(/subtitles?\s*:\s*(['"])([\s\S]*?)\1/);
@@ -1350,8 +1538,8 @@ export function extractStreamsFromEmbed(
   }
 
   // 3. Blogger (<c-wiz data-p="..."> containing googlevideo.com/videoplayback)
-  if (body.includes('googlevideo.com/videoplayback')) {
-    const unescaped = body.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) =>
+  if (scanBody.includes('googlevideo.com/videoplayback')) {
+    const unescaped = scanBody.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) =>
       String.fromCharCode(Number.parseInt(h, 16))
     );
     const re = /\["(https:\/\/[^"\s]+?googlevideo\.com\/videoplayback\?[^"\s]+)",\[(\d+)\]\]/g;
@@ -1377,7 +1565,7 @@ export function extractStreamsFromEmbed(
   }
 
   // 4. JW Player (`jwplayer(...).setup({...})`) & generic inline stream scan
-  const jwSourcesMatch = body.match(/sources\s*:\s*(\[[\s\S]*?\])/);
+  const jwSourcesMatch = scanBody.match(/sources\s*:\s*(\[[\s\S]*?\])/);
   if (jwSourcesMatch) {
     const parsed = tryParseLooseJsArray(jwSourcesMatch[1]) as
       | Array<{ file?: string; src?: string; url?: string; label?: string; type?: string }>
@@ -1404,7 +1592,7 @@ export function extractStreamsFromEmbed(
   }
 
   // Extract JW Player tracks if present
-  const tracksMatch = body.match(/tracks\s*:\s*(\[[\s\S]*?\])/);
+  const tracksMatch = scanBody.match(/tracks\s*:\s*(\[[\s\S]*?\])/);
   if (tracksMatch) {
     const parsed = tryParseLooseJsArray(tracksMatch[1]) as
       | Array<{ file?: string; label?: string; kind?: string; default?: boolean }>
@@ -1426,12 +1614,17 @@ export function extractStreamsFromEmbed(
     }
   }
 
-  // Fallback direct scan for `.m3u8` and `.mp4` URLs
+  // Fallback direct scan for `.m3u8` and `.mp4` URLs (including protocol-relative `//...`)
   if (!streams.length) {
-    const urlRe = /https?:\/\/[^"'\\\s<>]+?(?:\.m3u8|\.mp4)(?:\?[^"'\\\s<>]*)?/gi;
+    const urlRe = /(?:https?:)?\/\/[^"'\\\s<>]+?(?:\.m3u8|\.mp4)(?:\?[^"'\\\s<>]*)?/gi;
     let m: RegExpExecArray | null;
-    while ((m = urlRe.exec(body)) !== null) {
-      const foundUrl = m[0];
+    while ((m = urlRe.exec(scanBody)) !== null) {
+      let foundUrl: string;
+      try {
+        foundUrl = new URL(m[0], embedUrl).href;
+      } catch {
+        continue;
+      }
       if (AD_HOST_RE.test(foundUrl)) continue;
       const format = guessStreamFormat(foundUrl);
       const height = labelToHeight('', foundUrl);
@@ -1444,7 +1637,7 @@ export function extractStreamsFromEmbed(
     }
   }
 
-  const imageMatch = body.match(/["']?image["']?\s*:\s*["'](https?:\/\/[^"']+)["']/i);
+  const imageMatch = scanBody.match(/["']?image["']?\s*:\s*["'](https?:\/\/[^"']+)["']/i);
   if (!poster && imageMatch?.[1] && isSafeExternalHttpUrl(imageMatch[1])) {
     poster = imageMatch[1];
   }
@@ -1453,10 +1646,12 @@ export function extractStreamsFromEmbed(
     streams: dedupeAndSortStreams(streams),
     subtitles: dedupeSubtitles(subtitles),
     poster,
-    provider: embedUrl.includes('booonceivu.shop')
-      ? 'Zuplay'
-      : embedUrl.includes('antivirus')
-        ? 'KojimaCDN'
-        : 'Direto',
+    provider: isMixDropEmbedUrl(embedUrl)
+      ? 'MixDrop'
+      : embedUrl.includes('booonceivu.shop')
+        ? 'Zuplay'
+        : embedUrl.includes('antivirus')
+          ? 'KojimaCDN'
+          : 'Direto',
   };
 }

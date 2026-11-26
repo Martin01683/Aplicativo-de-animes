@@ -302,6 +302,7 @@ public class LocalProxyPlugin extends Plugin {
 
         executor.execute(() -> {
             HttpURLConnection conn = null;
+            boolean shouldDisconnect = false;
             try {
                 RedirectResult res = openWithRedirects(
                     rawUrl,
@@ -317,7 +318,12 @@ public class LocalProxyPlugin extends Plugin {
                 conn = res.connection;
                 int status = conn.getResponseCode();
                 InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
-                String body = stream != null ? readStreamAsString(stream) : "";
+                String body = "";
+                if (stream != null) {
+                    try (InputStream managedStream = stream) {
+                        body = readStreamAsString(managedStream);
+                    }
+                }
 
                 JSObject ret = new JSObject();
                 ret.put("status", status);
@@ -326,9 +332,10 @@ public class LocalProxyPlugin extends Plugin {
                 ret.put("body", body);
                 call.resolve(ret);
             } catch (Exception e) {
+                shouldDisconnect = true;
                 call.reject(e.getMessage() != null ? e.getMessage() : "Falha na requisição HTTP.");
             } finally {
-                if (conn != null) {
+                if (shouldDisconnect && conn != null) {
                     conn.disconnect();
                 }
             }

@@ -44,6 +44,8 @@ import type {
   SubtitleTrack,
 } from '../lib/types';
 import {
+  formatEpisodeCardBadge,
+  formatEpisodeCardTitle,
   formatEpisodeCountdown,
   formatEpisodeReleaseDate,
   formatUpcomingEpisodeNotice,
@@ -3232,12 +3234,14 @@ export function AnimePlayer({
                 seriesEpisodes.map((ep) => {
                   const available = isEpisodeAvailableOnServer(ep);
                   const isCurrent = isSameEpisodeUrl(ep.url, episodeUrl);
+                  const epBadge = formatEpisodeCardBadge(ep, isMovie);
+                  const epDisplayTitle = formatEpisodeCardTitle(ep, isMovie);
+                  const releaseDate = formatEpisodeReleaseDate(
+                    ep.date,
+                    ep.airingAt,
+                    ep.hasExactAiringTime
+                  );
                   if (!available) {
-                    const releaseDate = formatEpisodeReleaseDate(
-                      ep.date,
-                      ep.airingAt,
-                      ep.hasExactAiringTime
-                    );
                     const countdown = formatEpisodeCountdown(
                       ep.airingAt,
                       scheduleNowMs,
@@ -3252,13 +3256,16 @@ export function AnimePlayer({
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-1.5">
                             <span className="font-mono text-[11px] font-semibold tabular-nums text-slate-500">
-                              {ep.numberLabel || 'EP'}
+                              {epBadge}
                             </span>
                           </div>
                           <div className="mt-0.5 truncate text-xs font-medium text-slate-400">
-                            {ep.title}
+                            {epDisplayTitle}
                           </div>
-                          <div className="mt-0.5 inline-flex items-center gap-1 text-[10px] tabular-nums text-slate-500">
+                          <div
+                            data-player-episode-date="true"
+                            className="mt-0.5 inline-flex items-center gap-1 text-[10px] tabular-nums text-slate-500"
+                          >
                             <Calendar className="h-2.5 w-2.5 shrink-0" />
                             <span>{releaseDate || 'Data ainda não confirmada'}</span>
                           </div>
@@ -3311,7 +3318,7 @@ export function AnimePlayer({
                               isCurrent ? 'text-[#fb923c]' : 'text-slate-400'
                             }`}
                           >
-                            {ep.numberLabel || 'EP'}
+                            {epBadge}
                           </span>
                           {isCurrent && (
                             <span className="rounded bg-[#f97316]/25 px-1.5 py-0.5 text-[10px] font-semibold text-[#fb923c]">
@@ -3324,7 +3331,18 @@ export function AnimePlayer({
                             </span>
                           )}
                         </div>
-                        <div className="mt-0.5 truncate text-xs font-medium">{ep.title}</div>
+                        <div className="mt-0.5 truncate text-xs font-medium">{epDisplayTitle}</div>
+                        {releaseDate && (
+                          <div
+                            data-player-episode-date="true"
+                            className={`mt-1 inline-flex items-center gap-1 text-[10px] tabular-nums ${
+                              isCurrent ? 'text-slate-300' : 'text-slate-400'
+                            }`}
+                          >
+                            <Calendar className="h-2.5 w-2.5 shrink-0" />
+                            <span>{releaseDate}</span>
+                          </div>
+                        )}
                       </div>
                       <Play
                         className={`h-3.5 w-3.5 shrink-0 ${

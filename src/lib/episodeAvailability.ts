@@ -74,24 +74,24 @@ export function parseEpisodeNumberFromLabel(label?: string): number | null {
   if (!label) return null;
   const cleaned = label.trim();
   if (!cleaned) return null;
-  const epMatch = cleaned.match(/(?:ep\.?|epis[oó]dio)\s*0*(\d+)/i);
+  const parseNum = (raw: string): number | null => {
+    const n = Number.parseFloat(raw.replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+  const epMatch = cleaned.match(/(?:ep\.?|epis[oó]dio)\s*0*(\d+(?:[.,]\d+)?)/i);
   if (epMatch?.[1]) {
-    const n = Number.parseInt(epMatch[1], 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    return parseNum(epMatch[1]);
   }
-  const seMatch = cleaned.match(/S\d+E0*(\d+)/i);
+  const seMatch = cleaned.match(/S\d+E0*(\d+(?:[.,]\d+)?)/i);
   if (seMatch?.[1]) {
-    const n = Number.parseInt(seMatch[1], 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    return parseNum(seMatch[1]);
   }
-  const dashMatch = cleaned.match(/^\d+\s*[-·]\s*0*(\d+)$/);
+  const dashMatch = cleaned.match(/^\d+\s*[-·]\s*0*(\d+(?:[.,]\d+)?)$/);
   if (dashMatch?.[1]) {
-    const n = Number.parseInt(dashMatch[1], 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+    return parseNum(dashMatch[1]);
   }
-  if (/^\d+$/.test(cleaned)) {
-    const n = Number.parseInt(cleaned, 10);
-    return Number.isFinite(n) && n > 0 ? n : null;
+  if (/^\d+(?:[.,]\d+)?$/.test(cleaned)) {
+    return parseNum(cleaned);
   }
   return null;
 }
@@ -706,30 +706,36 @@ export function mergeServerAndCatalogEpisodes(params: {
 
     if (matchedServer) {
       consumedServerUrls.add(matchedServer.url);
+      const hasRichCatalogTitle =
+        Boolean(catEp.title) && !isGenericEpisodeTitle(catEp.title);
       const preferCatalogTitle =
-        Boolean(catEp.title) &&
-        !isGenericEpisodeTitle(catEp.title) &&
-        isGenericEpisodeTitle(matchedServer.title);
+        hasRichCatalogTitle ||
+        (Boolean(catEp.title) && isGenericEpisodeTitle(matchedServer.title));
       const uncensored = isEpisodeUncensored(matchedServer) || isEpisodeUncensored(catEp);
-      const hasMisleadingSeason1Label =
-        sNum > 1 && /^\s*1\s*[-·]\s*\d+\s*$/.test(matchedServer.numberLabel || '');
+      const canonicalNumberLabel =
+        catEp.numberLabel ||
+        (sNum > 1 ? `T${sNum} · EP ${eNum ?? ''}`.trim() : eNum !== null ? `EP ${eNum}` : matchedServer.numberLabel);
       merged.push({
-        ...matchedServer,
+        ...catEp,
+        url: matchedServer.url,
+        ...(matchedServer.audioType ? { audioType: matchedServer.audioType } : {}),
         title: preferCatalogTitle ? catEp.title : matchedServer.title,
         ...(preferCatalogTitle && catEp.titleLocalized ? { titleLocalized: true } : {}),
         ...(uncensored ? { uncensored: true } : {}),
         seasonNumber: sNum,
         seasonLabel: catEp.seasonLabel || matchedServer.seasonLabel || `Temporada ${sNum}`,
-        numberLabel: hasMisleadingSeason1Label
-          ? catEp.numberLabel || `T${sNum} · EP ${eNum ?? ''}`.trim()
-          : matchedServer.numberLabel || catEp.numberLabel,
-        date: matchedServer.date || catEp.date,
+        numberLabel: canonicalNumberLabel,
+        episodeNumber: eNum ?? matchedServer.episodeNumber,
+        date: catEp.date || matchedServer.date,
         thumb: catEp.thumb || matchedServer.thumb,
-        overview: matchedServer.overview || catEp.overview,
-        durationMinutes: matchedServer.durationMinutes || catEp.durationMinutes,
-        airingAt: matchedServer.airingAt ?? catEp.airingAt,
-        hasExactAiringTime: matchedServer.hasExactAiringTime || catEp.hasExactAiringTime,
-        tvdbEpisodeId: matchedServer.tvdbEpisodeId ?? catEp.tvdbEpisodeId,
+        ...(catEp.thumb && matchedServer.thumb && matchedServer.thumb !== catEp.thumb
+          ? { fallbackThumb: matchedServer.thumb }
+          : {}),
+        overview: catEp.overview || matchedServer.overview,
+        durationMinutes: catEp.durationMinutes || matchedServer.durationMinutes,
+        airingAt: catEp.airingAt ?? matchedServer.airingAt,
+        hasExactAiringTime: Boolean(catEp.hasExactAiringTime || matchedServer.hasExactAiringTime),
+        tvdbEpisodeId: catEp.tvdbEpisodeId ?? matchedServer.tvdbEpisodeId,
         availableOnServer: true,
       });
     } else {
@@ -777,3 +783,77 @@ export function mergeServerAndCatalogEpisodes(params: {
 
   return merged;
 }
+
+/**
+ * Collects unique TheTVDB episode IDs whose titles are not yet localized to PT-BR.
+ */
+export function collectUnlocalizedEpisodeIds(
+  episodes: readonly AnimeEpisodeLink[],
+  isMovie = false
+): number[] {
+  if (isMovie || episodes.length === 0) return [];
+  const ids: number[] = [];
+  const seen = new Set<number>();
+  for (const ep of episodes) {
+    if (
+      ep.titleLocalized ||
+      !ep.tvdbEpisodeId ||
+      ep.tvdbEpisodeId <= 0 ||
+      seen.has(ep.tvdbEpisodeId)
+    ) {
+      continue;
+    }
+    seen.add(ep.tvdbEpisodeId);
+    ids.push(ep.tvdbEpisodeId);
+  }
+  return ids;
+}
+
+/**
+ * Applies cached/hydrated PT-BR episode titles onto a list of AnimeEpisodeLink items
+ * without mutating the original array. Returns the original reference if nothing changed.
+ */
+export function applyLocalizedEpisodeTitles(
+  episodes: readonly AnimeEpisodeLink[],
+  titlesById: Readonly<Record<number, string>>
+): AnimeEpisodeLink[] {
+  if (episodes.length === 0) return episodes as AnimeEpisodeLink[];
+  let changed = false;
+  const next = episodes.map((ep) => {
+    const id = ep.tvdbEpisodeId;
+    if (!id || id <= 0) return ep;
+    const localized = titlesById[id]?.trim();
+    if (!localized || (ep.titleLocalized && ep.title === localized)) {
+      return ep;
+    }
+    changed = true;
+    return {
+      ...ep,
+      title: localized,
+      titleLocalized: true,
+    };
+  });
+  return changed ? next : (episodes as AnimeEpisodeLink[]);
+}
+
+/**
+ * Picks the first valid, non-failed image URL from an ordered preference list
+ * (e.g. TheTVDB primary -> provider fallback) for runtime `onError` recovery.
+ */
+export function pickImageWithFallback(
+  candidates: readonly (string | undefined | null)[],
+  failedUrls: ReadonlySet<string> | readonly string[]
+): string {
+  const isFailed = Array.isArray(failedUrls)
+    ? (u: string) => failedUrls.includes(u)
+    : (u: string) => (failedUrls as ReadonlySet<string>).has(u);
+  const seen = new Set<string>();
+  for (const raw of candidates) {
+    const clean = typeof raw === 'string' ? raw.trim() : '';
+    if (!clean || seen.has(clean)) continue;
+    seen.add(clean);
+    if (!isFailed(clean)) return clean;
+  }
+  return '';
+}
+

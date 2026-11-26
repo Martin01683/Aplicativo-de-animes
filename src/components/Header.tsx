@@ -10,6 +10,9 @@ export type NavSection = 'releases' | 'calendar' | 'catalog' | 'library';
 interface HeaderProps {
   activeSection: NavSection;
   onSelectSection: (section: NavSection) => void;
+  onPrefetchSection?: (section: NavSection) => void;
+  onPrefetchSettings?: () => void;
+  isBusy?: boolean;
   onGoHome: () => void;
   alerts: FavoriteAlertEntry[];
   unreadCount: number;
@@ -44,6 +47,9 @@ const NAV_ITEMS: Array<{ id: NavSection; label: string }> = [
 export function Header({
   activeSection,
   onSelectSection,
+  onPrefetchSection,
+  onPrefetchSettings,
+  isBusy = false,
   onGoHome,
   alerts,
   unreadCount,
@@ -125,6 +131,9 @@ export function Header({
                 key={item.id}
                 type="button"
                 onClick={() => onSelectSection(item.id)}
+                onMouseEnter={() => onPrefetchSection?.(item.id)}
+                onFocus={() => onPrefetchSection?.(item.id)}
+                onTouchStart={() => onPrefetchSection?.(item.id)}
                 className={`relative shrink-0 whitespace-nowrap rounded-lg px-3.5 py-2 text-sm font-medium transition-colors ${
                   active
                     ? 'bg-white/10 text-white'
@@ -205,12 +214,28 @@ export function Header({
               setOpenPopover(false);
               onOpenSettings();
             }}
+            onMouseEnter={() => onPrefetchSettings?.()}
+            onFocus={() => onPrefetchSettings?.()}
+            onTouchStart={() => onPrefetchSettings?.()}
             aria-label="Abrir configurações do Anisync"
             className="relative flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-[#151921] text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
           >
             <Settings className="h-4.5 w-4.5" />
           </button>
         </div>
+      </div>
+      {/* Whisper-quiet hairline background activity indicator — never blocks navigation */}
+      <div
+        aria-hidden="true"
+        data-testid="header-loading-bar"
+        data-page-loading={isBusy ? 'true' : 'false'}
+        className={`pointer-events-none absolute inset-x-0 bottom-0 h-[2px] overflow-hidden transition-opacity duration-200 ${
+          isBusy ? 'opacity-100' : 'opacity-0'
+        }`}
+      >
+        {isBusy && (
+          <div className="anisync-progress-bar h-full w-1/2 rounded-full bg-gradient-to-r from-transparent via-[#f97316] to-transparent" />
+        )}
       </div>
     </header>
   );

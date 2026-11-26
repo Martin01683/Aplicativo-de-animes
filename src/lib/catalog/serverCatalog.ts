@@ -40,8 +40,10 @@ import {
   normalizeTopAnimesUrl,
 } from '../urlSafety.ts';
 import {
+  expandTitleVariantsForMatch,
   normalizeTitleForMatch,
   scoreTitleSimilarity,
+  splitAlternativeTitleString,
   stripSeasonFromTitle,
 } from './idCodec.ts';
 
@@ -152,27 +154,69 @@ async function getFallbackFilters(snapshotReader?: SnapshotAssetReader): Promise
   }
 }
 
+const HINATASOUL_HOME_DEDUPE_TTL_MS = 30 * 1000;
+const HINATASOUL_SEARCH_DEDUPE_TTL_MS = 60 * 1000;
+
+interface DedupeCacheSlot<T> {
+  value?: T;
+  expiresAt: number;
+  inFlight?: Promise<T>;
+}
+
+const hsHomeDedupeByFetcher = new WeakMap<HttpFetcher, DedupeCacheSlot<HomeCatalog | null>>();
+const hsSearchDedupeByFetcher = new WeakMap<
+  HttpFetcher,
+  Map<string, DedupeCacheSlot<{ results: SearchResultItem[]; totalPages: number }>>
+>();
+
 async function fetchHinataSoulHomeSafe(fetchHttp: HttpFetcher): Promise<HomeCatalog | null> {
-  const hsOrigin = HINATASOUL_BUILTIN_SOURCE.baseUrl.replace(/\/+$/, '');
-  try {
-    const res = await fetchHttp(`${hsOrigin}/`, {
-      referer: `${hsOrigin}/`,
-      timeoutMs: 9000,
-    });
-    if (!res.ok) return null;
-    const parsed = parseHinataSoulHomeHtml(res.body, 'live', hsOrigin);
-    if (
-      parsed.releases.length > 0 ||
-      parsed.animes.length > 0 ||
-      parsed.movies.length > 0 ||
-      (parsed.series && parsed.series.length > 0)
-    ) {
-      return parsed;
+  const now = Date.now();
+  const existing = hsHomeDedupeByFetcher.get(fetchHttp);
+  if (existing) {
+    if (existing.expiresAt > now && existing.value !== undefined) {
+      return existing.value;
     }
-  } catch {
-    // Ignore Hinata Soul transient errors so TopAnimes still loads cleanly
+    if (existing.inFlight) {
+      return existing.inFlight;
+    }
   }
-  return null;
+
+  const hsOrigin = HINATASOUL_BUILTIN_SOURCE.baseUrl.replace(/\/+$/, '');
+  const req = (async (): Promise<HomeCatalog | null> => {
+    try {
+      const res = await fetchHttp(`${hsOrigin}/`, {
+        referer: `${hsOrigin}/`,
+        timeoutMs: 9000,
+      });
+      if (!res.ok) return null;
+      const parsed = parseHinataSoulHomeHtml(res.body, 'live', hsOrigin);
+      if (
+        parsed.releases.length > 0 ||
+        parsed.animes.length > 0 ||
+        parsed.movies.length > 0 ||
+        (parsed.series && parsed.series.length > 0)
+      ) {
+        return parsed;
+      }
+    } catch {
+      // Ignore Hinata Soul transient errors so TopAnimes still loads cleanly
+    }
+    return null;
+  })();
+
+  const slot: DedupeCacheSlot<HomeCatalog | null> = { expiresAt: 0, inFlight: req };
+  hsHomeDedupeByFetcher.set(fetchHttp, slot);
+
+  try {
+    const value = await req;
+    if (value) {
+      slot.value = value;
+      slot.expiresAt = Date.now() + HINATASOUL_HOME_DEDUPE_TTL_MS;
+    }
+    return value;
+  } finally {
+    slot.inFlight = undefined;
+  }
 }
 
 /**
@@ -643,25 +687,65 @@ async function fetchHinataSoulSearchSafe(
   query: string,
   page = 1
 ): Promise<{ results: SearchResultItem[]; totalPages: number }> {
+  const cacheKey = `${query.trim().toLowerCase()}::p${page}`;
+  let map = hsSearchDedupeByFetcher.get(fetchHttp);
+  if (!map) {
+    map = new Map();
+    hsSearchDedupeByFetcher.set(fetchHttp, map);
+  }
+
+  const now = Date.now();
+  const existing = map.get(cacheKey);
+  if (existing) {
+    if (existing.expiresAt > now && existing.value !== undefined) {
+      return existing.value;
+    }
+    if (existing.inFlight) {
+      return existing.inFlight;
+    }
+  }
+
   const hsSource = HINATASOUL_BUILTIN_SOURCE;
   const hsOrigin = hsSource.baseUrl.replace(/\/+$/, '');
   const targetUrl =
     page > 1
       ? `${hsOrigin}/busca?busca=${encodeURIComponent(query)}&page=${page}`
       : `${hsOrigin}/busca?busca=${encodeURIComponent(query)}`;
+
+  const req = (async (): Promise<{ results: SearchResultItem[]; totalPages: number }> => {
+    try {
+      const res = await fetchHttp(targetUrl, {
+        referer: `${hsOrigin}/`,
+        timeoutMs: 8000,
+      });
+      if (!res.ok) return { results: [], totalPages: 1 };
+      const parsed = parseHinataSoulSearchHtml(res.body, page, hsOrigin);
+      return {
+        results: tagServerSearchItems(parsed.results, hsSource.name),
+        totalPages: parsed.totalPages,
+      };
+    } catch {
+      return { results: [], totalPages: 1 };
+    }
+  })();
+
+  if (map.size > 60) {
+    const oldest = map.keys().next().value;
+    if (oldest) map.delete(oldest);
+  }
+  const slot: DedupeCacheSlot<{ results: SearchResultItem[]; totalPages: number }> = {
+    expiresAt: 0,
+    inFlight: req,
+  };
+  map.set(cacheKey, slot);
+
   try {
-    const res = await fetchHttp(targetUrl, {
-      referer: `${hsOrigin}/`,
-      timeoutMs: 8000,
-    });
-    if (!res.ok) return { results: [], totalPages: 1 };
-    const parsed = parseHinataSoulSearchHtml(res.body, page, hsOrigin);
-    return {
-      results: tagServerSearchItems(parsed.results, hsSource.name),
-      totalPages: parsed.totalPages,
-    };
-  } catch {
-    return { results: [], totalPages: 1 };
+    const value = await req;
+    slot.value = value;
+    slot.expiresAt = Date.now() + HINATASOUL_SEARCH_DEDUPE_TTL_MS;
+    return value;
+  } finally {
+    slot.inFlight = undefined;
   }
 }
 
@@ -867,12 +951,24 @@ export async function findServerAnimePageForTitles(
   const topSource = TOPANIMES_BUILTIN_SOURCE;
   const hsSource = HINATASOUL_BUILTIN_SOURCE;
 
-  const cleanTerms = Array.from(
-    new Set(titles.map((t) => cleanText(t)).filter((t) => t.length >= 2))
-  ).slice(0, 4);
+  const expandedTerms: string[] = [];
+  const seenTermKeys = new Set<string>();
+  for (const rawTitle of titles) {
+    for (const part of splitAlternativeTitleString(rawTitle)) {
+      const cleaned = cleanText(part);
+      if (cleaned.length < 2) continue;
+      const key = cleaned.toLowerCase();
+      if (seenTermKeys.has(key)) continue;
+      seenTermKeys.add(key);
+      expandedTerms.push(cleaned);
+    }
+  }
+  const latinTerms = expandedTerms.filter((t) => /[a-z]/i.test(t));
+  const otherTerms = expandedTerms.filter((t) => !/[a-z]/i.test(t));
+  const cleanTerms = [...latinTerms, ...otherTerms].slice(0, 6);
   if (!cleanTerms.length) return null;
 
-  const targetSeason = Math.max(...cleanTerms.map((t) => extractHinataSoulSeasonNumber(t)));
+  const targetSeason = extractHinataSoulSeasonNumber(cleanTerms[0] || '');
   const searchTerms = buildProgressiveServerSearchTerms(cleanTerms);
 
   type MatchedServerCandidate = {
@@ -890,7 +986,10 @@ export async function findServerAnimePageForTitles(
     let nextBest = currentBest;
     for (const r of results) {
       if (r.kind === 'episode') continue;
-      const rawSim = Math.max(...cleanTerms.map((ref) => scoreTitleSimilarity(ref, r.title)));
+      const candVariants = expandTitleVariantsForMatch(r.title);
+      const rawSim = Math.max(
+        ...cleanTerms.flatMap((ref) => candVariants.map((cv) => scoreTitleSimilarity(ref, cv)))
+      );
       const candSeason = extractHinataSoulSeasonNumber(r.title);
       let adjusted = rawSim;
       if (targetSeason > 1) {

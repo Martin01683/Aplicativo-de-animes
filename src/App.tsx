@@ -1,20 +1,36 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Trash2, WifiOff } from 'lucide-react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import { ArrowLeft, Trash2, WifiOff } from 'lucide-react';
+import type { AnimeDetailLoadingStage } from './components/AnimeDetailView';
 import { CatalogView } from './components/CatalogView';
 import { Header, type NavSection } from './components/Header';
 import { MobileTabBar } from './components/MobileTabBar';
 import { NotificationToastStack } from './components/NotificationToastStack';
 
-const AnimeDetailView = lazy(() =>
-  import('./components/AnimeDetailView').then((m) => ({ default: m.AnimeDetailView })),
-);
-const EpisodeWorkspace = lazy(() =>
-  import('./components/EpisodeWorkspace').then((m) => ({ default: m.EpisodeWorkspace })),
-);
-const SettingsModal = lazy(() =>
-  import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal })),
-);
+const loadAnimeDetailView = () =>
+  import('./components/AnimeDetailView').then((m) => ({ default: m.AnimeDetailView }));
+const loadEpisodeWorkspace = () =>
+  import('./components/EpisodeWorkspace').then((m) => ({ default: m.EpisodeWorkspace }));
+const loadSettingsModal = () =>
+  import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal }));
+
+const AnimeDetailView = lazy(loadAnimeDetailView);
+const EpisodeWorkspace = lazy(loadEpisodeWorkspace);
+const SettingsModal = lazy(loadSettingsModal);
 import { useOnlineStatus } from './hooks/useOnlineStatus';
+import {
+  usePageImagesPending,
+  useSettledLoadingIndicator,
+} from './hooks/usePageImagesPending';
 import {
   addApkDownloadProgressListener,
   apiFetch,
@@ -37,7 +53,7 @@ import {
   type AppUpdateCheckResult,
   type RemoteAppRelease,
 } from './lib/appUpdater';
-import { inferMediaKindFromTarget, parseAnisyncUri } from './lib/catalog/idCodec';
+import { inferMediaKindFromTarget, isAnisyncUri, parseAnisyncUri } from './lib/catalog/idCodec';
 import {
   advanceBaselineWithWatchedEpisodes,
   buildFavoriteBaseline,
@@ -85,6 +101,38 @@ import {
   resolveBackNavigationStep,
   type AppRouteFrame,
 } from './lib/navigationHistory';
+import { isActivePageLoading } from './lib/pageLoadingState';
+import {
+  buildOptimisticEpisodeDetails,
+  canBackgroundPrefetch,
+  clearPrefetchCaches,
+  deleteCachedEpisodeDetails,
+  fetchAnimeDetailsFull,
+  fetchAnimeDetailsQuick,
+  fetchArchivePageCached,
+  fetchCalendarCached,
+  fetchEpisodeDetailsFast,
+  fetchFilteredCatalogCached,
+  fetchGlossaryCached,
+  fetchReleasesPageCached,
+  fetchSearchPageCached,
+  getCachedAnimeDetailsFull,
+  getCachedEpisodeDetails,
+  isSwrDataFresh,
+  loadPersistedSwrSnapshot,
+  persistSwrHome,
+  prefetchAnimeTarget,
+  prefetchArchiveCategoryTarget,
+  prefetchCalendarTarget,
+  prefetchEpisodeTarget,
+  prefetchReleasesPageTarget,
+  preloadAllRouteChunks,
+  preloadRouteChunk,
+  registerRouteChunkPreloaders,
+  scheduleBackgroundPrefetch,
+  setCachedEpisodeDetails,
+  type MediaNavigationSeed,
+} from './lib/prefetchCache';
 import {
   DEFAULT_APP_SETTINGS,
   getEpisodeCheckIntervalMs,
@@ -123,6 +171,7 @@ import {
 import type {
   AnimeDetails,
   CalendarDaySection,
+  CalendarLayout,
   CatalogArchiveCategory,
   CatalogFilters,
   CatalogMediaItem,
@@ -130,17 +179,19 @@ import type {
   FavoriteAlertEntry,
   FavoriteBaselineMap,
   FavoriteLatestInfo,
-  GlossaryResponse,
   HomeCatalog,
   LiveChartScheduleMode,
   MediaKind,
-  PaginatedCatalogResponse,
-  PaginatedSearchResponse,
   SearchResultItem,
   SliderMovieItem,
   WatchHistoryEntry,
-  WeeklyCalendarResponse,
 } from './lib/types';
+
+registerRouteChunkPreloaders({
+  anime: loadAnimeDetailView,
+  episode: loadEpisodeWorkspace,
+  settings: loadSettingsModal,
+});
 
 type ActiveRoute = AppRouteFrame;
 
@@ -189,8 +240,23 @@ function dedupeSearchItems(list: SearchResultItem[]): SearchResultItem[] {
   return out;
 }
 
+function RouteSuspenseFallback({
+  onPendingChange,
+  children,
+}: {
+  onPendingChange: (pending: boolean) => void;
+  children: ReactNode;
+}) {
+  useLayoutEffect(() => {
+    onPendingChange(true);
+    return () => onPendingChange(false);
+  }, [onPendingChange]);
+  return <>{children}</>;
+}
+
 export default function App() {
   const isOnline = useOnlineStatus();
+  const initialSwr = useMemo(() => loadPersistedSwrSnapshot(), []);
   const [settings, setSettings] = useState<AppSettings>(() => loadAppSettings());
   const [settingsMeta, setSettingsMeta] = useState<AppSettingsMeta>(() => loadAppSettingsMeta());
   const [acknowledgedReleaseKey, setAcknowledgedReleaseKey] = useState<string | null>(() =>
@@ -214,35 +280,68 @@ export default function App() {
       : loadAppSettings().defaultSection
   );
 
-  const [catalog, setCatalog] = useState<HomeCatalog | null>(null);
-  const [loadingCatalog, setLoadingCatalog] = useState(true);
+  const [catalog, setCatalog] = useState<HomeCatalog | null>(() => initialSwr?.home?.data ?? null);
+  const [loadingCatalog, setLoadingCatalog] = useState(() => !initialSwr?.home?.data);
   const [catalogError, setCatalogError] = useState('');
 
-  const [releases, setReleases] = useState<CatalogMediaItem[]>([]);
+  const [releases, setReleases] = useState<CatalogMediaItem[]>(
+    () => initialSwr?.releases?.items ?? initialSwr?.home?.data.releases ?? []
+  );
   const [releasesPage, setReleasesPage] = useState(1);
-  const [releasesTotalPages, setReleasesTotalPages] = useState(1);
+  const [releasesTotalPages, setReleasesTotalPages] = useState(
+    () => initialSwr?.releases?.totalPages ?? 1
+  );
+  const [loadingInitialReleases, setLoadingInitialReleases] = useState(true);
   const [loadingMoreReleases, setLoadingMoreReleases] = useState(false);
 
   const [archiveCategory, setArchiveCategory] = useState<CatalogArchiveCategory>('animes');
   const [archiveState, setArchiveState] = useState<
     Record<CatalogArchiveCategory, ArchiveCategoryBucket>
-  >({
-    animes: { ...EMPTY_BUCKET },
-    movies: { ...EMPTY_BUCKET },
-    series: { ...EMPTY_BUCKET },
-    dublado: { ...EMPTY_BUCKET },
-    legendado: { ...EMPTY_BUCKET },
-    donghua: { ...EMPTY_BUCKET },
-    cartoon: { ...EMPTY_BUCKET },
-    'live-action': { ...EMPTY_BUCKET },
+  >(() => {
+    const buildInitialBucket = (
+      category: CatalogArchiveCategory,
+      homeFallback?: CatalogMediaItem[]
+    ): ArchiveCategoryBucket => {
+      const snap = initialSwr?.archive?.[category];
+      if (snap && snap.items.length > 0) {
+        return {
+          items: snap.items,
+          currentPage: snap.currentPage || 1,
+          totalPages: snap.totalPages || 1,
+          loading: false,
+          initialized: isSwrDataFresh(snap.fetchedAtMs),
+        };
+      }
+      if (homeFallback && homeFallback.length > 0) {
+        return { ...EMPTY_BUCKET, items: homeFallback };
+      }
+      return { ...EMPTY_BUCKET };
+    };
+    return {
+      animes: buildInitialBucket('animes', initialSwr?.home?.data.animes),
+      movies: buildInitialBucket('movies', initialSwr?.home?.data.movies),
+      series: buildInitialBucket('series', initialSwr?.home?.data.series),
+      dublado: buildInitialBucket('dublado'),
+      legendado: buildInitialBucket('legendado'),
+      donghua: buildInitialBucket('donghua'),
+      cartoon: buildInitialBucket('cartoon'),
+      'live-action': buildInitialBucket('live-action'),
+    };
   });
-  const [featuredAnimes, setFeaturedAnimes] = useState<CatalogMediaItem[]>([]);
-  const [sliderMovies, setSliderMovies] = useState<SliderMovieItem[]>([]);
-  const [catalogFilters, setCatalogFilters] = useState<CatalogFilters>({
-    genres: [],
-    years: [],
-    types: [],
-  });
+  const [featuredAnimes, setFeaturedAnimes] = useState<CatalogMediaItem[]>(
+    () => initialSwr?.featuredAnimes ?? []
+  );
+  const [sliderMovies, setSliderMovies] = useState<SliderMovieItem[]>(
+    () => initialSwr?.sliderMovies ?? []
+  );
+  const [catalogFilters, setCatalogFilters] = useState<CatalogFilters>(
+    () =>
+      initialSwr?.catalogFilters ?? {
+        genres: [],
+        years: [],
+        types: [],
+      }
+  );
   const [selectedGenre, setSelectedGenre] = useState('');
   const [selectedYear, setSelectedYear] = useState('');
   const [selectedGlossary, setSelectedGlossary] = useState('');
@@ -250,11 +349,18 @@ export default function App() {
     ...EMPTY_BUCKET,
   });
 
-  const [weeklyCalendarDays, setWeeklyCalendarDays] = useState<CalendarDaySection[]>([]);
+  const [weeklyCalendarDays, setWeeklyCalendarDays] = useState<CalendarDaySection[]>(() => {
+    const mode = loadAppSettings().calendarScheduleMode;
+    return initialSwr?.calendar?.[mode]?.days ?? [];
+  });
   const [selectedCalendarDay, setSelectedCalendarDay] = useState('hoje');
   const [loadingWeeklyCalendar, setLoadingWeeklyCalendar] = useState(false);
   const [calendarError, setCalendarError] = useState('');
-  const [weeklyCalendarInitialized, setWeeklyCalendarInitialized] = useState(false);
+  const [weeklyCalendarInitialized, setWeeklyCalendarInitialized] = useState(() => {
+    const mode = loadAppSettings().calendarScheduleMode;
+    const snap = initialSwr?.calendar?.[mode];
+    return Boolean(snap && snap.days.length > 0 && isSwrDataFresh(snap.fetchedAtMs));
+  });
 
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResultItem[] | null>(null);
@@ -265,8 +371,13 @@ export default function App() {
   const [loadingRandom, setLoadingRandom] = useState(false);
 
   const [animeDetails, setAnimeDetails] = useState<AnimeDetails | null>(null);
+  const [animeDetailStage, setAnimeDetailStage] = useState<AnimeDetailLoadingStage>('idle');
   const [episodeDetails, setEpisodeDetails] = useState<EpisodeDetails | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [routeChunkLoading, setRouteChunkLoading] = useState(false);
+  const [animeViewHydrating, setAnimeViewHydrating] = useState(false);
+  const [episodeViewLoading, setEpisodeViewLoading] = useState(false);
+  const mainRef = useRef<HTMLElement>(null);
   const [loadingExtraServers, setLoadingExtraServers] = useState<{
     episodeUrl: string;
     sourceNames: string[];
@@ -316,6 +427,7 @@ export default function App() {
   const apkUpdateRequestTokenRef = useRef(0);
   const apkInstalledClearTimerRef = useRef<number | null>(null);
 
+  const catalogRef = useRef(catalog);
   const favoritesRef = useRef(favorites);
   const mutedFavoriteUrlsRef = useRef(mutedFavoriteUrls);
   const baselinesRef = useRef(baselines);
@@ -333,8 +445,8 @@ export default function App() {
   const routeRef = useRef(route);
   const routeStackRef = useRef(routeStack);
   const watchedEpisodeKeysRef = useRef<Set<string>>(new Set());
-  const animeDetailsCacheRef = useRef<Map<string, AnimeDetails>>(new Map());
-  const episodeDetailsCacheRef = useRef<Map<string, EpisodeDetails>>(new Map());
+  const catalogScrollYRef = useRef(0);
+  const prevRouteViewRef = useRef(route.view);
   const navRequestGenRef = useRef(0);
   const handlingPopstateRef = useRef(false);
   const initialCheckDoneRef = useRef(false);
@@ -344,6 +456,7 @@ export default function App() {
   const autoDownloadTriggeredForRef = useRef<string | null>(null);
   const updateToastNotifiedForRef = useRef<string | null>(null);
 
+  catalogRef.current = catalog;
   favoritesRef.current = favorites;
   mutedFavoriteUrlsRef.current = mutedFavoriteUrls;
   baselinesRef.current = baselines;
@@ -360,6 +473,21 @@ export default function App() {
   acknowledgedReleaseKeyRef.current = acknowledgedReleaseKey;
   routeRef.current = route;
   routeStackRef.current = routeStack;
+
+  // Preserve exact scroll position when leaving/returning to CatalogView (zero re-mount)
+  useEffect(() => {
+    const prevView = prevRouteViewRef.current;
+    prevRouteViewRef.current = route.view;
+    if (typeof window === 'undefined') return;
+    if (route.view === 'catalog' && prevView !== 'catalog') {
+      const targetY = catalogScrollYRef.current;
+      window.requestAnimationFrame(() => {
+        window.scrollTo(0, targetY);
+      });
+    } else if (route.view !== 'catalog') {
+      window.scrollTo(0, 0);
+    }
+  }, [route.view, route.view === 'catalog' ? '' : route.url]);
 
   useEffect(() => {
     saveActiveRouteSession({ routeStack, activeSection });
@@ -416,10 +544,10 @@ export default function App() {
       void setNativeVlcVideoScale(sanitizeVideoScaleMode(patch.videoScale));
     }
     if (patch.episodeSources || patch.defaultAudioFilter) {
-      episodeDetailsCacheRef.current.clear();
+      clearPrefetchCaches('episodes');
     }
     if (patch.catalogCredentials || patch.episodeSources) {
-      animeDetailsCacheRef.current.clear();
+      clearPrefetchCaches('catalog');
       setArchiveState((prev) => ({
         animes: { ...prev.animes, initialized: false },
         movies: { ...prev.movies, initialized: false },
@@ -440,8 +568,7 @@ export default function App() {
 
   const resetSettings = useCallback(() => {
     const defaults = { ...DEFAULT_APP_SETTINGS };
-    episodeDetailsCacheRef.current.clear();
-    animeDetailsCacheRef.current.clear();
+    clearPrefetchCaches('all');
     setSettings(defaults);
     saveAppSettings(defaults);
     void setNativeVlcVideoScale(defaults.videoScale);
@@ -853,42 +980,51 @@ export default function App() {
 
   const fetchCatalog = useCallback(async () => {
     setLoadingCatalog(true);
+    setLoadingInitialReleases(true);
     setCatalogError('');
+    // Fire /api/episodes?page=1 in parallel without blocking /api/home first paint
+    const episodesPromise = fetchReleasesPageCached(1).catch(() => null);
     try {
-      const [homeRes, epRes] = await Promise.all([
-        apiFetch('/api/home'),
-        apiFetch('/api/episodes?page=1').catch(() => null),
-      ]);
+      const homeRes = await apiFetch('/api/home');
       const data = await homeRes.json();
       if (!homeRes.ok) throw new Error(data.error || 'Erro ao carregar catálogo');
       const home = data as HomeCatalog;
       setCatalog(home);
+      persistSwrHome(home);
 
-      let loadedReleases = home.releases;
-      if (epRes && epRes.ok) {
-        const epData = (await epRes.json()) as PaginatedCatalogResponse;
-        loadedReleases = epData.items.length ? epData.items : home.releases;
-        setReleases(loadedReleases);
-        setReleasesPage(epData.currentPage || 1);
-        setReleasesTotalPages(epData.totalPages || 1);
-      } else {
-        setReleases(home.releases);
-        setReleasesPage(1);
-        setReleasesTotalPages(1);
-      }
+      // Show home releases right away if no fuller page-1 list has arrived yet
+      setReleases((prev) => (prev.length === 0 ? home.releases : prev));
 
       setArchiveState((prev) => ({
         ...prev,
         animes: prev.animes.initialized
           ? prev.animes
-          : { ...prev.animes, items: home.animes },
+          : {
+              ...prev.animes,
+              items: prev.animes.items.length ? prev.animes.items : home.animes,
+            },
         movies: prev.movies.initialized
           ? prev.movies
-          : { ...prev.movies, items: home.movies },
+          : {
+              ...prev.movies,
+              items: prev.movies.items.length ? prev.movies.items : home.movies,
+            },
         series: prev.series.initialized
           ? prev.series
-          : { ...prev.series, items: home.series || [] },
+          : {
+              ...prev.series,
+              items: prev.series.items.length ? prev.series.items : home.series || [],
+            },
       }));
+
+      setLoadingCatalog(false);
+
+      const epData = await episodesPromise;
+      const loadedReleases =
+        epData && epData.items.length > 0 ? epData.items : home.releases;
+      setReleases(loadedReleases);
+      setReleasesPage(epData?.currentPage || 1);
+      setReleasesTotalPages(epData?.totalPages || 1);
 
       if (
         !initialCheckDoneRef.current &&
@@ -899,17 +1035,90 @@ export default function App() {
         void checkFavoriteUpdates({ currentReleases: loadedReleases });
       }
     } catch (err) {
-      setCatalogError(
-        err instanceof Error ? err.message : 'Falha ao conectar ao catálogo.'
-      );
+      if (!catalogRef.current) {
+        setCatalogError(
+          err instanceof Error ? err.message : 'Falha ao conectar ao catálogo.'
+        );
+      }
     } finally {
       setLoadingCatalog(false);
+      setLoadingInitialReleases(false);
     }
   }, [checkFavoriteUpdates]);
 
   useEffect(() => {
-    fetchCatalog();
+    void fetchCatalog();
   }, [fetchCatalog]);
+
+  // Idle background warmup: preload detail/player JS chunks + warm Calendar & Catalog archives silently
+  useEffect(() => {
+    if (!isOnline) return;
+    let cancelled = false;
+    const runWarmup = () => {
+      if (cancelled) return;
+      preloadAllRouteChunks();
+      if (!canBackgroundPrefetch()) return;
+
+      const mode = settingsRef.current.calendarScheduleMode;
+      const tzOffsetMinutes = -new Date().getTimezoneOffset();
+      scheduleBackgroundPrefetch(`warmup-calendar:${mode}:${tzOffsetMinutes}`, async () => {
+        const data = await fetchCalendarCached(mode, tzOffsetMinutes);
+        if (!cancelled && Array.isArray(data.days) && data.days.length > 0) {
+          setWeeklyCalendarDays(data.days);
+          setSelectedCalendarDay((current) =>
+            current === 'all' || data.days.some((d) => d.id === current)
+              ? current
+              : data.days[0].id
+          );
+          setWeeklyCalendarInitialized(true);
+        }
+      });
+
+      scheduleBackgroundPrefetch('warmup-archive:animes:p1', async () => {
+        const data = await fetchArchivePageCached('animes', 1);
+        if (cancelled) return;
+        if (Array.isArray(data.featured) && data.featured.length > 0) {
+          setFeaturedAnimes(data.featured);
+        }
+        if (data.filters && data.filters.genres.length > 0) {
+          setCatalogFilters(data.filters);
+        }
+        setArchiveState((prev) =>
+          prev.animes.initialized && prev.animes.currentPage > 1
+            ? prev
+            : {
+                ...prev,
+                animes: {
+                  items: data.items || [],
+                  currentPage: data.currentPage || 1,
+                  totalPages: data.totalPages || 1,
+                  loading: false,
+                  initialized: true,
+                },
+              }
+        );
+      });
+
+      prefetchArchiveCategoryTarget('movies', 1);
+    };
+
+    const win = window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (id: number) => void;
+    };
+    if (typeof win.requestIdleCallback === 'function') {
+      const idleId = win.requestIdleCallback(runWarmup, { timeout: 1400 });
+      return () => {
+        cancelled = true;
+        win.cancelIdleCallback?.(idleId);
+      };
+    }
+    const timer = window.setTimeout(runWarmup, 420);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [isOnline]);
 
   // Dynamic episode/news check interval + foreground/reconnect catch-up
   useEffect(() => {
@@ -1115,13 +1324,7 @@ export default function App() {
       }));
 
       try {
-        const params = new URLSearchParams();
-        params.set('category', category);
-        params.set('page', String(page));
-
-        const res = await apiFetch(`/api/catalog?${params.toString()}`);
-        const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
-        if (!res.ok) throw new Error(data.error || 'Erro ao carregar categoria');
+        const data = await fetchArchivePageCached(category, page);
 
         if (category === 'animes' && Array.isArray(data.featured) && data.featured.length > 0) {
           setFeaturedAnimes(data.featured);
@@ -1164,15 +1367,12 @@ export default function App() {
     async (opts: { genre?: string; year?: string; page: number; append: boolean }) => {
       setFilteredCatalog((prev) => ({ ...prev, loading: true }));
       try {
-        const params = new URLSearchParams();
-        params.set('category', archiveCategory);
-        params.set('page', String(opts.page));
-        if (opts.genre) params.set('genre', opts.genre);
-        else if (opts.year) params.set('year', opts.year);
-
-        const res = await apiFetch(`/api/catalog?${params.toString()}`);
-        const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
-        if (!res.ok) throw new Error(data.error || 'Erro ao aplicar filtro');
+        const data = await fetchFilteredCatalogCached({
+          category: archiveCategory,
+          genre: opts.genre,
+          year: opts.year,
+          page: opts.page,
+        });
 
         if (data.filters && data.filters.genres.length > 0) {
           setCatalogFilters(data.filters);
@@ -1202,14 +1402,9 @@ export default function App() {
       setLoadingWeeklyCalendar(true);
       setCalendarError('');
       try {
-        const params = new URLSearchParams({
-          mode: effectiveMode,
-          tz: String(tzOffsetMinutes),
+        const data = await fetchCalendarCached(effectiveMode, tzOffsetMinutes, {
+          refresh: options.refresh,
         });
-        if (options.refresh) params.set('refresh', '1');
-        const res = await apiFetch(`/api/calendar?${params.toString()}`);
-        const data = (await res.json()) as WeeklyCalendarResponse & { error?: string };
-        if (!res.ok) throw new Error(data.error || 'Erro ao carregar calendário no LiveChart.me.');
         if (Array.isArray(data.days) && data.days.length > 0) {
           setWeeklyCalendarDays(data.days);
           setSelectedCalendarDay((current) =>
@@ -1246,11 +1441,7 @@ export default function App() {
             : category === 'animes'
               ? 'tvshows'
               : 'all';
-        const res = await apiFetch(
-          `/api/glossary?term=${encodeURIComponent(term)}&type=${encodeURIComponent(type)}`
-        );
-        const data = (await res.json()) as GlossaryResponse & { error?: string };
-        if (!res.ok) throw new Error(data.error || 'Erro ao consultar índice alfabético');
+        const data = await fetchGlossaryCached(term, type);
         setFilteredCatalog({
           items: Array.isArray(data.items) ? data.items : [],
           currentPage: 1,
@@ -1292,9 +1483,7 @@ export default function App() {
     const nextPage = releasesPage + 1;
     setLoadingMoreReleases(true);
     try {
-      const res = await apiFetch(`/api/episodes?page=${nextPage}`);
-      const data = (await res.json()) as PaginatedCatalogResponse & { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Erro ao carregar mais episódios');
+      const data = await fetchReleasesPageCached(nextPage);
       setReleases((prev) => dedupeMediaItems([...prev, ...(data.items || [])]));
       setReleasesPage(data.currentPage || nextPage);
       setReleasesTotalPages(data.totalPages || releasesTotalPages);
@@ -1319,6 +1508,13 @@ export default function App() {
       void fetchWeeklyCalendar({ mode });
     },
     [fetchWeeklyCalendar, updateSettings]
+  );
+
+  const handleChangeCalendarLayout = useCallback(
+    (layout: CalendarLayout) => {
+      updateSettings({ calendarLayout: layout });
+    },
+    [updateSettings]
   );
 
   const handleSelectGenre = useCallback(
@@ -1405,9 +1601,7 @@ export default function App() {
       setSearchPage(1);
       setSearchTotalPages(1);
       try {
-        const res = await apiFetch(`/api/search?q=${encodeURIComponent(query)}&page=1`);
-        const data = (await res.json()) as PaginatedSearchResponse & { error?: string };
-        if (!res.ok) throw new Error(data.error || 'Erro na busca');
+        const data = await fetchSearchPageCached(query, 1);
         setSearchResults(Array.isArray(data.results) ? data.results : []);
         setSearchPage(data.currentPage || 1);
         setSearchTotalPages(data.totalPages || 1);
@@ -1426,11 +1620,7 @@ export default function App() {
     const nextPage = searchPage + 1;
     setLoadingMoreSearch(true);
     try {
-      const res = await apiFetch(
-        `/api/search?q=${encodeURIComponent(searchQuery)}&page=${nextPage}`
-      );
-      const data = (await res.json()) as PaginatedSearchResponse & { error?: string };
-      if (!res.ok) throw new Error(data.error || 'Erro ao carregar mais resultados');
+      const data = await fetchSearchPageCached(searchQuery, nextPage);
       setSearchResults((prev) =>
         dedupeSearchItems([...(prev || []), ...(data.results || [])])
       );
@@ -1443,38 +1633,73 @@ export default function App() {
     }
   }, [loadingMoreSearch, searchPage, searchQuery, searchTotalPages, showToast]);
 
-  const loadAnimeDetailsForRoute = useCallback(async (url: string, reqGen: number) => {
-    const cacheKey = normalizeTopAnimesUrl(url) || url;
-    const cached = animeDetailsCacheRef.current.get(cacheKey);
-    if (cached) {
-      setAnimeDetails(cached);
-      setLoadingDetail(false);
-      setDetailError('');
-      return;
-    }
-
-    setLoadingDetail(true);
-    setDetailError('');
-    setAnimeDetails(null);
-    try {
-      const res = await apiFetch(`/api/media?url=${encodeURIComponent(url)}`);
-      const data = await res.json();
-      if (navRequestGenRef.current !== reqGen) return;
-      if (!res.ok) throw new Error(data.error || 'Erro ao carregar detalhes do título');
-      const details = data as AnimeDetails;
-      animeDetailsCacheRef.current.set(cacheKey, details);
-      setAnimeDetails(details);
-    } catch (err) {
-      if (navRequestGenRef.current !== reqGen) return;
-      setDetailError(
-        err instanceof Error ? err.message : 'Falha ao carregar detalhes do título.'
-      );
-    } finally {
-      if (navRequestGenRef.current === reqGen) {
+  const loadAnimeDetailsForRoute = useCallback(
+    async (url: string, reqGen: number, seed?: MediaNavigationSeed) => {
+      preloadRouteChunk('anime');
+      const fullCached = getCachedAnimeDetailsFull(url);
+      if (fullCached) {
+        setAnimeDetails(fullCached);
+        setAnimeDetailStage('ready');
         setLoadingDetail(false);
+        setDetailError('');
+        return;
       }
-    }
-  }, []);
+
+      // Build the profile & episodes directly from TheTVDB (never flash provider artwork/metadata
+      // or raw unmerged provider episodes only to overwrite them moments later).
+      setLoadingDetail(true);
+      setDetailError('');
+      setAnimeDetails(null);
+      setAnimeDetailStage('seed');
+
+      const fallbackFav = !seed ? findMatchingFavorite(url, favoritesRef.current) : undefined;
+      const effectiveTitle = seed?.title || fallbackFav?.title;
+      const effectiveTvdbId = seed?.externalIds?.tvdbId ?? fallbackFav?.externalIds?.tvdbId;
+      const effectiveTvdbSlug = seed?.externalIds?.tvdbSlug || fallbackFav?.externalIds?.tvdbSlug;
+      const effectiveKind = seed?.kind ?? fallbackFav?.kind;
+      const effectiveYear = seed?.year || fallbackFav?.year;
+      const hints =
+        effectiveTitle || effectiveTvdbId || effectiveTvdbSlug || effectiveKind || effectiveYear
+          ? {
+              title: effectiveTitle,
+              tvdbId: effectiveTvdbId,
+              tvdbSlug: effectiveTvdbSlug,
+              kind: effectiveKind === 'episode' ? ('anime' as const) : effectiveKind,
+              year: effectiveYear,
+            }
+          : undefined;
+
+      try {
+        const fullDetails = await fetchAnimeDetailsFull(url, { hints });
+        if (navRequestGenRef.current !== reqGen) return;
+        setAnimeDetails(fullDetails);
+        setAnimeDetailStage('ready');
+      } catch (err) {
+        if (navRequestGenRef.current !== reqGen) return;
+        // Fallback strictly to the provider page if the primary TVDB-enriched request fails
+        if (!isAnisyncUri(url)) {
+          try {
+            const providerFallback = await fetchAnimeDetailsQuick(url);
+            if (navRequestGenRef.current !== reqGen) return;
+            setAnimeDetails(providerFallback);
+            setAnimeDetailStage('ready');
+            return;
+          } catch {
+            // Fall through and surface original error below
+          }
+        }
+        setDetailError(
+          err instanceof Error ? err.message : 'Falha ao carregar detalhes do título.'
+        );
+        setAnimeDetailStage('ready');
+      } finally {
+        if (navRequestGenRef.current === reqGen) {
+          setLoadingDetail(false);
+        }
+      }
+    },
+    []
+  );
 
   const resolveKnownEpisodeMeta = useCallback((targetUrl: string) => {
     const key = canonicalEpisodeProgressKey(targetUrl);
@@ -1502,6 +1727,8 @@ export default function App() {
           seriesTitle: currentAnime.title,
           seriesUrl: matchedTrack?.sourceUrl || currentAnime.url,
           poster: currentAnime.poster,
+          backdrop: matchedEp.thumb || currentAnime.backdrop || currentAnime.poster,
+          episodeLabel: matchedEp.numberLabel || undefined,
           isMovie: currentAnime.kind === 'movie',
         };
       }
@@ -1514,6 +1741,8 @@ export default function App() {
         seriesTitle: currentEp.seriesTitle,
         seriesUrl: currentEp.seriesUrl,
         poster: currentEp.backdrop || currentEp.poster,
+        backdrop: currentEp.backdrop || currentEp.poster,
+        episodeLabel: currentEp.episodeLabel,
         isMovie: currentEp.isMovie,
       };
     }
@@ -1527,6 +1756,8 @@ export default function App() {
         seriesTitle: histMatch.seriesTitle,
         seriesUrl: histMatch.seriesUrl,
         poster: histMatch.poster,
+        backdrop: histMatch.poster,
+        episodeLabel: undefined,
         isMovie: histMatch.kind === 'movie',
       };
     }
@@ -1540,6 +1771,8 @@ export default function App() {
         seriesTitle: undefined,
         seriesUrl: undefined,
         poster: relMatch.poster,
+        backdrop: relMatch.poster,
+        episodeLabel: relMatch.episodeLabel,
         isMovie: relMatch.kind === 'movie',
       };
     }
@@ -1551,9 +1784,13 @@ export default function App() {
     async (
       url: string,
       reqGen: number,
-      options: { bypassCache?: boolean; preserveExisting?: boolean } = {}
+      options: {
+        bypassCache?: boolean;
+        preserveExisting?: boolean;
+        seed?: MediaNavigationSeed;
+      } = {}
     ) => {
-      const epCacheKey = normalizeTopAnimesUrl(url) || url;
+      preloadRouteChunk('episode');
       const openedEpKey = canonicalEpisodeKey(url);
       if (openedEpKey) {
         const hasMatchingUnread = alertsRef.current.some(
@@ -1569,7 +1806,7 @@ export default function App() {
       }
       const knownMeta = resolveKnownEpisodeMeta(url);
       if (!options.bypassCache) {
-        const cachedEp = episodeDetailsCacheRef.current.get(epCacheKey);
+        const cachedEp = getCachedEpisodeDetails(url);
         if (cachedEp) {
           setEpisodeDetails(cachedEp);
           setLoadingDetail(false);
@@ -1577,38 +1814,67 @@ export default function App() {
           return;
         }
       } else {
-        episodeDetailsCacheRef.current.delete(epCacheKey);
+        deleteCachedEpisodeDetails(url);
       }
 
       setDetailError('');
       setLoadingDetail(true);
       setLoadingExtraServers(null);
       if (!options.preserveExisting) {
-        setEpisodeDetails(null);
+        const mergedSeed: MediaNavigationSeed | undefined =
+          options.seed || knownMeta
+            ? {
+                title: options.seed?.title || knownMeta?.title,
+                seriesTitle: options.seed?.seriesTitle || knownMeta?.seriesTitle,
+                seriesUrl: options.seed?.seriesUrl || knownMeta?.seriesUrl,
+                poster: options.seed?.poster || knownMeta?.poster,
+                backdrop: options.seed?.backdrop || knownMeta?.backdrop || options.seed?.poster,
+                episodeLabel: options.seed?.episodeLabel || knownMeta?.episodeLabel,
+                seasonNumber: options.seed?.seasonNumber,
+                episodeNumber: options.seed?.episodeNumber,
+                prevUrl: options.seed?.prevUrl,
+                nextUrl: options.seed?.nextUrl,
+                kind: options.seed?.kind,
+                isMovie: options.seed?.isMovie ?? knownMeta?.isMovie,
+                year: options.seed?.year,
+                genres: options.seed?.genres,
+                externalIds: options.seed?.externalIds,
+                catalogSource: options.seed?.catalogSource,
+              }
+            : undefined;
+        const optimisticEp = buildOptimisticEpisodeDetails(
+          url,
+          mergedSeed,
+          animeDetailsRef.current
+        );
+        setEpisodeDetails(optimisticEp);
       }
       try {
-        const res = await apiFetch('/api/episode', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url,
-            sources: settingsRef.current.episodeSources,
-            audioPreference: settingsRef.current.defaultAudioFilter,
-            deferCrossSources: !options.bypassCache,
-          }),
+        const rawEp = await fetchEpisodeDetailsFast(url, {
+          sources: settingsRef.current.episodeSources,
+          audioPreference: settingsRef.current.defaultAudioFilter,
+          deferCrossSources: !options.bypassCache,
+          bypassCache: options.bypassCache,
         });
-        const data = await res.json();
         if (navRequestGenRef.current !== reqGen) return;
-        if (!res.ok) throw new Error(data.error || 'Erro ao consultar fontes do episódio');
-        const rawEp = data as EpisodeDetails;
         const ep: EpisodeDetails = {
           ...rawEp,
-          seriesTitle: rawEp.seriesTitle || knownMeta?.seriesTitle || rawEp.title,
-          seriesUrl: rawEp.seriesUrl || knownMeta?.seriesUrl || '',
-          poster: rawEp.poster || knownMeta?.poster || '',
-          backdrop: rawEp.backdrop || rawEp.poster || knownMeta?.poster || '',
+          seriesTitle:
+            rawEp.seriesTitle ||
+            options.seed?.seriesTitle ||
+            knownMeta?.seriesTitle ||
+            rawEp.title,
+          seriesUrl: rawEp.seriesUrl || options.seed?.seriesUrl || knownMeta?.seriesUrl || '',
+          poster: rawEp.poster || options.seed?.poster || knownMeta?.poster || '',
+          backdrop:
+            rawEp.backdrop ||
+            rawEp.poster ||
+            options.seed?.backdrop ||
+            knownMeta?.backdrop ||
+            knownMeta?.poster ||
+            '',
         };
-        episodeDetailsCacheRef.current.set(epCacheKey, ep);
+        setCachedEpisodeDetails(url, ep);
         setEpisodeDetails(ep);
 
         // Augment with secondary integrated servers (e.g. Hinata Soul) in the background
@@ -1690,9 +1956,9 @@ export default function App() {
                   };
                 };
 
-                const cachedNow = episodeDetailsCacheRef.current.get(epCacheKey);
+                const cachedNow = getCachedEpisodeDetails(url);
                 if (cachedNow) {
-                  episodeDetailsCacheRef.current.set(epCacheKey, mergeEpisode(cachedNow));
+                  setCachedEpisodeDetails(url, mergeEpisode(cachedNow));
                 }
                 setEpisodeDetails((prev) =>
                   prev && isSameEpisodeUrl(prev.url, ep.url) ? mergeEpisode(prev) : prev
@@ -1945,13 +2211,17 @@ export default function App() {
   }, []);
 
   const openMediaUrl = useCallback(
-    async (url: string, explicitKind?: MediaKind) => {
+    async (url: string, explicitKind?: MediaKind, seed?: MediaNavigationSeed) => {
       const parsed = parseAnisyncUri(url);
       const inferredKind: MediaKind = explicitKind || inferMediaKindFromTarget(url);
       const opensDetailPage =
         parsed.kind === 'media' ||
         (parsed.kind === 'legacy-url' &&
           (inferredKind === 'anime' || inferredKind === 'series'));
+
+      if (routeRef.current.view === 'catalog' && typeof window !== 'undefined') {
+        catalogScrollYRef.current = window.scrollY;
+      }
 
       const reqGen = ++navRequestGenRef.current;
       const nextFrame: ActiveRoute = opensDetailPage
@@ -1965,15 +2235,130 @@ export default function App() {
       pushBrowserHistoryIfNeeded(prevStack.length, nextStack.length);
 
       if (opensDetailPage) {
-        await loadAnimeDetailsForRoute(url, reqGen);
+        await loadAnimeDetailsForRoute(url, reqGen, seed);
         return;
       }
 
       const preserveExisting = routeRef.current.view === 'episode';
-      await loadEpisodeDetailsForRoute(url, reqGen, { preserveExisting });
+      await loadEpisodeDetailsForRoute(url, reqGen, { preserveExisting, seed });
     },
     [loadAnimeDetailsForRoute, loadEpisodeDetailsForRoute, pushBrowserHistoryIfNeeded]
   );
+
+  const handlePrefetchAnime = useCallback(
+    (animeUrl: string, seed?: MediaNavigationSeed) => {
+      prefetchAnimeTarget(animeUrl, seed, { intentTriggered: true });
+    },
+    []
+  );
+
+  const handlePrefetchEpisode = useCallback(
+    (
+      episodeUrl: string,
+      seed?: MediaNavigationSeed,
+      options?: { preResolvePrimaryEmbed?: boolean }
+    ) => {
+      prefetchEpisodeTarget(episodeUrl, {
+        seed,
+        sources: settingsRef.current.episodeSources,
+        audioPreference: settingsRef.current.defaultAudioFilter,
+        preResolvePrimaryEmbed: options?.preResolvePrimaryEmbed ?? true,
+        intentTriggered: true,
+      });
+    },
+    []
+  );
+
+  const handlePrefetchItem = useCallback(
+    (url: string, explicitKind?: MediaKind, seed?: MediaNavigationSeed) => {
+      if (!url) return;
+      const parsed = parseAnisyncUri(url);
+      const inferredKind: MediaKind = explicitKind || inferMediaKindFromTarget(url);
+      const opensDetailPage =
+        parsed.kind === 'media' ||
+        (parsed.kind === 'legacy-url' &&
+          (inferredKind === 'anime' || inferredKind === 'series'));
+
+      if (opensDetailPage) {
+        handlePrefetchAnime(url, seed);
+      } else {
+        handlePrefetchEpisode(url, seed, { preResolvePrimaryEmbed: true });
+      }
+    },
+    [handlePrefetchAnime, handlePrefetchEpisode]
+  );
+
+  const handlePrefetchArchiveCategory = useCallback((category: CatalogArchiveCategory) => {
+    prefetchArchiveCategoryTarget(category, 1, { intentTriggered: true });
+  }, []);
+
+  const handlePrefetchCalendarMode = useCallback((mode: LiveChartScheduleMode) => {
+    prefetchCalendarTarget(mode, { intentTriggered: true });
+  }, []);
+
+  const handlePrefetchSection = useCallback(
+    (section: NavSection) => {
+      if (section === 'calendar') {
+        prefetchCalendarTarget(settingsRef.current.calendarScheduleMode, { intentTriggered: true });
+      } else if (section === 'catalog') {
+        prefetchArchiveCategoryTarget(archiveCategory, 1, { intentTriggered: true });
+      } else if (section === 'releases') {
+        prefetchReleasesPageTarget(1, { intentTriggered: true });
+      }
+    },
+    [archiveCategory]
+  );
+
+  const handlePrefetchMoreReleases = useCallback(() => {
+    if (releasesPage >= releasesTotalPages) return;
+    prefetchReleasesPageTarget(releasesPage + 1, { intentTriggered: true });
+  }, [releasesPage, releasesTotalPages]);
+
+  const handlePrefetchMoreArchive = useCallback(
+    (category: CatalogArchiveCategory) => {
+      const bucket = archiveState[category];
+      if (!bucket || bucket.currentPage >= bucket.totalPages) return;
+      prefetchArchiveCategoryTarget(category, bucket.currentPage + 1, { intentTriggered: true });
+    },
+    [archiveState]
+  );
+
+  const handlePrefetchMoreFiltered = useCallback(() => {
+    if (
+      filteredCatalog.currentPage >= filteredCatalog.totalPages ||
+      (!selectedGenre && !selectedYear)
+    ) {
+      return;
+    }
+    const nextPage = filteredCatalog.currentPage + 1;
+    scheduleBackgroundPrefetch(
+      `filtered:${archiveCategory}:${selectedGenre}:${selectedYear}:p${nextPage}`,
+      () =>
+        fetchFilteredCatalogCached({
+          category: archiveCategory,
+          genre: selectedGenre || undefined,
+          year: selectedYear || undefined,
+          page: nextPage,
+        }),
+      { intentTriggered: true }
+    );
+  }, [
+    archiveCategory,
+    filteredCatalog.currentPage,
+    filteredCatalog.totalPages,
+    selectedGenre,
+    selectedYear,
+  ]);
+
+  const handlePrefetchMoreSearch = useCallback(() => {
+    if (!searchQuery || searchPage >= searchTotalPages) return;
+    const nextPage = searchPage + 1;
+    scheduleBackgroundPrefetch(
+      `search:${searchQuery.trim().toLowerCase()}:p${nextPage}`,
+      () => fetchSearchPageCached(searchQuery, nextPage),
+      { intentTriggered: true }
+    );
+  }, [searchPage, searchQuery, searchTotalPages]);
 
   const toggleFavorite = useCallback(
     (rawItem: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => {
@@ -2094,7 +2479,15 @@ export default function App() {
         saveFavoriteAlerts(next);
         return next;
       });
-      void openMediaUrl(alert.episodeUrl, 'episode');
+      void openMediaUrl(alert.episodeUrl, 'episode', {
+        title: alert.episodeTitle || `${alert.animeTitle} — ${alert.episodeLabel}`,
+        seriesTitle: alert.animeTitle,
+        seriesUrl: alert.animeUrl,
+        poster: alert.poster,
+        backdrop: alert.poster,
+        episodeLabel: alert.episodeLabel,
+        kind: 'episode',
+      });
     },
     [openMediaUrl]
   );
@@ -2506,11 +2899,56 @@ export default function App() {
     handleRefreshEpisodeSources,
   ]);
 
+  const pageScopeKey =
+    route.view === 'catalog'
+      ? `catalog:${activeSection}:${archiveCategory}:${selectedGenre}:${selectedYear}:${selectedGlossary}:${searchQuery}`
+      : `${route.view}:${route.url}`;
+
+  const { documentLoading, pendingVisibleImages } = usePageImagesPending(mainRef, pageScopeKey);
+
+  const isEpisodeExtraServersActive = Boolean(
+    route.view === 'episode' &&
+      episodeDetails &&
+      loadingExtraServers &&
+      isSameEpisodeUrl(loadingExtraServers.episodeUrl, episodeDetails.url)
+  );
+
+  const isPageLoadingRaw = isActivePageLoading({
+    routeView: route.view,
+    activeSection,
+    documentLoading,
+    routeChunkLoading,
+    loadingCatalog,
+    loadingInitialReleases,
+    loadingMoreReleases,
+    loadingWeeklyCalendar,
+    weeklyCalendarInitialized,
+    hasCalendarError: Boolean(calendarError),
+    loadingArchiveCategory: archiveState[archiveCategory].loading,
+    archiveCategoryInitialized: archiveState[archiveCategory].initialized,
+    hasActiveCatalogFilter: Boolean(selectedGenre || selectedYear || selectedGlossary),
+    loadingFilteredCatalog: filteredCatalog.loading,
+    searching,
+    loadingMoreSearch,
+    loadingRandom,
+    loadingDetail,
+    animeDetailStage,
+    animeViewHydrating,
+    loadingExtraServers: isEpisodeExtraServersActive,
+    episodeViewLoading,
+    pendingVisibleImages,
+  });
+
+  const isHeaderBusy = useSettledLoadingIndicator(isPageLoadingRaw);
+
   return (
     <div className="min-h-screen bg-[#0d0f12] text-[#f1f5f9]">
       <Header
         activeSection={activeSection}
+        isBusy={isHeaderBusy}
         onSelectSection={handleSelectSection}
+        onPrefetchSection={handlePrefetchSection}
+        onPrefetchSettings={() => preloadRouteChunk('settings')}
         onGoHome={() => handleSelectSection('releases')}
         alerts={alerts}
         unreadCount={unreadAlertCount}
@@ -2544,13 +2982,14 @@ export default function App() {
         </div>
       )}
 
-      <main className="pb-24 md:pb-16">
-        {route.view === 'catalog' && (
+      <main ref={mainRef} className="pb-24 md:pb-16">
+        <div className={route.view === 'catalog' ? '' : 'hidden'} aria-hidden={route.view !== 'catalog'}>
           <CatalogView
             catalog={catalog}
             loading={loadingCatalog}
             error={catalogError}
             activeSection={activeSection}
+            isHidden={route.view !== 'catalog'}
             searchQuery={searchQuery}
             searchResults={searchResults}
             searching={searching}
@@ -2574,6 +3013,7 @@ export default function App() {
             weeklyCalendarDays={weeklyCalendarDays}
             selectedCalendarDay={selectedCalendarDay}
             calendarScheduleMode={settings.calendarScheduleMode}
+            calendarLayout={settings.calendarLayout}
             loadingWeeklyCalendar={loadingWeeklyCalendar}
             calendarError={calendarError}
             favorites={favorites}
@@ -2603,8 +3043,16 @@ export default function App() {
             onLoadMoreFiltered={handleLoadMoreFiltered}
             onSelectCalendarDay={setSelectedCalendarDay}
             onChangeCalendarScheduleMode={handleChangeCalendarScheduleMode}
+            onChangeCalendarLayout={handleChangeCalendarLayout}
             onRefreshCalendar={() => void fetchWeeklyCalendar({ refresh: true })}
             onOpenItem={openMediaUrl}
+            onPrefetchItem={handlePrefetchItem}
+            onPrefetchArchiveCategory={handlePrefetchArchiveCategory}
+            onPrefetchCalendarMode={handlePrefetchCalendarMode}
+            onPrefetchMoreReleases={handlePrefetchMoreReleases}
+            onPrefetchMoreArchive={handlePrefetchMoreArchive}
+            onPrefetchMoreFiltered={handlePrefetchMoreFiltered}
+            onPrefetchMoreSearch={handlePrefetchMoreSearch}
             onToggleFavorite={toggleFavorite}
             onToggleMuteFavorite={handleToggleMuteFavorite}
             onCheckFavoriteUpdates={() => void checkFavoriteUpdates({ manual: true })}
@@ -2628,14 +3076,61 @@ export default function App() {
             defaultAudioFilter={settings.defaultAudioFilter}
             watchedEpisodeKeys={watchedEpisodeKeys}
           />
-        )}
+        </div>
 
         {route.view === 'anime' && (
           <>
             {loadingDetail && !animeDetails ? (
-              <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
-                <div className="h-64 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
-                <div className="h-40 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
+              <div
+                data-anime-profile-skeleton="true"
+                aria-label="Carregando perfil do anime no TheTVDB"
+                className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8"
+              >
+                <div className="mb-5 flex items-center justify-between gap-3">
+                  <button
+                    type="button"
+                    onClick={() => navigateBackStep()}
+                    className="inline-flex items-center gap-2 text-sm font-medium text-slate-400 transition-colors hover:text-white"
+                  >
+                    <ArrowLeft className="h-4 w-4" />
+                    <span>Voltar</span>
+                  </button>
+                </div>
+
+                <div className="overflow-hidden rounded-2xl border border-white/10 bg-[#151921]">
+                  <div className="md:grid md:grid-cols-[230px_1fr] md:items-start md:gap-6 md:p-6 lg:grid-cols-[250px_1fr] lg:gap-8 lg:p-7 xl:grid-cols-[264px_1fr]">
+                    <div className="anisync-shimmer aspect-[4/5] w-full bg-[#0d0f12] md:aspect-[2/3] md:rounded-xl" />
+                    <div className="space-y-4 px-4 pb-5 pt-4 sm:px-6 sm:pb-6 md:p-0">
+                      <div className="space-y-2.5">
+                        <div className="anisync-shimmer h-7 w-2/3 rounded-lg" />
+                        <div className="anisync-shimmer h-4 w-1/2 rounded" />
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          <div className="anisync-shimmer h-6 w-16 rounded-full" />
+                          <div className="anisync-shimmer h-6 w-20 rounded-full" />
+                          <div className="anisync-shimmer h-6 w-20 rounded-full" />
+                          <div className="anisync-shimmer h-6 w-16 rounded-full" />
+                        </div>
+                      </div>
+                      <div className="space-y-2 border-t border-white/10 pt-3.5">
+                        <div className="anisync-shimmer h-3.5 w-full rounded" />
+                        <div className="anisync-shimmer h-3.5 w-11/12 rounded" />
+                        <div className="anisync-shimmer h-3.5 w-4/5 rounded" />
+                      </div>
+                      <div className="anisync-shimmer h-32 rounded-xl border border-white/8" />
+                      <div className="flex gap-2.5 pt-1">
+                        <div className="anisync-shimmer h-11 w-44 rounded-xl" />
+                        <div className="anisync-shimmer h-11 w-28 rounded-xl" />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="mt-8 space-y-3">
+                  <div className="anisync-shimmer h-6 w-36 rounded-lg" />
+                  <div className="anisync-shimmer h-20 rounded-xl border border-white/8" />
+                  <div className="anisync-shimmer h-20 rounded-xl border border-white/8" />
+                  <div className="anisync-shimmer h-20 rounded-xl border border-white/8" />
+                </div>
               </div>
             ) : detailError && !animeDetails ? (
               <div className="mx-auto max-w-2xl px-4 py-12 text-center">
@@ -2653,10 +3148,12 @@ export default function App() {
             ) : animeDetails ? (
               <Suspense
                 fallback={
-                  <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
-                    <div className="h-64 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
-                    <div className="h-44 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
-                  </div>
+                  <RouteSuspenseFallback onPendingChange={setRouteChunkLoading}>
+                    <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
+                      <div className="anisync-shimmer h-64 rounded-2xl border border-white/8" />
+                      <div className="anisync-shimmer h-44 rounded-xl border border-white/8" />
+                    </div>
+                  </RouteSuspenseFallback>
                 }
               >
                 <AnimeDetailView
@@ -2665,6 +3162,12 @@ export default function App() {
                   isMuted={isFavoriteMuted(animeDetails.url, mutedFavoriteUrls)}
                   watchedUrls={watchedUrls}
                   progressMap={progressMap}
+                  loadingStage={animeDetailStage}
+                  detailError={detailError}
+                  onRetryDetail={() => {
+                    const reqGen = ++navRequestGenRef.current;
+                    void loadAnimeDetailsForRoute(animeDetails.url, reqGen);
+                  }}
                   onToggleFavorite={toggleFavorite}
                   onToggleMuteFavorite={handleToggleMuteFavorite}
                   onToggleEpisodesWatched={(eps, watched, label) =>
@@ -2673,8 +3176,11 @@ export default function App() {
                       toastMessage: label,
                     })
                   }
-                  onOpenEpisode={(epUrl) => openMediaUrl(epUrl, 'episode')}
-                  onOpenAnime={(animeUrl) => void openMediaUrl(animeUrl, 'anime')}
+                  onOpenEpisode={(epUrl, seed) => openMediaUrl(epUrl, 'episode', seed)}
+                  onOpenAnime={(animeUrl, seed) => void openMediaUrl(animeUrl, 'anime', seed)}
+                  onPrefetchEpisode={handlePrefetchEpisode}
+                  onPrefetchAnime={handlePrefetchAnime}
+                  onLoadingStateChange={setAnimeViewHydrating}
                   onBack={() => navigateBackStep()}
                 />
               </Suspense>
@@ -2685,9 +3191,9 @@ export default function App() {
         {route.view === 'episode' && (
           <>
             {loadingDetail && !episodeDetails ? (
-              <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
-                <div className="aspect-video animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
-                <div className="h-44 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
+              <div className="mx-auto max-w-5xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
+                <div className="anisync-shimmer aspect-video rounded-xl border border-white/8" />
+                <div className="anisync-shimmer h-44 rounded-xl border border-white/8" />
               </div>
             ) : detailError && !episodeDetails ? (
               <div className="mx-auto max-w-2xl px-4 py-12 text-center">
@@ -2705,10 +3211,12 @@ export default function App() {
             ) : episodeDetails ? (
               <Suspense
                 fallback={
-                  <div className="mx-auto max-w-7xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
-                    <div className="aspect-video animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
-                    <div className="h-44 animate-pulse rounded-xl border border-white/8 bg-[#151921]" />
-                  </div>
+                  <RouteSuspenseFallback onPendingChange={setRouteChunkLoading}>
+                    <div className="mx-auto max-w-5xl space-y-4 px-4 py-8 sm:px-6 lg:px-8">
+                      <div className="anisync-shimmer aspect-video rounded-xl border border-white/8" />
+                      <div className="anisync-shimmer h-44 rounded-xl border border-white/8" />
+                    </div>
+                  </RouteSuspenseFallback>
                 }
               >
                 {(() => {
@@ -2724,6 +3232,10 @@ export default function App() {
                       isFavorite={isItemFavorited(
                         episodeDetails.seriesUrl || episodeDetails.url,
                         favorites
+                      )}
+                      isMuted={isFavoriteMuted(
+                        episodeDetails.seriesUrl || episodeDetails.url,
+                        mutedFavoriteUrls
                       )}
                       watchedUrls={watchedUrls}
                       progressMap={progressMap}
@@ -2751,6 +3263,7 @@ export default function App() {
                       : []
                   }
                   onToggleFavorite={toggleFavorite}
+                  onToggleMuteFavorite={handleToggleMuteFavorite}
                   onToggleEpisodeWatched={(ep, watched) =>
                     handleToggleEpisodesWatched(
                       [
@@ -2768,6 +3281,8 @@ export default function App() {
                   }
                   onBack={() => navigateBackStep()}
                   onNavigateUrl={openMediaUrl}
+                  onPrefetchEpisode={handlePrefetchEpisode}
+                  onPrefetchAnime={handlePrefetchAnime}
                   onRefreshSources={handleRefreshEpisodeSources}
                   onNativeSessionSync={(result) => {
                     syncNativeSessionResult(result, {
@@ -2795,6 +3310,7 @@ export default function App() {
                   autoPlayNextEpisode={settings.autoPlayNextEpisode}
                   videoScale={settings.videoScale}
                   onChangeVideoScale={(videoScale) => updateSettings({ videoScale })}
+                  onLoadingStateChange={setEpisodeViewLoading}
                 />
                   );
                 })()}
@@ -2808,6 +3324,7 @@ export default function App() {
         activeSection={activeSection}
         unreadCount={unreadAlertCount}
         onSelectSection={handleSelectSection}
+        onPrefetchSection={handlePrefetchSection}
       />
 
       {settingsOpen && (

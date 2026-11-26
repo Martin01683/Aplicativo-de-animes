@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDownNarrowWide,
   ArrowLeft,
@@ -22,6 +22,7 @@ import {
   Layers,
   Play,
   Radio,
+  RefreshCw,
   Search,
   Server,
   SkipForward,
@@ -31,6 +32,10 @@ import {
 } from 'lucide-react';
 import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
 import {
+  buildAnimeInfoMetaItems,
+  resolveAnimeHeroAudioBadges,
+} from '../lib/animeInfoMeta';
+import {
   formatEpisodeCardBadge,
   formatEpisodeCardTitle,
   formatEpisodeCountdown,
@@ -38,8 +43,9 @@ import {
   formatEpisodeReleaseDate,
   isEpisodeAvailableOnServer,
   isEpisodeUncensored,
+  pickImageWithFallback,
 } from '../lib/episodeAvailability';
-import { normalizeTopAnimesUrl, pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
+import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
 import {
   canonicalEpisodeProgressKey,
   formatPlaybackTimestamp,
@@ -48,6 +54,14 @@ import {
   isEpisodeMarkedWatched,
   type EpisodeProgressMap,
 } from '../lib/playbackProgress';
+import {
+  buildSeedFromAnimeEpisode,
+  getCachedAnimeSynopsis,
+  readCachedEpisodeTitles,
+  setCachedAnimeSynopsis,
+  writeCachedEpisodeTitles,
+  type MediaNavigationSeed,
+} from '../lib/prefetchCache';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
@@ -57,12 +71,17 @@ import type {
 } from '../lib/types';
 import { MediaPoster } from './MediaPoster';
 
+export type AnimeDetailLoadingStage = 'idle' | 'seed' | 'quick' | 'ready';
+
 interface AnimeDetailViewProps {
   anime: AnimeDetails;
   isFavorite: boolean;
   isMuted?: boolean;
   watchedUrls: Set<string>;
   progressMap?: EpisodeProgressMap;
+  loadingStage?: AnimeDetailLoadingStage;
+  detailError?: string;
+  onRetryDetail?: () => void;
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
   onToggleMuteFavorite?: (animeUrl: string) => void;
   onToggleEpisodesWatched: (
@@ -70,8 +89,11 @@ interface AnimeDetailViewProps {
     watched: boolean,
     label?: string
   ) => void;
-  onOpenEpisode: (episodeUrl: string) => void;
-  onOpenAnime?: (animeUrl: string) => void;
+  onOpenEpisode: (episodeUrl: string, seed?: MediaNavigationSeed) => void;
+  onOpenAnime?: (animeUrl: string, seed?: MediaNavigationSeed) => void;
+  onPrefetchEpisode?: (episodeUrl: string, seed?: MediaNavigationSeed) => void;
+  onPrefetchAnime?: (animeUrl: string, seed?: MediaNavigationSeed) => void;
+  onLoadingStateChange?: (loading: boolean) => void;
   onBack: () => void;
 }
 
@@ -81,16 +103,23 @@ export function AnimeDetailView({
   isMuted = false,
   watchedUrls,
   progressMap,
+  loadingStage = 'ready',
+  detailError = '',
+  onRetryDetail,
   onToggleFavorite,
   onToggleMuteFavorite,
   onToggleEpisodesWatched,
   onOpenEpisode,
   onOpenAnime,
+  onPrefetchEpisode,
+  onPrefetchAnime,
+  onLoadingStateChange,
   onBack,
 }: AnimeDetailViewProps) {
   const [episodeFilter, setEpisodeFilter] = useState('');
   const [sortDesc, setSortDesc] = useState(false);
   const [synopsisExpandedUrl, setSynopsisExpandedUrl] = useState('');
+  const [failedHeroImageUrls, setFailedHeroImageUrls] = useState<string[]>([]);
   const [selectedAudioState, setSelectedAudioState] = useState<{
     animeUrl: string;
     audio: 'DUB' | 'LEG';
@@ -104,12 +133,16 @@ export function AnimeDetailView({
     overrides: Record<number, boolean>;
   }>({ animeUrl: '', overrides: {} });
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const synopsisCacheRef = useRef<Map<string, AnimeSynopsisResult | null>>(new Map());
   const [localizedSynopsisState, setLocalizedSynopsisState] = useState<{
     animeUrl: string;
     loading: boolean;
     result: AnimeSynopsisResult | null;
-  }>({ animeUrl: '', loading: false, result: null });
+  }>(() => {
+    const cached = getCachedAnimeSynopsis(anime.url);
+    return cached.hit
+      ? { animeUrl: anime.url, loading: false, result: cached.value }
+      : { animeUrl: '', loading: false, result: null };
+  });
   const [hydratedTitlesState, setHydratedTitlesState] = useState<{
     animeUrl: string;
     byId: Record<number, string>;
@@ -119,6 +152,46 @@ export function AnimeDetailView({
     animeUrl: '',
     ids: new Set(),
   });
+  const epHoverTimerRef = useRef<number | null>(null);
+
+  const scheduleEpisodeHoverPrefetch = useCallback(
+    (episodeUrl: string, seed?: MediaNavigationSeed) => {
+      if (!onPrefetchEpisode || !episodeUrl) return;
+      if (epHoverTimerRef.current !== null) {
+        window.clearTimeout(epHoverTimerRef.current);
+      }
+      epHoverTimerRef.current = window.setTimeout(() => {
+        epHoverTimerRef.current = null;
+        onPrefetchEpisode(episodeUrl, seed);
+      }, 85);
+    },
+    [onPrefetchEpisode]
+  );
+
+  const cancelEpisodeHoverPrefetch = useCallback(() => {
+    if (epHoverTimerRef.current !== null) {
+      window.clearTimeout(epHoverTimerRef.current);
+      epHoverTimerRef.current = null;
+    }
+  }, []);
+
+  const triggerImmediateEpisodePrefetch = useCallback(
+    (episodeUrl: string, seed?: MediaNavigationSeed) => {
+      cancelEpisodeHoverPrefetch();
+      if (onPrefetchEpisode && episodeUrl) {
+        onPrefetchEpisode(episodeUrl, seed);
+      }
+    },
+    [cancelEpisodeHoverPrefetch, onPrefetchEpisode]
+  );
+
+  useEffect(() => {
+    return () => {
+      if (epHoverTimerRef.current !== null) {
+        window.clearTimeout(epHoverTimerRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     setEpisodeFilter('');
@@ -127,34 +200,62 @@ export function AnimeDetailView({
 
   // Fetch TheTVDB anime synopsis (PT-BR -> Google Translate -> EN fallback) & artwork when needed
   useEffect(() => {
+    // Wait until real server/enriched metadata arrives before requesting TheTVDB synopsis
+    if (loadingStage === 'seed' || loadingStage === 'quick') {
+      const cached = getCachedAnimeSynopsis(anime.url);
+      if (cached.hit) {
+        setLocalizedSynopsisState({
+          animeUrl: anime.url,
+          loading: false,
+          result: cached.value,
+        });
+      }
+      return;
+    }
+
     const alreadyLocalizedFromTvdb =
       Boolean(anime.synopsis && anime.synopsis.trim()) &&
       (anime.synopsisSource === 'thetvdb-pt-br' ||
         anime.synopsisSource === 'thetvdb-google-translate');
 
     if (alreadyLocalizedFromTvdb) {
+      const result: AnimeSynopsisResult = {
+        synopsis: anime.synopsis,
+        language: anime.synopsisLanguage || 'pt-BR',
+        source: anime.synopsisSource!,
+        poster: anime.poster || undefined,
+        backdrop: anime.backdrop || undefined,
+        tvdbId: anime.externalIds?.tvdbId,
+        tvdbSlug: anime.externalIds?.tvdbSlug,
+      };
+      setCachedAnimeSynopsis(anime.url, result);
       setLocalizedSynopsisState({
         animeUrl: anime.url,
         loading: false,
-        result: {
-          synopsis: anime.synopsis,
-          language: anime.synopsisLanguage || 'pt-BR',
-          source: anime.synopsisSource!,
-          poster: anime.poster || undefined,
-          backdrop: anime.backdrop || undefined,
-          tvdbId: anime.externalIds?.tvdbId,
-          tvdbSlug: anime.externalIds?.tvdbSlug,
-        },
+        result,
       });
       return;
     }
 
-    const cacheKey = normalizeTopAnimesUrl(anime.url) || anime.url;
-    if (synopsisCacheRef.current.has(cacheKey)) {
+    // Backend already resolved the profile directly from TheTVDB and found no untranslated EN synopsis
+    if (
+      anime.enrichmentSources?.includes('thetvdb') &&
+      anime.synopsisSource !== 'thetvdb-en'
+    ) {
       setLocalizedSynopsisState({
         animeUrl: anime.url,
         loading: false,
-        result: synopsisCacheRef.current.get(cacheKey) ?? null,
+        result: null,
+      });
+      return;
+    }
+
+    const cached = getCachedAnimeSynopsis(anime.url);
+    if (cached.hit) {
+      setLocalizedSynopsisState({
+        animeUrl: anime.url,
+        loading: false,
+        result: cached.value,
       });
       return;
     }
@@ -185,7 +286,7 @@ export function AnimeDetailView({
       .then((payload: { result?: AnimeSynopsisResult | null } | null) => {
         if (cancelled) return;
         const resolvedResult = payload?.result ?? null;
-        synopsisCacheRef.current.set(cacheKey, resolvedResult);
+        setCachedAnimeSynopsis(anime.url, resolvedResult);
         setLocalizedSynopsisState({
           animeUrl: anime.url,
           loading: false,
@@ -207,6 +308,7 @@ export function AnimeDetailView({
     };
   }, [
     anime.backdrop,
+    anime.enrichmentSources,
     anime.externalIds?.tvdbId,
     anime.externalIds?.tvdbSlug,
     anime.kind,
@@ -218,15 +320,52 @@ export function AnimeDetailView({
     anime.title,
     anime.url,
     anime.year,
+    loadingStage,
   ]);
 
   const scopedSynopsis =
     localizedSynopsisState.animeUrl === anime.url
       ? localizedSynopsisState
-      : { loading: false, result: null };
+      : (() => {
+          const cached = getCachedAnimeSynopsis(anime.url);
+          return cached.hit
+            ? { loading: false, result: cached.value }
+            : { loading: false, result: null };
+        })();
   const tvdbAnimeSynopsis = scopedSynopsis.result;
-  const effectivePoster = tvdbAnimeSynopsis?.poster || anime.poster;
-  const effectiveBackdrop = tvdbAnimeSynopsis?.backdrop || anime.backdrop || effectivePoster;
+  const effectivePoster =
+    tvdbAnimeSynopsis?.poster || anime.poster || anime.fallbackPoster || '';
+  const effectiveBackdrop =
+    tvdbAnimeSynopsis?.backdrop ||
+    anime.backdrop ||
+    anime.fallbackBackdrop ||
+    effectivePoster;
+  const heroPosterSrc = pickImageWithFallback(
+    [
+      tvdbAnimeSynopsis?.poster,
+      anime.poster,
+      anime.fallbackPoster,
+      tvdbAnimeSynopsis?.backdrop,
+      anime.backdrop,
+      anime.fallbackBackdrop,
+    ],
+    failedHeroImageUrls
+  );
+  const heroBackdropSrc = pickImageWithFallback(
+    [
+      tvdbAnimeSynopsis?.backdrop,
+      anime.backdrop,
+      anime.fallbackBackdrop,
+      tvdbAnimeSynopsis?.poster,
+      anime.poster,
+      anime.fallbackPoster,
+    ],
+    failedHeroImageUrls
+  );
+  const markHeroImageFailed = (failedUrl: string) => {
+    if (!failedUrl) return;
+    setFailedHeroImageUrls((prev) => (prev.includes(failedUrl) ? prev : [...prev, failedUrl]));
+  };
 
   const isMovie = anime.kind === 'movie';
   const isSeries = anime.kind === 'series';
@@ -246,7 +385,7 @@ export function AnimeDetailView({
     hasBothAudioTracks && selectedAudioState.animeUrl === anime.url
       ? selectedAudioState.audio
       : defaultAudioTrack;
-  const effectiveAudioType = hasBothAudioTracks ? activeAudioTab : anime.audioType;
+  const heroAudioBadges = useMemo(() => resolveAnimeHeroAudioBadges(anime), [anime]);
   const activeEpisodes = useMemo(
     () =>
       hasBothAudioTracks
@@ -329,9 +468,56 @@ export function AnimeDetailView({
     return exists ? selectedSeasonState.season : 'all';
   }, [anime.url, baseSeasonGroups, selectedSeasonState.animeUrl, selectedSeasonState.season]);
 
+  // Eagerly hydrate official TheTVDB PT-BR episode titles via /api/episode-titles as soon as
+  // the anime profile opens (in 28-episode batches) so titles never swap visibly when expanding seasons.
+  const allUnlocalizedEpisodeIds = useMemo(() => {
+    if (isMovie) return [] as number[];
+    const ids: number[] = [];
+    const seen = new Set<number>();
+    const sources = [
+      anime.episodes,
+      dubTrack?.episodes || [],
+      legTrack?.episodes || [],
+    ];
+    for (const list of sources) {
+      for (const ep of list) {
+        if (
+          ep.titleLocalized ||
+          !ep.tvdbEpisodeId ||
+          ep.tvdbEpisodeId <= 0 ||
+          seen.has(ep.tvdbEpisodeId)
+        ) {
+          continue;
+        }
+        seen.add(ep.tvdbEpisodeId);
+        ids.push(ep.tvdbEpisodeId);
+      }
+    }
+    return ids;
+  }, [anime.episodes, dubTrack?.episodes, isMovie, legTrack?.episodes]);
+
+  const allUnlocalizedEpisodeIdsKey = useMemo(
+    () => allUnlocalizedEpisodeIds.join(','),
+    [allUnlocalizedEpisodeIds]
+  );
+
+  const cachedEpisodeTitlesSnapshot = useMemo(
+    () => readCachedEpisodeTitles(allUnlocalizedEpisodeIds),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [allUnlocalizedEpisodeIdsKey, hydratedTitlesState.settledIds.length]
+  );
+
   const hydratedTitlesById = useMemo(
-    () => (hydratedTitlesState.animeUrl === anime.url ? hydratedTitlesState.byId : {}),
-    [anime.url, hydratedTitlesState.animeUrl, hydratedTitlesState.byId]
+    () => ({
+      ...cachedEpisodeTitlesSnapshot.byId,
+      ...(hydratedTitlesState.animeUrl === anime.url ? hydratedTitlesState.byId : {}),
+    }),
+    [
+      anime.url,
+      cachedEpisodeTitlesSnapshot.byId,
+      hydratedTitlesState.animeUrl,
+      hydratedTitlesState.byId,
+    ]
   );
 
   const visibleSeasonGroups = useMemo(() => {
@@ -399,45 +585,18 @@ export function AnimeDetailView({
     return baseSeasonGroups.length <= 1;
   };
 
-  // Eagerly hydrate official TheTVDB PT-BR episode titles via /api/episode-titles as soon as
-  // the anime profile opens (in 28-episode batches) so titles never swap visibly when expanding seasons.
-  const allUnlocalizedEpisodeIds = useMemo(() => {
-    if (isMovie) return [] as number[];
-    const ids: number[] = [];
-    const seen = new Set<number>();
-    const sources = [
-      anime.episodes,
-      dubTrack?.episodes || [],
-      legTrack?.episodes || [],
-    ];
-    for (const list of sources) {
-      for (const ep of list) {
-        if (
-          ep.titleLocalized ||
-          !ep.tvdbEpisodeId ||
-          ep.tvdbEpisodeId <= 0 ||
-          seen.has(ep.tvdbEpisodeId)
-        ) {
-          continue;
-        }
-        seen.add(ep.tvdbEpisodeId);
-        ids.push(ep.tvdbEpisodeId);
-      }
-    }
-    return ids;
-  }, [anime.episodes, dubTrack?.episodes, isMovie, legTrack?.episodes]);
-
-  const allUnlocalizedEpisodeIdsKey = useMemo(
-    () => allUnlocalizedEpisodeIds.join(','),
-    [allUnlocalizedEpisodeIds]
-  );
-
   const settledTitleIdsSet = useMemo(
     () =>
-      new Set<number>(
-        hydratedTitlesState.animeUrl === anime.url ? hydratedTitlesState.settledIds : []
-      ),
-    [anime.url, hydratedTitlesState.animeUrl, hydratedTitlesState.settledIds]
+      new Set<number>([
+        ...cachedEpisodeTitlesSnapshot.settledIds,
+        ...(hydratedTitlesState.animeUrl === anime.url ? hydratedTitlesState.settledIds : []),
+      ]),
+    [
+      anime.url,
+      cachedEpisodeTitlesSnapshot.settledIds,
+      hydratedTitlesState.animeUrl,
+      hydratedTitlesState.settledIds,
+    ]
   );
 
   const isEpisodeTitleLoading = (ep: AnimeEpisodeLink): boolean => {
@@ -459,20 +618,57 @@ export function AnimeDetailView({
     [allUnlocalizedEpisodeIds, hydratedTitlesById, isMovie, settledTitleIdsSet]
   );
 
+  const alreadyLocalizedSynopsis =
+    Boolean(anime.synopsis && anime.synopsis.trim()) &&
+    (anime.synopsisSource === 'thetvdb-pt-br' ||
+      anime.synopsisSource === 'thetvdb-google-translate');
+  const alreadyResolvedByTvdb =
+    alreadyLocalizedSynopsis ||
+    (Boolean(anime.enrichmentSources?.includes('thetvdb')) &&
+      anime.synopsisSource !== 'thetvdb-en');
+  const hasSynopsisQueryInput = Boolean(
+    anime.title ||
+      anime.originalTitle ||
+      anime.externalIds?.tvdbId ||
+      anime.externalIds?.tvdbSlug
+  );
+  const isSynopsisPending =
+    scopedSynopsis.loading ||
+    (loadingStage === 'ready' &&
+      !alreadyResolvedByTvdb &&
+      !getCachedAnimeSynopsis(anime.url).hit &&
+      hasSynopsisQueryInput &&
+      localizedSynopsisState.animeUrl !== anime.url);
+
+  const isAnimeContentHydrating =
+    loadingStage === 'seed' ||
+    loadingStage === 'quick' ||
+    isSynopsisPending ||
+    isHydratingEpisodeTitles;
+
+  useLayoutEffect(() => {
+    onLoadingStateChange?.(isAnimeContentHydrating);
+  }, [isAnimeContentHydrating, onLoadingStateChange]);
+
+  useLayoutEffect(() => {
+    return () => {
+      onLoadingStateChange?.(false);
+    };
+  }, [onLoadingStateChange]);
+
   useEffect(() => {
     if (isMovie || !allUnlocalizedEpisodeIdsKey) return;
     if (settledEpisodeTitleIdsRef.current.animeUrl !== anime.url) {
       settledEpisodeTitleIdsRef.current = { animeUrl: anime.url, ids: new Set() };
     }
-    const idsToFetch = allUnlocalizedEpisodeIdsKey
+    const parsedIds = allUnlocalizedEpisodeIdsKey
       .split(',')
       .map((s) => Number.parseInt(s, 10))
-      .filter(
-        (id) =>
-          Number.isFinite(id) &&
-          id > 0 &&
-          !settledEpisodeTitleIdsRef.current.ids.has(id)
-      );
+      .filter((id) => Number.isFinite(id) && id > 0);
+    const { missingIds } = readCachedEpisodeTitles(parsedIds);
+    const idsToFetch = missingIds.filter(
+      (id) => !settledEpisodeTitleIdsRef.current.ids.has(id)
+    );
     if (idsToFetch.length === 0) return;
 
     const batches: number[][] = [];
@@ -490,11 +686,15 @@ export function AnimeDetailView({
       if (tvdbId) params.set('tvdbId', String(tvdbId));
 
       const nextEntries: Record<number, string> = {};
+      let okToCache = false;
       try {
         const res = await apiFetch(`/api/episode-titles?${params.toString()}`);
         const data: { titlesById?: Record<string, string> } | null = res.ok
           ? await res.json()
           : null;
+        if (res.ok) {
+          okToCache = true;
+        }
         if (data?.titlesById) {
           for (const [k, v] of Object.entries(data.titlesById)) {
             const numId = Number.parseInt(k, 10);
@@ -507,6 +707,9 @@ export function AnimeDetailView({
         // Non-fatal: settle IDs so cards fall back cleanly to guide titles
       }
 
+      if (okToCache) {
+        writeCachedEpisodeTitles(nextEntries, batchIds);
+      }
       if (cancelled) return;
       if (settledEpisodeTitleIdsRef.current.animeUrl === anime.url) {
         for (const id of batchIds) {
@@ -547,6 +750,18 @@ export function AnimeDetailView({
     anime.url,
     isMovie,
   ]);
+
+  // Quietly prefetch the primary CTA episode in background shortly after the detail page renders
+  useEffect(() => {
+    if (!onPrefetchEpisode || !firstEpisode || loadingStage === 'seed') return;
+    const timer = window.setTimeout(() => {
+      onPrefetchEpisode(
+        firstEpisode.url,
+        buildSeedFromAnimeEpisode(anime, firstEpisode, activeEpisodes)
+      );
+    }, 520);
+    return () => window.clearTimeout(timer);
+  }, [activeEpisodes, anime, firstEpisode, loadingStage, onPrefetchEpisode]);
 
   const toggleSeasonExpanded = (seasonNumber: number) => {
     const currentlyExpanded = isSeasonExpanded(seasonNumber);
@@ -600,57 +815,7 @@ export function AnimeDetailView({
     (g) => g.trim().toLowerCase() !== redundantGenreLabel
   );
 
-  const extraMetaItems: Array<{
-    label: string;
-    value: string;
-    kind?: 'status' | 'date' | 'clock' | 'layers' | 'studio' | 'network' | 'globe' | 'server';
-    highlight?: boolean;
-  }> = [];
-  if (anime.status) {
-    extraMetaItems.push({
-      label: 'Status',
-      value: anime.status,
-      kind: 'status',
-      highlight: /em exibição|lançamento|airing|ongoing|continuing/i.test(anime.status),
-    });
-  }
-  if (anime.studio) {
-    extraMetaItems.push({ label: 'Estúdio', value: anime.studio, kind: 'studio' });
-  }
-  if (anime.network) {
-    extraMetaItems.push({ label: 'Rede', value: anime.network, kind: 'network' });
-  }
-  if (anime.firstAirDate) {
-    extraMetaItems.push({
-      label: 'Estreia',
-      value: formatEpisodeReleaseDate(anime.firstAirDate) || anime.firstAirDate,
-      kind: 'date',
-    });
-  } else if (anime.year) {
-    extraMetaItems.push({ label: 'Ano', value: anime.year, kind: 'date' });
-  }
-  if (anime.lastAirDate) {
-    extraMetaItems.push({
-      label: 'Recente',
-      value: formatEpisodeReleaseDate(anime.lastAirDate) || anime.lastAirDate,
-      kind: 'date',
-    });
-  }
-  if (anime.averageDuration) {
-    extraMetaItems.push({ label: 'Duração', value: anime.averageDuration, kind: 'clock' });
-  }
-  if (anime.seasonsCount) {
-    extraMetaItems.push({ label: 'Temporadas', value: anime.seasonsCount, kind: 'layers' });
-  }
-  if (anime.originalLanguage) {
-    extraMetaItems.push({ label: 'Idioma', value: anime.originalLanguage, kind: 'globe' });
-  }
-  if (anime.originalCountry) {
-    extraMetaItems.push({ label: 'País', value: anime.originalCountry, kind: 'globe' });
-  }
-  if (anime.sourceServerName) {
-    extraMetaItems.push({ label: 'Provedor', value: anime.sourceServerName, kind: 'server' });
-  }
+  const extraMetaItems = useMemo(() => buildAnimeInfoMetaItems(anime), [anime]);
 
   // Only show TheTVDB and LiveChart.me links
   const externalLinks = useMemo(() => {
@@ -687,9 +852,29 @@ export function AnimeDetailView({
   };
 
   const isSynopsisExpanded = synopsisExpandedUrl === anime.url;
+  const firstEpisodeSeed = useMemo(
+    () => (firstEpisode ? buildSeedFromAnimeEpisode(anime, firstEpisode, activeEpisodes) : undefined),
+    [activeEpisodes, anime, firstEpisode]
+  );
+  const quickLastEpisodeSeed = useMemo(() => {
+    if (!quickLastEpisode) return undefined;
+    const matched = activeEpisodes.find((ep) => ep.url === quickLastEpisode.url);
+    return matched
+      ? buildSeedFromAnimeEpisode(anime, matched, activeEpisodes)
+      : {
+          title: `${anime.title} — ${quickLastEpisode.label}`,
+          seriesTitle: anime.title,
+          seriesUrl: anime.url,
+          poster: effectivePoster,
+          backdrop: effectiveBackdrop,
+          episodeLabel: quickLastEpisode.label,
+          kind: isMovie ? ('movie' as const) : ('episode' as const),
+          isMovie,
+        };
+  }, [activeEpisodes, anime, effectiveBackdrop, effectivePoster, isMovie, quickLastEpisode]);
 
   return (
-    <div className="mx-auto max-w-7xl px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
+    <div className="mx-auto max-w-7xl anisync-view-enter px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
       <div className="mb-5 flex items-center justify-between gap-3">
         <button
           type="button"
@@ -703,58 +888,49 @@ export function AnimeDetailView({
 
       {/* Hero Info Card enriched by TheTVDB */}
       <div className="relative overflow-hidden rounded-2xl border border-white/10 bg-[#151921]">
-        {effectiveBackdrop && (
-          <div className="pointer-events-none absolute inset-x-0 top-0 h-[340px] overflow-hidden lg:inset-0 lg:h-full">
+        {heroBackdropSrc && (
+          <div
+            aria-hidden="true"
+            className="pointer-events-none absolute inset-0 hidden overflow-hidden md:block"
+          >
             <img
-              src={effectiveBackdrop}
+              src={heroBackdropSrc}
               alt=""
-              aria-hidden="true"
+              decoding="async"
               referrerPolicy="no-referrer"
-              className="h-full w-full scale-105 object-cover opacity-25 blur-md lg:scale-100 lg:opacity-15 lg:blur-sm"
+              onError={() => markHeroImageFailed(heroBackdropSrc)}
+              className="h-full w-full object-cover object-center opacity-[0.16] blur-[2px]"
             />
-            <div className="absolute inset-0 bg-gradient-to-b from-[#151921]/30 via-[#151921]/75 to-[#151921] lg:bg-gradient-to-r lg:from-[#151921] lg:via-[#151921]/92 lg:to-[#151921]/80" />
+            <div className="absolute inset-0 bg-gradient-to-r from-[#151921] via-[#151921]/92 to-[#151921]/72" />
+            <div className="absolute inset-0 bg-gradient-to-t from-[#151921] via-transparent to-[#151921]/35" />
           </div>
         )}
 
-        <div className="relative grid gap-5 p-4 pt-6 sm:p-6 lg:grid-cols-[230px_1fr] lg:items-start lg:gap-8 lg:p-7">
-          <MediaPoster
-            src={effectivePoster}
-            alt={displayTitle}
-            aspect="portrait"
-            className="mx-auto w-[204px] rounded-2xl border border-white/15 shadow-[0_18px_45px_rgba(0,0,0,0.65)] ring-1 ring-white/10 sm:w-[220px] lg:mx-0 lg:w-full lg:max-w-[230px]"
-          />
-
-          <div className="min-w-0 space-y-4">
-            {/* Identity: Non-redundant Badges -> Title -> Subtitle -> Genres */}
-            <div className="space-y-2">
+        <div className="relative md:grid md:grid-cols-[230px_1fr] md:items-start md:gap-6 md:p-6 lg:grid-cols-[250px_1fr] lg:gap-8 lg:p-7 xl:grid-cols-[264px_1fr]">
+          {heroPosterSrc && (
+            <div
+              data-hero-banner="true"
+              className="relative aspect-[4/5] w-full overflow-hidden bg-[#0d0f12] md:aspect-auto md:rounded-xl md:border md:border-white/15 md:shadow-[0_20px_50px_rgba(0,0,0,0.65)] md:ring-1 md:ring-white/10"
+            >
+              <img
+                src={heroPosterSrc}
+                alt={displayTitle}
+                fetchPriority="high"
+                decoding="async"
+                referrerPolicy="no-referrer"
+                onError={() => markHeroImageFailed(heroPosterSrc)}
+                className="block h-full w-full object-fill md:h-auto md:object-contain"
+              />
               <div
-                data-hero-badges="true"
-                className="flex flex-wrap items-center gap-x-2 gap-y-1.5 text-xs font-medium text-slate-400"
-              >
-                <span className="inline-flex items-center gap-1 rounded-md border border-[#f97316]/30 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
-                  {isMovie ? <Film className="h-3 w-3" /> : <Tv className="h-3 w-3" />}
-                  <span>{isMovie ? 'Filme' : isSeries ? 'Série' : 'Anime'}</span>
-                </span>
-                {effectiveAudioType && (
-                  <span
-                    data-hero-audio-badge={effectiveAudioType}
-                    className={`rounded-md border px-2 py-0.5 text-[11px] font-semibold ${
-                      effectiveAudioType === 'DUB'
-                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
-                        : 'border-sky-500/35 bg-sky-500/12 text-sky-300'
-                    }`}
-                  >
-                    {effectiveAudioType === 'DUB' ? 'Dublado' : 'Legendado'}
-                  </span>
-                )}
-                {anime.rating && Number.parseFloat(anime.rating) > 0 && (
-                  <span className="inline-flex items-center gap-1 font-bold tabular-nums text-amber-400">
-                    <Star className="h-3.5 w-3.5 fill-amber-400" />
-                    {anime.rating}
-                  </span>
-                )}
-              </div>
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-[#151921] via-[#151921]/20 to-transparent md:hidden"
+              />
+            </div>
+          )}
 
+          <div className="min-w-0 space-y-4 px-4 pb-5 pt-3 sm:px-6 sm:pb-6 sm:pt-4 md:p-0">
+            {/* Identity: Title -> Subtitle -> Unified Type, Audio & Genre Tags */}
+            <div className="space-y-2">
               <h1 className="text-xl font-bold leading-snug tracking-tight text-white sm:text-2xl lg:text-3xl">
                 {displayTitle}
               </h1>
@@ -765,18 +941,36 @@ export function AnimeDetailView({
                 </p>
               )}
 
-              {visibleGenres.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 pt-0.5">
-                  {visibleGenres.map((genre) => (
-                    <span
-                      key={genre}
-                      className="rounded-full border border-white/10 bg-[#0d0f12]/70 px-2.5 py-0.5 text-[11px] font-medium text-slate-300 sm:text-xs"
-                    >
-                      {genre}
-                    </span>
-                  ))}
-                </div>
-              )}
+              <div
+                data-hero-badges="true"
+                className="flex flex-wrap items-center gap-1.5 pt-0.5"
+              >
+                <span className="inline-flex items-center gap-1 rounded-full border border-[#f97316]/30 bg-[#f97316]/12 px-2.5 py-0.5 text-[11px] font-semibold text-[#fb923c] sm:text-xs">
+                  {isMovie ? <Film className="h-3 w-3" /> : <Tv className="h-3 w-3" />}
+                  <span>{isMovie ? 'Filme' : isSeries ? 'Série' : 'Anime'}</span>
+                </span>
+                {heroAudioBadges.map((audioBadge) => (
+                  <span
+                    key={audioBadge}
+                    data-hero-audio-badge={audioBadge}
+                    className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold sm:text-xs ${
+                      audioBadge === 'DUB'
+                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                        : 'border-sky-500/35 bg-sky-500/12 text-sky-300'
+                    }`}
+                  >
+                    {audioBadge === 'DUB' ? 'Dublado' : 'Legendado'}
+                  </span>
+                ))}
+                {visibleGenres.map((genre) => (
+                  <span
+                    key={genre}
+                    className="rounded-full border border-white/10 bg-[#0d0f12]/70 px-2.5 py-0.5 text-[11px] font-medium text-slate-300 sm:text-xs"
+                  >
+                    {genre}
+                  </span>
+                ))}
+              </div>
             </div>
 
             {/* Synopsis right below genres */}
@@ -792,8 +986,11 @@ export function AnimeDetailView({
                       ? 'TheTVDB · Original (EN)'
                       : null;
               const canExpandSynopsis = Boolean(displaySynopsis && displaySynopsis.length > 260);
+              const awaitingSynopsis =
+                (scopedSynopsis.loading || loadingStage === 'seed' || loadingStage === 'quick') &&
+                !displaySynopsis;
 
-              if (scopedSynopsis.loading && !displaySynopsis) {
+              if (awaitingSynopsis) {
                 return (
                   <div
                     data-anime-synopsis-loading="true"
@@ -805,12 +1002,14 @@ export function AnimeDetailView({
                         Sinopse
                       </span>
                       <span className="text-[11px] font-medium text-slate-500">
-                        Buscando sinopse no TheTVDB...
+                        {loadingStage === 'seed'
+                          ? 'Carregando detalhes...'
+                          : 'Buscando sinopse no TheTVDB...'}
                       </span>
                     </div>
-                    <div className="h-3.5 w-3/4 animate-pulse rounded bg-white/10" />
-                    <div className="h-3.5 w-full animate-pulse rounded bg-white/8" />
-                    <div className="h-3.5 w-5/6 animate-pulse rounded bg-white/8" />
+                    <div className="anisync-shimmer h-3.5 w-3/4 rounded" />
+                    <div className="anisync-shimmer h-3.5 w-full rounded" />
+                    <div className="anisync-shimmer h-3.5 w-5/6 rounded" />
                   </div>
                 );
               }
@@ -876,36 +1075,74 @@ export function AnimeDetailView({
 
                 {extraMetaItems.length > 0 && (
                   <dl className="grid grid-cols-2 gap-x-4 gap-y-3 px-3.5 py-3 text-xs sm:grid-cols-3 xl:grid-cols-4">
-                    {extraMetaItems.map((meta) => (
-                      <div key={meta.label} className="min-w-0">
-                        <dt className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-slate-500">
-                          {meta.kind === 'status' && (
-                            <span
-                              aria-hidden="true"
-                              className={`h-2 w-2 shrink-0 rounded-full ${
-                                meta.highlight ? 'bg-emerald-400' : 'bg-slate-500'
-                              }`}
-                            />
-                          )}
-                          {meta.kind === 'date' && <Calendar className="h-3 w-3 shrink-0 text-slate-400" />}
-                          {meta.kind === 'clock' && <Clock className="h-3 w-3 shrink-0 text-slate-400" />}
-                          {meta.kind === 'layers' && <Layers className="h-3 w-3 shrink-0 text-slate-400" />}
-                          {meta.kind === 'studio' && <Building2 className="h-3 w-3 shrink-0 text-slate-400" />}
-                          {meta.kind === 'network' && <Radio className="h-3 w-3 shrink-0 text-slate-400" />}
-                          {meta.kind === 'globe' && <Globe className="h-3 w-3 shrink-0 text-slate-400" />}
-                          {meta.kind === 'server' && <Server className="h-3 w-3 shrink-0 text-slate-400" />}
-                          <span className="truncate">{meta.label}</span>
-                        </dt>
-                        <dd
-                          title={meta.value}
-                          className={`mt-0.5 truncate font-semibold tabular-nums ${
-                            meta.highlight ? 'text-emerald-300' : 'text-slate-200'
+                    {extraMetaItems.map((meta) => {
+                      const isMultiProvider =
+                        meta.kind === 'server' && Boolean(meta.items && meta.items.length > 1);
+                      return (
+                        <div
+                          key={meta.id}
+                          data-anime-meta={meta.id}
+                          className={`min-w-0 ${
+                            meta.fullWidth
+                              ? 'col-span-full border-t border-white/8 pt-2.5'
+                              : ''
                           }`}
                         >
-                          {meta.value}
-                        </dd>
-                      </div>
-                    ))}
+                          <dt className="flex items-center gap-1.5 text-[10px] font-medium uppercase tracking-wide text-slate-500">
+                            {meta.kind === 'status' && (
+                              <span
+                                aria-hidden="true"
+                                className={`h-2 w-2 shrink-0 rounded-full ${
+                                  meta.highlight ? 'bg-emerald-400' : 'bg-slate-500'
+                                }`}
+                              />
+                            )}
+                            {meta.kind === 'rating' && (
+                              <Star className="h-3 w-3 shrink-0 fill-amber-400 text-amber-400" />
+                            )}
+                            {meta.kind === 'date' && <Calendar className="h-3 w-3 shrink-0 text-slate-400" />}
+                            {meta.kind === 'clock' && <Clock className="h-3 w-3 shrink-0 text-slate-400" />}
+                            {meta.kind === 'layers' && <Layers className="h-3 w-3 shrink-0 text-slate-400" />}
+                            {meta.kind === 'studio' && <Building2 className="h-3 w-3 shrink-0 text-slate-400" />}
+                            {meta.kind === 'network' && <Radio className="h-3 w-3 shrink-0 text-slate-400" />}
+                            {meta.kind === 'globe' && <Globe className="h-3 w-3 shrink-0 text-slate-400" />}
+                            {meta.kind === 'server' && <Server className="h-3 w-3 shrink-0 text-slate-400" />}
+                            <span className="truncate">{meta.label}</span>
+                          </dt>
+                          {isMultiProvider && meta.items ? (
+                            <dd
+                              title={meta.value}
+                              className="mt-1.5 flex flex-wrap items-center gap-1.5"
+                            >
+                              {meta.items.map((provider) => (
+                                <span
+                                  key={provider}
+                                  data-anime-provider-chip="true"
+                                  className="inline-flex items-center rounded-md border border-white/10 bg-white/[0.04] px-2 py-0.5 text-[11px] font-semibold leading-snug text-slate-200"
+                                >
+                                  {provider}
+                                </span>
+                              ))}
+                            </dd>
+                          ) : (
+                            <dd
+                              title={meta.value}
+                              className={`mt-0.5 font-semibold tabular-nums ${
+                                meta.kind === 'server'
+                                  ? 'break-words leading-snug text-slate-200'
+                                  : meta.kind === 'rating'
+                                    ? 'truncate font-bold text-amber-400'
+                                    : meta.highlight
+                                      ? 'truncate text-emerald-300'
+                                      : 'truncate text-slate-200'
+                              }`}
+                            >
+                              {meta.value}
+                            </dd>
+                          )}
+                        </div>
+                      );
+                    })}
                   </dl>
                 )}
 
@@ -938,7 +1175,17 @@ export function AnimeDetailView({
                 {firstEpisode && (
                   <button
                     type="button"
-                    onClick={() => onOpenEpisode(firstEpisode.url)}
+                    onMouseEnter={() =>
+                      scheduleEpisodeHoverPrefetch(firstEpisode.url, firstEpisodeSeed)
+                    }
+                    onMouseLeave={cancelEpisodeHoverPrefetch}
+                    onFocus={() =>
+                      triggerImmediateEpisodePrefetch(firstEpisode.url, firstEpisodeSeed)
+                    }
+                    onTouchStart={() =>
+                      triggerImmediateEpisodePrefetch(firstEpisode.url, firstEpisodeSeed)
+                    }
+                    onClick={() => onOpenEpisode(firstEpisode.url, firstEpisodeSeed)}
                     className="inline-flex h-11 min-w-0 flex-1 items-center justify-center gap-2 rounded-xl bg-[#f97316] px-4 text-sm font-bold text-[#0d0f12] shadow-lg shadow-orange-500/15 transition-colors hover:bg-[#fb923c] sm:flex-none sm:px-5"
                   >
                     <Play className="h-4 w-4 shrink-0 fill-current" />
@@ -949,7 +1196,17 @@ export function AnimeDetailView({
                 {quickLastEpisode && (
                   <button
                     type="button"
-                    onClick={() => onOpenEpisode(quickLastEpisode.url)}
+                    onMouseEnter={() =>
+                      scheduleEpisodeHoverPrefetch(quickLastEpisode.url, quickLastEpisodeSeed)
+                    }
+                    onMouseLeave={cancelEpisodeHoverPrefetch}
+                    onFocus={() =>
+                      triggerImmediateEpisodePrefetch(quickLastEpisode.url, quickLastEpisodeSeed)
+                    }
+                    onTouchStart={() =>
+                      triggerImmediateEpisodePrefetch(quickLastEpisode.url, quickLastEpisodeSeed)
+                    }
+                    onClick={() => onOpenEpisode(quickLastEpisode.url, quickLastEpisodeSeed)}
                     className="hidden h-11 items-center gap-2 rounded-xl border border-[#f97316]/45 bg-[#f97316]/12 px-4 text-xs font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/20 sm:inline-flex"
                   >
                     <SkipForward className="h-4 w-4 shrink-0" />
@@ -1010,6 +1267,9 @@ export function AnimeDetailView({
                 {anime.allSeasonsUrl && onOpenAnime && (
                   <button
                     type="button"
+                    onMouseEnter={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
+                    onFocus={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
+                    onTouchStart={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
                     onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
                     className="hidden h-11 items-center gap-1.5 rounded-xl border border-white/15 bg-[#0d0f12] px-3.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white sm:inline-flex"
                   >
@@ -1022,7 +1282,10 @@ export function AnimeDetailView({
               {quickLastEpisode && (
                 <button
                   type="button"
-                  onClick={() => onOpenEpisode(quickLastEpisode.url)}
+                  onTouchStart={() =>
+                    triggerImmediateEpisodePrefetch(quickLastEpisode.url, quickLastEpisodeSeed)
+                  }
+                  onClick={() => onOpenEpisode(quickLastEpisode.url, quickLastEpisodeSeed)}
                   className="flex h-10 w-full items-center justify-between rounded-xl border border-white/10 bg-[#0d0f12]/80 px-3.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/45 hover:text-[#fb923c] sm:hidden"
                 >
                   <span className="inline-flex items-center gap-2">
@@ -1038,6 +1301,7 @@ export function AnimeDetailView({
               {anime.allSeasonsUrl && onOpenAnime && (
                 <button
                   type="button"
+                  onTouchStart={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
                   onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
                   className="flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-white/12 bg-[#0d0f12]/80 px-3.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white sm:hidden"
                 >
@@ -1053,7 +1317,7 @@ export function AnimeDetailView({
       {/* Episodes / Movie Playback Section */}
       <section className="mt-8">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
             <h2 className="text-lg font-semibold text-white">
               {isMovie ? 'Reprodução' : 'Episódios'}
             </h2>
@@ -1068,6 +1332,11 @@ export function AnimeDetailView({
                     · {unavailableCount} {unavailableCount === 1 ? 'indisponível' : 'indisponíveis'}
                   </span>
                 )}
+              </span>
+            )}
+            {loadingStage === 'quick' && (
+              <span className="text-[11px] font-medium text-slate-500">
+                Sincronizando metadados e temporadas...
               </span>
             )}
           </div>
@@ -1312,9 +1581,42 @@ export function AnimeDetailView({
         )}
 
         {activeEpisodes.length === 0 ? (
-          <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
-            Nenhum episódio listado nos provedores ativos para este título ainda.
-          </div>
+          loadingStage === 'seed' ? (
+            <div
+              data-episodes-loading="true"
+              className="overflow-hidden rounded-xl border border-white/10 bg-[#151921] divide-y divide-white/8"
+              aria-label="Carregando episódios"
+            >
+              {Array.from({ length: 4 }).map((_, idx) => (
+                <div key={idx} className="flex items-start gap-3 px-3.5 py-3 sm:gap-4 sm:px-4">
+                  <div className="anisync-shimmer mt-0.5 h-[54px] w-[96px] shrink-0 rounded-md sm:h-16 sm:w-28" />
+                  <div className="min-w-0 flex-1 space-y-2 py-0.5">
+                    <div className="anisync-shimmer h-3 w-20 rounded" />
+                    <div className="anisync-shimmer h-4 w-3/4 rounded" />
+                    <div className="anisync-shimmer h-3 w-1/3 rounded" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : detailError ? (
+            <div className="rounded-xl border border-red-500/20 bg-[#151921] p-8 text-center">
+              <p className="text-sm text-red-200">{detailError}</p>
+              {onRetryDetail && (
+                <button
+                  type="button"
+                  onClick={onRetryDetail}
+                  className="mt-4 inline-flex items-center gap-2 rounded-lg bg-[#f97316] px-4 py-2 text-xs font-semibold text-[#0d0f12]"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>Tentar novamente</span>
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center text-sm text-slate-400">
+              Nenhum episódio listado nos provedores ativos para este título ainda.
+            </div>
+          )
         ) : visibleSeasonGroups.length === 0 ? (
           <div className="rounded-xl border border-white/10 bg-[#151921] p-8 text-center">
             <p className="text-sm text-slate-400">
@@ -1549,9 +1851,10 @@ export function AnimeDetailView({
                             className="bg-[#0d0f12]/35 px-3.5 py-3 sm:px-4"
                           >
                             <div className="flex items-start gap-3 sm:gap-4">
-                              {ep.thumb ? (
+                              {ep.thumb || ep.fallbackThumb ? (
                                 <MediaPoster
                                   src={ep.thumb}
+                                  fallbackSrc={ep.fallbackThumb}
                                   alt={epDisplayTitle}
                                   aspect="landscape"
                                   className="mt-0.5 h-[54px] w-[96px] shrink-0 rounded-md border border-white/10 opacity-60 sm:h-16 sm:w-28"
@@ -1647,6 +1950,7 @@ export function AnimeDetailView({
                             )
                           : 0;
                       const watched = isWatchedEpisode(ep);
+                      const epSeed = buildSeedFromAnimeEpisode(anime, ep, activeEpisodes);
                       return (
                         <div
                           key={ep.url}
@@ -1657,12 +1961,17 @@ export function AnimeDetailView({
                             {ep.thumb ? (
                               <button
                                 type="button"
-                                onClick={() => onOpenEpisode(ep.url)}
+                                onMouseEnter={() => scheduleEpisodeHoverPrefetch(ep.url, epSeed)}
+                                onMouseLeave={cancelEpisodeHoverPrefetch}
+                                onFocus={() => triggerImmediateEpisodePrefetch(ep.url, epSeed)}
+                                onTouchStart={() => triggerImmediateEpisodePrefetch(ep.url, epSeed)}
+                                onClick={() => onOpenEpisode(ep.url, epSeed)}
                                 aria-label={`Assistir ${epBadge}: ${epDisplayTitle}`}
                                 className="relative mt-0.5 h-[54px] w-[96px] shrink-0 overflow-hidden rounded-md border border-white/10 sm:h-16 sm:w-28"
                               >
                                 <MediaPoster
                                   src={ep.thumb}
+                                  fallbackSrc={ep.fallbackThumb}
                                   alt={epDisplayTitle}
                                   aspect="landscape"
                                   className="h-full w-full"
@@ -1692,7 +2001,11 @@ export function AnimeDetailView({
                             <div className="min-w-0 flex-1">
                               <button
                                 type="button"
-                                onClick={() => onOpenEpisode(ep.url)}
+                                onMouseEnter={() => scheduleEpisodeHoverPrefetch(ep.url, epSeed)}
+                                onMouseLeave={cancelEpisodeHoverPrefetch}
+                                onFocus={() => triggerImmediateEpisodePrefetch(ep.url, epSeed)}
+                                onTouchStart={() => triggerImmediateEpisodePrefetch(ep.url, epSeed)}
+                                onClick={() => onOpenEpisode(ep.url, epSeed)}
                                 className="block w-full text-left"
                               >
                                 <div className="flex flex-wrap items-center gap-1.5">

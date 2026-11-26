@@ -5,6 +5,7 @@ interface MobileTabBarProps {
   activeSection: NavSection;
   unreadCount?: number;
   onSelectSection: (section: NavSection) => void;
+  onPrefetchSection?: (section: NavSection) => void;
 }
 
 const MOBILE_TABS: Array<{ id: NavSection; label: string; icon: typeof Flame }> = [
@@ -18,6 +19,7 @@ export function MobileTabBar({
   activeSection,
   unreadCount = 0,
   onSelectSection,
+  onPrefetchSection,
 }: MobileTabBarProps) {
   return (
     <nav
@@ -34,6 +36,9 @@ export function MobileTabBar({
               key={tab.id}
               type="button"
               onClick={() => onSelectSection(tab.id)}
+              onTouchStart={() => onPrefetchSection?.(tab.id)}
+              onMouseEnter={() => onPrefetchSection?.(tab.id)}
+              onFocus={() => onPrefetchSection?.(tab.id)}
               className={`relative flex min-h-[56px] flex-col items-center justify-center gap-1 px-1 py-2 text-[11px] font-medium transition-colors ${
                 active ? 'text-[#f97316]' : 'text-slate-400 hover:text-slate-200'
               }`}

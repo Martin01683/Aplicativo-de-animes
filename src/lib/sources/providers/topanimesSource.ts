@@ -6,6 +6,7 @@ import {
   extractMissingDooPlayerOptions,
   extractStreamsFromEmbed,
   formatServerLabel,
+  isMixDropEmbedUrl,
   parseAnimePageHtml,
   parseDooPlayerAjaxResponse,
   parseEpisodePageHtml,
@@ -15,7 +16,11 @@ import {
 import { extractHinataSoulSeasonNumber } from '../../hinatasoulParser.ts';
 import type { AnimeEpisodeLink, PlayerOption, ResolvedEmbed } from '../../types.ts';
 import { isSafeExternalHttpUrl, unwrapAvisoUrl } from '../../urlSafety.ts';
-import { scoreTitleSimilarity, stripSeasonFromTitle } from '../../catalog/idCodec.ts';
+import {
+  scoreTitleSimilarity,
+  splitAlternativeTitleString,
+  stripSeasonFromTitle,
+} from '../../catalog/idCodec.ts';
 import type {
   AggregatedServerOption,
   EpisodeSourceConfig,
@@ -382,17 +387,19 @@ export async function resolveFromTopAnimesSource(
   }
 
   // Build deduplicated search terms (primary title, romaji/original title, synonyms)
-  const rawTerms = [
-    query.title,
-    query.originalTitle,
-    ...(query.alternativeTitles || []),
-  ]
-    .map((t) => (t || '').trim())
-    .filter((t) => t.length >= 2 && /[a-z0-9]/i.test(t));
+  const rawTerms: string[] = [];
+  const rawSeen = new Set<string>();
+  for (const input of [query.title, query.originalTitle, ...(query.alternativeTitles || [])]) {
+    for (const part of splitAlternativeTitleString(input)) {
+      if (part.length < 2 || !/[a-z0-9]/i.test(part)) continue;
+      const key = part.toLowerCase();
+      if (rawSeen.has(key)) continue;
+      rawSeen.add(key);
+      rawTerms.push(part);
+    }
+  }
 
-  const titleSeason = rawTerms.length
-    ? Math.max(...rawTerms.map((t) => extractHinataSoulSeasonNumber(t)))
-    : 1;
+  const titleSeason = extractHinataSoulSeasonNumber(query.title || '');
   const targetSeason =
     query.seasonNumber && query.seasonNumber > 1 ? query.seasonNumber : titleSeason;
 
@@ -668,9 +675,11 @@ export async function resolveTopAnimesEmbed(
 
     const streamReferer = /csst\.online/i.test(cleanEmbed)
       ? 'https://www.incvideo1.online/'
-      : /antivirus|booonceivu/i.test(cleanEmbed)
-        ? baseReferer
-        : cleanEmbed;
+      : isMixDropEmbedUrl(cleanEmbed)
+        ? `${new URL(cleanEmbed).origin}/`
+        : /antivirus|booonceivu/i.test(cleanEmbed)
+          ? baseReferer
+          : cleanEmbed;
 
     const firstUrl = extracted.streams[0]?.url || '';
     const preferDirect =

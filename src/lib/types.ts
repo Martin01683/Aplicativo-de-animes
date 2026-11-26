@@ -2,6 +2,7 @@ export type AudioType = 'DUB' | 'LEG' | null;
 export type MediaKind = 'episode' | 'anime' | 'series' | 'movie';
 export type CatalogSourceId = 'thetvdb' | 'livechart' | 'server';
 export type LiveChartScheduleMode = 'streams' | 'dub' | 'jp';
+export type CalendarLayout = 'grid' | 'timeline';
 
 export type CatalogArchiveCategory =
   | 'animes'
@@ -179,6 +180,7 @@ export interface AnimeEpisodeLink {
   audioType?: AudioType;
   date?: string;
   thumb?: string;
+  fallbackThumb?: string;
   overview?: string;
   durationMinutes?: number;
   rating?: string;
@@ -216,7 +218,9 @@ export interface AnimeDetails {
   enrichmentSources?: CatalogSourceId[];
   externalLinks?: ExternalDatabaseLinkItem[];
   poster: string;
+  fallbackPoster?: string;
   backdrop: string;
+  fallbackBackdrop?: string;
   synopsis: string;
   synopsisSource?: EpisodeSynopsisSource;
   synopsisLanguage?: 'pt-BR' | 'en';

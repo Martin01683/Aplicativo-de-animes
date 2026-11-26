@@ -271,3 +271,97 @@ export function scoreTitleSimilarity(query: string, candidate: string): number {
 
   return Math.max(0, Math.min(0.99, jaccard * 0.55 + containment * 0.35 + prefixBonus + seasonPenalty));
 }
+
+/**
+ * Splits composite alternative title strings emitted by providers (e.g.
+ * `"Ore dake Level Up na Ken | Na Honjaman Level Up, I Level Up Alone"`) into clean,
+ * deduplicated individual titles without breaking standalone titles that legitimately contain commas.
+ */
+export function splitAlternativeTitleString(raw: string | undefined): string[] {
+  const input = (raw || '').replace(/\u200b/g, '').replace(/\s+/g, ' ').trim();
+  if (!input) return [];
+
+  const hasExplicitListDelimiter = /[|｜;]|\s+\/\s+/.test(input);
+  const primaryParts = hasExplicitListDelimiter
+    ? input.split(/\s*(?:[|｜;]|\s+\/\s+)\s*/)
+    : [input];
+
+  const expanded: string[] = [];
+  for (const part of primaryParts) {
+    const cleanPart = part.trim();
+    if (!cleanPart) continue;
+    if (hasExplicitListDelimiter && /,\s+/.test(cleanPart)) {
+      const subParts = cleanPart
+        .split(/,\s+/)
+        .map((s) => s.trim())
+        .filter((s) => s.length >= 3);
+      if (subParts.length >= 2) {
+        expanded.push(...subParts);
+        continue;
+      }
+    }
+    expanded.push(cleanPart);
+  }
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const item of expanded) {
+    const clean = item.replace(/\s+/g, ' ').trim();
+    if (clean.length < 2) continue;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+  }
+  return out;
+}
+
+/**
+ * Expands a single candidate title into matchable alias variants, including parenthetical
+ * bilingual aliases like `"Ore dake Level Up na Ken (Solo Leveling)"` ->
+ * `["Ore dake Level Up na Ken (Solo Leveling)", "Ore dake Level Up na Ken", "Solo Leveling"]`.
+ */
+export function expandTitleVariantsForMatch(raw: string | undefined): string[] {
+  const input = (raw || '').replace(/\u200b/g, '').replace(/\s+/g, ' ').trim();
+  if (!input) return [];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (val: string) => {
+    const clean = val.replace(/\s+/g, ' ').trim();
+    if (clean.length < 2) return;
+    const key = clean.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(clean);
+  };
+
+  add(input);
+  for (const part of splitAlternativeTitleString(input)) {
+    add(part);
+  }
+
+  // Extract meaningful parenthetical alternate title (ignoring audio/format/year tags)
+  const parenRe = /\(([^()]{3,})\)/g;
+  let m: RegExpExecArray | null;
+  let hadMeaningfulParen = false;
+  while ((m = parenRe.exec(input)) !== null) {
+    const inner = m[1].trim();
+    if (
+      /^(?:dublado|legendado|dub|leg|pt[\s-]?br|dual[\s-]?audio|hd|full\s*hd|tv|ova|ona|special|especial|filme|movie|\d{4})$/i.test(
+        inner
+      )
+    ) {
+      continue;
+    }
+    hadMeaningfulParen = true;
+    add(inner);
+  }
+  if (hadMeaningfulParen) {
+    const withoutParens = input.replace(/\s*\([^()]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
+    if (withoutParens.length >= 2) add(withoutParens);
+  }
+
+  return out;
+}
+

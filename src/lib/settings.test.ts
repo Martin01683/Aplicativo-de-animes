@@ -56,6 +56,7 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy remove
     autoDownloadAppUpdates: true,
     defaultSection: 'library',
     defaultAudioFilter: 'DUB',
+    calendarLayout: 'timeline',
     skipIntroSeconds: 90,
     autoPlayNextEpisode: true,
     videoScale: 'fill',
@@ -76,6 +77,8 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy remove
   assert.equal(result.autoDownloadAppUpdates, true);
   assert.equal(result.defaultSection, 'library');
   assert.equal(result.defaultAudioFilter, 'DUB');
+  assert.equal(result.calendarLayout, 'timeline');
+  assert.equal(sanitizeAppSettings({ calendarLayout: 'invalid' }).calendarLayout, 'grid');
   assert.equal(result.skipIntroSeconds, 90);
   assert.equal(result.autoPlayNextEpisode, true);
   assert.equal(result.videoScale, 'fill');

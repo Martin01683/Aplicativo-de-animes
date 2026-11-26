@@ -657,7 +657,7 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(detailTsx, /\/api\/anime-synopsis\?/);
     assert.match(detailTsx, /data-anime-synopsis="true"/);
     assert.match(detailTsx, /TheTVDB · Traduzido via Google Tradutor/);
-    assert.match(detailTsx, /effectivePoster = tvdbAnimeSynopsis\?\.poster \|\| anime\.poster/);
+    assert.match(detailTsx, /effectivePoster\s*=\s*tvdbAnimeSynopsis\?\.poster\s*\|\|\s*anime\.poster/);
     assert.doesNotMatch(
       detailTsx,
       /hidden h-12 w-20 shrink-0 rounded-md border border-white\/10 sm:block/,
@@ -815,7 +815,8 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
     assert.match(detailTsx, /data-audio-track-tabs="true"/);
     assert.match(detailTsx, /data-audio-track-tab=\{audioKey\}/);
-    assert.match(detailTsx, /data-hero-audio-badge=\{effectiveAudioType\}/);
+    assert.match(detailTsx, /resolveAnimeHeroAudioBadges\(anime\)/);
+    assert.match(detailTsx, /data-hero-audio-badge=\{audioBadge\}/);
     assert.match(detailTsx, /Sem dublagem/);
     assert.match(detailTsx, /primaryLatestEpisode/);
 
@@ -841,37 +842,37 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(workspaceTsx, /data-episode-uncensored="true"[\s\S]*?Sem censura/);
   });
 
-  it('orders AnimeDetailView hero as Style A (Poster+Backdrop -> Clean Badges -> Title -> Subtitle -> Genres -> Synopsis -> Info Panel -> Actions) and eagerly hydrates episode titles with loading skeleton', () => {
+  it('orders AnimeDetailView hero as Title -> Subtitle -> Unified Badges+Genres -> Synopsis -> Info Panel -> Actions and eagerly hydrates episode titles with loading skeleton', () => {
     const detailTsx = readRepoFile('src/components/AnimeDetailView.tsx');
     const heroStart = detailTsx.indexOf('{/* Hero Info Card enriched by TheTVDB */}');
     const episodesStart = detailTsx.indexOf('{/* Episodes / Movie Playback Section */}');
     assert.ok(heroStart > 0 && episodesStart > heroStart);
 
     const hero = detailTsx.slice(heroStart, episodesStart);
-    const badgesIdx = hero.indexOf('data-hero-badges="true"');
     const titleIdx = hero.indexOf('<h1');
     const subtitleIdx = hero.indexOf('{subtitleParts.join');
+    const badgesIdx = hero.indexOf('data-hero-badges="true"');
     const genresIdx = hero.indexOf('{visibleGenres.map');
     const synopsisIdx = hero.indexOf('data-anime-synopsis="true"');
     const infoPanelIdx = hero.indexOf('data-anime-info-panel="true"');
     const actionsIdx = hero.indexOf('data-anime-actions="true"');
 
     assert.ok(
-      badgesIdx > 0 &&
-        titleIdx > badgesIdx &&
+      titleIdx > 0 &&
         subtitleIdx > titleIdx &&
-        genresIdx > subtitleIdx &&
+        badgesIdx > subtitleIdx &&
+        genresIdx > badgesIdx &&
         synopsisIdx > genresIdx &&
         infoPanelIdx > synopsisIdx &&
         actionsIdx > infoPanelIdx,
-      'Hero sections must follow: Badges -> Title -> Subtitle -> Genres -> Synopsis -> Info Panel -> Actions',
+      'Hero sections must follow: Title -> Subtitle -> Unified Badges+Genres -> Synopsis -> Info Panel -> Actions',
     );
 
-    const badgesBlock = hero.slice(badgesIdx, titleIdx);
+    const badgesBlock = hero.slice(badgesIdx, synopsisIdx);
     assert.doesNotMatch(
       badgesBlock,
-      /anime\.year|activeEpisodes\.length|Provedor:/,
-      'Top hero badges must omit redundant year, episode count, and provider text',
+      /anime\.year|activeEpisodes\.length|Provedor:|anime\.rating/,
+      'Hero tags row must omit redundant year, episode count, provider, and rating (moved to Informações)',
     );
 
     assert.match(detailTsx, /allUnlocalizedEpisodeIds/);

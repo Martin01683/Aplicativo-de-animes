@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Bell,
+  BellOff,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -15,11 +17,8 @@ import {
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
 import {
-  createEmbedCacheEntry,
-  isEmbedCacheEntryValid,
-  type CachedEmbedEntry,
-} from '../lib/embedCache';
-import {
+  applyLocalizedEpisodeTitles,
+  collectUnlocalizedEpisodeIds,
   formatEpisodeCountdown,
   formatEpisodeReleaseDate,
   formatUpcomingEpisodeNotice,
@@ -42,10 +41,22 @@ import {
   type EpisodeProgressMap,
   type VideoScaleMode,
 } from '../lib/playbackProgress';
+import {
+  clearCachedEmbeds,
+  deleteCachedEmbed,
+  fetchAnimeDetailsFull,
+  getCachedAnimeDetailsFull,
+  getCachedEmbed,
+  getCachedEpisodeSynopsis,
+  readCachedEpisodeTitles,
+  resolveEmbedCachedGlobal,
+  setCachedEpisodeSynopsis,
+  writeCachedEpisodeTitles,
+  type MediaNavigationSeed,
+} from '../lib/prefetchCache';
 import { pickBestFailoverServer } from '../lib/serverFailover';
-import { formatServerLabel } from '../lib/topanimesParser';
+import { formatServerLabel } from '../lib/serverLabel';
 import type {
-  AnimeDetails,
   AnimeEpisodeLink,
   AnimeSynopsisResult,
   CatalogMediaItem,
@@ -56,12 +67,12 @@ import type {
   PlayerOption,
   ResolvedEmbed,
 } from '../lib/types';
-import { isSafeExternalHttpUrl } from '../lib/urlSafety';
 import { AnimePlayer } from './AnimePlayer';
 
 interface EpisodeWorkspaceProps {
   episode: EpisodeDetails;
   isFavorite: boolean;
+  isMuted?: boolean;
   watchedUrls?: Set<string>;
   progressMap?: EpisodeProgressMap;
   initialSeriesEpisodes?: AnimeEpisodeLink[];
@@ -71,9 +82,20 @@ interface EpisodeWorkspaceProps {
   loadingExtraServers?: boolean;
   loadingExtraServerNames?: string[];
   onToggleFavorite: (item: CatalogMediaItem, knownLatest?: FavoriteLatestInfo | null) => void;
+  onToggleMuteFavorite?: (animeUrl: string) => void;
   onToggleEpisodeWatched?: (episode: EpisodeDetails, watched: boolean) => void;
   onBack: () => void;
-  onNavigateUrl: (url: string, kind: 'episode' | 'anime' | 'series' | 'movie') => void;
+  onNavigateUrl: (
+    url: string,
+    kind: 'episode' | 'anime' | 'series' | 'movie',
+    seed?: MediaNavigationSeed
+  ) => void;
+  onPrefetchEpisode?: (
+    episodeUrl: string,
+    seed?: MediaNavigationSeed,
+    options?: { preResolvePrimaryEmbed?: boolean }
+  ) => void;
+  onPrefetchAnime?: (animeUrl: string, seed?: MediaNavigationSeed) => void;
   onRefreshSources?: () => void;
   onNativeSessionSync?: (result: NativeVlcPlayResult) => void;
   onPlaybackProgress?: () => void;
@@ -82,6 +104,7 @@ interface EpisodeWorkspaceProps {
   autoPlayNextEpisode?: boolean;
   videoScale?: VideoScaleMode;
   onChangeVideoScale?: (scale: VideoScaleMode) => void;
+  onLoadingStateChange?: (loading: boolean) => void;
 }
 
 interface ScopedResolvedEmbed {
@@ -106,6 +129,7 @@ function pickInitialOption(options: PlayerOption[]): PlayerOption | null {
 export function EpisodeWorkspace({
   episode,
   isFavorite,
+  isMuted = false,
   watchedUrls,
   progressMap,
   initialSeriesEpisodes,
@@ -115,9 +139,12 @@ export function EpisodeWorkspace({
   loadingExtraServers = false,
   loadingExtraServerNames = [],
   onToggleFavorite,
+  onToggleMuteFavorite,
   onToggleEpisodeWatched,
   onBack,
   onNavigateUrl,
+  onPrefetchEpisode,
+  onPrefetchAnime,
   onRefreshSources,
   onNativeSessionSync,
   onPlaybackProgress,
@@ -126,6 +153,7 @@ export function EpisodeWorkspace({
   autoPlayNextEpisode = false,
   videoScale,
   onChangeVideoScale,
+  onLoadingStateChange,
 }: EpisodeWorkspaceProps) {
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
 
@@ -138,7 +166,15 @@ export function EpisodeWorkspace({
   const [selectedOption, setSelectedOption] = useState<PlayerOption | null>(() =>
     pickInitialOption(playableOptions)
   );
-  const [resolvedState, setResolvedState] = useState<ScopedResolvedEmbed | null>(null);
+  const [resolvedState, setResolvedState] = useState<ScopedResolvedEmbed | null>(() => {
+    const initialOpt = pickInitialOption(playableOptions);
+    if (!initialOpt || initialOpt.directStreamUrl) return null;
+    const cached = getCachedEmbed(initialOpt.embedUrl);
+    if (cached && cached.status === 'resolved' && cached.streams.length > 0) {
+      return { episodeUrl: episode.url, embedUrl: initialOpt.embedUrl, data: cached };
+    }
+    return null;
+  });
   const [loadingEmbed, setLoadingEmbed] = useState(false);
   const [failoverExhaustedMsg, setFailoverExhaustedMsg] = useState('');
   const [resumeAfterFailover, setResumeAfterFailover] = useState<{
@@ -147,12 +183,10 @@ export function EpisodeWorkspace({
     key: number;
   } | null>(null);
 
-  const embedCacheRef = useRef<Map<string, CachedEmbedEntry>>(new Map());
   const failedServersByEpisodeRef = useRef<Map<string, Set<string>>>(new Map());
   const activeEpisodeUrlRef = useRef(episode.url);
   activeEpisodeUrlRef.current = episode.url;
 
-  const seriesDetailsCacheRef = useRef<Map<string, AnimeDetails>>(new Map());
   const seriesExternalIdsCacheRef = useRef<Map<string, ExternalMediaIds>>(new Map());
   const seriesArtworkCacheRef = useRef<Map<string, { poster?: string; backdrop?: string }>>(
     new Map()
@@ -169,16 +203,27 @@ export function EpisodeWorkspace({
   const [seriesMediaReadyForUrl, setSeriesMediaReadyForUrl] = useState<string>(
     initialSeriesEpisodes && initialSeriesEpisodes.length > 0 ? episode.seriesUrl || '' : ''
   );
+  const [hydratedSeriesTitlesState, setHydratedSeriesTitlesState] = useState<{
+    scopeKey: string;
+    byId: Record<number, string>;
+    settledIds: number[];
+  }>({ scopeKey: '', byId: {}, settledIds: [] });
+  const settledSeriesTitleIdsRef = useRef<{ scopeKey: string; ids: Set<number> }>({
+    scopeKey: '',
+    ids: new Set(),
+  });
 
-  const synopsisCacheRef = useRef<Map<string, EpisodeSynopsisResult | null>>(new Map());
   const [localizedSynopsisState, setLocalizedSynopsisState] = useState<{
     episodeUrl: string;
     loading: boolean;
     result: EpisodeSynopsisResult | null;
-  }>({
-    episodeUrl: episode.url,
-    loading: false,
-    result: null,
+  }>(() => {
+    const cached = getCachedEpisodeSynopsis(episode.url);
+    return {
+      episodeUrl: episode.url,
+      loading: false,
+      result: cached.hit ? cached.value : null,
+    };
   });
 
   const resolved =
@@ -200,8 +245,14 @@ export function EpisodeWorkspace({
   useEffect(() => {
     if (!isSameEpisodeUrl(lastResetEpisodeUrlRef.current, episode.url)) {
       lastResetEpisodeUrlRef.current = episode.url;
-      setSelectedOption(pickInitialOption(playableOptions));
-      setResolvedState(null);
+      const nextOpt = pickInitialOption(playableOptions);
+      setSelectedOption(nextOpt);
+      const cachedNext = nextOpt && !nextOpt.directStreamUrl ? getCachedEmbed(nextOpt.embedUrl) : undefined;
+      setResolvedState(
+        nextOpt && cachedNext && cachedNext.status === 'resolved' && cachedNext.streams.length > 0
+          ? { episodeUrl: episode.url, embedUrl: nextOpt.embedUrl, data: cachedNext }
+          : null
+      );
       setFailoverExhaustedMsg('');
       setResumeAfterFailover(null);
       return;
@@ -248,7 +299,12 @@ export function EpisodeWorkspace({
     if (initialSeriesArtwork?.poster || initialSeriesArtwork?.backdrop) {
       seriesArtworkCacheRef.current.set(seriesKey, initialSeriesArtwork);
     }
-    if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
+    const hasEnrichedInitialEpisodes = Boolean(
+      initialSeriesEpisodes &&
+        initialSeriesEpisodes.length > 0 &&
+        initialSeriesEpisodes.some((ep) => Boolean(ep.tvdbEpisodeId || ep.titleLocalized))
+    );
+    if (hasEnrichedInitialEpisodes && initialSeriesEpisodes) {
       setSeriesEpisodes(initialSeriesEpisodes);
       const cachedIds = seriesExternalIdsCacheRef.current.get(seriesKey);
       setSeriesExternalIds(episode.externalIds || initialSeriesExternalIds || cachedIds);
@@ -259,20 +315,32 @@ export function EpisodeWorkspace({
       return;
     }
 
-    const cachedDetails = seriesDetailsCacheRef.current.get(seriesKey);
+    const cachedDetails = getCachedAnimeDetailsFull(seriesUrl);
     if (cachedDetails) {
       const resolvedTrackEps =
         resolveSeriesEpisodesForEpisode(cachedDetails, episode.url, seriesUrl) ||
         cachedDetails.episodes;
       if (resolvedTrackEps.length > 0) {
         setSeriesEpisodes(resolvedTrackEps);
+        if (cachedDetails.externalIds) {
+          seriesExternalIdsCacheRef.current.set(seriesKey, cachedDetails.externalIds);
+        }
+        if (cachedDetails.poster || cachedDetails.backdrop) {
+          seriesArtworkCacheRef.current.set(seriesKey, {
+            poster: cachedDetails.poster || undefined,
+            backdrop: cachedDetails.backdrop || undefined,
+          });
+        }
         setSeriesExternalIds(
           episode.externalIds ||
             initialSeriesExternalIds ||
+            cachedDetails.externalIds ||
             seriesExternalIdsCacheRef.current.get(seriesKey)
         );
         setSeriesArtwork(
-          initialSeriesArtwork || seriesArtworkCacheRef.current.get(seriesKey) || {}
+          initialSeriesArtwork ||
+            seriesArtworkCacheRef.current.get(seriesKey) ||
+            {}
         );
         setSeriesMediaReadyForUrl(seriesUrl);
         return;
@@ -280,12 +348,17 @@ export function EpisodeWorkspace({
     }
 
     let cancelled = false;
-    apiFetch(`/api/media?url=${encodeURIComponent(seriesUrl)}`)
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: AnimeDetails | null) => {
+    fetchAnimeDetailsFull(seriesUrl, {
+      hints: {
+        title: episode.seriesTitle,
+        tvdbId: episode.externalIds?.tvdbId ?? initialSeriesExternalIds?.tvdbId,
+        kind: episode.mediaType,
+        year: episode.year,
+      },
+    })
+      .then((data) => {
         if (cancelled) return;
         if (data && Array.isArray(data.episodes)) {
-          seriesDetailsCacheRef.current.set(seriesKey, data);
           const resolvedTrackEps =
             resolveSeriesEpisodesForEpisode(data, episode.url, seriesUrl) || data.episodes;
           setSeriesEpisodes(resolvedTrackEps);
@@ -306,6 +379,9 @@ export function EpisodeWorkspace({
       })
       .catch(() => {
         if (!cancelled) {
+          if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
+            setSeriesEpisodes(initialSeriesEpisodes);
+          }
           setSeriesMediaReadyForUrl(seriesUrl);
         }
       });
@@ -316,16 +392,152 @@ export function EpisodeWorkspace({
   }, [
     episode.externalIds,
     episode.isMovie,
+    episode.mediaType,
+    episode.seriesTitle,
     episode.seriesUrl,
     episode.url,
+    episode.year,
     initialSeriesArtwork,
     initialSeriesEpisodes,
     initialSeriesExternalIds,
   ]);
 
+  const seriesTitlesScopeKey = episode.seriesUrl || episode.url;
+  const unlocalizedSeriesEpisodeIds = useMemo(
+    () => collectUnlocalizedEpisodeIds(seriesEpisodes, episode.isMovie),
+    [episode.isMovie, seriesEpisodes]
+  );
+  const unlocalizedSeriesEpisodeIdsKey = useMemo(
+    () => unlocalizedSeriesEpisodeIds.join(','),
+    [unlocalizedSeriesEpisodeIds]
+  );
+
+  const cachedSeriesTitlesSnapshot = useMemo(
+    () => readCachedEpisodeTitles(unlocalizedSeriesEpisodeIds),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [unlocalizedSeriesEpisodeIdsKey, hydratedSeriesTitlesState.settledIds.length]
+  );
+
+  const hydratedSeriesTitlesById = useMemo(
+    () => ({
+      ...cachedSeriesTitlesSnapshot.byId,
+      ...(hydratedSeriesTitlesState.scopeKey === seriesTitlesScopeKey
+        ? hydratedSeriesTitlesState.byId
+        : {}),
+    }),
+    [
+      cachedSeriesTitlesSnapshot.byId,
+      hydratedSeriesTitlesState.byId,
+      hydratedSeriesTitlesState.scopeKey,
+      seriesTitlesScopeKey,
+    ]
+  );
+
+  useEffect(() => {
+    if (episode.isMovie || !unlocalizedSeriesEpisodeIdsKey) return;
+    if (settledSeriesTitleIdsRef.current.scopeKey !== seriesTitlesScopeKey) {
+      settledSeriesTitleIdsRef.current = { scopeKey: seriesTitlesScopeKey, ids: new Set() };
+    }
+    const parsedIds = unlocalizedSeriesEpisodeIdsKey
+      .split(',')
+      .map((s) => Number.parseInt(s, 10))
+      .filter((id) => Number.isFinite(id) && id > 0);
+    const { missingIds } = readCachedEpisodeTitles(parsedIds);
+    const idsToFetch = missingIds.filter(
+      (id) => !settledSeriesTitleIdsRef.current.ids.has(id)
+    );
+    if (idsToFetch.length === 0) return;
+
+    const batches: number[][] = [];
+    for (let i = 0; i < idsToFetch.length; i += 28) {
+      batches.push(idsToFetch.slice(i, i + 28));
+    }
+
+    let cancelled = false;
+    const tvdbSlug = episode.externalIds?.tvdbSlug || seriesExternalIds?.tvdbSlug;
+    const tvdbId = episode.externalIds?.tvdbId || seriesExternalIds?.tvdbId;
+
+    const runBatch = async (batchIds: number[]) => {
+      const params = new URLSearchParams({ ids: batchIds.join(',') });
+      if (tvdbSlug) params.set('tvdbSlug', tvdbSlug);
+      if (tvdbId && tvdbId > 0) params.set('tvdbId', String(tvdbId));
+
+      const nextEntries: Record<number, string> = {};
+      let okToCache = false;
+      try {
+        const res = await apiFetch(`/api/episode-titles?${params.toString()}`);
+        const data: { titlesById?: Record<string, string> } | null = res.ok
+          ? await res.json()
+          : null;
+        if (res.ok) {
+          okToCache = true;
+        }
+        if (data?.titlesById) {
+          for (const [k, v] of Object.entries(data.titlesById)) {
+            const numId = Number.parseInt(k, 10);
+            if (Number.isFinite(numId) && numId > 0 && typeof v === 'string' && v.trim()) {
+              nextEntries[numId] = v.trim();
+            }
+          }
+        }
+      } catch {
+        // Non-fatal: keep fallback guide titles
+      }
+
+      if (okToCache) {
+        writeCachedEpisodeTitles(nextEntries, batchIds);
+      }
+      if (cancelled) return;
+      if (settledSeriesTitleIdsRef.current.scopeKey === seriesTitlesScopeKey) {
+        for (const id of batchIds) {
+          settledSeriesTitleIdsRef.current.ids.add(id);
+        }
+      }
+      setHydratedSeriesTitlesState((prev) => {
+        const prevById = prev.scopeKey === seriesTitlesScopeKey ? prev.byId : {};
+        const prevSettled = prev.scopeKey === seriesTitlesScopeKey ? prev.settledIds : [];
+        const mergedSettled = Array.from(new Set([...prevSettled, ...batchIds]));
+        return {
+          scopeKey: seriesTitlesScopeKey,
+          byId: { ...prevById, ...nextEntries },
+          settledIds: mergedSettled,
+        };
+      });
+    };
+
+    const concurrency = Math.min(2, batches.length);
+    let cursor = 0;
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (!cancelled && cursor < batches.length) {
+        const batch = batches[cursor++];
+        if (batch) {
+          await runBatch(batch);
+        }
+      }
+    });
+    void Promise.all(workers);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    episode.externalIds?.tvdbId,
+    episode.externalIds?.tvdbSlug,
+    episode.isMovie,
+    seriesExternalIds?.tvdbId,
+    seriesExternalIds?.tvdbSlug,
+    seriesTitlesScopeKey,
+    unlocalizedSeriesEpisodeIdsKey,
+  ]);
+
+  const localizedSeriesEpisodes = useMemo(
+    () => applyLocalizedEpisodeTitles(seriesEpisodes, hydratedSeriesTitlesById),
+    [hydratedSeriesTitlesById, seriesEpisodes]
+  );
+
   const matchedSeriesEpisode = useMemo(() => {
-    if (!seriesEpisodes.length) return undefined;
-    const byUrl = seriesEpisodes.find((ep) => isSameEpisodeUrl(ep.url, episode.url));
+    if (!localizedSeriesEpisodes.length) return undefined;
+    const byUrl = localizedSeriesEpisodes.find((ep) => isSameEpisodeUrl(ep.url, episode.url));
     if (byUrl) return byUrl;
     const targetEpNum =
       episode.episodeNumber ??
@@ -335,21 +547,26 @@ export function EpisodeWorkspace({
     if (!targetEpNum) return undefined;
     const targetSeason = episode.seasonNumber || 1;
     return (
-      seriesEpisodes.find(
+      localizedSeriesEpisodes.find(
         (ep) => (ep.seasonNumber || 1) === targetSeason && ep.episodeNumber === targetEpNum
-      ) || seriesEpisodes.find((ep) => ep.episodeNumber === targetEpNum)
+      ) || localizedSeriesEpisodes.find((ep) => ep.episodeNumber === targetEpNum)
     );
-  }, [episode.episodeLabel, episode.episodeNumber, episode.seasonNumber, episode.title, episode.url, seriesEpisodes]);
+  }, [episode.episodeLabel, episode.episodeNumber, episode.seasonNumber, episode.title, episode.url, localizedSeriesEpisodes]);
 
   // Fetch TheTVDB episode/movie synopsis & artwork (PT-BR -> Google Translate -> EN fallback) asynchronously
   useEffect(() => {
-    const epCacheKey = normalizeTopAnimesUrl(episode.url) || episode.url;
-    if (synopsisCacheRef.current.has(epCacheKey)) {
+    const cachedSynopsis = getCachedEpisodeSynopsis(episode.url);
+    if (cachedSynopsis.hit) {
       setLocalizedSynopsisState({
         episodeUrl: episode.url,
         loading: false,
-        result: synopsisCacheRef.current.get(epCacheKey) ?? null,
+        result: cachedSynopsis.value,
       });
+      return;
+    }
+
+    // If still on a bare optimistic seed without series context yet, wait for real episode metadata
+    if (loadingEpisode && episode.options.length === 0 && !episode.seriesUrl) {
       return;
     }
 
@@ -387,7 +604,7 @@ export function EpisodeWorkspace({
                 tvdbSeriesId: movieRes.tvdbId,
               }
             : null;
-          synopsisCacheRef.current.set(epCacheKey, mapped);
+          setCachedEpisodeSynopsis(episode.url, mapped);
           if (movieRes?.poster || movieRes?.backdrop) {
             setSeriesArtwork((prev) => ({
               poster: movieRes.poster || prev.poster,
@@ -465,7 +682,7 @@ export function EpisodeWorkspace({
       .then((payload: { result?: EpisodeSynopsisResult | null } | null) => {
         if (cancelled) return;
         const resolvedResult = payload?.result ?? null;
-        synopsisCacheRef.current.set(epCacheKey, resolvedResult);
+        setCachedEpisodeSynopsis(episode.url, resolvedResult);
         setLocalizedSynopsisState({
           episodeUrl: episode.url,
           loading: false,
@@ -492,6 +709,7 @@ export function EpisodeWorkspace({
     episode.externalIds?.tvdbSlug,
     episode.isMovie,
     episode.mediaType,
+    episode.options.length,
     episode.originalTitle,
     episode.seasonNumber,
     episode.seriesTitle,
@@ -499,6 +717,7 @@ export function EpisodeWorkspace({
     episode.title,
     episode.url,
     episode.year,
+    loadingEpisode,
     matchedSeriesEpisode?.episodeNumber,
     matchedSeriesEpisode?.overview,
     matchedSeriesEpisode?.seasonNumber,
@@ -509,63 +728,7 @@ export function EpisodeWorkspace({
   ]);
 
   const resolveEmbedCached = useCallback(async (opt: PlayerOption): Promise<ResolvedEmbed> => {
-    // Short-circuit immediately for pre-resolved direct streams
-    if (opt.directStreamUrl && isSafeExternalHttpUrl(opt.directStreamUrl)) {
-      const format =
-        opt.directFormat ||
-        (/\.m3u8(?:$|\?)/i.test(opt.directStreamUrl)
-          ? 'hls'
-          : /\.(?:mp4|mkv|webm|m4v)(?:$|\?)/i.test(opt.directStreamUrl)
-            ? 'mp4'
-            : 'unknown');
-      return {
-        embedUrl: opt.embedUrl || opt.directStreamUrl,
-        provider: opt.label,
-        status: 'resolved',
-        streams: [
-          {
-            label: opt.qualityLabel || (format === 'hls' ? 'HLS' : 'Direto'),
-            height: 1080,
-            url: opt.directStreamUrl,
-            format,
-          },
-        ],
-        subtitles: opt.directSubtitles || [],
-        referer: opt.directReferer || opt.directStreamUrl,
-        preferDirect: true,
-      };
-    }
-
-    const cacheKey = opt.embedUrl;
-    const cached = embedCacheRef.current.get(cacheKey);
-    if (isEmbedCacheEntryValid(cached)) {
-      return cached.data;
-    }
-    if (cached) {
-      embedCacheRef.current.delete(cacheKey);
-    }
-
-    try {
-      const res = await apiFetch(`/api/resolve-embed?url=${encodeURIComponent(opt.embedUrl)}`);
-      const data = (await res.json()) as ResolvedEmbed;
-      const entry = createEmbedCacheEntry(data);
-      if (entry) {
-        embedCacheRef.current.set(cacheKey, entry);
-      } else {
-        embedCacheRef.current.delete(cacheKey);
-      }
-      return data;
-    } catch {
-      return {
-        embedUrl: opt.embedUrl,
-        provider: opt.label,
-        status: 'error',
-        streams: [],
-        subtitles: [],
-        referer: opt.directReferer || 'https://topanimes.net/',
-        errorMessage: 'Não foi possível contactar o servidor de extração.',
-      };
-    }
+    return resolveEmbedCachedGlobal(opt);
   }, []);
 
   const findBestAvailableServer = useCallback(
@@ -591,9 +754,28 @@ export function EpisodeWorkspace({
 
   // Resolve chosen server via backend (and auto-failover to best quality server if resolution fails)
   useEffect(() => {
-    if (!selectedOption) return;
+    if (!selectedOption) {
+      setLoadingEmbed(false);
+      return;
+    }
     const targetEpisodeUrl = episode.url;
     const targetOption = selectedOption;
+
+    // Zero-latency hit when the primary stream was prefetched in the background
+    if (!targetOption.directStreamUrl) {
+      const preCached = getCachedEmbed(targetOption.embedUrl);
+      if (preCached && preCached.status === 'resolved' && preCached.streams.length > 0) {
+        setResolvedState({
+          episodeUrl: targetEpisodeUrl,
+          embedUrl: targetOption.embedUrl,
+          data: preCached,
+        });
+        setLoadingEmbed(false);
+        setFailoverExhaustedMsg('');
+        return;
+      }
+    }
+
     let cancelled = false;
     setLoadingEmbed(true);
     setFailoverExhaustedMsg('');
@@ -659,7 +841,7 @@ export function EpisodeWorkspace({
 
       const failedOpt = playableOptions.find((o) => o.nume === failedNume);
       if (failedOpt) {
-        embedCacheRef.current.delete(failedOpt.embedUrl);
+        deleteCachedEmbed(failedOpt.embedUrl);
       }
 
       setLoadingEmbed(true);
@@ -703,7 +885,7 @@ export function EpisodeWorkspace({
       const failedSet = failedServersByEpisodeRef.current.get(epKey);
       if (failedSet?.has(opt.nume)) {
         failedSet.delete(opt.nume);
-        embedCacheRef.current.delete(opt.embedUrl);
+        deleteCachedEmbed(opt.embedUrl);
       }
       setFailoverExhaustedMsg('');
       setSelectedOption({ ...opt });
@@ -714,7 +896,7 @@ export function EpisodeWorkspace({
   const handleRetryAllServers = useCallback(() => {
     const epKey = normalizeTopAnimesUrl(episode.url) || episode.url;
     failedServersByEpisodeRef.current.delete(epKey);
-    embedCacheRef.current.clear();
+    clearCachedEmbeds();
     setFailoverExhaustedMsg('');
     const first = pickInitialOption(playableOptions);
     if (first) {
@@ -778,7 +960,47 @@ export function EpisodeWorkspace({
   const scopedSynopsis =
     localizedSynopsisState.episodeUrl === episode.url
       ? localizedSynopsisState
-      : { loading: false, result: null };
+      : (() => {
+          const cached = getCachedEpisodeSynopsis(episode.url);
+          return cached.hit
+            ? { loading: false, result: cached.value }
+            : { loading: false, result: null };
+        })();
+
+  const isSeriesMediaLoading =
+    !episode.isMovie &&
+    Boolean(episode.seriesUrl) &&
+    seriesMediaReadyForUrl !== episode.seriesUrl;
+  const isEpisodeSynopsisPending =
+    scopedSynopsis.loading ||
+    (!getCachedEpisodeSynopsis(episode.url).hit &&
+      !loadingEpisode &&
+      localizedSynopsisState.episodeUrl !== episode.url);
+  const isEmbedPending =
+    loadingEmbed ||
+    (Boolean(selectedOption) &&
+      !loadingEpisode &&
+      !(
+        resolvedState &&
+        isSameEpisodeUrl(resolvedState.episodeUrl, episode.url) &&
+        resolvedState.embedUrl === selectedOption?.embedUrl
+      ));
+  const isEpisodeWorkspaceLoading =
+    loadingEpisode ||
+    loadingExtraServers ||
+    isSeriesMediaLoading ||
+    isEpisodeSynopsisPending ||
+    isEmbedPending;
+
+  useLayoutEffect(() => {
+    onLoadingStateChange?.(isEpisodeWorkspaceLoading);
+  }, [isEpisodeWorkspaceLoading, onLoadingStateChange]);
+
+  useLayoutEffect(() => {
+    return () => {
+      onLoadingStateChange?.(false);
+    };
+  }, [onLoadingStateChange]);
   const tvdbSynopsis = scopedSynopsis.result;
   const displaySynopsis = tvdbSynopsis?.synopsis || episode.synopsis;
   const synopsisSourceCaption =
@@ -801,8 +1023,94 @@ export function EpisodeWorkspace({
   const effectiveSeriesPoster =
     seriesArtwork.poster || episode.poster || effectiveEpisodePoster;
 
+  const buildAdjacentEpisodeSeed = useCallback(
+    (targetUrl: string): MediaNavigationSeed => {
+      const matched = localizedSeriesEpisodes.find((ep) => isSameEpisodeUrl(ep.url, targetUrl));
+      return {
+        title:
+          matched?.title ||
+          (matched?.numberLabel
+            ? `${episode.seriesTitle} — ${matched.numberLabel}`
+            : episode.seriesTitle),
+        seriesTitle: episode.seriesTitle,
+        seriesUrl: episode.seriesUrl,
+        poster: effectiveSeriesPoster,
+        backdrop: matched?.thumb || effectiveEpisodePoster,
+        episodeLabel: matched?.numberLabel || undefined,
+        seasonNumber: matched?.seasonNumber,
+        episodeNumber: matched?.episodeNumber ?? undefined,
+        kind: episode.isMovie ? 'movie' : 'episode',
+        isMovie: episode.isMovie,
+        year: episode.year,
+        genres: episode.genres,
+        externalIds: episode.externalIds || seriesExternalIds,
+        catalogSource: episode.catalogSource,
+      };
+    },
+    [
+      effectiveEpisodePoster,
+      effectiveSeriesPoster,
+      episode.catalogSource,
+      episode.externalIds,
+      episode.genres,
+      episode.isMovie,
+      episode.seriesTitle,
+      episode.seriesUrl,
+      episode.year,
+      localizedSeriesEpisodes,
+      seriesExternalIds,
+    ]
+  );
+
+  const seriesNavSeed = useMemo<MediaNavigationSeed | undefined>(() => {
+    if (!episode.seriesUrl) return undefined;
+    return {
+      title: episode.seriesTitle,
+      poster: effectiveSeriesPoster,
+      backdrop: seriesArtwork.backdrop || episode.backdrop || effectiveSeriesPoster,
+      kind: parentMediaKind,
+      year: episode.year,
+      genres: episode.genres,
+      externalIds: episode.externalIds || seriesExternalIds,
+      catalogSource: episode.catalogSource,
+      isMovie: episode.isMovie,
+    };
+  }, [
+    effectiveSeriesPoster,
+    episode.backdrop,
+    episode.catalogSource,
+    episode.externalIds,
+    episode.genres,
+    episode.isMovie,
+    episode.seriesTitle,
+    episode.seriesUrl,
+    episode.year,
+    parentMediaKind,
+    seriesArtwork.backdrop,
+    seriesExternalIds,
+  ]);
+
+  // Quietly pre-warm the next episode (and its primary video stream) shortly after current playback resolves
+  useEffect(() => {
+    if (!onPrefetchEpisode || !effectiveNextUrl || !hasResolvedStreams || episode.isMovie) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      onPrefetchEpisode(effectiveNextUrl, buildAdjacentEpisodeSeed(effectiveNextUrl), {
+        preResolvePrimaryEmbed: true,
+      });
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [
+    buildAdjacentEpisodeSeed,
+    effectiveNextUrl,
+    episode.isMovie,
+    hasResolvedStreams,
+    onPrefetchEpisode,
+  ]);
+
   return (
-    <div className="mx-auto max-w-5xl px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
+    <div className="mx-auto max-w-5xl anisync-view-enter px-4 py-5 sm:px-6 sm:py-8 lg:px-8">
       {/* Top Breadcrumb & Prev/Next Episode Controls */}
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 sm:mb-6">
         <div className="flex min-w-0 flex-wrap items-center gap-2 text-xs text-slate-400 sm:text-sm">
@@ -819,7 +1127,10 @@ export function EpisodeWorkspace({
               <span>/</span>
               <button
                 type="button"
-                onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind)}
+                onMouseEnter={() => onPrefetchAnime?.(episode.seriesUrl!, seriesNavSeed)}
+                onFocus={() => onPrefetchAnime?.(episode.seriesUrl!, seriesNavSeed)}
+                onTouchStart={() => onPrefetchAnime?.(episode.seriesUrl!, seriesNavSeed)}
+                onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind, seriesNavSeed)}
                 className="truncate font-medium text-slate-300 transition-colors hover:text-[#f97316]"
               >
                 {episode.seriesTitle}
@@ -839,7 +1150,32 @@ export function EpisodeWorkspace({
             <button
               type="button"
               disabled={!effectivePrevUrl || isTransitioning}
-              onClick={() => effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')}
+              onMouseEnter={() =>
+                effectivePrevUrl &&
+                onPrefetchEpisode?.(effectivePrevUrl, buildAdjacentEpisodeSeed(effectivePrevUrl), {
+                  preResolvePrimaryEmbed: true,
+                })
+              }
+              onFocus={() =>
+                effectivePrevUrl &&
+                onPrefetchEpisode?.(effectivePrevUrl, buildAdjacentEpisodeSeed(effectivePrevUrl), {
+                  preResolvePrimaryEmbed: true,
+                })
+              }
+              onTouchStart={() =>
+                effectivePrevUrl &&
+                onPrefetchEpisode?.(effectivePrevUrl, buildAdjacentEpisodeSeed(effectivePrevUrl), {
+                  preResolvePrimaryEmbed: true,
+                })
+              }
+              onClick={() =>
+                effectivePrevUrl &&
+                onNavigateUrl(
+                  effectivePrevUrl,
+                  'episode',
+                  buildAdjacentEpisodeSeed(effectivePrevUrl)
+                )
+              }
               className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
             >
               <ChevronLeft className="h-4 w-4" />
@@ -895,7 +1231,38 @@ export function EpisodeWorkspace({
               <button
                 type="button"
                 disabled={!effectiveNextUrl || isTransitioning}
-                onClick={() => effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')}
+                onMouseEnter={() =>
+                  effectiveNextUrl &&
+                  onPrefetchEpisode?.(
+                    effectiveNextUrl,
+                    buildAdjacentEpisodeSeed(effectiveNextUrl),
+                    { preResolvePrimaryEmbed: true }
+                  )
+                }
+                onFocus={() =>
+                  effectiveNextUrl &&
+                  onPrefetchEpisode?.(
+                    effectiveNextUrl,
+                    buildAdjacentEpisodeSeed(effectiveNextUrl),
+                    { preResolvePrimaryEmbed: true }
+                  )
+                }
+                onTouchStart={() =>
+                  effectiveNextUrl &&
+                  onPrefetchEpisode?.(
+                    effectiveNextUrl,
+                    buildAdjacentEpisodeSeed(effectiveNextUrl),
+                    { preResolvePrimaryEmbed: true }
+                  )
+                }
+                onClick={() =>
+                  effectiveNextUrl &&
+                  onNavigateUrl(
+                    effectiveNextUrl,
+                    'episode',
+                    buildAdjacentEpisodeSeed(effectiveNextUrl)
+                  )
+                }
                 className="inline-flex items-center gap-1 rounded-lg border border-white/12 bg-[#151921] px-3 py-2 text-xs font-medium text-slate-200 transition-colors hover:border-white/25 disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <span>Próximo</span>
@@ -915,7 +1282,7 @@ export function EpisodeWorkspace({
             seriesUrl={episode.seriesUrl}
             seriesTitle={episode.seriesTitle}
             isMovie={episode.isMovie}
-            seriesEpisodes={seriesEpisodes}
+            seriesEpisodes={localizedSeriesEpisodes}
             watchedUrls={watchedUrls}
             playerOptions={playableOptions}
             selectedServerNume={selectedOption?.nume}
@@ -944,14 +1311,24 @@ export function EpisodeWorkspace({
             autoPlayNextEpisode={autoPlayNextEpisode}
             videoScale={videoScale}
             onPrevEpisode={() =>
-              effectivePrevUrl && onNavigateUrl(effectivePrevUrl, 'episode')
+              effectivePrevUrl &&
+              onNavigateUrl(
+                effectivePrevUrl,
+                'episode',
+                buildAdjacentEpisodeSeed(effectivePrevUrl)
+              )
             }
             onNextEpisode={() =>
-              effectiveNextUrl && onNavigateUrl(effectiveNextUrl, 'episode')
+              effectiveNextUrl &&
+              onNavigateUrl(
+                effectiveNextUrl,
+                'episode',
+                buildAdjacentEpisodeSeed(effectiveNextUrl)
+              )
             }
             onSelectEpisode={(epUrl) => {
               if (!isSameEpisodeUrl(epUrl, episode.url)) {
-                onNavigateUrl(epUrl, 'episode');
+                onNavigateUrl(epUrl, 'episode', buildAdjacentEpisodeSeed(epUrl));
               }
             }}
             onSelectServer={(nume) => {
@@ -966,11 +1343,24 @@ export function EpisodeWorkspace({
             onToast={onToast}
           />
         ) : isTransitioning ? (
-          <div className="flex aspect-video w-full flex-col items-center justify-center rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
-            <div className="h-10 w-10 animate-spin rounded-full border-3 border-white/15 border-t-[#f97316]" />
-            <p className="mt-3 text-sm font-medium text-slate-300">
-              Consultando provedores e extraindo vídeo...
-            </p>
+          <div className="relative flex aspect-video w-full flex-col items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-[#0b0e14] p-6 text-center">
+            {effectiveEpisodePoster && (
+              <>
+                <img
+                  src={effectiveEpisodePoster}
+                  alt=""
+                  aria-hidden="true"
+                  decoding="async"
+                  referrerPolicy="no-referrer"
+                  className="pointer-events-none absolute inset-0 h-full w-full scale-105 object-cover opacity-35 blur-md"
+                />
+                <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-[#0b0e14]/90 via-[#0b0e14]/55 to-[#0b0e14]/75" />
+              </>
+            )}
+            <div className="relative z-10 inline-flex items-center gap-2.5 rounded-full border border-white/15 bg-[#0d0f12]/80 px-4 py-2 text-xs font-medium text-slate-200 shadow-lg backdrop-blur-md sm:text-sm">
+              <Loader2 className="h-4 w-4 animate-spin text-[#f97316]" />
+              <span>Preparando vídeo...</span>
+            </div>
           </div>
         ) : (
           <div className="flex aspect-video w-full flex-col items-center justify-center gap-3 rounded-xl border border-white/10 bg-[#151921] p-6 text-center">
@@ -1016,9 +1406,9 @@ export function EpisodeWorkspace({
                 className="space-y-2"
                 aria-label="Carregando sinopse do episódio"
               >
-                <div className="h-3 w-2/3 animate-pulse rounded bg-white/10" />
-                <div className="h-3 w-full animate-pulse rounded bg-white/8" />
-                <div className="h-3 w-5/6 animate-pulse rounded bg-white/8" />
+                <div className="anisync-shimmer h-3 w-2/3 rounded" />
+                <div className="anisync-shimmer h-3 w-full rounded" />
+                <div className="anisync-shimmer h-3 w-5/6 rounded" />
               </div>
             ) : displaySynopsis ? (
               <div
@@ -1047,7 +1437,10 @@ export function EpisodeWorkspace({
               <div>
                 <button
                   type="button"
-                  onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind)}
+                  onMouseEnter={() => onPrefetchAnime?.(episode.seriesUrl!, seriesNavSeed)}
+                  onFocus={() => onPrefetchAnime?.(episode.seriesUrl!, seriesNavSeed)}
+                  onTouchStart={() => onPrefetchAnime?.(episode.seriesUrl!, seriesNavSeed)}
+                  onClick={() => onNavigateUrl(episode.seriesUrl!, parentMediaKind, seriesNavSeed)}
                   className="inline-flex w-full items-center justify-center gap-2 rounded-lg border border-white/12 bg-[#0d0f12] px-3.5 py-2.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white sm:w-auto"
                 >
                   <Layers className="h-3.5 w-3.5 text-[#f97316]" />
@@ -1056,7 +1449,7 @@ export function EpisodeWorkspace({
               </div>
             )}
 
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 sm:gap-2.5">
               {onToggleEpisodeWatched && (() => {
                 const watched = isEpisodeMarkedWatched(episode.url, progressMap, watchedUrls);
                 return (
@@ -1064,14 +1457,20 @@ export function EpisodeWorkspace({
                     type="button"
                     onClick={() => onToggleEpisodeWatched(episode, !watched)}
                     aria-pressed={watched}
-                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                    aria-label={watched ? 'Visto' : 'Marcar como visto'}
+                    title={watched ? 'Visto' : 'Marcar como visto'}
+                    className={`inline-flex h-11 min-w-0 flex-1 items-center justify-center gap-2 rounded-xl border px-4 text-xs font-semibold transition-colors sm:flex-none sm:text-sm ${
                       watched
-                        ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                        : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
+                        ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/20'
+                        : 'border-white/15 bg-[#0d0f12] text-slate-200 hover:border-emerald-400/50 hover:text-white'
                     }`}
                   >
-                    <Check className="h-3.5 w-3.5" />
-                    <span>{watched ? 'Visto' : 'Marcar como visto'}</span>
+                    <Check
+                      className={`h-4 w-4 shrink-0 ${
+                        watched ? 'text-emerald-300' : 'text-emerald-400'
+                      }`}
+                    />
+                    <span className="truncate">{watched ? 'Visto' : 'Marcar como visto'}</span>
                   </button>
                 );
               })()}
@@ -1109,17 +1508,51 @@ export function EpisodeWorkspace({
                   );
                 }}
                 aria-pressed={isFavorite}
-                className={`inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-3 py-2 text-xs font-medium transition-colors ${
+                aria-label={isFavorite ? 'Nos Favoritos' : 'Favoritar'}
+                title={isFavorite ? 'Nos Favoritos' : 'Favoritar'}
+                className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-xl border text-xs font-semibold transition-colors sm:w-auto sm:px-4 sm:text-sm ${
                   isFavorite
-                    ? 'border-rose-500/40 bg-rose-500/10 text-rose-300'
-                    : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:text-white'
+                    ? 'border-rose-500/45 bg-rose-500/15 text-rose-200 hover:bg-rose-500/20'
+                    : 'border-white/15 bg-[#0d0f12] text-slate-200 hover:border-rose-400/50 hover:text-white'
                 }`}
               >
                 <Heart
-                  className={`h-3.5 w-3.5 ${isFavorite ? 'fill-rose-400 text-rose-400' : ''}`}
+                  className={`h-[18px] w-[18px] shrink-0 sm:h-4 sm:w-4 ${
+                    isFavorite ? 'fill-rose-400 text-rose-400' : 'text-rose-400'
+                  }`}
                 />
-                <span>{isFavorite ? 'Nos Favoritos' : 'Favoritar'}</span>
+                <span className="hidden sm:inline">
+                  {isFavorite ? 'Nos Favoritos' : 'Favoritar'}
+                </span>
               </button>
+
+              {isFavorite && onToggleMuteFavorite && (
+                <button
+                  type="button"
+                  onClick={() => onToggleMuteFavorite(episode.seriesUrl || episode.url)}
+                  aria-pressed={isMuted}
+                  aria-label={
+                    isMuted
+                      ? `Ativar avisos de novos episódios de ${episode.seriesTitle}`
+                      : `Silenciar avisos de novos episódios de ${episode.seriesTitle}`
+                  }
+                  title={isMuted ? 'Avisos silenciados' : 'Avisos ativos'}
+                  className={`inline-flex h-11 w-11 shrink-0 items-center justify-center gap-2 rounded-xl border text-xs font-semibold transition-colors sm:w-auto sm:px-3.5 ${
+                    isMuted
+                      ? 'border-white/15 bg-[#0d0f12] text-slate-400 hover:border-white/25 hover:text-white'
+                      : 'border-[#f97316]/40 bg-[#f97316]/12 text-[#fb923c] hover:bg-[#f97316]/20'
+                  }`}
+                >
+                  {isMuted ? (
+                    <BellOff className="h-[18px] w-[18px] shrink-0 sm:h-4 sm:w-4" />
+                  ) : (
+                    <Bell className="h-[18px] w-[18px] shrink-0 sm:h-4 sm:w-4" />
+                  )}
+                  <span className="hidden sm:inline">
+                    {isMuted ? 'Avisos silenciados' : 'Avisos ativos'}
+                  </span>
+                </button>
+              )}
             </div>
           </div>
 

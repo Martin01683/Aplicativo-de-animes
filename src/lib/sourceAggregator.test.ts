@@ -332,3 +332,96 @@ test('Hinata Soul resolves Season 2 (LEG + DUB) and signs Full HD / HD / SD R2 s
   assert.equal(testRes.ok, true);
   assert.equal(testRes.sourceId, 'hinatasoul');
 });
+
+test('Hinata Soul resolves Solo Leveling under hex-hash URL via split romaji alias from composite alternativeTitles', async () => {
+  const searchedQueries: string[] = [];
+  const soloHashUrl =
+    'https://www.hinatasoul.com/animes/2fb91a215b53e7b3d3416c707b39a990f835820e';
+
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url.startsWith('https://www.hinatasoul.com/busca?busca=')) {
+      const q = decodeURIComponent(url.split('busca=')[1] || '');
+      searchedQueries.push(q);
+      if (q.toLowerCase() === 'ore dake level up na ken') {
+        return {
+          status: 200,
+          ok: true,
+          finalUrl: url,
+          body: `
+            <div class="ultimosAnimesHomeItem">
+              <a href="/animes/2fb91a215b53e7b3d3416c707b39a990f835820e">
+                <div class="ultimosAnimesHomeItemInfos">
+                  <div class="ultimosAnimesHomeItemInfosNome">Ore dake Level Up na Ken</div>
+                  <div class="ultimosAnimesHomeItemTipo">Anime</div>
+                </div>
+              </a>
+            </div>`,
+        };
+      }
+      return { status: 200, ok: true, finalUrl: url, body: '<div class="aniContainer"></div>' };
+    }
+    if (url === soloHashUrl) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `
+          <div class="tituloPage"><h1>Ore dake Level Up na Ken</h1></div>
+          <div class="mainSingle"><div class="right"><div class="aniContainer">
+            <div class="ultimosEpisodiosHomeItem">
+              <a href="/videos/510007" title="Ore dake Level Up na Ken ep 7">
+                <div class="ultimosEpisodiosHomeItemInfosNum">Episódio 07</div>
+              </a>
+            </div>
+          </div></div></div>`,
+      };
+    }
+    return { status: 404, ok: false, finalUrl: url, body: '' };
+  };
+
+  const res = await resolveFromHinataSoulSource(mockFetcher, HINATASOUL_BUILTIN_SOURCE, {
+    title: 'Solo Leveling',
+    originalTitle: '俺だけレベルアップな件',
+    alternativeTitles: [
+      'Ore dake Level Up na Ken | Na Honjaman Level Up, I Level Up Alone',
+      'Only I Level Up',
+      'Solo Leveling Season 2 -Arise from the Shadow-',
+    ],
+    mediaType: 'anime',
+    seasonNumber: 1,
+    episodeNumber: 7,
+  });
+
+  assert.ok(
+    searchedQueries.some((q) => q.toLowerCase() === 'ore dake level up na ken'),
+    `Expected romaji alias query, got: ${JSON.stringify(searchedQueries)}`
+  );
+  assert.equal(res.options.length, 1);
+  assert.equal(res.options[0].sourceId, 'hinatasoul');
+  assert.equal(res.options[0].embedUrl, 'https://www.hinatasoul.com/videos/510007');
+});
+
+test('resolveEmbedByUrl resolves MixDrop packed embeds with origin referer and proxy mode', async () => {
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url === 'https://mixdrop.ag/e/pkd3x7wjcq4p3p') {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `<script>eval(function(p,a,c,k,e,d){e=function(c){return c};if(!''.replace(/^/,String)){while(c--){d[c]=k[c]||c}k=[function(e){return d[e]}];e=function(){return'\\\\w+'};c=1};while(c--){if(k[c]){p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c])}}return p}('1.7="//3-2.5.4/6/8.9?10=11";',10,12,'|MDCore|delivery31|a|net|mxcontent|v2|wurl|pkd3x7wjcq4p3p|mp4|s|tok123'.split('|'),0,{}))</script>`,
+      };
+    }
+    return { status: 404, ok: false, finalUrl: url, body: '' };
+  };
+
+  const resolved = await resolveEmbedByUrl(mockFetcher, 'https://mixdrop.ag/e/pkd3x7wjcq4p3p');
+  assert.equal(resolved.status, 'resolved');
+  assert.equal(resolved.provider, 'MixDrop');
+  assert.equal(resolved.referer, 'https://mixdrop.ag/');
+  assert.equal(resolved.preferDirect, false);
+  assert.equal(
+    resolved.streams[0]?.url,
+    'https://a-delivery31.mxcontent.net/v2/pkd3x7wjcq4p3p.mp4?s=tok123'
+  );
+});
+

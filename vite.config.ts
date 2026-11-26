@@ -137,12 +137,30 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /\/api\/(home|anime|media|catalog|calendar)$/i,
+              urlPattern: /\/api\/(home|episodes|catalog|calendar|glossary)(?:\?.*)?$/i,
+              handler: 'StaleWhileRevalidate',
+              options: {
+                cacheName: 'anisync-catalog-swr-cache',
+                expiration: { maxEntries: 60, maxAgeSeconds: 60 * 30 },
+                cacheableResponse: { statuses: [0, 200] },
+              },
+            },
+            {
+              urlPattern: /\/api\/(anime|media|anime-synopsis|episode-synopsis|episode-titles)(?:\?.*)?$/i,
               handler: 'NetworkFirst',
               options: {
-                cacheName: 'anisync-catalog-cache',
-                networkTimeoutSeconds: 4,
-                expiration: { maxEntries: 30, maxAgeSeconds: 60 * 15 },
+                cacheName: 'anisync-media-cache',
+                networkTimeoutSeconds: 3,
+                expiration: { maxEntries: 80, maxAgeSeconds: 60 * 60 * 6 },
+                cacheableResponse: { statuses: [0, 200] },
+              },
+            },
+            {
+              urlPattern: /^https:\/\/(?:artworks\.thetvdb\.com|u\.livechart\.me|image\.tmdb\.org)\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'anisync-artwork-images',
+                expiration: { maxEntries: 250, maxAgeSeconds: 60 * 60 * 24 * 7 },
                 cacheableResponse: { statuses: [0, 200] },
               },
             },

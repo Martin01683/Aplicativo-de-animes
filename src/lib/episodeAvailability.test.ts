@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyLocalizedEpisodeTitles,
+  collectUnlocalizedEpisodeIds,
   extractExplicitSeasonNumber,
   formatEpisodeCardBadge,
   formatEpisodeCardTitle,
@@ -13,6 +15,7 @@ import {
   isUncensoredEpisodeTitle,
   mergeServerAndCatalogEpisodes,
   parseEpisodeDateToTimestampSec,
+  pickImageWithFallback,
   stripUncensoredTag,
 } from './episodeAvailability';
 import { pickLatestAnimeEpisode } from './favoriteAlerts';
@@ -609,6 +612,144 @@ test('mergeServerAndCatalogEpisodes preserves uncensored flag while replacing ge
   assert.equal(isEpisodeUncensored(merged[1]), true);
   assert.equal(formatEpisodeCardTitle(merged[1]), 'Dia de piscina no Conselho Estudantil');
 });
+
+test('collectUnlocalizedEpisodeIds and applyLocalizedEpisodeTitles localize player drawer episodes without mutating input', () => {
+  const rawEpisodes: AnimeEpisodeLink[] = [
+    {
+      numberLabel: '1 - 1',
+      episodeNumber: 1,
+      seasonNumber: 1,
+      title: 'Episódio 1 — O Despertar',
+      url: 'https://topanimes.net/ep/1/',
+      tvdbEpisodeId: 1001,
+      titleLocalized: true,
+    },
+    {
+      numberLabel: '1 - 7',
+      episodeNumber: 7,
+      seasonNumber: 1,
+      title: 'Episódio 7 — Let\'s See How Far I Can Go',
+      url: 'https://topanimes.net/ep/7/',
+      tvdbEpisodeId: 1007,
+      titleLocalized: false,
+    },
+    {
+      numberLabel: '1 - 8',
+      episodeNumber: 8,
+      seasonNumber: 1,
+      title: 'Episódio 8 — This Is Frustrating',
+      url: 'https://topanimes.net/ep/8/',
+      tvdbEpisodeId: 1008,
+    },
+  ];
+
+  assert.deepEqual(collectUnlocalizedEpisodeIds(rawEpisodes), [1007, 1008]);
+  assert.deepEqual(collectUnlocalizedEpisodeIds(rawEpisodes, true), []);
+
+  const unchanged = applyLocalizedEpisodeTitles(rawEpisodes, {});
+  assert.equal(unchanged, rawEpisodes);
+
+  const localized = applyLocalizedEpisodeTitles(rawEpisodes, {
+    1007: 'Vamos Ver Até Onde Eu Consigo Ir',
+    1008: 'Isso É Frustrante',
+  });
+  assert.notEqual(localized, rawEpisodes);
+  assert.equal(localized[0].title, 'Episódio 1 — O Despertar');
+  assert.equal(localized[1].title, 'Vamos Ver Até Onde Eu Consigo Ir');
+  assert.equal(localized[1].titleLocalized, true);
+  assert.equal(localized[2].title, 'Isso É Frustrante');
+  assert.equal(localized[2].titleLocalized, true);
+  assert.equal(formatEpisodeCardTitle(localized[1]), 'Vamos Ver Até Onde Eu Consigo Ir');
+  // Original array remains unmutated
+  assert.equal(rawEpisodes[1].title, 'Episódio 7 — Let\'s See How Far I Can Go');
+});
+
+test('mergeServerAndCatalogEpisodes builds matched episodes authoritatively from TheTVDB metadata while attaching provider playback links', () => {
+  const merged = mergeServerAndCatalogEpisodes({
+    serverTitle: 'Sousou no Frieren',
+    serverUrl: 'https://topanimes.net/animes/sousou-no-frieren/',
+    serverEpisodes: [
+      {
+        numberLabel: '1 - 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        title: 'Sousou no Frieren Episódio 1 Dublado HD',
+        url: 'https://topanimes.net/episodio/frieren-ep-1/',
+        date: '15/01/2025',
+        thumb: 'https://topanimes.net/uploads/provider-thumb-1.jpg',
+        overview: 'Sinopse genérica do provedor',
+        durationMinutes: 20,
+        audioType: 'DUB',
+      },
+    ],
+    catalogEpisodes: [
+      {
+        numberLabel: 'EP 1',
+        episodeNumber: 1,
+        seasonNumber: 1,
+        seasonLabel: 'Temporada 1',
+        title: 'Episódio 1 — O Fim da Jornada',
+        titleLocalized: true,
+        url: 'anisync://episode/anime/thetvdb/424536/s1/e1',
+        date: '2023-09-29',
+        thumb: 'https://artworks.thetvdb.com/banners/v4/episode/9901/screencap/ep1.jpg',
+        overview: 'Sinopse oficial do TheTVDB em PT-BR.',
+        durationMinutes: 28,
+        tvdbEpisodeId: 9901,
+      },
+    ],
+    serverMatched: true,
+    tvdbId: 424536,
+  });
+
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].title, 'Episódio 1 — O Fim da Jornada');
+  assert.equal(merged[0].titleLocalized, true);
+  assert.equal(merged[0].numberLabel, 'EP 1');
+  assert.equal(merged[0].date, '2023-09-29');
+  assert.equal(
+    merged[0].thumb,
+    'https://artworks.thetvdb.com/banners/v4/episode/9901/screencap/ep1.jpg'
+  );
+  assert.equal(
+    merged[0].fallbackThumb,
+    'https://topanimes.net/uploads/provider-thumb-1.jpg'
+  );
+  assert.equal(merged[0].overview, 'Sinopse oficial do TheTVDB em PT-BR.');
+  assert.equal(merged[0].durationMinutes, 28);
+  assert.equal(merged[0].tvdbEpisodeId, 9901);
+  // Playback fields come strictly from the matched provider
+  assert.equal(merged[0].url, 'https://topanimes.net/episodio/frieren-ep-1/');
+  assert.equal(merged[0].audioType, 'DUB');
+  assert.equal(merged[0].availableOnServer, true);
+});
+
+test('pickImageWithFallback prioritizes TheTVDB artwork and falls back cleanly to provider images on failure', () => {
+  const tvdbPoster = 'https://artworks.thetvdb.com/frieren-poster.jpg';
+  const providerPoster = 'https://topanimes.net/frieren-provider.jpg';
+  const tvdbBackdrop = 'https://artworks.thetvdb.com/frieren-backdrop.jpg';
+
+  assert.equal(
+    pickImageWithFallback([tvdbPoster, providerPoster, tvdbBackdrop], []),
+    tvdbPoster
+  );
+  assert.equal(
+    pickImageWithFallback([tvdbPoster, providerPoster, tvdbBackdrop], [tvdbPoster]),
+    providerPoster
+  );
+  assert.equal(
+    pickImageWithFallback([tvdbPoster, providerPoster, tvdbBackdrop], [tvdbPoster, providerPoster]),
+    tvdbBackdrop
+  );
+  assert.equal(
+    pickImageWithFallback(
+      [tvdbPoster, providerPoster, tvdbBackdrop],
+      [tvdbPoster, providerPoster, tvdbBackdrop]
+    ),
+    ''
+  );
+});
+
 
 
 

@@ -15,6 +15,7 @@ import {
   normalizeHinataSoulUrl,
 } from './urlSafety.ts';
 import { isUncensoredEpisodeTitle } from './episodeAvailability.ts';
+import { splitAlternativeTitleString } from './catalog/idCodec.ts';
 
 export const HINATASOUL_ORIGIN = 'https://www.hinatasoul.com';
 export const HINATASOUL_R2_ORIGIN =
@@ -255,11 +256,13 @@ function parseAnimeCardNodes(
 
   scope.find('.ultimosAnimesHomeItem').each((idx, el) => {
     const root = $(el);
-    const link = root.find('a[href]').first().attr('href') || '';
+    const anchorEl = root.find('a[href]').first();
+    const link = anchorEl.attr('href') || '';
     const url = normalizeHinataSoulUrl(link, baseOrigin);
     const title =
       cleanText(root.find('.ultimosAnimesHomeItemInfosNome').first().text()) ||
-      cleanText(root.find('img').first().attr('alt'));
+      cleanText(root.find('img').first().attr('alt')) ||
+      cleanText(anchorEl.attr('title'));
     if (!url || !title || seen.has(url)) return;
     seen.add(url);
 
@@ -534,7 +537,9 @@ export function parseHinataSoulAnimePageHtml(
     if (!val || /^desconhecido$/i.test(val)) return;
     if (label.includes('alternativo')) {
       alternativeTitle = val;
-      if (!alternativeTitles.includes(val)) alternativeTitles.push(val);
+      for (const alias of splitAlternativeTitleString(val)) {
+        if (!alternativeTitles.includes(alias)) alternativeTitles.push(alias);
+      }
     } else if (label.includes('estúdio') || label.includes('estudio')) {
       studio = val;
     }

@@ -451,4 +451,102 @@ describe('topanimesParser', () => {
     assert.equal(filteredEmbed.streams.length, 1);
     assert.ok(filteredEmbed.streams[0].url.includes('doce-de-leite-vegano.b-cdn.net'));
   });
+
+  it('parses TopAnimes .se-cu compact episode grid (Frieren layout without .episodiotitle) and splits composite alternativeTitle aliases', () => {
+    const html = `
+      <div class="sheader">
+        <div class="poster"><img src="https://image.tmdb.org/t/p/w500/frieren.jpg" /></div>
+        <div class="data">
+          <h1>Sousou no Frieren</h1>
+          <div class="extra"><span class="date">Ore dake Level Up na Ken | Na Honjaman Level Up, I Level Up Alone</span></div>
+        </div>
+      </div>
+      <div id="seasons">
+        <div class="se-cu">
+          <div class="se-q"></div>
+          <div class="capitulos_list on-visited se-a" style="display:block">
+            <ul class="episodios">
+              <li class="item-1">
+                <div style="display:none" class="epnumber">1</div>
+                <a title="Sousou no Frieren - Episódio 1 Online" href="https://topanimes.net/episodio/sousou-no-frieren-episodio-1/">1</a>
+              </li>
+              <li class="item-28">
+                <div style="display:none" class="epnumber">28</div>
+                <a title="Sousou no Frieren - Episódio 28 Online" href="https://topanimes.net/episodio/sousou-no-frieren-episodio-28/">28</a>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>`;
+
+    const anime = parseAnimePageHtml(html, 'https://topanimes.net/animes/sousou-no-frieren/');
+    assert.equal(anime.episodes.length, 2);
+    assert.equal(anime.episodes[0].episodeNumber, 1);
+    assert.equal(anime.episodes[0].seasonNumber, 1);
+    assert.equal(anime.episodes[0].title, 'Episódio 1');
+    assert.equal(anime.episodes[0].url, 'https://topanimes.net/episodio/sousou-no-frieren-episodio-1/');
+    assert.equal(anime.episodes[1].episodeNumber, 28);
+    assert.equal(anime.episodes[1].title, 'Episódio 28');
+    assert.deepEqual(anime.alternativeTitles, [
+      'Ore dake Level Up na Ken',
+      'Na Honjaman Level Up',
+      'I Level Up Alone',
+    ]);
+  });
+
+  it('unpacks Dean Edwards packed MixDrop scripts and extracts protocol-relative MDCore.wurl MP4 and poster', () => {
+    const mixdropHtml = `
+      <html><body><script>
+        eval(function(p,a,c,k,e,d){e=function(c){return c};if(!''.replace(/^/,String)){while(c--){d[c]=k[c]||c}k=[function(e){return d[e]}];e=function(){return'\\\\w+'};c=1};while(c--){if(k[c]){p=p.replace(new RegExp('\\\\b'+e(c)+'\\\\b','g'),k[c])}}return p}('1.31="//4-3.8.2/30/7.29";1.28=" ";1.27="//4-3.8.2/26/7.6?25=24-23&22=21&20=19";1.18="17.6";1.16="4-3";1.15="";1.14=0;1.13="";1.12="11%10%5%9.2%5";',10,32,'|MDCore|net|delivery31|a|2F|mp4|pkd3x7wjcq4p3p|mxcontent|2Ftopanimes|3A|https|referrer|adTagUrl|chromeInject|remotesub|vserver|774680c43f14016b39274168cb54d992|vfile|1795696037|_t|1795716320|e|RBhQ|qwzUGVYZYgeowuFi2|s|v2|wurl|furl|jpg|thumbs|poster'.split('|'),0,{}))
+      </script></body></html>
+    `;
+
+    const extracted = extractStreamsFromEmbed(
+      'https://mixdrop.ag/e/pkd3x7wjcq4p3p',
+      mixdropHtml
+    );
+    assert.equal(extracted.provider, 'MixDrop');
+    assert.equal(extracted.streams.length, 1);
+    assert.equal(
+      extracted.streams[0].url,
+      'https://a-delivery31.mxcontent.net/v2/pkd3x7wjcq4p3p.mp4?s=qwzUGVYZYgeowuFi2-RBhQ&e=1795716320&_t=1795696037'
+    );
+    assert.equal(extracted.streams[0].format, 'mp4');
+    assert.equal(
+      extracted.poster,
+      'https://a-delivery31.mxcontent.net/thumbs/pkd3x7wjcq4p3p.jpg'
+    );
+  });
+
+  it('preserves fractional recap episode numbers (7.5 vs 7) so they do not collide with Episode 7', () => {
+    const html = `
+      <div class="sheader"><div class="data"><h1>Solo Leveling</h1></div></div>
+      <div id="seasons">
+        <div class="se-cu">
+          <div class="se-q"><span class="se-t">1</span><span class="title">Temporada 1</span></div>
+          <div class="se-a">
+            <ul class="episodios">
+              <li>
+                <div class="numerando">1 - 7.5</div>
+                <div class="epnumber">7.5</div>
+                <div class="episodiotitle"><a href="https://topanimes.net/episodio/solo-leveling-episodio-7-5/">Episódio 7.5</a></div>
+              </li>
+              <li>
+                <div class="numerando">1 - 7</div>
+                <div class="epnumber">7</div>
+                <div class="episodiotitle"><a href="https://topanimes.net/episodio/solo-leveling-episodio-7/">Episódio 7</a></div>
+              </li>
+            </ul>
+          </div>
+        </div>
+      </div>`;
+
+    const anime = parseAnimePageHtml(html, 'https://topanimes.net/animes/upando-sozinho/');
+    assert.equal(anime.episodes.length, 2);
+    assert.equal(anime.episodes[0].episodeNumber, 7.5);
+    assert.equal(anime.episodes[0].url, 'https://topanimes.net/episodio/solo-leveling-episodio-7-5/');
+    assert.equal(anime.episodes[1].episodeNumber, 7);
+    assert.equal(anime.episodes[1].url, 'https://topanimes.net/episodio/solo-leveling-episodio-7/');
+  });
 });
+

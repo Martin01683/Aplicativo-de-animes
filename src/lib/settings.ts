@@ -9,7 +9,11 @@ import {
   sanitizeEpisodeSources,
   type EpisodeSourceConfig,
 } from './sources/types.ts';
-import type { CatalogSourceCredentials, LiveChartScheduleMode } from './types.ts';
+import type {
+  CalendarLayout,
+  CatalogSourceCredentials,
+  LiveChartScheduleMode,
+} from './types.ts';
 
 export type EpisodeCheckIntervalMinutes = 0 | 15 | 30 | 60;
 export type AppUpdateIntervalHours = 6 | 24 | 168;
@@ -33,6 +37,7 @@ export interface AppSettings {
   defaultSection: NavSection;
   defaultAudioFilter: DefaultAudioFilter;
   calendarScheduleMode: LiveChartScheduleMode;
+  calendarLayout: CalendarLayout;
   skipIntroSeconds: SkipIntroSeconds;
   autoPlayNextEpisode: boolean;
   videoScale: VideoScaleMode;
@@ -62,6 +67,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   defaultSection: 'releases',
   defaultAudioFilter: 'ALL',
   calendarScheduleMode: 'streams',
+  calendarLayout: 'grid',
   skipIntroSeconds: 85,
   autoPlayNextEpisode: false,
   videoScale: DEFAULT_VIDEO_SCALE,
@@ -104,6 +110,7 @@ const VALID_UPDATE_INTERVALS = new Set<number>([6, 24, 168]);
 const VALID_SECTIONS = new Set<NavSection>(['releases', 'calendar', 'catalog', 'library']);
 const VALID_AUDIO_FILTERS = new Set<DefaultAudioFilter>(['ALL', 'DUB', 'LEG']);
 const VALID_SCHEDULE_MODES = new Set<LiveChartScheduleMode>(['streams', 'dub', 'jp']);
+const VALID_CALENDAR_LAYOUTS = new Set<CalendarLayout>(['grid', 'timeline']);
 const VALID_SKIP_SECONDS = new Set<number>([30, 60, 85, 90]);
 
 function sanitizeHour(raw: unknown, fallback: number): number {
@@ -182,6 +189,10 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
     ? (input.calendarScheduleMode as LiveChartScheduleMode)
     : DEFAULT_APP_SETTINGS.calendarScheduleMode;
 
+  const calendarLayout = VALID_CALENDAR_LAYOUTS.has(input.calendarLayout as CalendarLayout)
+    ? (input.calendarLayout as CalendarLayout)
+    : DEFAULT_APP_SETTINGS.calendarLayout;
+
   const skipIntroSeconds = VALID_SKIP_SECONDS.has(Number(input.skipIntroSeconds))
     ? (Number(input.skipIntroSeconds) as SkipIntroSeconds)
     : DEFAULT_APP_SETTINGS.skipIntroSeconds;
@@ -218,6 +229,7 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
     defaultSection,
     defaultAudioFilter,
     calendarScheduleMode,
+    calendarLayout,
     skipIntroSeconds,
     autoPlayNextEpisode:
       typeof input.autoPlayNextEpisode === 'boolean'
