@@ -230,6 +230,8 @@ public class TvCastService extends Service {
     private volatile double volume = 1.0;
     private volatile boolean muted = false;
     private volatile long lastProgressPersistMs = 0L;
+    private volatile long lastSeekTargetMs = -1L;
+    private volatile long lastSeekRequestedAtMs = 0L;
     private volatile boolean handledCompletionForEpisode = false;
     private volatile boolean attemptedDirectFallback = false;
 
@@ -384,6 +386,8 @@ public class TvCastService extends Service {
         sessionActive = true;
         status = "connecting";
         errorMessage = "";
+        lastSeekTargetMs = -1L;
+        lastSeekRequestedAtMs = 0L;
         handledCompletionForEpisode = false;
         attemptedDirectFallback = false;
 
@@ -603,6 +607,8 @@ public class TvCastService extends Service {
         if (durationMs > 0L && clamped > durationMs) {
             clamped = Math.max(0L, durationMs - 1000L);
         }
+        lastSeekTargetMs = clamped;
+        lastSeekRequestedAtMs = System.currentTimeMillis();
         try {
             if (chromecastController != null) {
                 chromecastController.seek(clamped);
@@ -675,6 +681,8 @@ public class TvCastService extends Service {
             subtitleLabel = !resolved.subtitles.isEmpty() ? resolved.subtitles.get(0).label : "Legenda";
             positionMs = 0L;
             durationMs = 0L;
+            lastSeekTargetMs = -1L;
+            lastSeekRequestedAtMs = 0L;
             handledCompletionForEpisode = false;
             attemptedDirectFallback = false;
 
@@ -1704,9 +1712,25 @@ public class TvCastService extends Service {
                 "GetPositionInfo",
                 singletonInstanceArgs()
             );
-            long relMs = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "RelTime"));
+            long relRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "RelTime"));
+            long absRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "AbsTime"));
+            long reportedPos = relRaw > 0L ? relRaw : (absRaw > 0L ? absRaw : relRaw);
             long durMs = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "TrackDuration"));
-            if (relMs >= 0L) positionMs = relMs;
+            long nowMs = System.currentTimeMillis();
+            boolean withinSeekGrace = lastSeekTargetMs >= 0L && (nowMs - lastSeekRequestedAtMs) < 8000L;
+            boolean userSoughtNearStart = lastSeekTargetMs >= 0L && lastSeekTargetMs <= 2000L;
+            boolean ignoreZeroReset = reportedPos <= 2000L
+                && !userSoughtNearStart
+                && positionMs >= 8000L
+                && ("TRANSITIONING".equals(transportState) || "PLAYING".equals(transportState) || withinSeekGrace);
+            boolean ignoreStaleSeekPoll = withinSeekGrace
+                && Math.abs(reportedPos - lastSeekTargetMs) > 12_000L;
+            if (reportedPos >= 0L && !ignoreZeroReset && !ignoreStaleSeekPoll) {
+                positionMs = reportedPos;
+                if (withinSeekGrace && Math.abs(reportedPos - lastSeekTargetMs) <= 8000L) {
+                    lastSeekTargetMs = -1L;
+                }
+            }
             if (durMs > 0L) durationMs = durMs;
 
             if ("PLAYING".equals(transportState)) {

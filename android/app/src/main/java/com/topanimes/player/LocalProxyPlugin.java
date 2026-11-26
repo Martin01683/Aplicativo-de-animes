@@ -4,6 +4,8 @@ import android.Manifest;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.ContentResolver;
+import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.InstallSourceInfo;
@@ -14,7 +16,9 @@ import android.content.pm.Signature;
 import android.content.pm.SigningInfo;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Environment;
 import android.os.Process;
+import android.provider.MediaStore;
 import android.provider.Settings;
 import android.util.Log;
 
@@ -729,6 +733,7 @@ public class LocalProxyPlugin extends Plugin {
         Context ctx = getContext();
         String rawName = call.getString("filename", "anisync-backup.json");
         String content = call.getString("content", "");
+        String destination = call.getString("destination", "downloads");
         if (ctx == null || content == null || content.isEmpty()) {
             call.reject("Conteúdo de backup inválido.");
             return;
@@ -737,10 +742,29 @@ public class LocalProxyPlugin extends Plugin {
         if (!safeName.endsWith(".json")) {
             safeName = safeName + ".json";
         }
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+
+        if ("downloads".equalsIgnoreCase(destination)) {
+            try {
+                String savedPath = saveBackupToDownloads(ctx, safeName, bytes);
+                if (savedPath != null && !savedPath.isEmpty()) {
+                    JSObject ret = new JSObject();
+                    ret.put("saved", true);
+                    ret.put("shared", false);
+                    ret.put("path", savedPath);
+                    ret.put("message", "Backup salvo na pasta Downloads (" + savedPath + ").");
+                    call.resolve(ret);
+                    return;
+                }
+            } catch (Exception downloadErr) {
+                Log.w(TAG, "Failed saving backup to Downloads, falling back to share sheet: " + downloadErr.getMessage());
+            }
+        }
+
         try {
             File outFile = new File(ctx.getCacheDir(), safeName);
             try (FileOutputStream fos = new FileOutputStream(outFile, false)) {
-                fos.write(content.getBytes(StandardCharsets.UTF_8));
+                fos.write(bytes);
                 fos.getFD().sync();
             }
             Uri uri = FileProvider.getUriForFile(ctx, ctx.getPackageName() + ".fileprovider", outFile);
@@ -764,6 +788,54 @@ public class LocalProxyPlugin extends Plugin {
             Log.e(TAG, "Failed exporting backup file", e);
             call.reject("Não foi possível exportar o arquivo de backup.");
         }
+    }
+
+    private String saveBackupToDownloads(Context ctx, String safeName, byte[] bytes) throws IOException {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentResolver resolver = ctx.getContentResolver();
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, safeName);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, "application/json");
+            values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+
+            Uri itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (itemUri == null) {
+                throw new IOException("MediaStore.Downloads retornou URI nula");
+            }
+            boolean wroteOk = false;
+            try (OutputStream out = resolver.openOutputStream(itemUri, "w")) {
+                if (out == null) {
+                    throw new IOException("Não foi possível abrir fluxo de escrita em Downloads");
+                }
+                out.write(bytes);
+                out.flush();
+                wroteOk = true;
+            } finally {
+                if (wroteOk) {
+                    ContentValues done = new ContentValues();
+                    done.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    resolver.update(itemUri, done, null, null);
+                } else {
+                    try {
+                        resolver.delete(itemUri, null, null);
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            return "Download/" + safeName;
+        }
+
+        File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (downloadsDir != null && (downloadsDir.exists() || downloadsDir.mkdirs())) {
+            File target = new File(downloadsDir, safeName);
+            try (FileOutputStream fos = new FileOutputStream(target, false)) {
+                fos.write(bytes);
+                fos.getFD().sync();
+            }
+            return "Download/" + safeName;
+        }
+        return null;
     }
 
     @PluginMethod

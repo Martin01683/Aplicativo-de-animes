@@ -12,6 +12,7 @@ import {
   Copy,
   ExternalLink,
   Loader2,
+  Minus,
   Pause,
   Play,
   Plus,
@@ -43,6 +44,7 @@ import {
   prepareExternalTvCast,
   resolveCastDisplayedPositionMs,
   startNativeTvCast,
+  stepCastVolumePercent,
   stopTvCastDiscovery,
   tvCastNextEpisode,
   tvCastPause,
@@ -138,21 +140,41 @@ export function TvCastModal({
   const volumeTrackRef = useRef<HTMLDivElement | null>(null);
   const activeVolumePointerIdRef = useRef<number | null>(null);
   const dragVolumeRef = useRef<number | null>(null);
+  const volumeHoldPointerIdRef = useRef<number | null>(null);
+  const volumeHoldTimeoutRef = useRef<number | null>(null);
+  const volumeHoldIntervalRef = useRef<number | null>(null);
+  const volumeHoldLastSentAtRef = useRef<number>(0);
+
+  const clearVolumeHoldTimers = useCallback(() => {
+    if (volumeHoldTimeoutRef.current !== null) {
+      window.clearTimeout(volumeHoldTimeoutRef.current);
+      volumeHoldTimeoutRef.current = null;
+    }
+    if (volumeHoldIntervalRef.current !== null) {
+      window.clearInterval(volumeHoldIntervalRef.current);
+      volumeHoldIntervalRef.current = null;
+    }
+  }, []);
 
   const castEpisodeKey = `${castState.deviceId}|${castState.episodeUrl || castState.streamUrl || castState.episodeTitle}`;
 
   useEffect(() => {
     if (!open || !castState.active) {
+      clearVolumeHoldTimers();
       activeSeekPointerIdRef.current = null;
       scrubPositionRef.current = null;
       activeVolumePointerIdRef.current = null;
+      volumeHoldPointerIdRef.current = null;
       dragVolumeRef.current = null;
       setScrubPositionMs(null);
       setPendingSeek(null);
       setDragVolume(null);
       setPendingVolume(null);
     }
-  }, [castState.active, open]);
+    return () => {
+      clearVolumeHoldTimers();
+    };
+  }, [castState.active, clearVolumeHoldTimers, open]);
 
   useEffect(() => {
     if (!pendingSeek) return;
@@ -176,7 +198,7 @@ export function TvCastModal({
 
   useEffect(() => {
     if (!pendingVolume) return;
-    if (Math.abs(castState.volume - pendingVolume.level) <= 0.06) {
+    if (Math.abs(castState.volume - pendingVolume.level) <= 0.009) {
       setPendingVolume(null);
       return;
     }
@@ -455,10 +477,84 @@ export function TvCastModal({
   const handleVolumeKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
       e.preventDefault();
-      commitVolumeLevel(displayedVolume + 0.05);
+      commitVolumeLevel(stepCastVolumePercent(displayedVolume, 1));
     } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
       e.preventDefault();
-      commitVolumeLevel(displayedVolume - 0.05);
+      commitVolumeLevel(stepCastVolumePercent(displayedVolume, -1));
+    }
+  };
+
+  const handleVolumeStepPointerDown = (
+    deltaPercent: -1 | 1,
+    e: ReactPointerEvent<HTMLButtonElement>
+  ) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    clearVolumeHoldTimers();
+    volumeHoldPointerIdRef.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+
+    const applyStep = (sendLiveIfDue: boolean) => {
+      const base = dragVolumeRef.current ?? displayedVolume;
+      const next = stepCastVolumePercent(base, deltaPercent);
+      dragVolumeRef.current = next;
+      setDragVolume(next);
+      if (sendLiveIfDue) {
+        const now = Date.now();
+        if (now - volumeHoldLastSentAtRef.current >= 240) {
+          volumeHoldLastSentAtRef.current = now;
+          void tvCastSetVolume(next);
+        }
+      }
+      return next;
+    };
+
+    volumeHoldLastSentAtRef.current = Date.now();
+    applyStep(false);
+
+    volumeHoldTimeoutRef.current = window.setTimeout(() => {
+      volumeHoldIntervalRef.current = window.setInterval(() => {
+        applyStep(true);
+      }, 70);
+    }, 300);
+  };
+
+  const finishVolumeStepHold = (
+    e: ReactPointerEvent<HTMLButtonElement>,
+    commit: boolean
+  ) => {
+    if (volumeHoldPointerIdRef.current !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    volumeHoldPointerIdRef.current = null;
+    clearVolumeHoldTimers();
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+    const finalVol = dragVolumeRef.current;
+    dragVolumeRef.current = null;
+    setDragVolume(null);
+    if (commit && finalVol !== null) {
+      commitVolumeLevel(finalVol);
+    }
+  };
+
+  const handleVolumeStepKeyDown = (
+    deltaPercent: -1 | 1,
+    e: ReactKeyboardEvent<HTMLButtonElement>
+  ) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      commitVolumeLevel(stepCastVolumePercent(displayedVolume, deltaPercent));
     }
   };
 
@@ -731,12 +827,12 @@ export function TvCastModal({
                     )}
                     <button
                       type="button"
-                      onClick={() => handleRelativeSeek(-15_000)}
-                      aria-label="Voltar 15 segundos na TV"
+                      onClick={() => handleRelativeSeek(-5_000)}
+                      aria-label="Voltar 5 segundos na TV"
                       className="inline-flex h-10 items-center gap-1 rounded-xl border border-white/10 bg-white/5 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10"
                     >
                       <RotateCcw className="h-3.5 w-3.5" />
-                      <span>-15s</span>
+                      <span>-5s</span>
                     </button>
                     <button
                       type="button"
@@ -756,12 +852,12 @@ export function TvCastModal({
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleRelativeSeek(15_000)}
-                      aria-label="Avançar 15 segundos na TV"
+                      onClick={() => handleRelativeSeek(5_000)}
+                      aria-label="Avançar 5 segundos na TV"
                       className="inline-flex h-10 items-center gap-1 rounded-xl border border-white/10 bg-white/5 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10"
                     >
                       <RotateCw className="h-3.5 w-3.5" />
-                      <span>+15s</span>
+                      <span>+5s</span>
                     </button>
                     <button
                       type="button"
@@ -786,9 +882,23 @@ export function TvCastModal({
                     )}
                   </div>
 
-                  {/* Volume Slider — drag smoothly and apply on release */}
-                  <div className="flex items-center gap-2.5 pt-1">
+                  {/* Volume Slider + 1% press-and-hold fine buttons */}
+                  <div className="flex items-center gap-2 pt-1">
                     <Volume2 className="h-4 w-4 shrink-0 text-slate-400" />
+                    <button
+                      type="button"
+                      data-cast-volume-dec="true"
+                      aria-label="Diminuir volume da TV em 1%"
+                      title="Diminuir 1% (segure para diminuir continuamente)"
+                      onPointerDown={(e) => handleVolumeStepPointerDown(-1, e)}
+                      onPointerUp={(e) => finishVolumeStepHold(e, true)}
+                      onPointerCancel={(e) => finishVolumeStepHold(e, false)}
+                      onKeyDown={(e) => handleVolumeStepKeyDown(-1, e)}
+                      onContextMenu={(e) => e.preventDefault()}
+                      className="flex h-8 w-8 shrink-0 touch-none select-none items-center justify-center rounded-lg border border-white/12 bg-white/5 text-slate-200 transition-colors hover:border-[#f97316]/50 hover:bg-white/10 active:bg-[#f97316]/20 active:text-[#fb923c]"
+                    >
+                      <Minus className="h-3.5 w-3.5" />
+                    </button>
                     <div
                       ref={volumeTrackRef}
                       role="slider"
@@ -821,6 +931,20 @@ export function TvCastModal({
                         />
                       </div>
                     </div>
+                    <button
+                      type="button"
+                      data-cast-volume-inc="true"
+                      aria-label="Aumentar volume da TV em 1%"
+                      title="Aumentar 1% (segure para aumentar continuamente)"
+                      onPointerDown={(e) => handleVolumeStepPointerDown(1, e)}
+                      onPointerUp={(e) => finishVolumeStepHold(e, true)}
+                      onPointerCancel={(e) => finishVolumeStepHold(e, false)}
+                      onKeyDown={(e) => handleVolumeStepKeyDown(1, e)}
+                      onContextMenu={(e) => e.preventDefault()}
+                      className="flex h-8 w-8 shrink-0 touch-none select-none items-center justify-center rounded-lg border border-white/12 bg-white/5 text-slate-200 transition-colors hover:border-[#f97316]/50 hover:bg-white/10 active:bg-[#f97316]/20 active:text-[#fb923c]"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                    </button>
                     <span
                       className={`w-9 text-right font-mono text-[11px] tabular-nums ${
                         isDraggingVolume ? 'font-semibold text-[#fb923c]' : 'text-slate-400'

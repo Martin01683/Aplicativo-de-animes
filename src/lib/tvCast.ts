@@ -199,7 +199,14 @@ export function computeCastVolumeLevel(
     return 0;
   }
   const ratio = Math.max(0, Math.min(1, (clientX - trackLeft) / trackWidth));
-  return Math.round(ratio * 20) / 20;
+  return Math.round(ratio * 100) / 100;
+}
+
+export function stepCastVolumePercent(currentVolume: number, deltaPercent: number): number {
+  const basePct = Number.isFinite(currentVolume) ? Math.round(currentVolume * 100) : 0;
+  const stepPct = Number.isFinite(deltaPercent) ? Math.round(deltaPercent) : 0;
+  const nextPct = Math.max(0, Math.min(100, basePct + stepPct));
+  return nextPct / 100;
 }
 
 export function resolveCastDisplayedPositionMs(params: {

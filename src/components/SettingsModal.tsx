@@ -14,6 +14,7 @@ import {
   RotateCcw,
   Send,
   Server,
+  Share2,
   Trash2,
   Upload,
   X,
@@ -88,7 +89,7 @@ interface SettingsModalProps {
   alertsCount: number;
   onClearHistory: () => void;
   onClearAlerts: () => void;
-  onExportBackup: () => Promise<void> | void;
+  onExportBackup: (destination?: 'downloads' | 'share') => Promise<void> | void;
   onImportBackup: (payload: AnisyncBackupPayload, mode: BackupImportMode) => void;
 }
 
@@ -168,7 +169,7 @@ export function SettingsModal({
   const [showCredsPanel, setShowCredsPanel] = useState(false);
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
-  const [exportingBackup, setExportingBackup] = useState(false);
+  const [exportingBackup, setExportingBackup] = useState<'downloads' | 'share' | null>(null);
   const [backupError, setBackupError] = useState('');
   const [pendingBackupImport, setPendingBackupImport] = useState<{
     filename: string;
@@ -205,14 +206,14 @@ export function SettingsModal({
     }
   };
 
-  const handleExportBackupClick = async () => {
+  const handleExportBackupClick = async (destination: 'downloads' | 'share') => {
     if (exportingBackup) return;
     setBackupError('');
-    setExportingBackup(true);
+    setExportingBackup(destination);
     try {
-      await onExportBackup();
+      await onExportBackup(destination);
     } finally {
-      setExportingBackup(false);
+      setExportingBackup(null);
     }
   };
 
@@ -1187,48 +1188,64 @@ export function SettingsModal({
             {/* Backup & Restore (JSON) */}
             <div
               data-backup-section="true"
-              className="space-y-2.5 rounded-xl border border-white/10 bg-[#0d0f12]/70 p-3.5"
+              className="space-y-3 rounded-xl border border-white/10 bg-[#0d0f12]/70 p-4"
             >
-              <div className="flex flex-wrap items-center justify-between gap-2.5">
-                <div className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium text-slate-200">
-                    Backup de dados locais
-                  </span>
-                  <span className="mt-0.5 block text-xs text-slate-400">
-                    Exporte ou restaure Minha Lista, histórico, episódios assistidos e configurações em JSON.
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-2">
+              <div className="space-y-1">
+                <span className="block text-sm font-semibold text-slate-200">
+                  Backup de dados locais
+                </span>
+                <span className="block text-xs leading-relaxed text-slate-400">
+                  Exporte ou restaure Minha Lista, histórico, episódios assistidos e configurações em JSON.
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  data-backup-export-downloads="true"
+                  disabled={exportingBackup !== null}
+                  onClick={() => void handleExportBackupClick('downloads')}
+                  className="inline-flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-[#f97316]/45 bg-[#f97316]/12 px-3 py-1.5 text-xs font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/20 hover:text-white disabled:opacity-50"
+                >
+                  {exportingBackup === 'downloads' ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                  ) : (
+                    <Download className="h-3.5 w-3.5 text-[#f97316]" />
+                  )}
+                  <span>{isNativeAndroid ? 'Salvar em Downloads' : 'Exportar backup'}</span>
+                </button>
+                {isNativeAndroid && (
                   <button
                     type="button"
-                    disabled={exportingBackup}
-                    onClick={() => void handleExportBackupClick()}
-                    className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white disabled:opacity-50"
+                    data-backup-export-share="true"
+                    disabled={exportingBackup !== null}
+                    onClick={() => void handleExportBackupClick('share')}
+                    className="inline-flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white disabled:opacity-50"
                   >
-                    {exportingBackup ? (
+                    {exportingBackup === 'share' ? (
                       <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
                     ) : (
-                      <Download className="h-3.5 w-3.5 text-[#f97316]" />
+                      <Share2 className="h-3.5 w-3.5 text-[#f97316]" />
                     )}
-                    <span>Exportar backup</span>
+                    <span>Compartilhar</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => backupFileInputRef.current?.click()}
-                    className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
-                  >
-                    <Upload className="h-3.5 w-3.5 text-[#f97316]" />
-                    <span>Importar backup</span>
-                  </button>
-                  <input
-                    ref={backupFileInputRef}
-                    type="file"
-                    accept=".json,application/json"
-                    onChange={(e) => void handleBackupFileSelected(e)}
-                    className="hidden"
-                    aria-label="Selecionar arquivo de backup JSON"
-                  />
-                </div>
+                )}
+                <button
+                  type="button"
+                  data-backup-import="true"
+                  onClick={() => backupFileInputRef.current?.click()}
+                  className="inline-flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-white/12 bg-[#151921] px-3 py-1.5 text-xs font-medium text-slate-200 transition-colors hover:border-[#f97316]/60 hover:text-white"
+                >
+                  <Upload className="h-3.5 w-3.5 text-[#f97316]" />
+                  <span>Importar backup</span>
+                </button>
+                <input
+                  ref={backupFileInputRef}
+                  type="file"
+                  accept=".json,application/json"
+                  onChange={(e) => void handleBackupFileSelected(e)}
+                  className="hidden"
+                  aria-label="Selecionar arquivo de backup JSON"
+                />
               </div>
 
               {backupError && (

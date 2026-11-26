@@ -20,6 +20,7 @@ import {
   resolveActiveTvCastDevice,
   resolveCastDisplayedPositionMs,
   sanitizeCastStateSnapshot,
+  stepCastVolumePercent,
   type TvCastDevice,
   type TvCastStateSnapshot,
 } from './tvCast.ts';
@@ -117,7 +118,13 @@ describe('tvCast helpers', () => {
 
     assert.equal(computeCastVolumeLevel(50, 50, 200), 0);
     assert.equal(computeCastVolumeLevel(150, 50, 200), 0.5);
+    assert.equal(computeCastVolumeLevel(52, 50, 200), 0.01);
     assert.equal(computeCastVolumeLevel(260, 50, 200), 1);
+
+    assert.equal(stepCastVolumePercent(0.42, 1), 0.43);
+    assert.equal(stepCastVolumePercent(0.42, -1), 0.41);
+    assert.equal(stepCastVolumePercent(0, -1), 0);
+    assert.equal(stepCastVolumePercent(1, 1), 1);
 
     // While user holds/drags, scrubPositionMs owns the bar even if live TV poll is still at 0:00
     assert.equal(
@@ -352,6 +359,11 @@ describe('Android background TV Cast architecture & UI wiring guards', () => {
     assert.match(modalTsx, /touch-none/);
     assert.match(modalTsx, /setPointerCapture/);
     assert.match(modalTsx, /onPointerUp=\{handleSeekPointerUp\}/);
+    assert.match(modalTsx, /handleRelativeSeek\(-5_000\)/);
+    assert.match(modalTsx, /handleRelativeSeek\(5_000\)/);
+    assert.match(modalTsx, /data-cast-volume-dec="true"/);
+    assert.match(modalTsx, /data-cast-volume-inc="true"/);
+    assert.match(modalTsx, /data-cast-volume-slider="true"/);
     assert.doesNotMatch(modalTsx, /onChange=\{\(e\) => void tvCastSeek/);
 
     // Remote controls must stay reachable when leaving TvCastModal and allow switching video server on TV

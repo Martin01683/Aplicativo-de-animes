@@ -643,19 +643,26 @@ export default function App() {
     showToast('Configurações restauradas para o padrão.');
   }, [showToast]);
 
-  const handleExportBackup = useCallback(async () => {
-    try {
-      const data = collectUserBackupData();
-      const payload = buildAnisyncBackupPayload(data, {
-        appVersion: buildInfo.androidVersionName || buildInfo.version,
-      });
-      const filename = buildBackupFilename();
-      const res = await exportBackupJsonFile(filename, serializeAnisyncBackup(payload));
-      showToast(res.message);
-    } catch {
-      showToast('Não foi possível exportar o backup.');
-    }
-  }, [buildInfo.androidVersionName, buildInfo.version, showToast]);
+  const handleExportBackup = useCallback(
+    async (destination: 'downloads' | 'share' = 'downloads') => {
+      try {
+        const data = collectUserBackupData();
+        const payload = buildAnisyncBackupPayload(data, {
+          appVersion: buildInfo.androidVersionName || buildInfo.version,
+        });
+        const filename = buildBackupFilename();
+        const res = await exportBackupJsonFile(
+          filename,
+          serializeAnisyncBackup(payload),
+          destination
+        );
+        showToast(res.message);
+      } catch {
+        showToast('Não foi possível exportar o backup.');
+      }
+    },
+    [buildInfo.androidVersionName, buildInfo.version, showToast]
+  );
 
   const handleImportBackup = useCallback(
     (payload: AnisyncBackupPayload, mode: BackupImportMode) => {

@@ -324,10 +324,13 @@ describe('App resilience, backup, changelog, and updater enhancements', () => {
     assert.match(proxyPlugin, /launchLegacyApkInstallFallback/);
     assert.match(proxyPlugin, /setRequestUpdateOwnership\(true\)/);
     assert.match(proxyPlugin, /exportBackupFile/);
+    assert.match(proxyPlugin, /saveBackupToDownloads/);
+    assert.match(proxyPlugin, /MediaStore\.Downloads/);
     assert.match(proxyPlugin, /Retry-After/);
 
     const settingsModal = readRepoFile('src/components/SettingsModal.tsx');
     assert.match(settingsModal, /data-release-changelog="true"/);
     assert.match(settingsModal, /data-backup-section="true"/);
+    assert.match(settingsModal, /data-backup-export-downloads="true"/);
   });
 });

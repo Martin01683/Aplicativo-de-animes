@@ -49,6 +49,7 @@ export interface LocalProxyPlugin {
   exportBackupFile(options: {
     filename: string;
     content: string;
+    destination?: 'downloads' | 'share';
   }): Promise<{ saved: boolean; shared?: boolean; path?: string; message?: string }>;
   addListener(
     eventName: 'apkDownloadProgress',
@@ -309,11 +310,12 @@ const nativePageFetcher: PageFetcher = createResilientHttpFetcher(rawNativePageF
 
 export async function exportBackupJsonFile(
   filename: string,
-  content: string
+  content: string,
+  destination: 'downloads' | 'share' = 'downloads'
 ): Promise<{ mode: 'native' | 'browser'; message: string }> {
   if (isNativeAndroidApp()) {
     try {
-      const res = await LocalProxy.exportBackupFile({ filename, content });
+      const res = await LocalProxy.exportBackupFile({ filename, content, destination });
       if (res?.saved || res?.shared) {
         return {
           mode: 'native',
