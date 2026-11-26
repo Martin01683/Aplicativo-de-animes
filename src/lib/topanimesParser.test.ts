@@ -113,11 +113,12 @@ describe('topanimesParser', () => {
     assert.equal(ep.nextUrl, undefined);
     assert.deepEqual(ep.genres, ['Drama', 'Histórico', 'Medical', 'Mistério']);
 
-    assert.equal(ep.options.length, 4);
+    assert.equal(ep.options.length, 5);
     assert.deepEqual(
       ep.options.map((o) => o.label),
-      ['KojimaCDN', 'Zuplay', 'Vidstreaming', 'Ruplay']
+      ['KojimaCDN', 'Zuplay', 'Vidstreaming', 'Ruplay', 'Aniplay']
     );
+    assert.equal(ep.options[4].providerKind, 'abyss');
     assert.equal(formatServerLabel('ruplay'), 'Ruplay');
     assert.equal(formatServerLabel('aniplay'), 'Aniplay');
     assert.equal(formatServerLabel('KojimaCDN'), 'KojimaCDN');
@@ -401,8 +402,9 @@ describe('topanimesParser', () => {
     assert.equal(ajaxCfg.playMethod, 'admin_ajax');
 
     const missing = extractMissingDooPlayerOptions(html);
-    assert.equal(missing.length, 1);
+    assert.equal(missing.length, 2);
     assert.deepEqual(missing[0], { post: '666510', nume: '2', type: 'tv', label: 'Zuplay' });
+    assert.deepEqual(missing[1], { post: '666510', nume: '5', type: 'tv', label: 'Aniplay' });
 
     assert.equal(
       parseDooPlayerAjaxResponse(

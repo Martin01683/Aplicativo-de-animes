@@ -1083,13 +1083,11 @@ export function buildOptimisticEpisodeDetails(
 }
 
 export function pickPrimaryEmbedOption(options: readonly PlayerOption[]): PlayerOption | null {
-  const playable = options.filter(
-    (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
-  );
+  const playable = options;
   return (
     playable.find((o) => Boolean(o.directStreamUrl)) ||
     playable.find((o) =>
-      ['hinatasoul', 'kojima', 'zuplay', 'vidstreaming', 'playerjs', 'direct'].includes(
+      ['hinatasoul', 'kojima', 'zuplay', 'abyss', 'vidstreaming', 'playerjs', 'direct'].includes(
         o.providerKind
       )
     ) ||

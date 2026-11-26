@@ -10,7 +10,7 @@ const PROVIDER_TIEBREAKER: Record<PlayerOption['providerKind'], number> = {
   playerjs: 2,
   blogger: 1,
   other: 1,
-  abyss: 0,
+  abyss: 4,
 };
 
 /**

@@ -1,6 +1,7 @@
 package com.topanimes.player;
 
 import android.text.Html;
+import android.util.Base64;
 import android.util.Log;
 
 import org.json.JSONArray;
@@ -16,6 +17,7 @@ import java.net.URL;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -26,6 +28,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.crypto.Cipher;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 
 public final class TopAnimesEpisodeResolver {
     private static final String TAG = "TopAnimesEpResolver";
@@ -45,6 +51,9 @@ public final class TopAnimesEpisodeResolver {
     private static final Pattern AD_HOST_PATTERN = Pattern.compile(
         "(?:^|[/._-])(?:ads?|vast|vmap|adserver|doubleclick|googlesyndication|supervideoad|yandex|tracker|metilinksemvoce|viewanalitycs|agl004|videoad|autotop|canalfutebol)(?:[/._?-]|$)",
         Pattern.CASE_INSENSITIVE
+    );
+    private static final Pattern ABYSS_DATAS_PATTERN = Pattern.compile(
+        "\\b(?:const|let|var)\\s+datas\\s*=\\s*[\"']([A-Za-z0-9+/=_-]{24,})[\"']"
     );
 
     public static final class StreamCandidate {
@@ -321,11 +330,6 @@ public final class TopAnimesEpisodeResolver {
         }
 
         String lowerEmbed = cleanEmbed.toLowerCase(Locale.ROOT);
-        if (lowerEmbed.contains("abyssplayer.com") || lowerEmbed.contains("abyss.to")
-            || lowerEmbed.contains("abysscdn.com") || lowerEmbed.contains("short.icu")) {
-            return new ResolvedEmbedData(false, "Aniplay", baseReferer, false, Collections.emptyList(), Collections.emptyList(), "Servidor indisponível.");
-        }
-
         String fetchTarget = cleanEmbed;
         if (lowerEmbed.contains("sk-boyceta.booonceivu.shop")) {
             fetchTarget = cleanEmbed.contains("?")
@@ -334,8 +338,12 @@ public final class TopAnimesEpisodeResolver {
         }
 
         try {
-            String body = fetchText(fetchTarget, baseReferer, 12000);
-            ExtractedResult extracted = extractStreamsFromEmbed(cleanEmbed, body);
+            FetchResult fetched = fetchTextWithFinalUrl(fetchTarget, baseReferer, 12000);
+            String effectiveEmbedUrl = (fetched.finalUrl != null && isSafeHttpUrl(fetched.finalUrl))
+                ? fetched.finalUrl
+                : cleanEmbed;
+            String lowerEffective = effectiveEmbedUrl.toLowerCase(Locale.ROOT);
+            ExtractedResult extracted = extractStreamsFromEmbed(effectiveEmbedUrl, fetched.body);
 
             if (extracted.streams.isEmpty()) {
                 Matcher zuplayMatcher = Pattern.compile("^https?://csst\\.online/embed/(video/[^?#]+)", Pattern.CASE_INSENSITIVE).matcher(cleanEmbed);
@@ -351,7 +359,7 @@ public final class TopAnimesEpisodeResolver {
                 return new ResolvedEmbedData(
                     false,
                     extracted.provider,
-                    cleanEmbed,
+                    effectiveEmbedUrl,
                     false,
                     Collections.emptyList(),
                     extracted.subtitles,
@@ -359,22 +367,27 @@ public final class TopAnimesEpisodeResolver {
                 );
             }
 
-            String streamReferer = lowerEmbed.contains("csst.online")
-                ? "https://www.incvideo1.online/"
-                : (lowerEmbed.contains("antivirus") || lowerEmbed.contains("booonceivu"))
-                    ? baseReferer
-                    : cleanEmbed;
+            boolean isAbyss = isAbyssEmbedUrl(effectiveEmbedUrl) || "Aniplay".equals(extracted.provider);
+            String streamReferer = isAbyss
+                ? extractOriginWithSlash(effectiveEmbedUrl, baseReferer)
+                : lowerEffective.contains("csst.online")
+                    ? "https://www.incvideo1.online/"
+                    : (lowerEffective.contains("antivirus") || lowerEffective.contains("booonceivu"))
+                        ? baseReferer
+                        : effectiveEmbedUrl;
 
             boolean preferDirect = false;
-            try {
-                String host = URI.create(extracted.streams.get(0).url).getHost();
-                if (host != null) {
-                    String lh = host.toLowerCase(Locale.ROOT);
-                    preferDirect = lh.endsWith("booonceivu.shop")
-                        || lh.endsWith("123flmsfree.com")
-                        || lh.endsWith("321moviesfree.com");
+            if (!isAbyss) {
+                try {
+                    String host = URI.create(extracted.streams.get(0).url).getHost();
+                    if (host != null) {
+                        String lh = host.toLowerCase(Locale.ROOT);
+                        preferDirect = lh.endsWith("booonceivu.shop")
+                            || lh.endsWith("123flmsfree.com")
+                            || lh.endsWith("321moviesfree.com");
+                    }
+                } catch (Exception ignored) {
                 }
-            } catch (Exception ignored) {
             }
 
             return new ResolvedEmbedData(
@@ -464,7 +477,7 @@ public final class TopAnimesEpisodeResolver {
     public static int providerPriority(String providerKind) {
         if ("hinatasoul".equals(providerKind)) return 6;
         if ("kojima".equals(providerKind)) return 5;
-        if ("zuplay".equals(providerKind)) return 4;
+        if ("zuplay".equals(providerKind) || "abyss".equals(providerKind)) return 4;
         if ("vidstreaming".equals(providerKind)) return 3;
         if ("playerjs".equals(providerKind)) return 2;
         if ("blogger".equals(providerKind) || "other".equals(providerKind)) return 1;
@@ -667,7 +680,6 @@ public final class TopAnimesEpisodeResolver {
             if (titleM.find()) {
                 label = formatServerLabel(cleanHtmlText(titleM.group(1)), label);
             }
-            if ("abyss".equals(classifyProviderKind(label, ""))) continue;
 
             String resolvedUrl = resolveDooPlayerAjaxOption(ajaxUrl, playerApi, playMethod, episodeUrl, post, nume, type);
             if (!resolvedUrl.isEmpty()) {
@@ -771,7 +783,6 @@ public final class TopAnimesEpisodeResolver {
             String embedUrl = sourceMap.get(nume);
             if (embedUrl == null || embedUrl.isEmpty()) continue;
             String kind = classifyProviderKind(label, embedUrl);
-            if ("abyss".equals(kind)) continue;
             options.add(new ServerOption(nume, label, embedUrl, kind));
         }
 
@@ -818,10 +829,234 @@ public final class TopAnimesEpisodeResolver {
         }
     }
 
+    private static boolean isAbyssEmbedUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.isEmpty()) return false;
+        try {
+            String host = URI.create(rawUrl.trim()).getHost();
+            if (host == null) return false;
+            String lh = host.toLowerCase(Locale.ROOT);
+            return "abyssplayer.com".equals(lh) || lh.endsWith(".abyssplayer.com")
+                || "abyss.to".equals(lh) || lh.endsWith(".abyss.to")
+                || "abysscdn.com".equals(lh) || lh.endsWith(".abysscdn.com")
+                || "short.icu".equals(lh) || lh.endsWith(".short.icu");
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static String extractOriginWithSlash(String rawUrl, String fallback) {
+        try {
+            URI uri = URI.create(rawUrl.trim());
+            String scheme = uri.getScheme();
+            String host = uri.getHost();
+            if (scheme != null && host != null && !host.isEmpty()) {
+                int port = uri.getPort();
+                return scheme + "://" + host + (port > 0 ? ":" + port : "") + "/";
+            }
+        } catch (Exception ignored) {
+        }
+        return fallback;
+    }
+
+    private static String md5HexBytes(byte[] input) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("MD5");
+        byte[] digest = md.digest(input);
+        StringBuilder sb = new StringBuilder(32);
+        for (byte b : digest) {
+            sb.append(String.format(Locale.US, "%02x", b & 0xFF));
+        }
+        return sb.toString();
+    }
+
+    private static String md5AbyssNumericQuirk(long size) throws Exception {
+        String text = Long.toString(size);
+        byte[] digits = new byte[text.length()];
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            digits[i] = (c >= '0' && c <= '9') ? (byte) (c - '0') : 0;
+        }
+        return md5HexBytes(digits);
+    }
+
+    private static byte[] aes256CtrCrypt(byte[] input, byte[] key32, byte[] iv16, boolean encrypt) throws Exception {
+        Cipher cipher = Cipher.getInstance("AES/CTR/NoPadding");
+        SecretKeySpec keySpec = new SecretKeySpec(key32, "AES");
+        IvParameterSpec ivSpec = new IvParameterSpec(iv16);
+        cipher.init(encrypt ? Cipher.ENCRYPT_MODE : Cipher.DECRYPT_MODE, keySpec, ivSpec);
+        return cipher.doFinal(input);
+    }
+
+    private static String encryptAbyssSoraToken(String plainPath, long size) throws Exception {
+        byte[] keyBytes = md5AbyssNumericQuirk(size).getBytes(StandardCharsets.UTF_8);
+        byte[] ivBytes = new byte[16];
+        System.arraycopy(keyBytes, 0, ivBytes, 0, 16);
+        byte[] enc = aes256CtrCrypt(plainPath.getBytes(StandardCharsets.UTF_8), keyBytes, ivBytes, true);
+        String b1 = Base64.encodeToString(enc, Base64.NO_WRAP | Base64.NO_PADDING);
+        return Base64.encodeToString(b1.getBytes(StandardCharsets.ISO_8859_1), Base64.NO_WRAP | Base64.NO_PADDING);
+    }
+
+    private static int parseAbyssLabelHeight(String label) {
+        if (label == null) return 0;
+        Matcher m = Pattern.compile("(\\d{3,4})p?", Pattern.CASE_INSENSITIVE).matcher(label);
+        if (m.find()) {
+            try {
+                return Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 0;
+    }
+
+    private static ExtractedResult extractAbyssStreams(String embedUrl, String body) {
+        if (body == null || body.isEmpty()) return null;
+        Matcher datasMatch = ABYSS_DATAS_PATTERN.matcher(body);
+        if (!datasMatch.find()) return null;
+
+        try {
+            String rawB64 = datasMatch.group(1).replace('-', '+').replace('_', '/');
+            byte[] decodedBytes = Base64.decode(rawB64, Base64.DEFAULT);
+            JSONObject datas = new JSONObject(new String(decodedBytes, StandardCharsets.ISO_8859_1));
+
+            String slug = datas.optString("slug", "");
+            String md5Id = datas.optString("md5_id", "");
+            String userId = datas.optString("user_id", "");
+            Object mediaRaw = datas.opt("media");
+            JSONObject mediaJson = null;
+
+            if (mediaRaw instanceof JSONObject) {
+                mediaJson = (JSONObject) mediaRaw;
+            } else if (mediaRaw instanceof String && !slug.isEmpty() && !md5Id.isEmpty() && !userId.isEmpty()) {
+                String secret = userId + ":" + slug + ":" + md5Id;
+                byte[] keyBytes = md5HexBytes(secret.getBytes(StandardCharsets.UTF_8)).getBytes(StandardCharsets.UTF_8);
+                byte[] ivBytes = new byte[16];
+                System.arraycopy(keyBytes, 0, ivBytes, 0, 16);
+                byte[] cipherBytes = ((String) mediaRaw).getBytes(StandardCharsets.ISO_8859_1);
+                byte[] plainBytes = aes256CtrCrypt(cipherBytes, keyBytes, ivBytes, false);
+                mediaJson = new JSONObject(new String(plainBytes, StandardCharsets.UTF_8));
+            }
+            if (mediaJson == null) return null;
+
+            JSONObject mp4Obj = mediaJson.optJSONObject("mp4");
+            if (mp4Obj == null) return null;
+            JSONArray sourcesArr = mp4Obj.optJSONArray("sources");
+            JSONArray domainsArr = mp4Obj.optJSONArray("domains");
+            if (sourcesArr == null || sourcesArr.length() == 0) return null;
+
+            List<String> domains = new ArrayList<>();
+            if (domainsArr != null) {
+                for (int i = 0; i < domainsArr.length(); i++) {
+                    String d = domainsArr.optString(i, "").trim();
+                    if (!d.isEmpty()) domains.add(d);
+                }
+            }
+
+            Map<String, List<JSONObject>> grouped = new HashMap<>();
+            int totalSources = sourcesArr.length();
+            for (int i = 0; i < totalSources; i++) {
+                JSONObject item = sourcesArr.optJSONObject(i);
+                if (item == null) continue;
+                String label = item.optString("label", "").trim();
+                if (label.isEmpty()) continue;
+                if ("origin".equalsIgnoreCase(label) && totalSources > 1) continue;
+                if ("1440p".equalsIgnoreCase(label) || "2160p".equalsIgnoreCase(label)) continue;
+                List<JSONObject> bucket = grouped.get(label);
+                if (bucket == null) {
+                    bucket = new ArrayList<>();
+                    grouped.put(label, bucket);
+                }
+                bucket.add(item);
+            }
+
+            List<StreamCandidate> streams = new ArrayList<>();
+            for (Map.Entry<String, List<JSONObject>> entry : grouped.entrySet()) {
+                String label = entry.getKey();
+                List<JSONObject> candidates = entry.getValue();
+                Collections.sort(candidates, (a, b) -> {
+                    int aAv1 = "av1".equalsIgnoreCase(a.optString("codec", "")) ? 0 : 1;
+                    int bAv1 = "av1".equalsIgnoreCase(b.optString("codec", "")) ? 0 : 1;
+                    if (bAv1 != aAv1) return Integer.compare(bAv1, aAv1);
+                    int aScore = !a.optString("path", "").isEmpty() ? 2 : (a.optBoolean("status", false) ? 1 : 0);
+                    int bScore = !b.optString("path", "").isEmpty() ? 2 : (b.optBoolean("status", false) ? 1 : 0);
+                    return Integer.compare(bScore, aScore);
+                });
+                JSONObject best = candidates.get(0);
+                long size = best.optLong("size", 0L);
+                int resId = best.optInt("res_id", -1);
+                String sub = best.optString("sub", "").trim();
+                String fileUrl = best.optString("file", "").trim();
+
+                String streamUrl = "";
+                if (size > 0L && resId >= 0 && !sub.isEmpty() && !md5Id.isEmpty() && !slug.isEmpty()) {
+                    String matchedDomain = "";
+                    for (String dom : domains) {
+                        if (dom.contains(sub)) {
+                            matchedDomain = dom;
+                            break;
+                        }
+                    }
+                    if (!matchedDomain.isEmpty()) {
+                        String plainPath = "/mp4/" + md5Id + "/" + resId + "/" + size + "?v=" + slug;
+                        String token = encryptAbyssSoraToken(plainPath, size);
+                        String cleanDom = matchedDomain.replaceFirst("(?i)^https?://", "").replaceAll("/+$", "");
+                        streamUrl = "https://" + cleanDom + "/sora/" + size + "/" + token;
+                    }
+                } else if (isSafeHttpUrl(fileUrl)) {
+                    streamUrl = fileUrl;
+                }
+
+                if (isSafeHttpUrl(streamUrl)) {
+                    int h = parseAbyssLabelHeight(label);
+                    streams.add(new StreamCandidate(h > 0 ? (h + "p") : label, h, streamUrl, "mp4"));
+                }
+            }
+
+            Collections.sort(streams, (a, b) -> Integer.compare(b.height, a.height));
+
+            List<SubtitleCandidate> subtitles = new ArrayList<>();
+            JSONObject cfgObj = datas.optJSONObject("config");
+            JSONArray subArr = cfgObj != null ? cfgObj.optJSONArray("subtitles") : null;
+            if (subArr != null && !md5Id.isEmpty()) {
+                for (int i = 0; i < subArr.length(); i++) {
+                    JSONObject s = subArr.optJSONObject(i);
+                    if (s == null) continue;
+                    String sSlug = s.optString("slug", "").trim();
+                    String sType = s.optString("type", "").trim();
+                    if (sSlug.isEmpty() || sType.isEmpty()) continue;
+                    String sUrl = "https://cdn.iamcdn.net/subtitle/" + md5Id + "/" + sSlug + "." + sType;
+                    if (!isSafeHttpUrl(sUrl)) continue;
+                    String rawLang = s.optString("lang", "Legenda");
+                    String decodedLang = rawLang;
+                    try {
+                        decodedLang = URLDecoder.decode(rawLang, "UTF-8").trim();
+                    } catch (Exception ignored) {
+                    }
+                    if (decodedLang.isEmpty()) decodedLang = "Legenda";
+                    boolean isPt = decodedLang.toLowerCase(Locale.ROOT).matches(".*(portugu|pt[-_ ]?br|brasil|brazil).*");
+                    subtitles.add(new SubtitleCandidate(decodedLang, sUrl, isPt));
+                }
+            }
+
+            if (streams.isEmpty()) return null;
+            return new ExtractedResult(streams, subtitles, "Aniplay");
+        } catch (Exception e) {
+            Log.w(TAG, "Failed decoding Abyss/Aniplay embed: " + e.getMessage());
+            return null;
+        }
+    }
+
     private static ExtractedResult extractStreamsFromEmbed(String embedUrl, String body) {
         List<StreamCandidate> streams = new ArrayList<>();
         List<SubtitleCandidate> subtitles = new ArrayList<>();
         String trimmed = body != null ? body.trim() : "";
+
+        // 0. Abyss / Aniplay (`datas` AES-256-CTR -> direct /sora/ MP4)
+        if (isAbyssEmbedUrl(embedUrl)
+            || (body != null && (body.contains("SoTrym") || ABYSS_DATAS_PATTERN.matcher(body).find()))) {
+            ExtractedResult abyss = extractAbyssStreams(embedUrl, body);
+            if (abyss != null && !abyss.streams.isEmpty()) {
+                return abyss;
+            }
+        }
 
         // 1. Vidstreaming JSON
         if (trimmed.startsWith("{")) {
@@ -1107,7 +1342,21 @@ public final class TopAnimesEpisodeResolver {
         return "hls".equals(format) ? "HLS Auto" : "Original";
     }
 
+    private static final class FetchResult {
+        final String finalUrl;
+        final String body;
+
+        FetchResult(String finalUrl, String body) {
+            this.finalUrl = finalUrl;
+            this.body = body;
+        }
+    }
+
     private static String fetchText(String rawUrl, String referer, int timeoutMs) throws IOException {
+        return fetchTextWithFinalUrl(rawUrl, referer, timeoutMs).body;
+    }
+
+    private static FetchResult fetchTextWithFinalUrl(String rawUrl, String referer, int timeoutMs) throws IOException {
         String currentUrl = rawUrl;
         HttpURLConnection conn = null;
         try {
@@ -1149,7 +1398,7 @@ public final class TopAnimesEpisodeResolver {
                         out.write(buf, 0, n);
                     }
                 }
-                return out.toString(StandardCharsets.UTF_8.name());
+                return new FetchResult(parsed.toString(), out.toString(StandardCharsets.UTF_8.name()));
             }
             throw new IOException("Excesso de redirecionamentos.");
         } finally {

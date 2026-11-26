@@ -1,4 +1,5 @@
 import * as cheerio from 'cheerio';
+import { extractAbyssStreamsFromHtml, isAbyssEmbedUrl } from './abyssDecoder.ts';
 import type {
   AnimeDetails,
   AnimeEpisodeLink,
@@ -739,7 +740,6 @@ export function extractMissingDooPlayerOptions(html: string): MissingDooPlayerOp
     const type = cleanText(li.attr('data-type')) || 'tv';
     if (!nume || !post || nume === 'trailer' || resolvedNumes.has(nume)) return;
     const label = formatServerLabel(li.find('.title').text(), `Servidor ${nume}`);
-    if (classifyProviderKind(label, '') === 'abyss') return;
     missing.push({ post, nume, type, label });
   });
 
@@ -1128,7 +1128,6 @@ export function parseEpisodePageHtml(html: string, pageUrl: string): EpisodeDeta
     const embedUrl = sourceMap.get(nume) || '';
     if (!embedUrl) return;
     const providerKind = classifyProviderKind(label, embedUrl);
-    if (providerKind === 'abyss') return;
     options.push({
       nume,
       label,
@@ -1371,6 +1370,18 @@ export function extractStreamsFromEmbed(
   const streams: StreamQuality[] = [];
   const subtitles: SubtitleTrack[] = [];
   let poster: string | undefined;
+
+  // 0. Abyss / Aniplay (`const datas = "<base64>"` -> AES-256-CTR + /sora/ MP4)
+  if (
+    isAbyssEmbedUrl(embedUrl) ||
+    body.includes('SoTrym') ||
+    /\b(?:const|let|var)\s+datas\s*=\s*["'][A-Za-z0-9+/=_-]{24,}["']/.test(body)
+  ) {
+    const abyss = extractAbyssStreamsFromHtml(embedUrl, body);
+    if (abyss && abyss.streams.length > 0) {
+      return abyss;
+    }
+  }
 
   // 1. Vidstreaming JSON (`{ status: "success", midias: [...], legendas: [...] }`)
   if (trimmed.startsWith('{')) {

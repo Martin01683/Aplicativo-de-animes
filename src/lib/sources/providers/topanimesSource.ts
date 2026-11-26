@@ -1,4 +1,5 @@
 import type { HttpFetcher } from '../../httpTypes.ts';
+import { isAbyssEmbedUrl } from '../../abyssDecoder.ts';
 import {
   classifyProviderKind,
   extractDooPlayAjaxConfig,
@@ -169,7 +170,6 @@ export async function hydrateDooPlayEpisodeOptions(
           const embedUrl = parseDooPlayerAjaxResponse(body, pageUrl);
           if (embedUrl) {
             const providerKind = classifyProviderKind(item.label, embedUrl);
-            if (providerKind === 'abyss') return null;
             return {
               nume: item.nume,
               label: formatServerLabel(item.label, `Servidor ${item.nume}`),
@@ -605,18 +605,6 @@ export async function resolveTopAnimesEmbed(
     };
   }
 
-  if (/abyssplayer\.com|abyss\.to|abysscdn\.com|short\.icu/i.test(cleanEmbed)) {
-    return {
-      embedUrl: cleanEmbed,
-      provider: 'Aniplay',
-      status: 'embed-only',
-      streams: [],
-      subtitles: [],
-      referer: baseReferer,
-      errorMessage: 'Servidor indisponível neste player.',
-    };
-  }
-
   let fetchTarget = cleanEmbed;
   if (/sk-boyceta\.booonceivu\.shop/i.test(cleanEmbed)) {
     const u = new URL(cleanEmbed);
@@ -632,7 +620,7 @@ export async function resolveTopAnimesEmbed(
     if (!res.ok) {
       return {
         embedUrl: cleanEmbed,
-        provider: 'Servidor',
+        provider: isAbyssEmbedUrl(cleanEmbed) ? 'Aniplay' : 'Servidor',
         status: 'error',
         streams: [],
         subtitles: [],
@@ -641,7 +629,10 @@ export async function resolveTopAnimesEmbed(
       };
     }
 
-    let extracted = extractStreamsFromEmbed(cleanEmbed, res.body);
+    const effectiveEmbedUrl =
+      res.finalUrl && isSafeExternalHttpUrl(res.finalUrl) ? res.finalUrl : cleanEmbed;
+
+    let extracted = extractStreamsFromEmbed(effectiveEmbedUrl, res.body);
 
     if (!extracted.streams.length) {
       const zuplayPathMatch = cleanEmbed.match(/^https?:\/\/csst\.online\/embed\/(video\/[^?#]+)/i);
@@ -667,22 +658,26 @@ export async function resolveTopAnimesEmbed(
         streams: [],
         subtitles: extracted.subtitles,
         poster: extracted.poster,
-        referer: cleanEmbed,
+        referer: effectiveEmbedUrl,
         errorMessage:
           'Nenhum link direto .m3u8/.mp4 encontrado neste servidor. Tente outro servidor abaixo.',
       };
     }
 
-    const streamReferer = /csst\.online/i.test(cleanEmbed)
-      ? 'https://www.incvideo1.online/'
-      : isMixDropEmbedUrl(cleanEmbed)
-        ? `${new URL(cleanEmbed).origin}/`
-        : /antivirus|booonceivu/i.test(cleanEmbed)
-          ? baseReferer
-          : cleanEmbed;
+    const isAbyss = isAbyssEmbedUrl(effectiveEmbedUrl) || extracted.provider === 'Aniplay';
+    const streamReferer = isAbyss
+      ? `${new URL(effectiveEmbedUrl).origin}/`
+      : /csst\.online/i.test(effectiveEmbedUrl)
+        ? 'https://www.incvideo1.online/'
+        : isMixDropEmbedUrl(effectiveEmbedUrl)
+          ? `${new URL(effectiveEmbedUrl).origin}/`
+          : /antivirus|booonceivu/i.test(effectiveEmbedUrl)
+            ? baseReferer
+            : effectiveEmbedUrl;
 
     const firstUrl = extracted.streams[0]?.url || '';
     const preferDirect =
+      !isAbyss &&
       /(?:^|\.)(?:booonceivu\.shop|123flmsfree\.com|321moviesfree\.com)$/i.test(
         new URL(firstUrl).hostname
       );
