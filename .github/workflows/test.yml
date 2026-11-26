@@ -79,6 +79,9 @@ jobs:
     name: Build Anisync APK (release)
     needs: validate-and-test
     runs-on: ubuntu-latest
+    outputs:
+      aria2_tag: ${{ steps.resolve-engines.outputs.aria2_tag }}
+      ytdlp_tag: ${{ steps.resolve-engines.outputs.ytdlp_tag }}
 
     steps:
       - name: Checkout repository
@@ -102,6 +105,36 @@ jobs:
       # dependências rodam sem acesso à chave de assinatura.
       - name: Install npm dependencies
         run: npm install
+
+      - name: Resolve latest stable aria2 and yt-dlp versions
+        id: resolve-engines
+        run: node scripts/resolve-download-engines.mjs --github-output
+
+      - name: Cache compiled Android aria2c binaries (keyed by latest stable tag)
+        id: cache-aria2
+        uses: actions/cache@v4
+        with:
+          path: android/app/src/main/jniLibs
+          key: aria2-android-${{ steps.resolve-engines.outputs.aria2_tag }}-${{ hashFiles('scripts/build-aria2-android.sh') }}
+
+      - name: Compile latest stable aria2c from github.com/aria2/aria2.git
+        if: steps.cache-aria2.outputs.cache-hit != 'true'
+        env:
+          ARIA2_TAG: ${{ steps.resolve-engines.outputs.aria2_tag }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake autopoint gettext libtool pkg-config make perl curl ca-certificates git binutils
+          chmod +x scripts/build-aria2-android.sh
+          bash scripts/build-aria2-android.sh "$ARIA2_TAG"
+
+      - name: Fetch and verify latest stable yt-dlp from github.com/yt-dlp/yt-dlp.git
+        env:
+          YTDLP_TAG: ${{ steps.resolve-engines.outputs.ytdlp_tag }}
+          ARIA2_TAG: ${{ steps.resolve-engines.outputs.aria2_tag }}
+        run: |
+          chmod +x scripts/fetch-ytdlp-stable.sh
+          bash scripts/fetch-ytdlp-stable.sh "$YTDLP_TAG" "$ARIA2_TAG"
 
       - name: Build web bundle and sync Capacitor Android
         env:
@@ -166,6 +199,23 @@ jobs:
             exit 1
           fi
 
+          APK_ENTRIES="$(unzip -Z1 "$APK")"
+          for required in \
+            "lib/arm64-v8a/libaria2c.so" \
+            "lib/armeabi-v7a/libaria2c.so" \
+            "lib/x86_64/libaria2c.so" \
+            "assets/download-engines.json"; do
+            if ! echo "$APK_ENTRIES" | grep -qxF "$required"; then
+              echo "::error::Artefato obrigatório do motor de download ausente no APK: $required"
+              exit 1
+            fi
+          done
+          if ! "$BUILD_TOOLS/aapt2" dump resources "$APK" | grep -q "raw/ytdlp"; then
+            echo "::error::Recurso obrigatório raw/ytdlp ausente no APK."
+            exit 1
+          fi
+          echo "Motores de download verificados no APK: aria2c (${{ steps.resolve-engines.outputs.aria2_tag }}) e yt-dlp (${{ steps.resolve-engines.outputs.ytdlp_tag }})."
+
       - name: Rename APK output
         run: cp android/app/build/outputs/apk/release/app-release.apk Anisync.apk
 
@@ -206,6 +256,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TARGET_SHA: ${{ github.sha }}
           TARGET_BRANCH: ${{ github.ref_name }}
+          ARIA2_TAG: ${{ needs.build-apk.outputs.aria2_tag }}
+          YTDLP_TAG: ${{ needs.build-apk.outputs.ytdlp_tag }}
         run: |
           BASE_TAG="v1.0.${{ github.run_number }}"
           TAG="$BASE_TAG"
@@ -280,6 +332,10 @@ jobs:
             echo "---"
             echo ""
             echo "Build automático (release assinado) gerado após validação de segurança, lint, testes unitários e compilação Android (${TARGET_SHA})."
+            if [ -n "$ARIA2_TAG" ] || [ -n "$YTDLP_TAG" ]; then
+              echo ""
+              echo "Motores de download integrados (versões estáveis mais recentes): aria2c \`${ARIA2_TAG}\` · yt-dlp \`${YTDLP_TAG}\`."
+            fi
             echo ""
             echo 'Instalação: baixe Anisync.apk e instale por cima da versão anterior. Se aparecer "pacote já existe" / "conflita com um pacote existente", desinstale o app UMA vez (se a versão anterior foi assinada com outra chave) e instale de novo; as próximas atualizações instalam por cima normalmente.'
           } > "$NOTES_FILE"

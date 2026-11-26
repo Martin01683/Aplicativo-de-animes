@@ -22,6 +22,11 @@ import {
 import type { CatalogPreferences, VlcPlaylistEntry } from './src/lib/types.ts';
 import { isPrivateOrReservedIp, isSafeExternalHttpUrl } from './src/lib/urlSafety.ts';
 import {
+  downloadWithServerAria2OrParallel,
+  getServerDownloadEnginesStatus,
+  resolveEmbedWithServerYtDlp,
+} from './src/lib/serverDownloadEngines.ts';
+import {
   controlServerTvCast,
   convertSrtToVtt,
   discoverLanTvDevices,
@@ -330,6 +335,95 @@ async function createAppServer(): Promise<void> {
   app.post('/api/resolve-embed', handleAggregatedRoute);
 
   // ---------------------------------------------------------------------------
+  // High-Speed Download Engines (aria2c max-connections + yt-dlp fallback)
+  // ---------------------------------------------------------------------------
+
+  app.get('/api/download-engines/status', async (_req: Request, res: Response) => {
+    try {
+      const info = await getServerDownloadEnginesStatus();
+      res.json(info);
+    } catch (err) {
+      res.status(500).json({
+        aria2Available: false,
+        ytdlpAvailable: false,
+        error: err instanceof Error ? err.message : 'Falha ao consultar motores de download.',
+      });
+    }
+  });
+
+  app.post('/api/download-engines/resolve-embed', async (req: Request, res: Response) => {
+    const body = (req.body || {}) as { embedUrl?: string; referer?: string };
+    const embedUrl = String(body.embedUrl || '').trim();
+    const referer = String(body.referer || DEFAULT_STREAM_REFERER).trim();
+    try {
+      await assertPublicTarget(embedUrl);
+      const resolved = await resolveEmbedWithServerYtDlp(embedUrl, referer);
+      res.status(resolved.ok ? 200 : 422).json(resolved);
+    } catch (err) {
+      res.status(400).json({
+        ok: false,
+        streams: [],
+        subtitles: [],
+        referer,
+        errorMessage: err instanceof Error ? err.message : 'URL inválida.',
+      });
+    }
+  });
+
+  app.get('/api/download-engines/fast-download', async (req: Request, res: Response) => {
+    const targetUrl = String(req.query.url || '').trim();
+    const refererParam = String(req.query.referer || DEFAULT_STREAM_REFERER).trim();
+    const referer = isSafeExternalHttpUrl(refererParam) ? refererParam : DEFAULT_STREAM_REFERER;
+
+    const dlAbort = new AbortController();
+    req.on('close', () => {
+      if (!res.writableEnded) dlAbort.abort();
+    });
+
+    try {
+      await assertPublicTarget(targetUrl);
+      const result = await downloadWithServerAria2OrParallel({
+        url: targetUrl,
+        referer,
+        signal: dlAbort.signal,
+      });
+
+      res.status(200);
+      res.setHeader('Content-Type', result.contentType || 'video/mp4');
+      if (result.sizeBytes > 0) {
+        res.setHeader('Content-Length', String(result.sizeBytes));
+      }
+      res.setHeader('X-Anisync-Download-Engine', result.engine);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+
+      const stream = fs.createReadStream(result.filePath);
+      const cleanupOnce = (() => {
+        let done = false;
+        return () => {
+          if (done) return;
+          done = true;
+          result.cleanup();
+        };
+      })();
+      stream.on('close', cleanupOnce);
+      stream.on('error', () => {
+        cleanupOnce();
+        if (!res.headersSent) res.status(502);
+        res.end();
+      });
+      res.on('close', () => {
+        stream.destroy();
+        cleanupOnce();
+      });
+      stream.pipe(res);
+    } catch (err) {
+      if (!res.headersSent && !dlAbort.signal.aborted) {
+        res.status(502).send(err instanceof Error ? err.message : 'Falha no download acelerado.');
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Automatic Wi-Fi TV Discovery & Casting (Chromecast / Android TV + DLNA)
   // ---------------------------------------------------------------------------
 
@@ -442,7 +536,10 @@ async function createAppServer(): Promise<void> {
     res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Content-Type, Accept');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
     res.setHeader('transferMode.dlna.org', 'Streaming');
-    res.setHeader('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0');
+    res.setHeader(
+      'contentFeatures.dlna.org',
+      'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000'
+    );
 
     const streamAbort = new AbortController();
     req.on('close', () => {

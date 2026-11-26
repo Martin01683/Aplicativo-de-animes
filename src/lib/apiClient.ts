@@ -98,7 +98,20 @@ async function ensureProxyBaseUrl(): Promise<string> {
   return '';
 }
 
+function isLoopbackOrLocalMediaUrl(url: string): boolean {
+  const lower = (url || '').trim().toLowerCase();
+  return (
+    lower.startsWith('http://127.0.0.1:') ||
+    lower.startsWith('http://localhost:') ||
+    lower.startsWith('blob:') ||
+    lower.startsWith('file://')
+  );
+}
+
 export function getStreamProxyUrl(targetUrl: string, referer = DEFAULT_STREAM_REFERER): string {
+  if (isLoopbackOrLocalMediaUrl(targetUrl)) {
+    return targetUrl;
+  }
   const params = new URLSearchParams({
     url: targetUrl,
     referer: referer || DEFAULT_STREAM_REFERER,

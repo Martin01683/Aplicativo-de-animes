@@ -101,6 +101,22 @@ import {
   type ToastKind,
 } from './lib/notifications';
 import {
+  buildOfflineEpisodeDetails,
+  cancelEpisodeOfflineDownload,
+  canonicalOfflineEpisodeUrl,
+  clearOfflineDownloadQueue,
+  deleteAllOfflineDownloads,
+  deleteEpisodeOfflineDownload,
+  ensureOfflinePlaybackSource,
+  getCompletedOfflineDownload,
+  getOfflineDownloadsSnapshot,
+  hydrateOfflineDownloads,
+  startEpisodeOfflineDownload,
+  subscribeOfflineDownloads,
+  type OfflineDownloadInput,
+  type OfflineDownloadRecord,
+} from './lib/offlineDownloads';
+import {
   canonicalEpisodeProgressKey,
   countAnimeEpisodesInHistory,
   getHistoryEntrySeriesName,
@@ -602,10 +618,118 @@ export default function App() {
     []
   );
 
+  const [offlineDownloads, setOfflineDownloads] = useState<OfflineDownloadRecord[]>(() =>
+    getOfflineDownloadsSnapshot()
+  );
+  const prevOfflineStatusRef = useRef<Map<string, OfflineDownloadRecord['status']>>(new Map());
+  const offlineDownloadsByKey = useMemo(() => {
+    const map = new Map<string, OfflineDownloadRecord>();
+    for (const rec of offlineDownloads) {
+      map.set(rec.canonicalUrl || canonicalOfflineEpisodeUrl(rec.episodeUrl), rec);
+    }
+    return map;
+  }, [offlineDownloads]);
+
   const refreshProgressState = useCallback(() => {
     setProgressMap(loadEpisodeProgressMap());
     setHistory(loadHistory());
   }, []);
+
+  useEffect(() => {
+    const sync = () => {
+      const next = getOfflineDownloadsSnapshot();
+      const prevMap = prevOfflineStatusRef.current;
+      for (const rec of next) {
+        const prevStatus = prevMap.get(rec.id);
+        if (prevStatus && prevStatus !== 'completed' && rec.status === 'completed') {
+          showToast(
+            `${rec.seriesTitle || rec.title}${rec.episodeLabel ? ` · ${rec.episodeLabel}` : ''} salvo no dispositivo!`,
+            {
+              kind: 'success',
+              description: 'Ao clicar para assistir, o vídeo local será usado automaticamente.',
+              dedupeKey: `offline-done-${rec.id}`,
+            }
+          );
+        }
+      }
+      const nextMap = new Map<string, OfflineDownloadRecord['status']>();
+      for (const rec of next) {
+        nextMap.set(rec.id, rec.status);
+      }
+      prevOfflineStatusRef.current = nextMap;
+      setOfflineDownloads(next);
+    };
+
+    const initialMap = new Map<string, OfflineDownloadRecord['status']>();
+    for (const rec of getOfflineDownloadsSnapshot()) {
+      initialMap.set(rec.id, rec.status);
+    }
+    prevOfflineStatusRef.current = initialMap;
+
+    const unsubscribe = subscribeOfflineDownloads(sync);
+    void hydrateOfflineDownloads();
+    return unsubscribe;
+  }, [showToast]);
+
+  const handleStartOfflineDownload = useCallback(
+    async (input: OfflineDownloadInput) => {
+      try {
+        const rec = await startEpisodeOfflineDownload({
+          ...input,
+          sources: settingsRef.current.episodeSources,
+          audioPreference: settingsRef.current.defaultAudioFilter,
+        });
+        if (rec.status === 'queued' && rec.queuePosition) {
+          showToast(`Adicionado à fila de downloads (#${rec.queuePosition}).`, {
+            dedupeKey: `offline-queue-${rec.id}`,
+          });
+        } else {
+          showToast('Preparando download offline...', {
+            dedupeKey: `offline-start-${canonicalOfflineEpisodeUrl(input.episodeUrl)}`,
+          });
+        }
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : 'Não foi possível baixar este episódio.';
+        showToast(msg, { kind: 'warning' });
+      }
+    },
+    [showToast]
+  );
+
+  const handleClearOfflineQueue = useCallback(() => {
+    const removed = clearOfflineDownloadQueue();
+    if (removed > 0) {
+      showToast(
+        removed === 1
+          ? '1 download removido da fila.'
+          : `${removed} downloads removidos da fila.`
+      );
+    }
+  }, [showToast]);
+
+  const handleCancelOfflineDownload = useCallback(
+    async (idOrUrl: string) => {
+      await cancelEpisodeOfflineDownload(idOrUrl);
+      showToast('Download cancelado.');
+    },
+    [showToast]
+  );
+
+  const handleDeleteOfflineDownload = useCallback(
+    async (idOrUrl: string) => {
+      await deleteEpisodeOfflineDownload(idOrUrl);
+      showToast('Vídeo salvo removido do dispositivo.');
+    },
+    [showToast]
+  );
+
+  const handleDeleteAllOfflineDownloads = useCallback(async () => {
+    await deleteAllOfflineDownloads();
+    showToast('Todos os vídeos salvos foram removidos.');
+  }, [showToast]);
 
   const updateSettings = useCallback((patch: Partial<AppSettings>) => {
     if (patch.videoScale) {
@@ -1915,6 +2039,83 @@ export default function App() {
         }
       }
       const knownMeta = resolveKnownEpisodeMeta(url);
+      const completedOffline = getCompletedOfflineDownload(url);
+      if (completedOffline) {
+        const readyOffline = await ensureOfflinePlaybackSource(completedOffline);
+        if (navRequestGenRef.current !== reqGen) return;
+        if (readyOffline) {
+          const cachedEp = !options.bypassCache ? getCachedEpisodeDetails(url) : undefined;
+          if (cachedEp) {
+            setEpisodeDetails(cachedEp);
+            setLoadingDetail(false);
+            setDetailError('');
+            return;
+          }
+          const matchedSeriesEps = resolveSeriesEpisodesForEpisode(
+            animeDetailsRef.current,
+            url,
+            readyOffline.seriesUrl || options.seed?.seriesUrl || knownMeta?.seriesUrl
+          );
+          const offlineEp = buildOfflineEpisodeDetails(readyOffline, matchedSeriesEps);
+          const mergedOfflineEp: EpisodeDetails = {
+            ...offlineEp,
+            seriesTitle:
+              offlineEp.seriesTitle ||
+              options.seed?.seriesTitle ||
+              knownMeta?.seriesTitle ||
+              offlineEp.title,
+            seriesUrl:
+              offlineEp.seriesUrl || options.seed?.seriesUrl || knownMeta?.seriesUrl || '',
+            poster: offlineEp.poster || options.seed?.poster || knownMeta?.poster || '',
+            backdrop:
+              offlineEp.backdrop ||
+              options.seed?.backdrop ||
+              knownMeta?.backdrop ||
+              knownMeta?.poster ||
+              '',
+            genres: options.seed?.genres?.length ? options.seed.genres : offlineEp.genres,
+            externalIds: options.seed?.externalIds || offlineEp.externalIds,
+            catalogSource: options.seed?.catalogSource || offlineEp.catalogSource,
+            prevUrl: offlineEp.prevUrl || options.seed?.prevUrl,
+            nextUrl: offlineEp.nextUrl || options.seed?.nextUrl,
+          };
+          setEpisodeDetails(mergedOfflineEp);
+          setLoadingDetail(false);
+          setDetailError('');
+          setLoadingExtraServers(null);
+
+          // When online, silently enrich episode metadata/online servers in background
+          // without interrupting or replacing the prioritized offline local playback.
+          if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+            void fetchEpisodeDetailsFast(url, {
+              sources: settingsRef.current.episodeSources,
+              audioPreference: settingsRef.current.defaultAudioFilter,
+              deferCrossSources: !options.bypassCache,
+              bypassCache: options.bypassCache,
+            })
+              .then((rawEp) => {
+                if (navRequestGenRef.current !== reqGen) return;
+                const enriched: EpisodeDetails = {
+                  ...rawEp,
+                  seriesTitle: rawEp.seriesTitle || mergedOfflineEp.seriesTitle,
+                  seriesUrl: rawEp.seriesUrl || mergedOfflineEp.seriesUrl,
+                  poster: rawEp.poster || mergedOfflineEp.poster,
+                  backdrop: rawEp.backdrop || rawEp.poster || mergedOfflineEp.backdrop,
+                  genres: rawEp.genres.length > 0 ? rawEp.genres : mergedOfflineEp.genres,
+                };
+                setCachedEpisodeDetails(url, enriched);
+                setEpisodeDetails((prev) =>
+                  prev && isSameEpisodeUrl(prev.url, url) ? enriched : prev
+                );
+              })
+              .catch(() => {
+                // Offline or network unreachable — local video keeps playing seamlessly
+              });
+          }
+          return;
+        }
+      }
+
       if (!options.bypassCache) {
         const cachedEp = getCachedEpisodeDetails(url);
         if (cachedEp) {
@@ -3595,6 +3796,10 @@ export default function App() {
                   onOpenAnime={(animeUrl, seed) => void openMediaUrl(animeUrl, 'anime', seed)}
                   onPrefetchEpisode={handlePrefetchEpisode}
                   onPrefetchAnime={handlePrefetchAnime}
+                  offlineDownloadsByKey={offlineDownloadsByKey}
+                  onStartOfflineDownload={handleStartOfflineDownload}
+                  onCancelOfflineDownload={handleCancelOfflineDownload}
+                  onDeleteOfflineDownload={handleDeleteOfflineDownload}
                   onLoadingStateChange={setAnimeViewHydrating}
                   onBack={() => navigateBackStep()}
                 />
@@ -3754,6 +3959,12 @@ export default function App() {
                   switchingCastServerNume={switchingCastServerNume}
                   onSwitchTvCastServer={(opt) => handleSwitchTvCastServer(opt)}
                   onOpenTvCast={handleOpenTvCast}
+                  offlineDownload={offlineDownloadsByKey.get(
+                    canonicalOfflineEpisodeUrl(episodeDetails.url)
+                  )}
+                  onStartOfflineDownload={handleStartOfflineDownload}
+                  onCancelOfflineDownload={handleCancelOfflineDownload}
+                  onDeleteOfflineDownload={handleDeleteOfflineDownload}
                   onLoadingStateChange={setEpisodeViewLoading}
                 />
                   );
@@ -3847,6 +4058,27 @@ export default function App() {
             }}
             onExportBackup={handleExportBackup}
             onImportBackup={handleImportBackup}
+            offlineDownloads={offlineDownloads}
+            onOpenOfflineEpisode={(rec) => {
+              closeSettingsModal();
+              void openMediaUrl(rec.episodeUrl, 'episode', {
+                title: rec.title,
+                seriesTitle: rec.seriesTitle,
+                seriesUrl: rec.seriesUrl,
+                poster: rec.poster,
+                backdrop: rec.poster,
+                episodeLabel: rec.episodeLabel,
+                isMovie: rec.isMovie,
+                seasonNumber: rec.seasonNumber,
+                episodeNumber: rec.episodeNumber,
+                prevUrl: rec.prevUrl,
+                nextUrl: rec.nextUrl,
+              });
+            }}
+            onCancelOfflineDownload={(id) => void handleCancelOfflineDownload(id)}
+            onDeleteOfflineDownload={(id) => void handleDeleteOfflineDownload(id)}
+            onClearOfflineQueue={handleClearOfflineQueue}
+            onDeleteAllOfflineDownloads={() => void handleDeleteAllOfflineDownloads()}
           />
         </Suspense>
       )}

@@ -44,6 +44,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(LocalProxyPlugin.class);
         registerPlugin(NativeVlcPlayerPlugin.class);
         registerPlugin(TvCastPlugin.class);
+        registerPlugin(OfflineDownloadsPlugin.class);
         super.onCreate(savedInstanceState);
 
         captureNotificationIntent(getIntent(), false);

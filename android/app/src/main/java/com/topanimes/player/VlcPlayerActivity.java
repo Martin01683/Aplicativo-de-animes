@@ -1660,6 +1660,14 @@ public class VlcPlayerActivity extends AppCompatActivity {
         }
     }
 
+    private static boolean isLocalOfflineUrl(String rawUrl) {
+        if (rawUrl == null || rawUrl.isEmpty()) return false;
+        String lower = rawUrl.trim().toLowerCase(Locale.ROOT);
+        return lower.startsWith("file://")
+            || lower.startsWith("http://127.0.0.1:")
+            || lower.startsWith("http://localhost:");
+    }
+
     private static boolean shouldSkipDirectFallbackForUrl(String rawUrl) {
         if (rawUrl == null || rawUrl.isEmpty()) return false;
         String lower = rawUrl.toLowerCase(Locale.ROOT);
@@ -1735,6 +1743,11 @@ public class VlcPlayerActivity extends AppCompatActivity {
         hasProxyBufferTelemetry = false;
         resetBufferProgress(pendingSeekMs);
 
+        boolean isLocalOffline = isLocalOfflineUrl(item.url);
+        if (isLocalOffline) {
+            useProxyForAttempt = false;
+        }
+
         String targetUrl = item.url;
         if (useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
             targetUrl = LocalProxyPlugin.buildSharedProxyUrl(item.url, referer, nextBufferSession);
@@ -1783,12 +1796,17 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
         Media media = new Media(libVlc, Uri.parse(targetUrl));
         media.setHWDecoderEnabled(true, false);
-        media.addOption(":http-user-agent=" + DEFAULT_UA);
-        if (!useProxyForAttempt && referer != null && !referer.isEmpty()) {
-            media.addOption(":http-referrer=" + referer);
+        if (isLocalOffline) {
+            media.addOption(":file-caching=300");
+            media.addOption(":network-caching=300");
+        } else {
+            media.addOption(":http-user-agent=" + DEFAULT_UA);
+            if (!useProxyForAttempt && referer != null && !referer.isEmpty()) {
+                media.addOption(":http-referrer=" + referer);
+            }
+            media.addOption(":http-reconnect=true");
+            media.addOption(":network-caching=1500");
         }
-        media.addOption(":http-reconnect=true");
-        media.addOption(":network-caching=1500");
 
         mediaPlayer.setMedia(media);
         media.release();
@@ -1812,7 +1830,7 @@ public class VlcPlayerActivity extends AppCompatActivity {
             ? streams.get(currentStreamIdx).url
             : "";
 
-        if (!triedAlternateTransport) {
+        if (!triedAlternateTransport && !isLocalOfflineUrl(currentUrl)) {
             if (!useProxyForAttempt && !proxyBaseUrl.isEmpty()) {
                 triedAlternateTransport = true;
                 useProxyForAttempt = true;
@@ -2975,6 +2993,115 @@ public class VlcPlayerActivity extends AppCompatActivity {
     }
 
     private void loadEpisodeInFullscreen(String rawTargetUrl, boolean saveOutgoingProgress) {
+        OfflineDownloadsPlugin.OfflinePlaybackInfo offlineHit =
+            OfflineDownloadsPlugin.findCompletedDownloadForEpisodeUrl(this, rawTargetUrl);
+        if (offlineHit != null && offlineHit.playbackUrl != null && !offlineHit.playbackUrl.isEmpty()) {
+            if (saveOutgoingProgress) {
+                captureCurrentPositionMs();
+                saveCurrentEpisodeProgress(playbackEnded);
+            }
+            episodeLoadGen.incrementAndGet();
+            activePlaybackSessionGen = -1L;
+            endReachedHandledSessionGen = -1L;
+            uiHandler.removeCallbacks(loadWatchdogRunnable);
+            uiHandler.removeCallbacks(pauseAfterRestoreRunnable);
+            uiHandler.removeCallbacks(pauseAfterRestoreFallbackRunnable);
+            clearPendingInteractiveSeek();
+            clearActiveSeekGuard();
+            pauseAfterRestoreFrame = false;
+            pauseAfterRestoreScheduled = false;
+            restoreFrameTimeReached = false;
+            restoreFrameTargetMs = 0L;
+            playbackEnded = false;
+            localSubtitleUri = null;
+            userDisabledSubtitles = false;
+            preferredAudioTrackId = -1;
+            clearCachedSubtitles();
+            failedServerNumes.clear();
+            currentServerRetryCount = 0;
+            retriedFreshServerEmbeds = false;
+            triedAlternateTransport = false;
+            hasPlaybackStartedForStream = false;
+            hasActiveVout = false;
+            firstTimeChangedMs = -1L;
+            playbackTimeAdvanceCount = 0;
+            userSeekedInCurrentStream = false;
+            streamPreparedWallMs = 0L;
+            loadingEpisode = false;
+            playbackFailed = false;
+
+            String resolvedEpUrl = rawTargetUrl != null && !rawTargetUrl.trim().isEmpty()
+                ? rawTargetUrl.trim()
+                : offlineHit.episodeUrl;
+            episodeUrl = resolvedEpUrl;
+            episodeTitle = offlineHit.title != null && !offlineHit.title.isEmpty()
+                ? formatEpisodeTitleWithSeries(seriesTitle, offlineHit.title)
+                : episodeTitle;
+            for (TopAnimesEpisodeResolver.EpisodeLink ep : seriesEpisodes) {
+                if (isSameEpisodeUrl(ep.url, resolvedEpUrl) && ep.title != null && !ep.title.isEmpty()) {
+                    episodeTitle = formatEpisodeTitleWithSeries(seriesTitle, ep.title);
+                    break;
+                }
+            }
+            pendingSeekMs = getSavedResumePositionMs(resolvedEpUrl);
+            lastKnownPositionMs = pendingSeekMs;
+            lastKnownDurationMs = 0L;
+            hasProxyBufferTelemetry = false;
+            seekBar.setProgress(0);
+            seekBar.setMax(100);
+            resetBufferProgress(pendingSeekMs);
+            timeCurrentView.setText(formatMs(pendingSeekMs));
+            timeDurationView.setText("0:00");
+
+            closeSettingsMenu();
+            closeEpisodesDrawer();
+            errorOverlay.setVisibility(View.GONE);
+            if (mediaPlayer != null) {
+                try {
+                    mediaPlayer.stop();
+                } catch (Exception ignored) {
+                }
+            }
+
+            selectedServerNume = "offline-local";
+            referer = "";
+            preferDirect = true;
+            useProxyForAttempt = false;
+            streams.clear();
+            String qLabel = offlineHit.qualityLabel != null && !offlineHit.qualityLabel.isEmpty()
+                ? offlineHit.qualityLabel + " · Offline"
+                : "Offline";
+            streams.add(new StreamItem(qLabel, offlineHit.playbackUrl));
+            currentStreamIdx = 0;
+
+            subtitles.clear();
+            for (OfflineDownloadsPlugin.OfflineSubtitleInfo sub : offlineHit.subtitles) {
+                subtitles.add(new SubtitleItem(sub.label, sub.url, sub.isDefault));
+            }
+
+            serverOptions.clear();
+            serverOptions.add(new TopAnimesEpisodeResolver.ServerOption(
+                "offline-local",
+                "Salvo no celular",
+                "offline://" + offlineHit.id,
+                "direct"
+            ));
+
+            recordVisitedEpisode(episodeUrl, episodeTitle, pendingSeekMs, 0L, isEpisodeCompletedInPref(episodeUrl));
+            persistPendingSessionPref("closed");
+            prevUrl = "";
+            nextUrl = "";
+            hasPrevFlag = false;
+            hasNextFlag = false;
+            syncPrevNextFromSeries();
+            updateQualityLabel();
+            updateHeaderTitles();
+            updateEpisodeNavButtons();
+            Toast.makeText(this, "Reproduzindo vídeo salvo no celular", Toast.LENGTH_SHORT).show();
+            prepareAndPlayCurrentStream();
+            return;
+        }
+
         if (rawTargetUrl != null && rawTargetUrl.trim().toLowerCase(Locale.ROOT).startsWith("anisync://")) {
             if (saveOutgoingProgress) {
                 captureCurrentPositionMs();

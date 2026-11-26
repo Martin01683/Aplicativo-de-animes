@@ -18,3 +18,9 @@ keystore.properties
 
 # AI Studio chat attachments — NEVER commit or bundle
 public/assets/aistudio/
+
+# Generated native download engine binaries (built fresh from latest stable tags in CI)
+android/app/src/main/jniLibs/*/libaria2c.so
+android/app/src/main/res/raw/ytdlp
+android/app/src/main/assets/download-engines.json
+.cache/download-engines/

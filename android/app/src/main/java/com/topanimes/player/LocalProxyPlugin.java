@@ -49,6 +49,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.RandomAccessFile;
 import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.InetAddress;
@@ -120,6 +121,13 @@ public class LocalProxyPlugin extends Plugin {
         "^#EXTINF:([0-9]+(?:\\.[0-9]+)?)",
         Pattern.CASE_INSENSITIVE
     );
+    private static final Pattern OFFLINE_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{4,64}$");
+    private static final Pattern OFFLINE_FILE_PATTERN = Pattern.compile("^[a-zA-Z0-9._-]{1,80}$");
+    private static final Pattern BYTE_RANGE_REQUEST_PATTERN = Pattern.compile(
+        "^bytes=(\\d*)-(\\d*)$",
+        Pattern.CASE_INSENSITIVE
+    );
+    private static volatile File sharedOfflineRootDir = null;
     private static final int MPEG_TS_PACKET_SIZE = 188;
     private static final int MPEG_TS_SYNC_BYTE = 0x47;
     private static final int TS_PROBE_BUFFER_SIZE = 32768;
@@ -373,11 +381,57 @@ public class LocalProxyPlugin extends Plugin {
         return sharedProxyBaseUrl;
     }
 
+    public static File getOfflineMediaRootDir(Context ctx) {
+        File current = sharedOfflineRootDir;
+        if (current != null && (current.exists() || current.mkdirs())) {
+            return current;
+        }
+        if (ctx == null) {
+            return current;
+        }
+        Context appCtx = ctx.getApplicationContext();
+        File base = appCtx.getExternalFilesDir(Environment.DIRECTORY_MOVIES);
+        if (base == null) {
+            base = appCtx.getFilesDir();
+        }
+        File dir = new File(base, "AnisyncOffline");
+        if (!dir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+        }
+        sharedOfflineRootDir = dir;
+        return dir;
+    }
+
+    public static String buildOfflineMediaUrl(String downloadId, String filename) {
+        if (downloadId == null || filename == null) return "";
+        if (!OFFLINE_ID_PATTERN.matcher(downloadId).matches()
+            || !OFFLINE_FILE_PATTERN.matcher(filename).matches()) {
+            return "";
+        }
+        String base = sharedProxyBaseUrl;
+        if (base == null || base.isEmpty() || !sharedProxyRunning) {
+            base = ensureSharedProxyBaseUrl();
+        }
+        if (base == null || base.isEmpty()) {
+            return "";
+        }
+        return base + "/offline/" + downloadId + "/" + filename;
+    }
+
     public static String buildSharedProxyUrl(String targetUrl, String referer) {
         return buildSharedProxyUrl(targetUrl, referer, 0L);
     }
 
     public static String buildSharedProxyUrl(String targetUrl, String referer, long sessionId) {
+        if (targetUrl != null) {
+            String lowerTarget = targetUrl.trim().toLowerCase(Locale.ROOT);
+            if (lowerTarget.startsWith("http://127.0.0.1:")
+                || lowerTarget.startsWith("http://localhost:")
+                || lowerTarget.startsWith("file://")) {
+                return targetUrl;
+            }
+        }
         String base = sharedProxyBaseUrl;
         if (base == null || base.isEmpty() || !sharedProxyRunning) {
             base = ensureSharedProxyBaseUrl();
@@ -407,6 +461,10 @@ public class LocalProxyPlugin extends Plugin {
     public void load() {
         super.load();
         activeInstanceRef = new WeakReference<>(this);
+        Context ctx = getContext();
+        if (ctx != null) {
+            getOfflineMediaRootDir(ctx);
+        }
         startProxyServer();
     }
 
@@ -1634,6 +1692,11 @@ public class LocalProxyPlugin extends Plugin {
                 return;
             }
 
+            if (target.startsWith("/offline/")) {
+                handleOfflineMediaRequest(method, target, reqHeaders, out);
+                return;
+            }
+
             if (!target.startsWith("/stream-proxy")) {
                 writeSimpleResponse(out, 404, "Not Found", "Not Found");
                 return;
@@ -1876,6 +1939,175 @@ public class LocalProxyPlugin extends Plugin {
         }
     }
 
+    private static String guessOfflineMimeType(String filename) {
+        String lower = filename.toLowerCase(Locale.ROOT);
+        if (lower.endsWith(".mp4") || lower.endsWith(".m4v") || lower.endsWith(".m4s")) {
+            return "video/mp4";
+        }
+        if (lower.endsWith(".m3u8")) {
+            return "application/vnd.apple.mpegurl; charset=utf-8";
+        }
+        if (lower.endsWith(".ts")) {
+            return "video/mp2t";
+        }
+        if (lower.endsWith(".vtt")) {
+            return "text/vtt; charset=utf-8";
+        }
+        if (lower.endsWith(".srt")) {
+            return "application/x-subrip; charset=utf-8";
+        }
+        if (lower.endsWith(".ass") || lower.endsWith(".ssa")) {
+            return "text/plain; charset=utf-8";
+        }
+        if (lower.endsWith(".webm")) {
+            return "video/webm";
+        }
+        if (lower.endsWith(".mkv")) {
+            return "video/x-matroska";
+        }
+        return "application/octet-stream";
+    }
+
+    private static void handleOfflineMediaRequest(
+        String method,
+        String target,
+        Map<String, String> reqHeaders,
+        OutputStream out
+    ) throws IOException {
+        if (!"GET".equals(method) && !"HEAD".equals(method)) {
+            writeSimpleResponse(out, 405, "Method Not Allowed", "Method Not Allowed");
+            return;
+        }
+        String pathOnly = target;
+        int qIdx = pathOnly.indexOf('?');
+        if (qIdx >= 0) {
+            pathOnly = pathOnly.substring(0, qIdx);
+        }
+        String rel = pathOnly.substring("/offline/".length());
+        int slashIdx = rel.indexOf('/');
+        if (slashIdx <= 0 || slashIdx >= rel.length() - 1) {
+            writeSimpleResponse(out, 404, "Not Found", "Arquivo offline inválido");
+            return;
+        }
+        String downloadId = rel.substring(0, slashIdx);
+        String filename = rel.substring(slashIdx + 1);
+        if (!OFFLINE_ID_PATTERN.matcher(downloadId).matches()
+            || !OFFLINE_FILE_PATTERN.matcher(filename).matches()
+            || filename.contains("..")
+            || filename.startsWith(".")) {
+            writeSimpleResponse(out, 400, "Bad Request", "Caminho offline inválido");
+            return;
+        }
+
+        File root = sharedOfflineRootDir;
+        if (root == null || !root.exists()) {
+            writeSimpleResponse(out, 404, "Not Found", "Armazenamento offline indisponível");
+            return;
+        }
+
+        File targetFile = new File(new File(root, downloadId), filename);
+        String rootCanon = root.getCanonicalPath();
+        String fileCanon = targetFile.getCanonicalPath();
+        if (!fileCanon.startsWith(rootCanon + File.separator) || !targetFile.isFile()) {
+            writeSimpleResponse(out, 404, "Not Found", "Arquivo offline não encontrado");
+            return;
+        }
+
+        long fileLen = targetFile.length();
+        String mime = guessOfflineMimeType(filename);
+        long start = 0L;
+        long end = fileLen > 0L ? fileLen - 1L : -1L;
+        boolean isRange = false;
+
+        String rangeHeader = reqHeaders.get("range");
+        if (rangeHeader != null && !rangeHeader.trim().isEmpty() && fileLen > 0L) {
+            String firstSpec = rangeHeader.trim();
+            int commaIdx = firstSpec.indexOf(',');
+            if (commaIdx > 0) {
+                firstSpec = firstSpec.substring(0, commaIdx).trim();
+            }
+            Matcher m = BYTE_RANGE_REQUEST_PATTERN.matcher(firstSpec);
+            if (m.matches()) {
+                String startStr = m.group(1);
+                String endStr = m.group(2);
+                try {
+                    if (startStr != null && !startStr.isEmpty()) {
+                        start = Long.parseLong(startStr);
+                        end = (endStr != null && !endStr.isEmpty())
+                            ? Math.min(Long.parseLong(endStr), fileLen - 1L)
+                            : fileLen - 1L;
+                    } else if (endStr != null && !endStr.isEmpty()) {
+                        long suffixLen = Long.parseLong(endStr);
+                        if (suffixLen > 0L) {
+                            start = Math.max(0L, fileLen - suffixLen);
+                            end = fileLen - 1L;
+                        }
+                    }
+                    if (start < 0L || start >= fileLen || start > end) {
+                        writeCorsHeaders(
+                            out,
+                            416,
+                            "Range Not Satisfiable",
+                            "text/plain; charset=utf-8",
+                            0L,
+                            "bytes */" + fileLen,
+                            "bytes",
+                            false
+                        );
+                        out.flush();
+                        return;
+                    }
+                    isRange = true;
+                } catch (NumberFormatException ignored) {
+                    start = 0L;
+                    end = fileLen - 1L;
+                    isRange = false;
+                }
+            }
+        }
+
+        long contentLength = fileLen == 0L ? 0L : (end - start + 1L);
+        if (isRange) {
+            writeCorsHeaders(
+                out,
+                206,
+                "Partial Content",
+                mime,
+                contentLength,
+                "bytes " + start + "-" + end + "/" + fileLen,
+                "bytes",
+                false
+            );
+        } else {
+            writeCorsHeaders(
+                out,
+                200,
+                "OK",
+                mime,
+                contentLength,
+                null,
+                "bytes",
+                false
+            );
+        }
+
+        if (!"HEAD".equals(method) && contentLength > 0L) {
+            try (RandomAccessFile raf = new RandomAccessFile(targetFile, "r")) {
+                raf.seek(start);
+                byte[] buf = new byte[65536];
+                long remaining = contentLength;
+                while (remaining > 0L) {
+                    int toRead = (int) Math.min(buf.length, remaining);
+                    int n = raf.read(buf, 0, toRead);
+                    if (n == -1) break;
+                    out.write(buf, 0, n);
+                    remaining -= n;
+                }
+            }
+        }
+        out.flush();
+    }
+
     static class RedirectResult {
         final HttpURLConnection connection;
         final String finalUrl;
@@ -1894,6 +2126,17 @@ public class LocalProxyPlugin extends Plugin {
         int timeoutMs
     ) throws IOException {
         return openWithRedirects(rawUrl, referer, accept, rangeHeader, timeoutMs, "GET", null, null, null);
+    }
+
+    static RedirectResult openWithRedirects(
+        String rawUrl,
+        String referer,
+        String accept,
+        String rangeHeader,
+        int timeoutMs,
+        String initialMethod
+    ) throws IOException {
+        return openWithRedirects(rawUrl, referer, accept, rangeHeader, timeoutMs, initialMethod, null, null, null);
     }
 
     /**
@@ -1924,7 +2167,9 @@ public class LocalProxyPlugin extends Plugin {
             ? "POST"
             : "PROPFIND".equalsIgnoreCase(initialMethod)
                 ? "PROPFIND"
-                : "GET";
+                : "HEAD".equalsIgnoreCase(initialMethod)
+                    ? "HEAD"
+                    : "GET";
         String currentBody = "POST".equals(currentMethod) ? requestBody : null;
         for (int hop = 0; hop <= 4; hop++) {
             if (!isSafeHttpUrl(currentUrl)) {
@@ -1939,6 +2184,9 @@ public class LocalProxyPlugin extends Plugin {
             conn.setRequestProperty("User-Agent", DEFAULT_UA);
             conn.setRequestProperty("Accept", accept != null ? accept : "*/*");
             conn.setRequestProperty("Accept-Language", "pt-BR,pt;q=0.9,en;q=0.8");
+            if ("HEAD".equals(currentMethod) || rangeHeader != null || "*/*".equals(accept)) {
+                conn.setRequestProperty("Accept-Encoding", "identity");
+            }
 
             String host = parsed.getHost() != null ? parsed.getHost().toLowerCase(Locale.ROOT) : "";
             boolean isFileVideo = host.contains("filevideo1.com");

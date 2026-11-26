@@ -19,6 +19,7 @@
     "apk:build": "npm run apk:sync && cd android && ./gradlew assembleDebug",
     "apk:release": "npm run apk:sync && cd android && ./gradlew assembleRelease",
     "apk:check": "node scripts/check-android-build.mjs",
+    "engines:resolve": "node scripts/resolve-download-engines.mjs --json",
     "prepush:check": "npm run validate && node scripts/check-android-build.mjs --pre-push"
   },
   "dependencies": {

@@ -3,13 +3,16 @@ import {
   Bell,
   BellOff,
   CheckCircle2,
+  Clock,
   Database,
   Download,
   ExternalLink,
   Film,
   Globe,
+  HardDrive,
   KeyRound,
   Loader2,
+  Play,
   RefreshCw,
   RotateCcw,
   Send,
@@ -18,6 +21,7 @@ import {
   Trash2,
   Upload,
   X,
+  Zap,
 } from 'lucide-react';
 import { apiFetch, type ApkDownloadProgressEvent } from '../lib/apiClient';
 import {
@@ -35,6 +39,14 @@ import {
 } from '../lib/backup';
 import { parseReleaseChangelog } from '../lib/changelogParser';
 import type { NotificationPermissionStatus } from '../lib/notifications';
+import {
+  computeTotalOfflineBytes,
+  formatDownloadSpeed,
+  getDownloadEnginesInfo,
+  updateYtDlpEngine,
+  type DownloadEnginesInfo,
+  type OfflineDownloadRecord,
+} from '../lib/offlineDownloads';
 import {
   VIDEO_SCALE_OPTIONS,
   type VideoScaleMode,
@@ -91,6 +103,13 @@ interface SettingsModalProps {
   onClearAlerts: () => void;
   onExportBackup: (destination?: 'downloads' | 'share') => Promise<void> | void;
   onImportBackup: (payload: AnisyncBackupPayload, mode: BackupImportMode) => void;
+  // Offline video downloads
+  offlineDownloads?: OfflineDownloadRecord[];
+  onOpenOfflineEpisode?: (record: OfflineDownloadRecord) => void;
+  onCancelOfflineDownload?: (idOrUrl: string) => void;
+  onDeleteOfflineDownload?: (idOrUrl: string) => void;
+  onClearOfflineQueue?: () => void;
+  onDeleteAllOfflineDownloads?: () => void;
 }
 
 interface ToggleSwitchProps {
@@ -161,6 +180,12 @@ export function SettingsModal({
   onClearAlerts,
   onExportBackup,
   onImportBackup,
+  offlineDownloads = [],
+  onOpenOfflineEpisode,
+  onCancelOfflineDownload,
+  onDeleteOfflineDownload,
+  onClearOfflineQueue,
+  onDeleteAllOfflineDownloads,
 }: SettingsModalProps) {
   const sourcesSectionRef = useRef<HTMLElement>(null);
   const notificationsSectionRef = useRef<HTMLElement>(null);
@@ -171,11 +196,63 @@ export function SettingsModal({
   const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
   const [exportingBackup, setExportingBackup] = useState<'downloads' | 'share' | null>(null);
   const [backupError, setBackupError] = useState('');
+  const [confirmClearAllOffline, setConfirmClearAllOffline] = useState(false);
+  const [engineInfo, setEngineInfo] = useState<DownloadEnginesInfo | null>(null);
+  const [updatingYtDlp, setUpdatingYtDlp] = useState(false);
+  const [ytDlpStatusMsg, setYtDlpStatusMsg] = useState('');
   const [pendingBackupImport, setPendingBackupImport] = useState<{
     filename: string;
     payload: AnisyncBackupPayload;
     summary: BackupImportSummary;
   } | null>(null);
+
+  const completedOfflineDownloads = useMemo(
+    () => offlineDownloads.filter((d) => d.status === 'completed'),
+    [offlineDownloads]
+  );
+  const queuedOfflineDownloads = useMemo(
+    () => offlineDownloads.filter((d) => d.status === 'queued'),
+    [offlineDownloads]
+  );
+  const totalOfflineBytes = useMemo(
+    () => computeTotalOfflineBytes(offlineDownloads),
+    [offlineDownloads]
+  );
+
+  useEffect(() => {
+    if (!confirmClearAllOffline) return;
+    const timer = window.setTimeout(() => setConfirmClearAllOffline(false), 4000);
+    return () => window.clearTimeout(timer);
+  }, [confirmClearAllOffline]);
+
+  useEffect(() => {
+    if (!open) return;
+    let active = true;
+    void getDownloadEnginesInfo().then((info) => {
+      if (active && info) setEngineInfo(info);
+    });
+    return () => {
+      active = false;
+    };
+  }, [open]);
+
+  const handleUpdateYtDlpClick = async () => {
+    if (updatingYtDlp) return;
+    setUpdatingYtDlp(true);
+    setYtDlpStatusMsg('');
+    try {
+      const res = await updateYtDlpEngine();
+      setYtDlpStatusMsg(res.message);
+      const refreshed = await getDownloadEnginesInfo();
+      if (refreshed) setEngineInfo(refreshed);
+    } catch (err) {
+      setYtDlpStatusMsg(
+        err instanceof Error && err.message ? err.message : 'Falha ao atualizar yt-dlp.'
+      );
+    } finally {
+      setUpdatingYtDlp(false);
+    }
+  };
 
   const parsedChangelogSections = useMemo(
     () => parseReleaseChangelog(appUpdateResult?.latestRelease?.notes),
@@ -1292,6 +1369,212 @@ export function SettingsModal({
                       Substituir tudo
                     </button>
                   </div>
+                </div>
+              )}
+            </div>
+
+            {/* Offline Saved Videos Management */}
+            <div
+              data-offline-downloads-section="true"
+              className="space-y-3 rounded-xl border border-white/8 bg-[#0d0f12]/70 p-3.5"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <HardDrive className="h-4 w-4 shrink-0 text-emerald-400" />
+                    <p className="text-sm font-medium text-white">Vídeos salvos offline</p>
+                    <span className="rounded-full border border-emerald-500/30 bg-emerald-500/12 px-2 py-0.5 text-[11px] font-semibold tabular-nums text-emerald-300">
+                      {completedOfflineDownloads.length}{' '}
+                      {completedOfflineDownloads.length === 1 ? 'vídeo' : 'vídeos'}
+                      {totalOfflineBytes > 0 ? ` · ${formatBytes(totalOfflineBytes)}` : ''}
+                    </span>
+                    {queuedOfflineDownloads.length > 0 && (
+                      <span
+                        data-offline-queue-badge="true"
+                        className="rounded-full border border-amber-400/35 bg-amber-500/12 px-2 py-0.5 text-[11px] font-semibold tabular-nums text-amber-300"
+                      >
+                        {queuedOfflineDownloads.length} na fila
+                      </span>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-slate-400">
+                    Episódios baixados são reproduzidos direto do celular automaticamente, sem
+                    gastar internet. Múltiplos downloads rodam em fila (1 por vez) na velocidade máxima.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {onClearOfflineQueue && queuedOfflineDownloads.length > 0 && (
+                    <button
+                      type="button"
+                      data-offline-clear-queue-btn="true"
+                      onClick={onClearOfflineQueue}
+                      className="inline-flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-lg border border-amber-400/35 bg-amber-500/10 px-2.5 py-1.5 text-xs font-medium text-amber-200 transition-colors hover:bg-amber-500/20"
+                    >
+                      <X className="h-3.5 w-3.5 shrink-0" />
+                      <span>Limpar fila ({queuedOfflineDownloads.length})</span>
+                    </button>
+                  )}
+
+                  {onDeleteAllOfflineDownloads && completedOfflineDownloads.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (confirmClearAllOffline) {
+                          setConfirmClearAllOffline(false);
+                          onDeleteAllOfflineDownloads();
+                        } else {
+                          setConfirmClearAllOffline(true);
+                        }
+                      }}
+                      className={`inline-flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                        confirmClearAllOffline
+                          ? 'border-rose-500/50 bg-rose-500/20 text-rose-200 hover:bg-rose-500/30'
+                          : 'border-white/12 bg-[#151921] text-slate-300 hover:border-rose-500/45 hover:text-rose-200'
+                      }`}
+                    >
+                      <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                      <span>{confirmClearAllOffline ? 'Confirmar exclusão?' : 'Apagar todos'}</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {engineInfo && (
+                <div
+                  data-download-engine-info="true"
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/8 bg-[#151921]/90 px-3 py-2 text-[11px]"
+                >
+                  <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-slate-300">
+                    <span className="inline-flex items-center gap-1 font-semibold text-[#fb923c]">
+                      <Zap className="h-3.5 w-3.5" />
+                      {engineInfo.aria2Available
+                        ? `aria2c ${engineInfo.aria2Version ? `v${engineInfo.aria2Version}` : ''}`.trim()
+                        : 'Acelerador paralelo'}
+                    </span>
+                    <span className="text-slate-400">
+                      {engineInfo.maxConnectionsPerServer} conexões · {engineInfo.maxSplits} partes
+                    </span>
+                    {engineInfo.ytdlpAvailable && (
+                      <span className="text-emerald-300">
+                        yt-dlp {engineInfo.ytdlpVersion || 'ativo'}
+                      </span>
+                    )}
+                  </div>
+                  {isNativeAndroid && engineInfo.ytdlpAvailable && (
+                    <button
+                      type="button"
+                      data-update-ytdlp-btn="true"
+                      disabled={updatingYtDlp}
+                      onClick={() => void handleUpdateYtDlpClick()}
+                      className="inline-flex h-7 items-center gap-1 rounded-md border border-white/12 bg-[#0d0f12] px-2 text-[11px] font-medium text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
+                    >
+                      {updatingYtDlp ? (
+                        <Loader2 className="h-3 w-3 animate-spin text-[#f97316]" />
+                      ) : (
+                        <RefreshCw className="h-3 w-3 text-[#f97316]" />
+                      )}
+                      <span>Atualizar yt-dlp</span>
+                    </button>
+                  )}
+                  {ytDlpStatusMsg && (
+                    <p className="w-full text-[11px] text-slate-300">{ytDlpStatusMsg}</p>
+                  )}
+                </div>
+              )}
+
+              {offlineDownloads.length === 0 ? (
+                <p className="rounded-lg border border-white/6 bg-[#151921]/70 px-3 py-2.5 text-xs text-slate-400">
+                  Nenhum episódio baixado ainda. Toque em <strong className="text-slate-200">Baixar</strong>{' '}
+                  no perfil de um anime ou na página do episódio.
+                </p>
+              ) : (
+                <div className="max-h-60 space-y-2 overflow-y-auto pr-0.5">
+                  {offlineDownloads.map((item) => {
+                    const isQueued = item.status === 'queued';
+                    const isBusy =
+                      item.status === 'resolving' || item.status === 'downloading';
+                    const isDone = item.status === 'completed';
+                    return (
+                      <div
+                        key={item.id}
+                        className="flex items-center justify-between gap-2.5 rounded-lg border border-white/8 bg-[#151921] px-3 py-2"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-xs font-semibold text-white">
+                            {item.seriesTitle || item.title}
+                          </p>
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-400">
+                            <span className="truncate">
+                              {item.episodeLabel ? `${item.episodeLabel} · ` : ''}
+                              {item.title}
+                            </span>
+                            {isDone && item.sizeBytes > 0 && (
+                              <span className="shrink-0 font-mono text-emerald-300">
+                                {formatBytes(item.sizeBytes)}
+                              </span>
+                            )}
+                            {isQueued && (
+                              <span className="inline-flex shrink-0 items-center gap-1 font-mono text-amber-300">
+                                <Clock className="h-3 w-3" />
+                                {item.queuePosition
+                                  ? `Na fila (#${item.queuePosition})`
+                                  : 'Na fila'}
+                              </span>
+                            )}
+                            {isBusy && (
+                              <span className="inline-flex shrink-0 items-center gap-1 font-mono text-[#fb923c]">
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                                {item.status === 'resolving'
+                                  ? 'Preparando...'
+                                  : `${item.progress}%${
+                                      item.speedBytesPerSec
+                                        ? ` · ${formatDownloadSpeed(item.speedBytesPerSec)}`
+                                        : ''
+                                    }`}
+                              </span>
+                            )}
+                            {item.status === 'error' && (
+                              <span className="shrink-0 text-amber-300">Falhou</span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          {isDone && onOpenOfflineEpisode && (
+                            <button
+                              type="button"
+                              onClick={() => onOpenOfflineEpisode(item)}
+                              aria-label={`Assistir ${item.title} offline`}
+                              className="inline-flex h-8 items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/15 px-2.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/25"
+                            >
+                              <Play className="h-3 w-3 fill-current" />
+                              <span>Assistir</span>
+                            </button>
+                          )}
+                          {(isBusy || isQueued) && onCancelOfflineDownload ? (
+                            <button
+                              type="button"
+                              onClick={() => onCancelOfflineDownload(item.id)}
+                              aria-label={`Cancelar download de ${item.title}`}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-white/10 bg-[#0d0f12] text-slate-300 hover:border-rose-500/45 hover:text-rose-300"
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </button>
+                          ) : onDeleteOfflineDownload ? (
+                            <button
+                              type="button"
+                              onClick={() => onDeleteOfflineDownload(item.id)}
+                              aria-label={`Apagar ${item.title}`}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-white/10 bg-[#0d0f12] text-slate-400 hover:border-rose-500/45 hover:text-rose-300"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>

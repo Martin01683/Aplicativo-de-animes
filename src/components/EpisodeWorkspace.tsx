@@ -9,16 +9,21 @@ import {
   ChevronRight,
   Clock,
   CloudOff,
+  Download,
   Film,
+  HardDrive,
   Heart,
   Keyboard,
   Layers,
   Loader2,
   RefreshCw,
   Server,
+  Trash2,
   Tv,
+  X,
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
+import { formatBytes } from '../lib/appUpdater';
 import {
   resolveEpisodeAudioBadges,
   resolveEpisodeMediaKind,
@@ -44,6 +49,14 @@ import {
   resolveSeriesPrevNext,
   type NativeVlcPlayResult,
 } from '../lib/nativeVlcPlayer';
+import {
+  buildOfflinePlayerOption,
+  buildOfflineResolvedEmbed,
+  ensureOfflinePlaybackSource,
+  OFFLINE_LOCAL_SERVER_NUME,
+  type OfflineDownloadInput,
+  type OfflineDownloadRecord,
+} from '../lib/offlineDownloads';
 import {
   isEpisodeMarkedWatched,
   type EpisodeProgressMap,
@@ -135,6 +148,10 @@ interface EpisodeWorkspaceProps {
       promptWebRemote?: () => Promise<void>;
     }
   ) => void;
+  offlineDownload?: OfflineDownloadRecord;
+  onStartOfflineDownload?: (input: OfflineDownloadInput) => Promise<void> | void;
+  onCancelOfflineDownload?: (idOrUrl: string) => Promise<void> | void;
+  onDeleteOfflineDownload?: (idOrUrl: string) => Promise<void> | void;
   onLoadingStateChange?: (loading: boolean) => void;
 }
 
@@ -146,9 +163,10 @@ interface ScopedResolvedEmbed {
 
 function pickInitialOption(options: PlayerOption[]): PlayerOption | null {
   return (
+    options.find((o) => o.nume === OFFLINE_LOCAL_SERVER_NUME) ||
     options.find((o) => Boolean(o.directStreamUrl)) ||
     options.find((o) =>
-      ['hinatasoul', 'kojima', 'zuplay', 'vidstreaming', 'playerjs', 'direct'].includes(
+      ['hinatasoul', 'kojima', 'zuplay', 'abyss', 'vidstreaming', 'playerjs', 'direct'].includes(
         o.providerKind
       )
     ) ||
@@ -192,22 +210,59 @@ export function EpisodeWorkspace({
   switchingCastServerNume,
   onSwitchTvCastServer,
   onOpenTvCast,
+  offlineDownload,
+  onStartOfflineDownload,
+  onCancelOfflineDownload,
+  onDeleteOfflineDownload,
   onLoadingStateChange,
 }: EpisodeWorkspaceProps) {
   const desktopShortcutsEnabled = isDesktopShortcutsEnabled();
+  const [confirmDeleteOffline, setConfirmDeleteOffline] = useState(false);
+
+  const offlineReadyRecord = useMemo(
+    () =>
+      offlineDownload?.status === 'completed' && offlineDownload.playbackUrl
+        ? offlineDownload
+        : null,
+    [offlineDownload]
+  );
+
+  useEffect(() => {
+    if (offlineDownload?.status === 'completed' && !offlineDownload.playbackUrl) {
+      void ensureOfflinePlaybackSource(offlineDownload);
+    }
+  }, [offlineDownload]);
+
+  useEffect(() => {
+    if (!confirmDeleteOffline) return;
+    const timer = window.setTimeout(() => setConfirmDeleteOffline(false), 4000);
+    return () => window.clearTimeout(timer);
+  }, [confirmDeleteOffline]);
 
   const playableOptions = useMemo(() => {
-    return episode.options
-      .filter((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label))
+    const remote = episode.options
+      .filter((o) => o.nume !== OFFLINE_LOCAL_SERVER_NUME)
       .map((o) => ({ ...o, label: formatServerLabel(o.label, `Servidor ${o.nume}`) }));
-  }, [episode.options]);
+    if (offlineReadyRecord) {
+      return [buildOfflinePlayerOption(offlineReadyRecord), ...remote];
+    }
+    return remote;
+  }, [episode.options, offlineReadyRecord]);
 
   const [selectedOption, setSelectedOption] = useState<PlayerOption | null>(() =>
     pickInitialOption(playableOptions)
   );
   const [resolvedState, setResolvedState] = useState<ScopedResolvedEmbed | null>(() => {
     const initialOpt = pickInitialOption(playableOptions);
-    if (!initialOpt || initialOpt.directStreamUrl) return null;
+    if (!initialOpt) return null;
+    if (initialOpt.nume === OFFLINE_LOCAL_SERVER_NUME && offlineReadyRecord) {
+      return {
+        episodeUrl: episode.url,
+        embedUrl: initialOpt.embedUrl,
+        data: buildOfflineResolvedEmbed(offlineReadyRecord),
+      };
+    }
+    if (initialOpt.directStreamUrl) return null;
     const cached = getCachedEmbed(initialOpt.embedUrl);
     if (cached && cached.status === 'resolved' && cached.streams.length > 0) {
       return { episodeUrl: episode.url, embedUrl: initialOpt.embedUrl, data: cached };
@@ -342,14 +397,24 @@ export function EpisodeWorkspace({
   useEffect(() => {
     if (!isSameEpisodeUrl(lastResetEpisodeUrlRef.current, episode.url)) {
       lastResetEpisodeUrlRef.current = episode.url;
+      setConfirmDeleteOffline(false);
       const nextOpt = pickInitialOption(playableOptions);
       setSelectedOption(nextOpt);
-      const cachedNext = nextOpt && !nextOpt.directStreamUrl ? getCachedEmbed(nextOpt.embedUrl) : undefined;
-      setResolvedState(
-        nextOpt && cachedNext && cachedNext.status === 'resolved' && cachedNext.streams.length > 0
-          ? { episodeUrl: episode.url, embedUrl: nextOpt.embedUrl, data: cachedNext }
-          : null
-      );
+      if (nextOpt?.nume === OFFLINE_LOCAL_SERVER_NUME && offlineReadyRecord) {
+        setResolvedState({
+          episodeUrl: episode.url,
+          embedUrl: nextOpt.embedUrl,
+          data: buildOfflineResolvedEmbed(offlineReadyRecord),
+        });
+      } else {
+        const cachedNext =
+          nextOpt && !nextOpt.directStreamUrl ? getCachedEmbed(nextOpt.embedUrl) : undefined;
+        setResolvedState(
+          nextOpt && cachedNext && cachedNext.status === 'resolved' && cachedNext.streams.length > 0
+            ? { episodeUrl: episode.url, embedUrl: nextOpt.embedUrl, data: cachedNext }
+            : null
+        );
+      }
       setFailoverExhaustedMsg('');
       setResumeAfterFailover(null);
       return;
@@ -376,7 +441,7 @@ export function EpisodeWorkspace({
         setSelectedOption(freshOption);
       }
     }
-  }, [episode.url, failoverExhaustedMsg, playableOptions]);
+  }, [episode.url, failoverExhaustedMsg, offlineReadyRecord, playableOptions]);
 
   // Fetch and cache the series episode list so in-fullscreen episode selection, TheTVDB IDs, genres & artwork are populated
   useEffect(() => {
@@ -990,6 +1055,17 @@ export function EpisodeWorkspace({
     const targetEpisodeUrl = episode.url;
     const targetOption = selectedOption;
 
+    if (targetOption.nume === OFFLINE_LOCAL_SERVER_NUME && offlineReadyRecord) {
+      setResolvedState({
+        episodeUrl: targetEpisodeUrl,
+        embedUrl: targetOption.embedUrl,
+        data: buildOfflineResolvedEmbed(offlineReadyRecord),
+      });
+      setLoadingEmbed(false);
+      setFailoverExhaustedMsg('');
+      return;
+    }
+
     // Zero-latency hit when the primary stream was prefetched in the background
     if (!targetOption.directStreamUrl) {
       const preCached = getCachedEmbed(targetOption.embedUrl);
@@ -1058,7 +1134,14 @@ export function EpisodeWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [episode.url, findBestAvailableServer, onToast, resolveEmbedCached, selectedOption]);
+  }, [
+    episode.url,
+    findBestAvailableServer,
+    offlineReadyRecord,
+    onToast,
+    resolveEmbedCached,
+    selectedOption,
+  ]);
 
   const handleServerPlaybackFailed = useCallback(
     async (failedNume: string, resumeTimeSec: number) => {
@@ -1613,6 +1696,35 @@ export function EpisodeWorkspace({
             onNativeSessionSync={onNativeSessionSync}
             castState={castState}
             onOpenTvCast={onOpenTvCast}
+            offlineDownload={offlineDownload}
+            onStartOfflineDownload={
+              onStartOfflineDownload
+                ? () => {
+                    void onStartOfflineDownload({
+                      episodeUrl: episode.url,
+                      title: episode.title,
+                      seriesTitle: episode.seriesTitle,
+                      seriesUrl: episode.seriesUrl,
+                      episodeLabel: episode.episodeLabel,
+                      poster: effectiveEpisodePoster,
+                      isMovie: episode.isMovie,
+                      seasonNumber: episode.seasonNumber,
+                      episodeNumber: episode.episodeNumber,
+                      prevUrl: effectivePrevUrl,
+                      nextUrl: effectiveNextUrl,
+                      resolvedEmbed:
+                        selectedOption?.nume !== OFFLINE_LOCAL_SERVER_NUME && hasResolvedStreams
+                          ? resolved
+                          : null,
+                      serverLabel:
+                        selectedOption?.nume !== OFFLINE_LOCAL_SERVER_NUME
+                          ? selectedOption?.label
+                          : undefined,
+                      episodeOptions: episode.options,
+                    });
+                  }
+                : undefined
+            }
             onRegisterCastHelpers={handleRegisterCastHelpers}
             onToast={onToast}
           />
@@ -1866,6 +1978,158 @@ export function EpisodeWorkspace({
                 </button>
               )}
 
+              {onStartOfflineDownload && (() => {
+                const dlStatus = offlineDownload?.status;
+                const isQueued = dlStatus === 'queued';
+                const isBusy = dlStatus === 'resolving' || dlStatus === 'downloading';
+                const isSaved = dlStatus === 'completed';
+                const isError = dlStatus === 'error';
+
+                if (isQueued && offlineDownload) {
+                  return (
+                    <button
+                      type="button"
+                      data-episode-download-btn="true"
+                      data-episode-download-queued="true"
+                      onClick={() => void onCancelOfflineDownload?.(offlineDownload.id)}
+                      aria-label="Remover episódio da fila de downloads"
+                      title="Aguardando na fila de downloads · Toque para remover"
+                      className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl border border-amber-400/40 bg-amber-500/12 px-3.5 text-xs font-semibold text-amber-300 transition-colors hover:bg-amber-500/20 sm:px-4 sm:text-sm"
+                    >
+                      <Clock className="h-4 w-4 shrink-0" />
+                      <span className="tabular-nums">
+                        {offlineDownload.queuePosition
+                          ? `Na fila (#${offlineDownload.queuePosition})`
+                          : 'Na fila'}
+                      </span>
+                      <X className="h-3.5 w-3.5 shrink-0 opacity-80" />
+                    </button>
+                  );
+                }
+
+                if (isBusy && offlineDownload) {
+                  return (
+                    <button
+                      type="button"
+                      data-episode-download-btn="true"
+                      onClick={() => void onCancelOfflineDownload?.(offlineDownload.id)}
+                      aria-label="Cancelar download offline"
+                      title="Toque para cancelar o download em andamento"
+                      className="inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl border border-[#f97316]/50 bg-[#f97316]/14 px-3.5 text-xs font-semibold text-[#fb923c] transition-colors hover:bg-[#f97316]/22 sm:px-4 sm:text-sm"
+                    >
+                      <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                      <span className="tabular-nums">
+                        {dlStatus === 'resolving'
+                          ? 'Preparando...'
+                          : `Baixando ${offlineDownload.progress}%`}
+                      </span>
+                      <X className="h-3.5 w-3.5 shrink-0 opacity-80" />
+                    </button>
+                  );
+                }
+
+                if (isSaved && offlineDownload) {
+                  return (
+                    <div
+                      data-episode-download-btn="true"
+                      className="inline-flex h-11 shrink-0 items-center overflow-hidden rounded-xl border border-emerald-500/45 bg-emerald-500/15 text-xs font-semibold text-emerald-200 sm:text-sm"
+                    >
+                      <span className="inline-flex items-center gap-1.5 px-3 sm:px-3.5">
+                        <HardDrive className="h-4 w-4 shrink-0 text-emerald-300" />
+                        <span>
+                          Salvo
+                          {offlineDownload.sizeBytes > 0
+                            ? ` (${formatBytes(offlineDownload.sizeBytes)})`
+                            : ''}
+                        </span>
+                      </span>
+                      {onDeleteOfflineDownload && (
+                        <button
+                          type="button"
+                          data-episode-download-delete-btn="true"
+                          onClick={() => {
+                            if (confirmDeleteOffline) {
+                              setConfirmDeleteOffline(false);
+                              void onDeleteOfflineDownload(offlineDownload.id);
+                            } else {
+                              setConfirmDeleteOffline(true);
+                            }
+                          }}
+                          aria-label={
+                            confirmDeleteOffline
+                              ? 'Confirmar exclusão do vídeo salvo'
+                              : 'Apagar vídeo salvo do celular'
+                          }
+                          title={
+                            confirmDeleteOffline
+                              ? 'Toque novamente para apagar do celular'
+                              : 'Apagar vídeo salvo'
+                          }
+                          className={`inline-flex h-full items-center gap-1 border-l px-2.5 text-xs transition-colors ${
+                            confirmDeleteOffline
+                              ? 'border-rose-500/45 bg-rose-500/25 text-rose-200 hover:bg-rose-500/35'
+                              : 'border-emerald-500/30 text-emerald-200/85 hover:bg-rose-500/20 hover:text-rose-200'
+                          }`}
+                        >
+                          <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                          {confirmDeleteOffline && <span>Apagar?</span>}
+                        </button>
+                      )}
+                    </div>
+                  );
+                }
+
+                return (
+                  <button
+                    type="button"
+                    data-episode-download-btn="true"
+                    disabled={loadingEpisode && !hasResolvedStreams && !episode.options.length}
+                    onClick={() =>
+                      void onStartOfflineDownload({
+                        episodeUrl: episode.url,
+                        title: episode.title,
+                        seriesTitle: episode.seriesTitle,
+                        seriesUrl: episode.seriesUrl,
+                        episodeLabel: episode.episodeLabel,
+                        poster: effectiveEpisodePoster,
+                        isMovie: episode.isMovie,
+                        seasonNumber: episode.seasonNumber,
+                        episodeNumber: episode.episodeNumber,
+                        prevUrl: effectivePrevUrl,
+                        nextUrl: effectiveNextUrl,
+                        resolvedEmbed:
+                          selectedOption?.nume !== OFFLINE_LOCAL_SERVER_NUME && hasResolvedStreams
+                            ? resolved
+                            : null,
+                        serverLabel:
+                          selectedOption?.nume !== OFFLINE_LOCAL_SERVER_NUME
+                            ? selectedOption?.label
+                            : undefined,
+                        episodeOptions: episode.options,
+                      })
+                    }
+                    aria-label={isError ? 'Tentar baixar novamente' : 'Baixar episódio para assistir offline'}
+                    title={
+                      isError
+                        ? offlineDownload?.errorMessage || 'Falha no download. Toque para tentar novamente.'
+                        : 'Baixar vídeo para assistir sem internet'
+                    }
+                    className={`inline-flex h-11 shrink-0 items-center justify-center gap-2 rounded-xl border px-3.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 sm:px-4 sm:text-sm ${
+                      isError
+                        ? 'border-amber-500/45 bg-amber-500/12 text-amber-200 hover:bg-amber-500/20'
+                        : 'border-white/15 bg-[#0d0f12] text-slate-200 hover:border-emerald-400/50 hover:text-white'
+                    }`}
+                  >
+                    <Download
+                      className={`h-[18px] w-[18px] shrink-0 sm:h-4 sm:w-4 ${
+                        isError ? 'text-amber-300' : 'text-emerald-400'
+                      }`}
+                    />
+                    <span>{isError ? 'Tentar baixar' : 'Baixar'}</span>
+                  </button>
+                );
+              })()}
+
               {onOpenTvCast && (
                 <button
                   type="button"
@@ -1946,9 +2210,23 @@ export function EpisodeWorkspace({
           {/* Aggregated Sources & Server Selector */}
           <div className="pt-4">
             <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2 text-xs font-medium text-slate-400">
-              <span className="inline-flex items-center gap-2">
+              <span className="inline-flex flex-wrap items-center gap-2">
                 <Server className="h-3.5 w-3.5 text-[#f97316]" />
                 <span>Servidores dos Provedores ({playableOptions.length})</span>
+                {selectedOption?.nume === OFFLINE_LOCAL_SERVER_NUME && offlineReadyRecord && (
+                  <span
+                    data-playing-offline-badge="true"
+                    className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-0.5 text-[10px] font-semibold text-emerald-300"
+                  >
+                    <HardDrive className="h-3 w-3 shrink-0" />
+                    <span>
+                      Reproduzindo vídeo salvo no celular
+                      {offlineReadyRecord.sizeBytes > 0
+                        ? ` · ${formatBytes(offlineReadyRecord.sizeBytes)}`
+                        : ''}
+                    </span>
+                  </span>
+                )}
                 {isCastingThisEpisode && (
                   <span className="rounded-full border border-[#f97316]/40 bg-[#f97316]/12 px-2 py-0.5 text-[10px] font-semibold text-[#fb923c]">
                     Troca direto na TV

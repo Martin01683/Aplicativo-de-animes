@@ -14,12 +14,15 @@ import {
   ChevronsUpDown,
   Clock,
   CloudOff,
+  Download,
   ExternalLink,
   Film,
   Globe,
+  HardDrive,
   Heart,
   Info,
   Layers,
+  Loader2,
   Play,
   Radio,
   RefreshCw,
@@ -28,10 +31,12 @@ import {
   Shield,
   SkipForward,
   Star,
+  Trash2,
   Tv,
   X,
 } from 'lucide-react';
 import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiClient';
+import { formatBytes } from '../lib/appUpdater';
 import {
   buildAnimeInfoMetaItems,
   formatSeasonDisplayHeading,
@@ -51,6 +56,11 @@ import {
   pickImageWithFallback,
 } from '../lib/episodeAvailability';
 import { pickLatestAnimeEpisode } from '../lib/favoriteAlerts';
+import {
+  canonicalOfflineEpisodeUrl,
+  type OfflineDownloadInput,
+  type OfflineDownloadRecord,
+} from '../lib/offlineDownloads';
 import {
   canonicalEpisodeProgressKey,
   formatPlaybackTimestamp,
@@ -98,6 +108,10 @@ interface AnimeDetailViewProps {
   onOpenAnime?: (animeUrl: string, seed?: MediaNavigationSeed) => void;
   onPrefetchEpisode?: (episodeUrl: string, seed?: MediaNavigationSeed) => void;
   onPrefetchAnime?: (animeUrl: string, seed?: MediaNavigationSeed) => void;
+  offlineDownloadsByKey?: Map<string, OfflineDownloadRecord>;
+  onStartOfflineDownload?: (input: OfflineDownloadInput) => Promise<void> | void;
+  onCancelOfflineDownload?: (idOrUrl: string) => Promise<void> | void;
+  onDeleteOfflineDownload?: (idOrUrl: string) => Promise<void> | void;
   onLoadingStateChange?: (loading: boolean) => void;
   onBack: () => void;
 }
@@ -116,11 +130,22 @@ export function AnimeDetailView({
   onToggleEpisodesWatched,
   onOpenEpisode,
   onPrefetchEpisode,
+  offlineDownloadsByKey,
+  onStartOfflineDownload,
+  onCancelOfflineDownload,
+  onDeleteOfflineDownload,
   onLoadingStateChange,
   onBack,
 }: AnimeDetailViewProps) {
   const [episodeFilter, setEpisodeFilter] = useState('');
   const [sortDesc, setSortDesc] = useState(false);
+  const [confirmDeleteOfflineId, setConfirmDeleteOfflineId] = useState('');
+
+  useEffect(() => {
+    if (!confirmDeleteOfflineId) return;
+    const timer = window.setTimeout(() => setConfirmDeleteOfflineId(''), 4000);
+    return () => window.clearTimeout(timer);
+  }, [confirmDeleteOfflineId]);
   const [synopsisExpandedUrl, setSynopsisExpandedUrl] = useState('');
   const [failedHeroImageUrls, setFailedHeroImageUrls] = useState<string[]>([]);
   const [selectedAudioState, setSelectedAudioState] = useState<{
@@ -2027,6 +2052,9 @@ export function AnimeDetailView({
                           : 0;
                       const watched = isWatchedEpisode(ep);
                       const epSeed = buildSeedFromAnimeEpisode(anime, ep, activeEpisodes);
+                      const epOffline = offlineDownloadsByKey?.get(
+                        canonicalOfflineEpisodeUrl(ep.url)
+                      );
                       return (
                         <div
                           key={ep.url}
@@ -2107,6 +2135,15 @@ export function AnimeDetailView({
                                       {finaleBadge}
                                     </span>
                                   )}
+                                  {epOffline?.status === 'completed' && (
+                                    <span
+                                      data-episode-offline-badge="true"
+                                      className="inline-flex shrink-0 items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-emerald-300"
+                                    >
+                                      <HardDrive className="h-2.5 w-2.5 shrink-0" />
+                                      <span>Offline</span>
+                                    </span>
+                                  )}
                                 </div>
 
                                 {epTitleLoading ? (
@@ -2142,24 +2179,181 @@ export function AnimeDetailView({
                                   )}
                                 </div>
 
-                                <button
-                                  type="button"
-                                  onClick={() => onToggleEpisodesWatched([ep], !watched)}
-                                  aria-pressed={watched}
-                                  aria-label={
-                                    watched
-                                      ? `Desmarcar ${epBadge} como visto`
-                                      : `Marcar ${epBadge} como visto`
-                                  }
-                                  className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors sm:px-2.5 sm:py-1 sm:text-xs ${
-                                    watched
-                                      ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
-                                      : 'border-white/12 bg-[#0d0f12] text-slate-400 hover:border-emerald-500/50 hover:text-white'
-                                  }`}
-                                >
-                                  <Check className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
-                                  <span>Visto</span>
-                                </button>
+                                <div className="flex shrink-0 items-center gap-1.5">
+                                  {onStartOfflineDownload && (() => {
+                                    const dlStatus = epOffline?.status;
+                                    const isQueued = dlStatus === 'queued';
+                                    const isBusy =
+                                      dlStatus === 'resolving' || dlStatus === 'downloading';
+                                    const isSaved = dlStatus === 'completed';
+                                    const isError = dlStatus === 'error';
+
+                                    if (isQueued && epOffline) {
+                                      return (
+                                        <button
+                                          type="button"
+                                          data-episode-download-btn="true"
+                                          data-episode-download-queued="true"
+                                          onClick={() => void onCancelOfflineDownload?.(epOffline.id)}
+                                          aria-label={`Remover ${epBadge} da fila de downloads`}
+                                          title={
+                                            epOffline.queuePosition
+                                              ? `Na fila (#${epOffline.queuePosition}) · Toque para remover da fila`
+                                              : 'Na fila de downloads · Toque para cancelar'
+                                          }
+                                          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-amber-400/40 bg-amber-500/12 px-2 py-0.5 text-[11px] font-semibold tabular-nums text-amber-300 transition-colors hover:bg-amber-500/20 sm:px-2.5 sm:py-1 sm:text-xs"
+                                        >
+                                          <Clock className="h-3 w-3 shrink-0 sm:h-3.5 sm:w-3.5" />
+                                          <span>
+                                            {epOffline.queuePosition
+                                              ? `Fila #${epOffline.queuePosition}`
+                                              : 'Na fila'}
+                                          </span>
+                                          <X className="h-3 w-3 shrink-0 opacity-80" />
+                                        </button>
+                                      );
+                                    }
+
+                                    if (isBusy && epOffline) {
+                                      return (
+                                        <button
+                                          type="button"
+                                          data-episode-download-btn="true"
+                                          onClick={() => void onCancelOfflineDownload?.(epOffline.id)}
+                                          aria-label={`Cancelar download de ${epBadge}`}
+                                          title="Toque para cancelar o download"
+                                          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-[#f97316]/50 bg-[#f97316]/15 px-2 py-0.5 text-[11px] font-semibold tabular-nums text-[#fb923c] transition-colors hover:bg-[#f97316]/25 sm:px-2.5 sm:py-1 sm:text-xs"
+                                        >
+                                          <Loader2 className="h-3 w-3 shrink-0 animate-spin sm:h-3.5 sm:w-3.5" />
+                                          <span>
+                                            {dlStatus === 'resolving'
+                                              ? '...'
+                                              : `${epOffline.progress}%`}
+                                          </span>
+                                          <X className="h-3 w-3 shrink-0 opacity-80" />
+                                        </button>
+                                      );
+                                    }
+
+                                    if (isSaved && epOffline) {
+                                      const confirming = confirmDeleteOfflineId === epOffline.id;
+                                      return (
+                                        <div
+                                          data-episode-download-btn="true"
+                                          className="inline-flex shrink-0 items-center overflow-hidden rounded-md border border-emerald-500/45 bg-emerald-500/15 text-[11px] font-medium text-emerald-300 sm:text-xs"
+                                        >
+                                          <button
+                                            type="button"
+                                            onClick={() => onOpenEpisode(ep.url, epSeed)}
+                                            aria-label={`Assistir ${epBadge} offline`}
+                                            title={
+                                              epOffline.sizeBytes > 0
+                                                ? `Salvo offline (${formatBytes(epOffline.sizeBytes)}) · Toque para assistir`
+                                                : 'Salvo offline · Toque para assistir'
+                                            }
+                                            className="inline-flex items-center gap-1 px-2 py-0.5 transition-colors hover:bg-emerald-500/20 sm:px-2.5 sm:py-1"
+                                          >
+                                            <HardDrive className="h-3 w-3 shrink-0 sm:h-3.5 sm:w-3.5" />
+                                            <span>Salvo</span>
+                                          </button>
+                                          {onDeleteOfflineDownload && (
+                                            <button
+                                              type="button"
+                                              onClick={() => {
+                                                if (confirming) {
+                                                  setConfirmDeleteOfflineId('');
+                                                  void onDeleteOfflineDownload(epOffline.id);
+                                                } else {
+                                                  setConfirmDeleteOfflineId(epOffline.id);
+                                                }
+                                              }}
+                                              aria-label={
+                                                confirming
+                                                  ? `Confirmar exclusão do vídeo salvo de ${epBadge}`
+                                                  : `Apagar vídeo salvo de ${epBadge}`
+                                              }
+                                              title={
+                                                confirming
+                                                  ? 'Toque novamente para apagar'
+                                                  : epOffline.sizeBytes > 0
+                                                    ? `Apagar vídeo salvo (${formatBytes(epOffline.sizeBytes)})`
+                                                    : 'Apagar vídeo salvo'
+                                              }
+                                              className={`inline-flex items-center gap-1 border-l px-1.5 py-0.5 transition-colors sm:px-2 sm:py-1 ${
+                                                confirming
+                                                  ? 'border-rose-500/45 bg-rose-500/25 text-rose-200 hover:bg-rose-500/35'
+                                                  : 'border-emerald-500/30 text-emerald-200/80 hover:bg-rose-500/20 hover:text-rose-200'
+                                              }`}
+                                            >
+                                              <Trash2 className="h-3 w-3 shrink-0" />
+                                              {confirming && <span>Apagar?</span>}
+                                            </button>
+                                          )}
+                                        </div>
+                                      );
+                                    }
+
+                                    return (
+                                      <button
+                                        type="button"
+                                        data-episode-download-btn="true"
+                                        onClick={() =>
+                                          void onStartOfflineDownload({
+                                            episodeUrl: ep.url,
+                                            title: epDisplayTitle,
+                                            seriesTitle: anime.title,
+                                            seriesUrl: anime.url,
+                                            episodeLabel: epBadge,
+                                            poster: ep.thumb || anime.backdrop || anime.poster,
+                                            isMovie,
+                                            seasonNumber: ep.seasonNumber,
+                                            episodeNumber: ep.episodeNumber ?? undefined,
+                                            prevUrl: epSeed.prevUrl,
+                                            nextUrl: epSeed.nextUrl,
+                                          })
+                                        }
+                                        aria-label={
+                                          isError
+                                            ? `Tentar baixar ${epBadge} novamente`
+                                            : `Baixar ${epBadge} para assistir offline`
+                                        }
+                                        title={
+                                          isError
+                                            ? epOffline?.errorMessage ||
+                                              'Falha no download. Toque para tentar novamente.'
+                                            : 'Baixar vídeo para assistir sem internet'
+                                        }
+                                        className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors sm:px-2.5 sm:py-1 sm:text-xs ${
+                                          isError
+                                            ? 'border-amber-500/45 bg-amber-500/12 text-amber-200 hover:bg-amber-500/20'
+                                            : 'border-white/12 bg-[#0d0f12] text-slate-300 hover:border-emerald-500/50 hover:text-white'
+                                        }`}
+                                      >
+                                        <Download className="h-3 w-3 shrink-0 text-emerald-400 sm:h-3.5 sm:w-3.5" />
+                                        <span>{isError ? 'Tentar' : 'Baixar'}</span>
+                                      </button>
+                                    );
+                                  })()}
+
+                                  <button
+                                    type="button"
+                                    onClick={() => onToggleEpisodesWatched([ep], !watched)}
+                                    aria-pressed={watched}
+                                    aria-label={
+                                      watched
+                                        ? `Desmarcar ${epBadge} como visto`
+                                        : `Marcar ${epBadge} como visto`
+                                    }
+                                    className={`inline-flex shrink-0 items-center gap-1 rounded-md border px-2 py-0.5 text-[11px] font-medium transition-colors sm:px-2.5 sm:py-1 sm:text-xs ${
+                                      watched
+                                        ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/20'
+                                        : 'border-white/12 bg-[#0d0f12] text-slate-400 hover:border-emerald-500/50 hover:text-white'
+                                    }`}
+                                  >
+                                    <Check className="h-3 w-3 sm:h-3.5 sm:w-3.5" />
+                                    <span>Visto</span>
+                                  </button>
+                                </div>
                               </div>
                             </div>
                           </div>

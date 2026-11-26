@@ -67,6 +67,10 @@ import {
 } from '../lib/subtitleParser';
 import { getStreamProxyUrl } from '../lib/apiClient';
 import {
+  isLocalOfflinePlaybackUrl,
+  type OfflineDownloadRecord,
+} from '../lib/offlineDownloads';
+import {
   isAndroidNativeVlcSupported,
   isDesktopShortcutsEnabled,
   isSameEpisodeUrl,
@@ -154,6 +158,8 @@ interface AnimePlayerProps {
       promptWebRemote?: () => Promise<void>;
     }
   ) => void;
+  offlineDownload?: OfflineDownloadRecord;
+  onStartOfflineDownload?: () => void;
   onRegisterCastHelpers?: (
     helpers: {
       pauseLocal: () => void;
@@ -287,6 +293,8 @@ export function AnimePlayer({
   onNativeSessionSync,
   castState,
   onOpenTvCast,
+  offlineDownload,
+  onStartOfflineDownload,
   onRegisterCastHelpers,
   onToast,
 }: AnimePlayerProps) {
@@ -305,9 +313,13 @@ export function AnimePlayer({
   const [selectedStreamIdx, setSelectedStreamIdx] = useState(0);
   const activeStream = sortedStreams[selectedStreamIdx] || sortedStreams[0] || null;
 
+  const isLocalOfflineActive = Boolean(
+    activeStream && isLocalOfflinePlaybackUrl(activeStream.url)
+  );
+
   type PlaybackMode = 'direct-cors' | 'proxy' | 'direct-nocors';
   const [playbackMode, setPlaybackMode] = useState<PlaybackMode>(
-    preferDirect ? 'direct-cors' : 'proxy'
+    preferDirect || isLocalOfflineActive ? 'direct-cors' : 'proxy'
   );
   const [retryToken, setRetryToken] = useState(0);
 
@@ -318,6 +330,7 @@ export function AnimePlayer({
 
   const activeMediaUrl = useMemo(() => {
     if (!activeStream) return '';
+    if (isLocalOfflinePlaybackUrl(activeStream.url)) return activeStream.url;
     return playbackMode === 'proxy' ? proxiedStreamUrl : activeStream.url;
   }, [activeStream, playbackMode, proxiedStreamUrl]);
 
@@ -662,8 +675,8 @@ export function AnimePlayer({
 
   // Reset playback mode whenever stream or preferDirect changes
   useEffect(() => {
-    setPlaybackMode(preferDirect ? 'direct-cors' : 'proxy');
-  }, [activeStream?.url, preferDirect]);
+    setPlaybackMode(preferDirect || isLocalOfflineActive ? 'direct-cors' : 'proxy');
+  }, [activeStream?.url, isLocalOfflineActive, preferDirect]);
 
   // Reset speed per video
   useEffect(() => {
@@ -783,15 +796,26 @@ export function AnimePlayer({
     if (resumeTime > 1) {
       pendingSeekSecRef.current = resumeTime;
     }
+    if (isLocalOfflinePlaybackUrl(activeStream.url)) {
+      setPlaying(false);
+      setWaiting(false);
+      if (hasUntriedFallbackServers && onServerPlaybackFailed && selectedServerNume) {
+        onServerPlaybackFailed(selectedServerNume, resumeTime);
+        return;
+      }
+      setErrorMsg('Não foi possível reproduzir o vídeo salvo offline. Tente baixar novamente.');
+      return;
+    }
     if (playbackMode === 'direct-cors') {
       setPlaybackMode('proxy');
       return;
     }
     const isHlsStream =
       activeStream.format === 'hls' || /\.m3u8(?:$|\?)/i.test(activeStream.url);
-    const requiresProxyHeaders = /googlevideo\.com|incvideo1\.|filevideo1\.|b-cdn\.net/i.test(
-      activeStream.url
-    );
+    const requiresProxyHeaders =
+      /googlevideo\.com|incvideo1\.|filevideo1\.|b-cdn\.net|sssrr\.org|iamcdn\.net|abyss/i.test(
+        activeStream.url
+      );
     if (playbackMode === 'proxy' && !isHlsStream && !requiresProxyHeaders) {
       setPlaybackMode('direct-nocors');
       return;
@@ -1660,6 +1684,18 @@ export function AnimePlayer({
   }, [onToast, title]);
 
   const handleDownloadVideo = useCallback(async () => {
+    if (onStartOfflineDownload) {
+      if (offlineDownload?.status === 'completed') {
+        onToast('Este episódio já está salvo no dispositivo para assistir offline.');
+        return;
+      }
+      if (offlineDownload?.status === 'resolving' || offlineDownload?.status === 'downloading') {
+        onToast(`Download em andamento (${offlineDownload.progress}%).`);
+        return;
+      }
+      onStartOfflineDownload();
+      return;
+    }
     if (!activeStream) return;
     if (activeStream.format === 'hls') {
       try {
@@ -1680,7 +1716,16 @@ export function AnimePlayer({
     a.download = `${cleanName}.mp4`;
     a.click();
     onToast('Iniciando download do vídeo MP4...');
-  }, [activeStream, onToast, preferDirect, proxiedStreamUrl, title]);
+  }, [
+    activeStream,
+    offlineDownload?.progress,
+    offlineDownload?.status,
+    onStartOfflineDownload,
+    onToast,
+    preferDirect,
+    proxiedStreamUrl,
+    title,
+  ]);
 
   const loadLocalSubtitleFile = useCallback(
     async (file: File) => {
