@@ -2,6 +2,20 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.36] — 2026-11-26
+
+### Novidades
+- TV Cast em segundo plano, DeepL, TheTVDB/TheXEM, MyAnimeList, backup JSON e melhorias no atualizador (`b8363c0`)
+- Prioritize TheTVDB profile, fix TopAnimes/MixDrop/HinataSoul detection, and persist calendar layout (`f561bb6`)
+
+### Correções
+- Resolve CI lint and npm warnings, localize language/country to PT-BR, and fix TV cast seekbar scrubbing (`4dd8ae3`)
+
+### Melhorias e Manutenção
+- Atualiza descrições de TheTVDB, MyAnimeList e LiveChart.me em Configurações (`97b50dc`)
+- Exibe botão Ler sinopse completa apenas quando há texto truncado (`7f1ffb5`)
+- Unifica tags de mídia, áudio e gêneros do TheTVDB na página do episódio e remove botão Todas as temporadas (`177e623`)
+
 ## [v1.0.35] — 2026-11-24
 
 ### Novidades
