@@ -34,6 +34,7 @@ import { apiFetch, isNativeAndroidApp, openExternalOrVlcUrl } from '../lib/apiCl
 import {
   buildAnimeInfoMetaItems,
   resolveAnimeHeroAudioBadges,
+  resolveVisibleGenres,
 } from '../lib/animeInfoMeta';
 import {
   formatEpisodeCardBadge,
@@ -110,9 +111,7 @@ export function AnimeDetailView({
   onToggleMuteFavorite,
   onToggleEpisodesWatched,
   onOpenEpisode,
-  onOpenAnime,
   onPrefetchEpisode,
-  onPrefetchAnime,
   onLoadingStateChange,
   onBack,
 }: AnimeDetailViewProps) {
@@ -810,10 +809,7 @@ export function AnimeDetailView({
     subtitleParts.push(anime.originalTitle);
   }
 
-  const redundantGenreLabel = isMovie ? 'filme' : isSeries ? 'série' : 'anime';
-  const visibleGenres = anime.genres.filter(
-    (g) => g.trim().toLowerCase() !== redundantGenreLabel
-  );
+  const visibleGenres = resolveVisibleGenres(anime.genres, undefined, anime.kind);
 
   const extraMetaItems = useMemo(() => buildAnimeInfoMetaItems(anime), [anime]);
 
@@ -870,6 +866,7 @@ export function AnimeDetailView({
           episodeLabel: quickLastEpisode.label,
           kind: isMovie ? ('movie' as const) : ('episode' as const),
           isMovie,
+          genres: anime.genres,
         };
   }, [activeEpisodes, anime, effectiveBackdrop, effectivePoster, isMovie, quickLastEpisode]);
 
@@ -1264,19 +1261,6 @@ export function AnimeDetailView({
                   </button>
                 )}
 
-                {anime.allSeasonsUrl && onOpenAnime && (
-                  <button
-                    type="button"
-                    onMouseEnter={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
-                    onFocus={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
-                    onTouchStart={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
-                    onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
-                    className="hidden h-11 items-center gap-1.5 rounded-xl border border-white/15 bg-[#0d0f12] px-3.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white sm:inline-flex"
-                  >
-                    <Layers className="h-3.5 w-3.5 text-[#f97316]" />
-                    <span>Todas as temporadas</span>
-                  </button>
-                )}
               </div>
 
               {quickLastEpisode && (
@@ -1295,18 +1279,6 @@ export function AnimeDetailView({
                   <span className="rounded-md bg-[#f97316]/15 px-2 py-0.5 font-mono text-[11px] font-bold text-[#fb923c]">
                     {quickLastEpisode.label}
                   </span>
-                </button>
-              )}
-
-              {anime.allSeasonsUrl && onOpenAnime && (
-                <button
-                  type="button"
-                  onTouchStart={() => onPrefetchAnime?.(anime.allSeasonsUrl!)}
-                  onClick={() => onOpenAnime(anime.allSeasonsUrl!)}
-                  className="flex h-10 w-full items-center justify-center gap-1.5 rounded-xl border border-white/12 bg-[#0d0f12]/80 px-3.5 text-xs font-semibold text-slate-200 transition-colors hover:border-[#f97316]/50 hover:text-white sm:hidden"
-                >
-                  <Layers className="h-3.5 w-3.5 text-[#f97316]" />
-                  <span>Todas as temporadas</span>
                 </button>
               )}
             </div>

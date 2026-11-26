@@ -8,14 +8,21 @@ import {
   ChevronRight,
   Clock,
   CloudOff,
+  Film,
   Heart,
   Keyboard,
   Layers,
   Loader2,
   RefreshCw,
   Server,
+  Tv,
 } from 'lucide-react';
 import { apiFetch } from '../lib/apiClient';
+import {
+  resolveEpisodeAudioBadges,
+  resolveEpisodeMediaKind,
+  resolveVisibleGenres,
+} from '../lib/animeInfoMeta';
 import {
   applyLocalizedEpisodeTitles,
   collectUnlocalizedEpisodeIds,
@@ -59,11 +66,13 @@ import { formatServerLabel } from '../lib/serverLabel';
 import type {
   AnimeEpisodeLink,
   AnimeSynopsisResult,
+  AudioType,
   CatalogMediaItem,
   EpisodeDetails,
   EpisodeSynopsisResult,
   ExternalMediaIds,
   FavoriteLatestInfo,
+  MediaKind,
   PlayerOption,
   ResolvedEmbed,
 } from '../lib/types';
@@ -78,6 +87,9 @@ interface EpisodeWorkspaceProps {
   initialSeriesEpisodes?: AnimeEpisodeLink[];
   initialSeriesArtwork?: { poster?: string; backdrop?: string };
   initialSeriesExternalIds?: ExternalMediaIds;
+  initialSeriesGenres?: string[];
+  initialSeriesKind?: MediaKind;
+  initialSeriesAudioType?: AudioType;
   loadingEpisode?: boolean;
   loadingExtraServers?: boolean;
   loadingExtraServerNames?: string[];
@@ -135,6 +147,9 @@ export function EpisodeWorkspace({
   initialSeriesEpisodes,
   initialSeriesArtwork,
   initialSeriesExternalIds,
+  initialSeriesGenres,
+  initialSeriesKind,
+  initialSeriesAudioType,
   loadingEpisode = false,
   loadingExtraServers = false,
   loadingExtraServerNames = [],
@@ -191,6 +206,10 @@ export function EpisodeWorkspace({
   const seriesArtworkCacheRef = useRef<Map<string, { poster?: string; backdrop?: string }>>(
     new Map()
   );
+  const seriesGenresCacheRef = useRef<Map<string, string[]>>(new Map());
+  const seriesMetaCacheRef = useRef<Map<string, { kind?: MediaKind; audioType?: AudioType }>>(
+    new Map()
+  );
   const [seriesEpisodes, setSeriesEpisodes] = useState<AnimeEpisodeLink[]>(
     initialSeriesEpisodes || []
   );
@@ -200,6 +219,39 @@ export function EpisodeWorkspace({
   const [seriesArtwork, setSeriesArtwork] = useState<{ poster?: string; backdrop?: string }>(
     initialSeriesArtwork || {}
   );
+  const [seriesGenresState, setSeriesGenresState] = useState<{
+    seriesKey: string;
+    genres: string[];
+  }>(() => {
+    const initialKey = episode.seriesUrl
+      ? normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl
+      : '';
+    if (initialSeriesGenres?.length) {
+      return { seriesKey: initialKey, genres: initialSeriesGenres };
+    }
+    if (episode.seriesUrl) {
+      const cached = getCachedAnimeDetailsFull(episode.seriesUrl);
+      if (cached?.genres?.length) {
+        return { seriesKey: initialKey, genres: cached.genres };
+      }
+    }
+    return { seriesKey: initialKey, genres: [] };
+  });
+  const [seriesMetaState, setSeriesMetaState] = useState<{
+    seriesKey: string;
+    kind?: MediaKind;
+    audioType?: AudioType;
+  }>(() => {
+    const initialKey = episode.seriesUrl
+      ? normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl
+      : '';
+    const cached = episode.seriesUrl ? getCachedAnimeDetailsFull(episode.seriesUrl) : undefined;
+    return {
+      seriesKey: initialKey,
+      kind: initialSeriesKind || cached?.kind,
+      audioType: initialSeriesAudioType ?? cached?.audioType ?? null,
+    };
+  });
   const [seriesMediaReadyForUrl, setSeriesMediaReadyForUrl] = useState<string>(
     initialSeriesEpisodes && initialSeriesEpisodes.length > 0 ? episode.seriesUrl || '' : ''
   );
@@ -281,23 +333,52 @@ export function EpisodeWorkspace({
     }
   }, [episode.url, failoverExhaustedMsg, playableOptions]);
 
-  // Fetch and cache the series episode list so in-fullscreen episode selection, TheTVDB IDs & artwork are populated
+  // Fetch and cache the series episode list so in-fullscreen episode selection, TheTVDB IDs, genres & artwork are populated
   useEffect(() => {
+    const seriesKey = episode.seriesUrl
+      ? normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl
+      : '';
+
     if (episode.isMovie || !episode.seriesUrl) {
       setSeriesEpisodes([]);
       setSeriesExternalIds(episode.externalIds || initialSeriesExternalIds);
       setSeriesArtwork(initialSeriesArtwork || {});
+      const movieCached = episode.seriesUrl
+        ? getCachedAnimeDetailsFull(episode.seriesUrl)
+        : undefined;
+      setSeriesGenresState({
+        seriesKey,
+        genres:
+          initialSeriesGenres?.length
+            ? initialSeriesGenres
+            : movieCached?.genres?.length
+              ? movieCached.genres
+              : [],
+      });
+      setSeriesMetaState({
+        seriesKey,
+        kind: initialSeriesKind || movieCached?.kind,
+        audioType: initialSeriesAudioType ?? movieCached?.audioType ?? null,
+      });
       setSeriesMediaReadyForUrl(episode.seriesUrl || '__none__');
       return;
     }
 
     const seriesUrl = episode.seriesUrl;
-    const seriesKey = normalizeTopAnimesUrl(seriesUrl) || seriesUrl;
     if (initialSeriesExternalIds) {
       seriesExternalIdsCacheRef.current.set(seriesKey, initialSeriesExternalIds);
     }
     if (initialSeriesArtwork?.poster || initialSeriesArtwork?.backdrop) {
       seriesArtworkCacheRef.current.set(seriesKey, initialSeriesArtwork);
+    }
+    if (initialSeriesGenres?.length) {
+      seriesGenresCacheRef.current.set(seriesKey, initialSeriesGenres);
+    }
+    if (initialSeriesKind || initialSeriesAudioType) {
+      seriesMetaCacheRef.current.set(seriesKey, {
+        kind: initialSeriesKind,
+        audioType: initialSeriesAudioType,
+      });
     }
     const hasEnrichedInitialEpisodes = Boolean(
       initialSeriesEpisodes &&
@@ -311,12 +392,33 @@ export function EpisodeWorkspace({
       setSeriesArtwork(
         initialSeriesArtwork || seriesArtworkCacheRef.current.get(seriesKey) || {}
       );
+      const cachedFull = getCachedAnimeDetailsFull(seriesUrl);
+      const cachedGenres =
+        initialSeriesGenres?.length
+          ? initialSeriesGenres
+          : seriesGenresCacheRef.current.get(seriesKey) || cachedFull?.genres || [];
+      setSeriesGenresState({ seriesKey, genres: cachedGenres });
+      const cachedMeta = seriesMetaCacheRef.current.get(seriesKey);
+      setSeriesMetaState({
+        seriesKey,
+        kind: initialSeriesKind || cachedMeta?.kind || cachedFull?.kind,
+        audioType: initialSeriesAudioType ?? cachedMeta?.audioType ?? cachedFull?.audioType ?? null,
+      });
       setSeriesMediaReadyForUrl(seriesUrl);
       return;
     }
 
     const cachedDetails = getCachedAnimeDetailsFull(seriesUrl);
     if (cachedDetails) {
+      if (cachedDetails.genres?.length) {
+        seriesGenresCacheRef.current.set(seriesKey, cachedDetails.genres);
+      }
+      if (cachedDetails.kind || cachedDetails.audioType) {
+        seriesMetaCacheRef.current.set(seriesKey, {
+          kind: cachedDetails.kind,
+          audioType: cachedDetails.audioType,
+        });
+      }
       const resolvedTrackEps =
         resolveSeriesEpisodesForEpisode(cachedDetails, episode.url, seriesUrl) ||
         cachedDetails.episodes;
@@ -342,6 +444,20 @@ export function EpisodeWorkspace({
             seriesArtworkCacheRef.current.get(seriesKey) ||
             {}
         );
+        setSeriesGenresState({
+          seriesKey,
+          genres:
+            initialSeriesGenres?.length
+              ? initialSeriesGenres
+              : cachedDetails.genres?.length
+                ? cachedDetails.genres
+                : seriesGenresCacheRef.current.get(seriesKey) || [],
+        });
+        setSeriesMetaState({
+          seriesKey,
+          kind: initialSeriesKind || cachedDetails.kind,
+          audioType: initialSeriesAudioType ?? cachedDetails.audioType ?? null,
+        });
         setSeriesMediaReadyForUrl(seriesUrl);
         return;
       }
@@ -375,12 +491,37 @@ export function EpisodeWorkspace({
           seriesArtworkCacheRef.current.set(seriesKey, art);
           setSeriesArtwork(art);
         }
+        if (data?.genres?.length) {
+          seriesGenresCacheRef.current.set(seriesKey, data.genres);
+          setSeriesGenresState({ seriesKey, genres: data.genres });
+        }
+        if (data?.kind || data?.audioType) {
+          seriesMetaCacheRef.current.set(seriesKey, {
+            kind: data.kind,
+            audioType: data.audioType,
+          });
+          setSeriesMetaState({
+            seriesKey,
+            kind: data.kind,
+            audioType: data.audioType ?? null,
+          });
+        }
         setSeriesMediaReadyForUrl(seriesUrl);
       })
       .catch(() => {
         if (!cancelled) {
           if (initialSeriesEpisodes && initialSeriesEpisodes.length > 0) {
             setSeriesEpisodes(initialSeriesEpisodes);
+          }
+          if (initialSeriesGenres?.length) {
+            setSeriesGenresState({ seriesKey, genres: initialSeriesGenres });
+          }
+          if (initialSeriesKind || initialSeriesAudioType) {
+            setSeriesMetaState({
+              seriesKey,
+              kind: initialSeriesKind,
+              audioType: initialSeriesAudioType ?? null,
+            });
           }
           setSeriesMediaReadyForUrl(seriesUrl);
         }
@@ -398,9 +539,52 @@ export function EpisodeWorkspace({
     episode.url,
     episode.year,
     initialSeriesArtwork,
+    initialSeriesAudioType,
     initialSeriesEpisodes,
     initialSeriesExternalIds,
+    initialSeriesGenres,
+    initialSeriesKind,
   ]);
+
+  const currentSeriesKey = episode.seriesUrl
+    ? normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl
+    : '';
+  const effectiveSeriesGenres = useMemo(() => {
+    if (initialSeriesGenres && initialSeriesGenres.length > 0) {
+      return initialSeriesGenres;
+    }
+    if (
+      seriesGenresState.seriesKey === currentSeriesKey &&
+      seriesGenresState.genres.length > 0
+    ) {
+      return seriesGenresState.genres;
+    }
+    return undefined;
+  }, [currentSeriesKey, initialSeriesGenres, seriesGenresState]);
+
+  const effectiveSeriesKind =
+    initialSeriesKind ||
+    (seriesMetaState.seriesKey === currentSeriesKey ? seriesMetaState.kind : undefined);
+  const effectiveSeriesAudioType =
+    initialSeriesAudioType ??
+    (seriesMetaState.seriesKey === currentSeriesKey ? seriesMetaState.audioType : null);
+
+  const parentMediaKind = useMemo(
+    () =>
+      resolveEpisodeMediaKind({
+        isMovie: episode.isMovie,
+        mediaType: episode.mediaType,
+        seriesKind: effectiveSeriesKind,
+        seriesUrl: episode.seriesUrl,
+        url: episode.url,
+      }),
+    [effectiveSeriesKind, episode.isMovie, episode.mediaType, episode.seriesUrl, episode.url]
+  );
+
+  const visibleGenres = useMemo(
+    () => resolveVisibleGenres(effectiveSeriesGenres, episode.genres, parentMediaKind),
+    [effectiveSeriesGenres, episode.genres, parentMediaKind]
+  );
 
   const seriesTitlesScopeKey = episode.seriesUrl || episode.url;
   const unlocalizedSeriesEpisodeIds = useMemo(
@@ -954,8 +1138,29 @@ export function EpisodeWorkspace({
     (opt) => opt.nume !== selectedOption?.nume && !currentFailedSet?.has(opt.nume)
   );
 
-  const parentMediaKind: 'anime' | 'series' | 'movie' =
-    episode.mediaType || (episode.isMovie ? 'movie' : 'anime');
+  const episodeAudioBadges = useMemo(
+    () =>
+      resolveEpisodeAudioBadges({
+        matchedEpisodeAudio: matchedSeriesEpisode?.audioType,
+        selectedOptionAudio: selectedOption?.audioType,
+        seriesAudioType: effectiveSeriesAudioType,
+        title: episode.title,
+        seriesTitle: episode.seriesTitle,
+        url: episode.url,
+        seriesUrl: episode.seriesUrl,
+        options: playableOptions,
+      }),
+    [
+      effectiveSeriesAudioType,
+      episode.seriesTitle,
+      episode.seriesUrl,
+      episode.title,
+      episode.url,
+      matchedSeriesEpisode?.audioType,
+      playableOptions,
+      selectedOption?.audioType,
+    ]
+  );
 
   const scopedSynopsis =
     localizedSynopsisState.episodeUrl === episode.url
@@ -1042,13 +1247,14 @@ export function EpisodeWorkspace({
         kind: episode.isMovie ? 'movie' : 'episode',
         isMovie: episode.isMovie,
         year: episode.year,
-        genres: episode.genres,
+        genres: effectiveSeriesGenres || episode.genres,
         externalIds: episode.externalIds || seriesExternalIds,
         catalogSource: episode.catalogSource,
       };
     },
     [
       effectiveEpisodePoster,
+      effectiveSeriesGenres,
       effectiveSeriesPoster,
       episode.catalogSource,
       episode.externalIds,
@@ -1070,12 +1276,13 @@ export function EpisodeWorkspace({
       backdrop: seriesArtwork.backdrop || episode.backdrop || effectiveSeriesPoster,
       kind: parentMediaKind,
       year: episode.year,
-      genres: episode.genres,
+      genres: effectiveSeriesGenres || episode.genres,
       externalIds: episode.externalIds || seriesExternalIds,
       catalogSource: episode.catalogSource,
       isMovie: episode.isMovie,
     };
   }, [
+    effectiveSeriesGenres,
     effectiveSeriesPoster,
     episode.backdrop,
     episode.catalogSource,
@@ -1392,11 +1599,51 @@ export function EpisodeWorkspace({
                   </span>
                 )}
               </div>
-              {episode.genres.length > 0 && (
-                <p className="mt-1 text-xs text-slate-400">
-                  {episode.genres.join(' · ')}
-                </p>
-              )}
+              <div
+                data-episode-badges="true"
+                data-episode-genres="true"
+                className="mt-2 flex flex-wrap items-center gap-1.5"
+              >
+                <span
+                  data-episode-media-type={parentMediaKind}
+                  className="inline-flex items-center gap-1 rounded-full border border-[#f97316]/30 bg-[#f97316]/12 px-2.5 py-0.5 text-[11px] font-semibold text-[#fb923c] sm:text-xs"
+                >
+                  {parentMediaKind === 'movie' ? (
+                    <Film className="h-3 w-3" />
+                  ) : (
+                    <Tv className="h-3 w-3" />
+                  )}
+                  <span>
+                    {parentMediaKind === 'movie'
+                      ? 'Filme'
+                      : parentMediaKind === 'series'
+                        ? 'Série'
+                        : 'Anime'}
+                  </span>
+                </span>
+                {episodeAudioBadges.map((audioBadge) => (
+                  <span
+                    key={audioBadge}
+                    data-episode-audio-badge={audioBadge}
+                    className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-semibold sm:text-xs ${
+                      audioBadge === 'DUB'
+                        ? 'border-emerald-500/35 bg-emerald-500/12 text-emerald-300'
+                        : 'border-sky-500/35 bg-sky-500/12 text-sky-300'
+                    }`}
+                  >
+                    {audioBadge === 'DUB' ? 'Dublado' : 'Legendado'}
+                  </span>
+                ))}
+                {visibleGenres.map((genre) => (
+                  <span
+                    key={genre}
+                    data-episode-genre={genre}
+                    className="rounded-full border border-white/10 bg-[#0d0f12]/70 px-2.5 py-0.5 text-[11px] font-medium text-slate-300 sm:text-xs"
+                  >
+                    {genre}
+                  </span>
+                ))}
+              </div>
             </div>
 
             {/* Episode Synopsis (TheTVDB PT-BR -> Google Translate -> EN fallback) */}

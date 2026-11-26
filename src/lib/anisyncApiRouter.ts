@@ -403,6 +403,15 @@ async function resolveEmbedCachedInRouter(
   }
 }
 
+function getCachedSeriesGenres(seriesUrl?: string): string[] | undefined {
+  if (!seriesUrl) return undefined;
+  const normSeries = isHinataSoulUrl(seriesUrl)
+    ? normalizeHinataSoulUrl(seriesUrl) || seriesUrl
+    : normalizeTopAnimesUrl(seriesUrl) || seriesUrl;
+  const cachedMedia = mediaDetailsCache.get(normSeries);
+  return cachedMedia?.genres?.length ? cachedMedia.genres : undefined;
+}
+
 async function resolveCrossSourceAliasesForEpisode(
   fetchHttp: HttpFetcher,
   params: {
@@ -412,10 +421,11 @@ async function resolveCrossSourceAliasesForEpisode(
     originalTitle?: string;
     alternativeTitles?: string[];
   }
-): Promise<{ originalTitle?: string; alternativeTitles: string[] }> {
+): Promise<{ originalTitle?: string; alternativeTitles: string[]; genres?: string[] }> {
   const seen = new Set<string>();
   const aliases: string[] = [];
   let resolvedOriginal = params.originalTitle?.trim() || undefined;
+  let resolvedGenres = getCachedSeriesGenres(params.seriesUrl);
 
   const pushAlias = (raw: string | undefined) => {
     for (const part of splitAlternativeTitleString(raw)) {
@@ -467,6 +477,9 @@ async function resolveCrossSourceAliasesForEpisode(
       if (!resolvedOriginal && tvdbMatch.originalTitle) {
         resolvedOriginal = tvdbMatch.originalTitle;
       }
+      if (!resolvedGenres?.length && tvdbMatch.genres?.length) {
+        resolvedGenres = tvdbMatch.genres;
+      }
       pushAlias(tvdbMatch.title);
       pushAlias(tvdbMatch.englishTitle);
       pushAlias(tvdbMatch.originalTitle);
@@ -479,6 +492,7 @@ async function resolveCrossSourceAliasesForEpisode(
   return {
     originalTitle: resolvedOriginal,
     alternativeTitles: aliases.filter((a) => a.toLowerCase() !== baseLower),
+    genres: resolvedGenres,
   };
 }
 
@@ -1315,8 +1329,10 @@ export async function dispatchAnisyncApiRequest(
             };
 
             if (deferCrossSources && primaryOptions.length > 0) {
+              const cachedGenres = getCachedSeriesGenres(parsed.seriesUrl);
               return {
                 ...parsed,
+                genres: cachedGenres?.length ? cachedGenres : parsed.genres,
                 options: primaryOptions,
                 sourceReports: [primaryReport],
                 sourceMode: 'live' as const,
@@ -1331,7 +1347,11 @@ export async function dispatchAnisyncApiRequest(
                   originalTitle: parsed.originalTitle,
                   alternativeTitles: parsed.alternativeTitles,
                 })
-              : { originalTitle: undefined, alternativeTitles: [] as string[] };
+              : {
+                  originalTitle: undefined,
+                  alternativeTitles: [] as string[],
+                  genres: undefined as string[] | undefined,
+                };
 
             const extra = parsed.seriesTitle
               ? await aggregateEpisodeServers(
@@ -1351,6 +1371,7 @@ export async function dispatchAnisyncApiRequest(
 
             return {
               ...parsed,
+              genres: crossAliases.genres?.length ? crossAliases.genres : parsed.genres,
               originalTitle: parsed.originalTitle || crossAliases.originalTitle,
               alternativeTitles:
                 parsed.alternativeTitles?.length
@@ -1428,8 +1449,10 @@ export async function dispatchAnisyncApiRequest(
             };
 
             if (primaryOptions.length > 0) {
+              const cachedGenres = getCachedSeriesGenres(parsed.seriesUrl);
               return {
                 ...parsed,
+                genres: cachedGenres?.length ? cachedGenres : parsed.genres,
                 episodeNumber: inferredEpNum,
                 seasonNumber: inferredSeason,
                 options: primaryOptions,
@@ -1446,7 +1469,11 @@ export async function dispatchAnisyncApiRequest(
                   originalTitle: parsed.originalTitle,
                   alternativeTitles: parsed.alternativeTitles,
                 })
-              : { originalTitle: undefined, alternativeTitles: [] as string[] };
+              : {
+                  originalTitle: undefined,
+                  alternativeTitles: [] as string[],
+                  genres: undefined as string[] | undefined,
+                };
 
             const extra = parsed.seriesTitle
               ? await aggregateEpisodeServers(
@@ -1466,6 +1493,7 @@ export async function dispatchAnisyncApiRequest(
 
             return {
               ...parsed,
+              genres: crossAliases.genres?.length ? crossAliases.genres : parsed.genres,
               originalTitle: parsed.originalTitle || crossAliases.originalTitle,
               alternativeTitles:
                 parsed.alternativeTitles?.length
@@ -1510,7 +1538,11 @@ export async function dispatchAnisyncApiRequest(
               : Promise.resolve({
                   options: [],
                   reports: [],
-                  crossAliases: { originalTitle: undefined, alternativeTitles: [] as string[] },
+                  crossAliases: {
+                    originalTitle: undefined,
+                    alternativeTitles: [] as string[],
+                    genres: undefined as string[] | undefined,
+                  },
                 }),
           ]);
 
@@ -1533,6 +1565,9 @@ export async function dispatchAnisyncApiRequest(
 
           return {
             ...parsed,
+            genres: extraWithAliases.crossAliases.genres?.length
+              ? extraWithAliases.crossAliases.genres
+              : parsed.genres,
             originalTitle: parsed.originalTitle || extraWithAliases.crossAliases.originalTitle,
             alternativeTitles:
               parsed.alternativeTitles?.length

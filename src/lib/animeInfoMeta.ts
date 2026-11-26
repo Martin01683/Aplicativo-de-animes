@@ -1,5 +1,5 @@
 import { formatEpisodeReleaseDate } from './episodeAvailability';
-import type { AnimeDetails } from './types';
+import type { AnimeDetails, AudioType, MediaKind } from './types';
 
 export type AnimeMetaKind =
   | 'status'
@@ -222,4 +222,120 @@ export function resolveAnimeHeroAudioBadges(
   }
   return [];
 }
+
+function cleanGenreList(
+  genres: readonly string[] | undefined,
+  redundantLabel: string
+): string[] {
+  if (!genres || genres.length === 0) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of genres) {
+    const clean = raw.trim();
+    if (!clean) continue;
+    const key = clean.toLowerCase();
+    if (key === redundantLabel) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(clean);
+  }
+  return out;
+}
+
+export function resolveVisibleGenres(
+  primaryGenres?: readonly string[],
+  fallbackGenres?: readonly string[],
+  kind?: MediaKind | null
+): string[] {
+  const redundantLabel = kind === 'movie' ? 'filme' : kind === 'series' ? 'série' : 'anime';
+  const primary = cleanGenreList(primaryGenres, redundantLabel);
+  if (primary.length > 0) return primary;
+  return cleanGenreList(fallbackGenres, redundantLabel);
+}
+
+export function resolveEpisodeMediaKind(params: {
+  isMovie?: boolean;
+  mediaType?: 'anime' | 'series' | 'movie';
+  seriesKind?: MediaKind | null;
+  seriesUrl?: string;
+  url?: string;
+}): 'anime' | 'series' | 'movie' {
+  if (
+    params.isMovie ||
+    params.mediaType === 'movie' ||
+    params.seriesKind === 'movie' ||
+    /\/filmes?\//i.test(params.url || '') ||
+    /\/filmes?\//i.test(params.seriesUrl || '')
+  ) {
+    return 'movie';
+  }
+  if (
+    params.mediaType === 'series' ||
+    params.seriesKind === 'series' ||
+    /\/series\//i.test(params.seriesUrl || '') ||
+    /\/series\//i.test(params.url || '')
+  ) {
+    return 'series';
+  }
+  return 'anime';
+}
+
+function inferAudioFromText(text?: string): HeroAudioBadge | null {
+  if (!text) return null;
+  if (/\bdublado\b|\bdub\b|-dublado\b|-dub(?=\/|-|$|\d)/i.test(text)) return 'DUB';
+  if (/\blegendado\b|\bleg\b|-legendado\b|-leg(?=\/|-|$|\d)/i.test(text)) return 'LEG';
+  return null;
+}
+
+export function resolveEpisodeAudioBadges(params: {
+  matchedEpisodeAudio?: AudioType;
+  selectedOptionAudio?: AudioType;
+  seriesAudioType?: AudioType;
+  title?: string;
+  seriesTitle?: string;
+  url?: string;
+  seriesUrl?: string;
+  options?: readonly { audioType?: AudioType; label?: string }[];
+}): HeroAudioBadge[] {
+  if (params.matchedEpisodeAudio === 'DUB' || params.matchedEpisodeAudio === 'LEG') {
+    return [params.matchedEpisodeAudio];
+  }
+
+  const fromTitleOrUrl =
+    inferAudioFromText(params.title) ||
+    inferAudioFromText(params.url) ||
+    inferAudioFromText(params.seriesTitle) ||
+    inferAudioFromText(params.seriesUrl);
+  if (fromTitleOrUrl) {
+    return [fromTitleOrUrl];
+  }
+
+  if (params.selectedOptionAudio === 'DUB' || params.selectedOptionAudio === 'LEG') {
+    return [params.selectedOptionAudio];
+  }
+
+  if (params.seriesAudioType === 'DUB' || params.seriesAudioType === 'LEG') {
+    return [params.seriesAudioType];
+  }
+
+  if (params.options && params.options.length > 0) {
+    const found = new Set<HeroAudioBadge>();
+    for (const opt of params.options) {
+      if (opt.audioType === 'DUB' || opt.audioType === 'LEG') {
+        found.add(opt.audioType);
+      } else {
+        const inferred = inferAudioFromText(opt.label);
+        if (inferred) found.add(inferred);
+      }
+    }
+    const ordered: HeroAudioBadge[] = [];
+    if (found.has('DUB')) ordered.push('DUB');
+    if (found.has('LEG')) ordered.push('LEG');
+    return ordered;
+  }
+
+  return [];
+}
+
+
 

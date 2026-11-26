@@ -1873,6 +1873,7 @@ export default function App() {
             knownMeta?.backdrop ||
             knownMeta?.poster ||
             '',
+          genres: rawEp.genres.length > 0 ? rawEp.genres : options.seed?.genres || [],
         };
         setCachedEpisodeDetails(url, ep);
         setEpisodeDetails(ep);
@@ -3225,7 +3226,14 @@ export default function App() {
                     episodeDetails.url,
                     episodeDetails.seriesUrl
                   );
-                  const matchesLoadedAnime = Boolean(matchedTrackEpisodes);
+                  const matchesLoadedAnime =
+                    Boolean(matchedTrackEpisodes) ||
+                    Boolean(
+                      animeDetails &&
+                        episodeDetails.seriesUrl &&
+                        normalizeTopAnimesUrl(animeDetails.url) ===
+                          normalizeTopAnimesUrl(episodeDetails.seriesUrl)
+                    );
                   return (
                     <EpisodeWorkspace
                       episode={episodeDetails}
@@ -3250,6 +3258,15 @@ export default function App() {
                       }
                       initialSeriesExternalIds={
                         matchesLoadedAnime ? animeDetails?.externalIds : undefined
+                      }
+                      initialSeriesGenres={
+                        matchesLoadedAnime ? animeDetails?.genres : undefined
+                      }
+                      initialSeriesKind={
+                        matchesLoadedAnime ? animeDetails?.kind : undefined
+                      }
+                      initialSeriesAudioType={
+                        matchesLoadedAnime ? animeDetails?.audioType : undefined
                       }
                   loadingEpisode={loadingDetail}
                   loadingExtraServers={Boolean(

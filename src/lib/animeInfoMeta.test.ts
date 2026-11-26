@@ -5,6 +5,9 @@ import {
   extractAnimeProviders,
   parseProviderNames,
   resolveAnimeHeroAudioBadges,
+  resolveEpisodeAudioBadges,
+  resolveEpisodeMediaKind,
+  resolveVisibleGenres,
 } from './animeInfoMeta';
 import type { AnimeDetails } from './types';
 
@@ -134,4 +137,85 @@ test('resolveAnimeHeroAudioBadges returns both DUB and LEG simultaneously when b
   const noAudio = makeAnime({ audioType: null });
   assert.deepEqual(resolveAnimeHeroAudioBadges(noAudio), []);
 });
+
+test('resolveVisibleGenres prioritizes TheTVDB primary genres, filters redundant media labels, and falls back to provider genres', () => {
+  assert.deepEqual(
+    resolveVisibleGenres(
+      ['Ação', 'Aventura', 'Animação', 'Anime', 'Fantasia', 'ação'],
+      ['Ação', 'Fantasia', 'Shounen'],
+      'anime'
+    ),
+    ['Ação', 'Aventura', 'Animação', 'Fantasia']
+  );
+
+  assert.deepEqual(
+    resolveVisibleGenres([], ['Ação', 'Anime', 'Fantasia', 'Shounen'], 'anime'),
+    ['Ação', 'Fantasia', 'Shounen']
+  );
+
+  assert.deepEqual(
+    resolveVisibleGenres(['Anime', '  '], ['Drama', 'Suspense'], 'anime'),
+    ['Drama', 'Suspense']
+  );
+
+  assert.deepEqual(
+    resolveVisibleGenres(['Filme', 'Ação', 'Ficção Científica'], undefined, 'movie'),
+    ['Ação', 'Ficção Científica']
+  );
+
+  assert.deepEqual(
+    resolveVisibleGenres(['Série', 'Drama', 'Mistério'], undefined, 'series'),
+    ['Drama', 'Mistério']
+  );
+});
+
+test('resolveEpisodeMediaKind distinguishes anime, movie, and series from episode or parent series metadata', () => {
+  assert.equal(resolveEpisodeMediaKind({ isMovie: true }), 'movie');
+  assert.equal(
+    resolveEpisodeMediaKind({ url: 'https://topanimes.net/filmes/suzume/' }),
+    'movie'
+  );
+  assert.equal(
+    resolveEpisodeMediaKind({ seriesUrl: 'https://topanimes.net/series/the-last-of-us/' }),
+    'series'
+  );
+  assert.equal(resolveEpisodeMediaKind({ seriesKind: 'series' }), 'series');
+  assert.equal(
+    resolveEpisodeMediaKind({ seriesUrl: 'https://topanimes.net/animes/solo-leveling/' }),
+    'anime'
+  );
+});
+
+test('resolveEpisodeAudioBadges identifies Dublado or Legendado for episodes opened directly from Home', () => {
+  assert.deepEqual(
+    resolveEpisodeAudioBadges({
+      title: 'Solo Leveling Dublado - EP 1',
+      url: 'https://topanimes.net/episodio/solo-leveling-dublado-episodio-1/',
+    }),
+    ['DUB']
+  );
+  assert.deepEqual(
+    resolveEpisodeAudioBadges({
+      title: 'Sousou no Frieren - EP 1',
+      matchedEpisodeAudio: 'LEG',
+    }),
+    ['LEG']
+  );
+  assert.deepEqual(
+    resolveEpisodeAudioBadges({
+      title: 'Sousou no Frieren - EP 1',
+      seriesAudioType: 'LEG',
+    }),
+    ['LEG']
+  );
+  assert.deepEqual(
+    resolveEpisodeAudioBadges({
+      title: 'Anime X - EP 2',
+      options: [{ label: 'Vidstreaming', audioType: 'DUB' }],
+    }),
+    ['DUB']
+  );
+});
+
+
 
