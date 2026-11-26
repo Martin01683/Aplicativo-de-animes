@@ -2285,15 +2285,6 @@ export function AnimeDetailView({
                                       {finaleBadge}
                                     </span>
                                   )}
-                                  {epOffline?.status === 'completed' && (
-                                    <span
-                                      data-episode-offline-badge="true"
-                                      className="inline-flex shrink-0 items-center gap-1 rounded border border-emerald-500/40 bg-emerald-500/15 px-1.5 py-[1px] text-[10px] font-semibold leading-tight text-emerald-300"
-                                    >
-                                      <HardDrive className="h-2.5 w-2.5 shrink-0" />
-                                      <span>Offline</span>
-                                    </span>
-                                  )}
                                 </div>
 
                                 {epTitleLoading ? (

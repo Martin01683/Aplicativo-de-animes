@@ -195,7 +195,11 @@ describe('offline video download engine helpers', () => {
 
     const animeDetail = readRepoFile('src/components/AnimeDetailView.tsx');
     assert.match(animeDetail, /data-episode-download-btn="true"/);
-    assert.match(animeDetail, /data-episode-offline-badge="true"/);
+    assert.doesNotMatch(
+      animeDetail,
+      /data-episode-offline-badge="true"/,
+      'Episode cards already show the "Salvo" pill button so an extra "Offline" tag is redundant'
+    );
 
     const settings = readRepoFile('src/components/SettingsModal.tsx');
     assert.match(settings, /data-offline-downloads-section="true"/);
