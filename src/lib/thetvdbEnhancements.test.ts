@@ -289,6 +289,8 @@ describe('TheTVDB and TheXEM metadata enhancements', () => {
     assert.equal(details.episodes[2].finaleType, 'series');
     assert.equal(details.contentRating, '14');
     assert.equal(details.airsTime, '23:00');
+    assert.equal(details.originalCountry, 'Japão');
+    assert.equal(details.originalLanguage, 'Japonês');
     assert.deepEqual(details.seasonNames, { 2: 'Entertainment District Arc' });
     assert.equal(details.externalIds?.imdbId, 'tt1234567');
     assert.equal(details.externalIds?.tmdbId, 95479);
@@ -419,6 +421,7 @@ describe('TheTVDB and TheXEM metadata enhancements', () => {
     assert.ok(parsed);
     assert.equal(parsed.contentRating, 'TV-14');
     assert.equal(parsed.airsTime, '11:15 PM');
+    assert.equal(parsed.originalLanguage, 'Japonês');
     assert.equal(parsed.externalIds?.imdbId, 'tt9335498');
     assert.equal(parsed.externalIds?.tmdbId, 85937);
     assert.equal(parsed.externalIds?.malId, 38000);

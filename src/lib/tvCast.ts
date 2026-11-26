@@ -174,6 +174,60 @@ export function formatCastDurationMs(ms: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+export function computeCastSeekPositionMs(
+  clientX: number,
+  trackLeft: number,
+  trackWidth: number,
+  durationMs: number
+): number {
+  const safeDuration = Number.isFinite(durationMs) && durationMs > 0 ? Math.round(durationMs) : 0;
+  if (safeDuration <= 0 || !Number.isFinite(trackWidth) || trackWidth <= 0 || !Number.isFinite(clientX)) {
+    return 0;
+  }
+  const ratio = Math.max(0, Math.min(1, (clientX - trackLeft) / trackWidth));
+  const rawMs = ratio * safeDuration;
+  const snappedMs = safeDuration >= 1000 ? Math.round(rawMs / 1000) * 1000 : Math.round(rawMs);
+  return Math.max(0, Math.min(safeDuration, snappedMs));
+}
+
+export function computeCastVolumeLevel(
+  clientX: number,
+  trackLeft: number,
+  trackWidth: number
+): number {
+  if (!Number.isFinite(trackWidth) || trackWidth <= 0 || !Number.isFinite(clientX)) {
+    return 0;
+  }
+  const ratio = Math.max(0, Math.min(1, (clientX - trackLeft) / trackWidth));
+  return Math.round(ratio * 20) / 20;
+}
+
+export function resolveCastDisplayedPositionMs(params: {
+  livePositionMs: number;
+  durationMs: number;
+  scrubPositionMs: number | null;
+  pendingSeekMs: number | null;
+  pendingSeekExpired?: boolean;
+}): number {
+  const maxMs = Math.max(
+    Number.isFinite(params.durationMs) ? params.durationMs : 0,
+    Number.isFinite(params.livePositionMs) ? params.livePositionMs : 0,
+    0
+  );
+  const clamp = (v: number) => Math.max(0, Math.min(maxMs > 0 ? maxMs : v, Math.round(v)));
+  if (params.scrubPositionMs !== null && Number.isFinite(params.scrubPositionMs)) {
+    return clamp(params.scrubPositionMs);
+  }
+  if (
+    params.pendingSeekMs !== null &&
+    Number.isFinite(params.pendingSeekMs) &&
+    !params.pendingSeekExpired
+  ) {
+    return clamp(params.pendingSeekMs);
+  }
+  return clamp(Number.isFinite(params.livePositionMs) ? params.livePositionMs : 0);
+}
+
 export function formatCastProtocolLabel(protocol: TvCastProtocolKind | ''): string {
   if (protocol === 'chromecast') return 'Chromecast / Android TV';
   if (protocol === 'dlna') return 'Smart TV (DLNA)';

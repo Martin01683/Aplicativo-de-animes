@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import {
   Cast,
   Check,
@@ -23,6 +30,8 @@ import {
 import {
   addManualTvCastDevice,
   addTvCastDevicesListener,
+  computeCastSeekPositionMs,
+  computeCastVolumeLevel,
   discoverTvCastDevicesDetailed,
   formatCastDeliveryLabel,
   formatCastDurationMs,
@@ -30,6 +39,7 @@ import {
   formatCastStatusLabel,
   isNativeAndroidCastSupported,
   prepareExternalTvCast,
+  resolveCastDisplayedPositionMs,
   startNativeTvCast,
   stopTvCastDiscovery,
   tvCastNextEpisode,
@@ -82,6 +92,78 @@ export function TvCastModal({
   const [manualPort, setManualPort] = useState('8009');
   const [copiedLink, setCopiedLink] = useState(false);
   const [preparingExternal, setPreparingExternal] = useState(false);
+
+  // Smooth press-hold-drag-release state for TV timeline & volume sliders
+  const [scrubPositionMs, setScrubPositionMs] = useState<number | null>(null);
+  const [pendingSeek, setPendingSeek] = useState<{
+    targetMs: number;
+    episodeKey: string;
+    expiresAt: number;
+  } | null>(null);
+  const [dragVolume, setDragVolume] = useState<number | null>(null);
+  const [pendingVolume, setPendingVolume] = useState<{ level: number; expiresAt: number } | null>(
+    null
+  );
+
+  const seekTrackRef = useRef<HTMLDivElement | null>(null);
+  const activeSeekPointerIdRef = useRef<number | null>(null);
+  const scrubPositionRef = useRef<number | null>(null);
+
+  const volumeTrackRef = useRef<HTMLDivElement | null>(null);
+  const activeVolumePointerIdRef = useRef<number | null>(null);
+  const dragVolumeRef = useRef<number | null>(null);
+
+  const castEpisodeKey = `${castState.deviceId}|${castState.episodeUrl || castState.streamUrl || castState.episodeTitle}`;
+
+  useEffect(() => {
+    if (!open || !castState.active) {
+      activeSeekPointerIdRef.current = null;
+      scrubPositionRef.current = null;
+      activeVolumePointerIdRef.current = null;
+      dragVolumeRef.current = null;
+      setScrubPositionMs(null);
+      setPendingSeek(null);
+      setDragVolume(null);
+      setPendingVolume(null);
+    }
+  }, [castState.active, open]);
+
+  useEffect(() => {
+    if (!pendingSeek) return;
+    if (
+      pendingSeek.episodeKey !== castEpisodeKey ||
+      Math.abs(castState.positionMs - pendingSeek.targetMs) <= 4000
+    ) {
+      setPendingSeek(null);
+      return;
+    }
+    const remaining = pendingSeek.expiresAt - Date.now();
+    if (remaining <= 0) {
+      setPendingSeek(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setPendingSeek((cur) => (cur && cur.expiresAt <= Date.now() ? null : cur));
+    }, remaining);
+    return () => window.clearTimeout(timer);
+  }, [castEpisodeKey, castState.positionMs, pendingSeek]);
+
+  useEffect(() => {
+    if (!pendingVolume) return;
+    if (Math.abs(castState.volume - pendingVolume.level) <= 0.06) {
+      setPendingVolume(null);
+      return;
+    }
+    const remaining = pendingVolume.expiresAt - Date.now();
+    if (remaining <= 0) {
+      setPendingVolume(null);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setPendingVolume((cur) => (cur && cur.expiresAt <= Date.now() ? null : cur));
+    }, remaining);
+    return () => window.clearTimeout(timer);
+  }, [castState.volume, pendingVolume]);
 
   const canAutoDiscover = isNativeAndroid || lanDiscoverySupported;
 
@@ -144,6 +226,214 @@ export function TvCastModal({
 
   const isPlayingOrBuffering =
     castState.status === 'playing' || castState.status === 'buffering' || castState.status === 'connecting';
+
+  const seekMaxMs = Math.max(castState.durationMs, castState.positionMs, 1000);
+  const displayedPositionMs = resolveCastDisplayedPositionMs({
+    livePositionMs: castState.positionMs,
+    durationMs: seekMaxMs,
+    scrubPositionMs,
+    pendingSeekMs: pendingSeek && pendingSeek.episodeKey === castEpisodeKey ? pendingSeek.targetMs : null,
+  });
+  const isScrubbing = scrubPositionMs !== null;
+  const seekProgressPct = Math.max(0, Math.min(100, (displayedPositionMs / seekMaxMs) * 100));
+  const previewBubblePct = Math.max(8, Math.min(92, seekProgressPct));
+
+  const displayedVolume =
+    dragVolume !== null
+      ? dragVolume
+      : pendingVolume !== null
+        ? pendingVolume.level
+        : castState.volume;
+  const isDraggingVolume = dragVolume !== null;
+  const volumePct = Math.max(0, Math.min(100, displayedVolume * 100));
+
+  const commitSeekPosition = (targetMs: number) => {
+    const clamped = Math.max(0, Math.min(seekMaxMs, Math.round(targetMs)));
+    setPendingSeek({
+      targetMs: clamped,
+      episodeKey: castEpisodeKey,
+      expiresAt: Date.now() + 4500,
+    });
+    void tvCastSeek(clamped);
+  };
+
+  const handleRelativeSeek = (deltaMs: number) => {
+    if (castState.durationMs > 0) {
+      commitSeekPosition(displayedPositionMs + deltaMs);
+    } else {
+      setPendingSeek(null);
+      void tvCastSeekBy(deltaMs);
+    }
+  };
+
+  const updateScrubFromClientX = (clientX: number): number => {
+    const el = seekTrackRef.current;
+    if (!el) return displayedPositionMs;
+    const rect = el.getBoundingClientRect();
+    const nextMs = computeCastSeekPositionMs(clientX, rect.left, rect.width, seekMaxMs);
+    scrubPositionRef.current = nextMs;
+    setScrubPositionMs(nextMs);
+    return nextMs;
+  };
+
+  const handleSeekPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    activeSeekPointerIdRef.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore if capture is unsupported
+    }
+    updateScrubFromClientX(e.clientX);
+  };
+
+  const handleSeekPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeSeekPointerIdRef.current !== e.pointerId) return;
+    e.preventDefault();
+    updateScrubFromClientX(e.clientX);
+  };
+
+  const handleSeekPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeSeekPointerIdRef.current !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    activeSeekPointerIdRef.current = null;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+    const el = seekTrackRef.current;
+    const finalMs = el
+      ? computeCastSeekPositionMs(
+          e.clientX,
+          el.getBoundingClientRect().left,
+          el.getBoundingClientRect().width,
+          seekMaxMs
+        )
+      : (scrubPositionRef.current ?? displayedPositionMs);
+    scrubPositionRef.current = null;
+    setScrubPositionMs(null);
+    commitSeekPosition(finalMs);
+  };
+
+  const handleSeekPointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeSeekPointerIdRef.current !== e.pointerId) return;
+    activeSeekPointerIdRef.current = null;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+    scrubPositionRef.current = null;
+    setScrubPositionMs(null);
+  };
+
+  const handleSeekKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      commitSeekPosition(displayedPositionMs + 5000);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      commitSeekPosition(displayedPositionMs - 5000);
+    } else if (e.key === 'Home') {
+      e.preventDefault();
+      commitSeekPosition(0);
+    } else if (e.key === 'End') {
+      e.preventDefault();
+      commitSeekPosition(seekMaxMs);
+    }
+  };
+
+  const commitVolumeLevel = (level: number) => {
+    const clamped = Math.max(0, Math.min(1, level));
+    setPendingVolume({ level: clamped, expiresAt: Date.now() + 2500 });
+    void tvCastSetVolume(clamped);
+  };
+
+  const updateVolumeFromClientX = (clientX: number): number => {
+    const el = volumeTrackRef.current;
+    if (!el) return displayedVolume;
+    const rect = el.getBoundingClientRect();
+    const nextVol = computeCastVolumeLevel(clientX, rect.left, rect.width);
+    dragVolumeRef.current = nextVol;
+    setDragVolume(nextVol);
+    return nextVol;
+  };
+
+  const handleVolumePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    activeVolumePointerIdRef.current = e.pointerId;
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+    updateVolumeFromClientX(e.clientX);
+  };
+
+  const handleVolumePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeVolumePointerIdRef.current !== e.pointerId) return;
+    e.preventDefault();
+    updateVolumeFromClientX(e.clientX);
+  };
+
+  const handleVolumePointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeVolumePointerIdRef.current !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    activeVolumePointerIdRef.current = null;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+    const el = volumeTrackRef.current;
+    const finalVol = el
+      ? computeCastVolumeLevel(
+          e.clientX,
+          el.getBoundingClientRect().left,
+          el.getBoundingClientRect().width
+        )
+      : (dragVolumeRef.current ?? displayedVolume);
+    dragVolumeRef.current = null;
+    setDragVolume(null);
+    commitVolumeLevel(finalVol);
+  };
+
+  const handleVolumePointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (activeVolumePointerIdRef.current !== e.pointerId) return;
+    activeVolumePointerIdRef.current = null;
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // ignore
+    }
+    dragVolumeRef.current = null;
+    setDragVolume(null);
+  };
+
+  const handleVolumeKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      commitVolumeLevel(displayedVolume + 0.05);
+    } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+      e.preventDefault();
+      commitVolumeLevel(displayedVolume - 0.05);
+    }
+  };
 
   const handleSelectDevice = async (device: TvCastDevice) => {
     if (!mediaPayload) {
@@ -346,20 +636,52 @@ export function TvCastModal({
 
               {castState.deliveryMode !== 'lan-link' && (
                 <>
-                  {/* Remote Seekbar */}
+                  {/* Remote Seekbar — press, hold, drag smoothly, and seek on release */}
                   <div className="space-y-1">
-                    <input
-                      type="range"
+                    <div
+                      ref={seekTrackRef}
+                      role="slider"
+                      tabIndex={0}
+                      data-cast-seekbar="true"
                       aria-label="Posição na TV"
-                      min={0}
-                      max={Math.max(castState.durationMs, castState.positionMs, 1000)}
-                      step={1000}
-                      value={castState.positionMs}
-                      onChange={(e) => void tvCastSeek(Number(e.target.value))}
-                      className="h-1.5 w-full cursor-pointer accent-[#f97316]"
-                    />
+                      aria-valuemin={0}
+                      aria-valuemax={seekMaxMs}
+                      aria-valuenow={displayedPositionMs}
+                      aria-valuetext={formatCastDurationMs(displayedPositionMs)}
+                      onPointerDown={handleSeekPointerDown}
+                      onPointerMove={handleSeekPointerMove}
+                      onPointerUp={handleSeekPointerUp}
+                      onPointerCancel={handleSeekPointerCancel}
+                      onKeyDown={handleSeekKeyDown}
+                      className="group relative flex h-9 w-full touch-none select-none cursor-pointer items-center focus:outline-none"
+                    >
+                      {isScrubbing && (
+                        <div
+                          style={{ left: `${previewBubblePct}%` }}
+                          className="pointer-events-none absolute -top-7 -translate-x-1/2 rounded-md border border-[#f97316]/50 bg-[#151921] px-2 py-0.5 font-mono text-[11px] font-bold tabular-nums text-[#fb923c] shadow-lg"
+                        >
+                          {formatCastDurationMs(displayedPositionMs)}
+                        </div>
+                      )}
+                      <div className="relative h-2 w-full rounded-full bg-white/15">
+                        <div
+                          style={{ width: `${seekProgressPct}%` }}
+                          className="h-full rounded-full bg-[#f97316]"
+                        />
+                        <div
+                          style={{ left: `${seekProgressPct}%` }}
+                          className={`pointer-events-none absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#f97316] shadow-md transition-transform ${
+                            isScrubbing
+                              ? 'h-5 w-5 scale-110 ring-4 ring-[#f97316]/35'
+                              : 'h-4 w-4 ring-2 ring-white/25 group-hover:scale-110'
+                          }`}
+                        />
+                      </div>
+                    </div>
                     <div className="flex justify-between font-mono text-[11px] tabular-nums text-slate-400">
-                      <span>{formatCastDurationMs(castState.positionMs)}</span>
+                      <span className={isScrubbing ? 'font-semibold text-[#fb923c]' : undefined}>
+                        {formatCastDurationMs(displayedPositionMs)}
+                      </span>
                       <span>{formatCastDurationMs(castState.durationMs)}</span>
                     </div>
                   </div>
@@ -369,7 +691,10 @@ export function TvCastModal({
                     {castState.hasPrev && (
                       <button
                         type="button"
-                        onClick={() => void tvCastPrevEpisode()}
+                        onClick={() => {
+                          setPendingSeek(null);
+                          void tvCastPrevEpisode();
+                        }}
                         aria-label="Episódio anterior na TV"
                         className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
                       >
@@ -378,7 +703,7 @@ export function TvCastModal({
                     )}
                     <button
                       type="button"
-                      onClick={() => void tvCastSeekBy(-15_000)}
+                      onClick={() => handleRelativeSeek(-15_000)}
                       aria-label="Voltar 15 segundos na TV"
                       className="inline-flex h-10 items-center gap-1 rounded-xl border border-white/10 bg-white/5 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10"
                     >
@@ -403,7 +728,7 @@ export function TvCastModal({
                     </button>
                     <button
                       type="button"
-                      onClick={() => void tvCastSeekBy(15_000)}
+                      onClick={() => handleRelativeSeek(15_000)}
                       aria-label="Avançar 15 segundos na TV"
                       className="inline-flex h-10 items-center gap-1 rounded-xl border border-white/10 bg-white/5 px-3 text-xs font-semibold text-slate-200 hover:bg-white/10"
                     >
@@ -412,7 +737,7 @@ export function TvCastModal({
                     </button>
                     <button
                       type="button"
-                      onClick={() => void tvCastSeekBy(skipIntroSeconds * 1000)}
+                      onClick={() => handleRelativeSeek(skipIntroSeconds * 1000)}
                       title={`Pular abertura (+${skipIntroSeconds}s)`}
                       className="inline-flex h-10 items-center rounded-xl border border-[#f97316]/40 bg-[#f97316]/12 px-2.5 font-mono text-xs font-bold text-[#fb923c] hover:bg-[#f97316]/20"
                     >
@@ -421,7 +746,10 @@ export function TvCastModal({
                     {castState.hasNext && (
                       <button
                         type="button"
-                        onClick={() => void tvCastNextEpisode()}
+                        onClick={() => {
+                          setPendingSeek(null);
+                          void tvCastNextEpisode();
+                        }}
                         aria-label="Próximo episódio na TV"
                         className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-slate-200 hover:bg-white/10"
                       >
@@ -430,21 +758,47 @@ export function TvCastModal({
                     )}
                   </div>
 
-                  {/* Volume Slider */}
+                  {/* Volume Slider — drag smoothly and apply on release */}
                   <div className="flex items-center gap-2.5 pt-1">
                     <Volume2 className="h-4 w-4 shrink-0 text-slate-400" />
-                    <input
-                      type="range"
+                    <div
+                      ref={volumeTrackRef}
+                      role="slider"
+                      tabIndex={0}
+                      data-cast-volume-slider="true"
                       aria-label="Volume da TV"
-                      min={0}
-                      max={1}
-                      step={0.05}
-                      value={castState.volume}
-                      onChange={(e) => void tvCastSetVolume(Number(e.target.value))}
-                      className="h-1 flex-1 cursor-pointer accent-[#f97316]"
-                    />
-                    <span className="w-9 text-right font-mono text-[11px] tabular-nums text-slate-400">
-                      {Math.round(castState.volume * 100)}%
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={Math.round(volumePct)}
+                      aria-valuetext={`${Math.round(volumePct)}%`}
+                      onPointerDown={handleVolumePointerDown}
+                      onPointerMove={handleVolumePointerMove}
+                      onPointerUp={handleVolumePointerUp}
+                      onPointerCancel={handleVolumePointerCancel}
+                      onKeyDown={handleVolumeKeyDown}
+                      className="group relative flex h-8 flex-1 touch-none select-none cursor-pointer items-center focus:outline-none"
+                    >
+                      <div className="relative h-1.5 w-full rounded-full bg-white/15">
+                        <div
+                          style={{ width: `${volumePct}%` }}
+                          className="h-full rounded-full bg-[#f97316]"
+                        />
+                        <div
+                          style={{ left: `${volumePct}%` }}
+                          className={`pointer-events-none absolute top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-[#f97316] shadow-md transition-transform ${
+                            isDraggingVolume
+                              ? 'h-4.5 w-4.5 scale-110 ring-4 ring-[#f97316]/35'
+                              : 'h-3.5 w-3.5 ring-2 ring-white/20 group-hover:scale-110'
+                          }`}
+                        />
+                      </div>
+                    </div>
+                    <span
+                      className={`w-9 text-right font-mono text-[11px] tabular-nums ${
+                        isDraggingVolume ? 'font-semibold text-[#fb923c]' : 'text-slate-400'
+                      }`}
+                    >
+                      {Math.round(volumePct)}%
                     </span>
                   </div>
                 </>

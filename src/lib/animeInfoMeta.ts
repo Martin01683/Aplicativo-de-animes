@@ -1,6 +1,510 @@
 import { formatEpisodeReleaseDate } from './episodeAvailability';
 import type { AnimeDetails, AudioType, MediaKind } from './types';
 
+const LANGUAGE_PT_BR_MAP: Record<string, string> = {
+  ja: 'Japonês',
+  jpn: 'Japonês',
+  japanese: 'Japonês',
+  'japonês': 'Japonês',
+  japones: 'Japonês',
+  zh: 'Chinês',
+  zho: 'Chinês',
+  chi: 'Chinês',
+  chinese: 'Chinês',
+  'chinês': 'Chinês',
+  chines: 'Chinês',
+  cmn: 'Mandarim',
+  mandarin: 'Mandarim',
+  'mandarin chinese': 'Mandarim',
+  mandarim: 'Mandarim',
+  yue: 'Cantonês',
+  cantonese: 'Cantonês',
+  'cantonês': 'Cantonês',
+  taiwanese: 'Taiwanês',
+  ko: 'Coreano',
+  kor: 'Coreano',
+  korean: 'Coreano',
+  coreano: 'Coreano',
+  en: 'Inglês',
+  eng: 'Inglês',
+  english: 'Inglês',
+  'inglês': 'Inglês',
+  ingles: 'Inglês',
+  pt: 'Português',
+  por: 'Português',
+  'pt-br': 'Português',
+  'pt-pt': 'Português',
+  portuguese: 'Português',
+  'brazilian portuguese': 'Português',
+  'português': 'Português',
+  portugues: 'Português',
+  es: 'Espanhol',
+  spa: 'Espanhol',
+  spanish: 'Espanhol',
+  castilian: 'Espanhol',
+  espanhol: 'Espanhol',
+  fr: 'Francês',
+  fra: 'Francês',
+  fre: 'Francês',
+  french: 'Francês',
+  'francês': 'Francês',
+  frances: 'Francês',
+  de: 'Alemão',
+  deu: 'Alemão',
+  ger: 'Alemão',
+  german: 'Alemão',
+  'alemão': 'Alemão',
+  alemao: 'Alemão',
+  it: 'Italiano',
+  ita: 'Italiano',
+  italian: 'Italiano',
+  italiano: 'Italiano',
+  ru: 'Russo',
+  rus: 'Russo',
+  russian: 'Russo',
+  russo: 'Russo',
+  th: 'Tailandês',
+  tha: 'Tailandês',
+  thai: 'Tailandês',
+  'tailandês': 'Tailandês',
+  tailandes: 'Tailandês',
+  vi: 'Vietnamita',
+  vie: 'Vietnamita',
+  vietnamese: 'Vietnamita',
+  vietnamita: 'Vietnamita',
+  id: 'Indonésio',
+  ind: 'Indonésio',
+  indonesian: 'Indonésio',
+  'indonésio': 'Indonésio',
+  indonesio: 'Indonésio',
+  ms: 'Malaio',
+  msa: 'Malaio',
+  may: 'Malaio',
+  malay: 'Malaio',
+  malaio: 'Malaio',
+  hi: 'Hindi',
+  hin: 'Hindi',
+  hindi: 'Hindi',
+  ar: 'Árabe',
+  ara: 'Árabe',
+  arabic: 'Árabe',
+  'árabe': 'Árabe',
+  arabe: 'Árabe',
+  tr: 'Turco',
+  tur: 'Turco',
+  turkish: 'Turco',
+  turco: 'Turco',
+  pl: 'Polonês',
+  pol: 'Polonês',
+  polish: 'Polonês',
+  'polonês': 'Polonês',
+  polones: 'Polonês',
+  nl: 'Holandês',
+  nld: 'Holandês',
+  dut: 'Holandês',
+  dutch: 'Holandês',
+  flemish: 'Holandês',
+  'holandês': 'Holandês',
+  holandes: 'Holandês',
+  'neerlandês': 'Holandês',
+  sv: 'Sueco',
+  swe: 'Sueco',
+  swedish: 'Sueco',
+  sueco: 'Sueco',
+  no: 'Norueguês',
+  nor: 'Norueguês',
+  nob: 'Norueguês',
+  nno: 'Norueguês',
+  norwegian: 'Norueguês',
+  'norueguês': 'Norueguês',
+  noruegues: 'Norueguês',
+  da: 'Dinamarquês',
+  dan: 'Dinamarquês',
+  danish: 'Dinamarquês',
+  'dinamarquês': 'Dinamarquês',
+  dinamarques: 'Dinamarquês',
+  fi: 'Finlandês',
+  fin: 'Finlandês',
+  finnish: 'Finlandês',
+  'finlandês': 'Finlandês',
+  finlandes: 'Finlandês',
+  cs: 'Tcheco',
+  ces: 'Tcheco',
+  cze: 'Tcheco',
+  czech: 'Tcheco',
+  tcheco: 'Tcheco',
+  uk: 'Ucraniano',
+  ukr: 'Ucraniano',
+  ukrainian: 'Ucraniano',
+  ucraniano: 'Ucraniano',
+  he: 'Hebraico',
+  heb: 'Hebraico',
+  hebrew: 'Hebraico',
+  hebraico: 'Hebraico',
+  tl: 'Filipino',
+  tgl: 'Filipino',
+  fil: 'Filipino',
+  tagalog: 'Filipino',
+  filipino: 'Filipino',
+  el: 'Grego',
+  ell: 'Grego',
+  gre: 'Grego',
+  greek: 'Grego',
+  grego: 'Grego',
+  hu: 'Húngaro',
+  hun: 'Húngaro',
+  hungarian: 'Húngaro',
+  'húngaro': 'Húngaro',
+  ro: 'Romeno',
+  ron: 'Romeno',
+  rum: 'Romeno',
+  romanian: 'Romeno',
+  romeno: 'Romeno',
+  fa: 'Persa',
+  fas: 'Persa',
+  per: 'Persa',
+  persian: 'Persa',
+  farsi: 'Persa',
+  persa: 'Persa',
+  bn: 'Bengali',
+  ben: 'Bengali',
+  bengali: 'Bengali',
+  ta: 'Tâmil',
+  tam: 'Tâmil',
+  tamil: 'Tâmil',
+  'tâmil': 'Tâmil',
+  te: 'Télugo',
+  tel: 'Télugo',
+  telugu: 'Télugo',
+  'télugo': 'Télugo',
+  la: 'Latim',
+  lat: 'Latim',
+  latin: 'Latim',
+  latim: 'Latim',
+  und: 'Desconhecido',
+  unknown: 'Desconhecido',
+};
+
+const COUNTRY_PT_BR_MAP: Record<string, string> = {
+  jp: 'Japão',
+  jpn: 'Japão',
+  japan: 'Japão',
+  'japão': 'Japão',
+  japao: 'Japão',
+  cn: 'China',
+  chn: 'China',
+  china: 'China',
+  "people's republic of china": 'China',
+  prc: 'China',
+  kr: 'Coreia do Sul',
+  kor: 'Coreia do Sul',
+  'south korea': 'Coreia do Sul',
+  korea: 'Coreia do Sul',
+  'republic of korea': 'Coreia do Sul',
+  'korea, republic of': 'Coreia do Sul',
+  'coreia do sul': 'Coreia do Sul',
+  kp: 'Coreia do Norte',
+  prk: 'Coreia do Norte',
+  'north korea': 'Coreia do Norte',
+  'coreia do norte': 'Coreia do Norte',
+  tw: 'Taiwan',
+  twn: 'Taiwan',
+  taiwan: 'Taiwan',
+  'republic of china': 'Taiwan',
+  hk: 'Hong Kong',
+  hkg: 'Hong Kong',
+  'hong kong': 'Hong Kong',
+  us: 'Estados Unidos',
+  usa: 'Estados Unidos',
+  'united states': 'Estados Unidos',
+  'united states of america': 'Estados Unidos',
+  'u.s.': 'Estados Unidos',
+  'u.s.a.': 'Estados Unidos',
+  'estados unidos': 'Estados Unidos',
+  gb: 'Reino Unido',
+  gbr: 'Reino Unido',
+  uk: 'Reino Unido',
+  'united kingdom': 'Reino Unido',
+  'great britain': 'Reino Unido',
+  england: 'Reino Unido',
+  scotland: 'Reino Unido',
+  wales: 'Reino Unido',
+  'reino unido': 'Reino Unido',
+  ca: 'Canadá',
+  can: 'Canadá',
+  canada: 'Canadá',
+  'canadá': 'Canadá',
+  au: 'Austrália',
+  aus: 'Austrália',
+  australia: 'Austrália',
+  'austrália': 'Austrália',
+  nz: 'Nova Zelândia',
+  nzl: 'Nova Zelândia',
+  'new zealand': 'Nova Zelândia',
+  'nova zelândia': 'Nova Zelândia',
+  br: 'Brasil',
+  bra: 'Brasil',
+  brazil: 'Brasil',
+  brasil: 'Brasil',
+  pt: 'Portugal',
+  prt: 'Portugal',
+  portugal: 'Portugal',
+  es: 'Espanha',
+  esp: 'Espanha',
+  spain: 'Espanha',
+  espanha: 'Espanha',
+  fr: 'França',
+  fra: 'França',
+  france: 'França',
+  'frança': 'França',
+  franca: 'França',
+  de: 'Alemanha',
+  deu: 'Alemanha',
+  ger: 'Alemanha',
+  germany: 'Alemanha',
+  alemanha: 'Alemanha',
+  it: 'Itália',
+  ita: 'Itália',
+  italy: 'Itália',
+  'itália': 'Itália',
+  italia: 'Itália',
+  ru: 'Rússia',
+  rus: 'Rússia',
+  russia: 'Rússia',
+  'russian federation': 'Rússia',
+  'rússia': 'Rússia',
+  mx: 'México',
+  mex: 'México',
+  mexico: 'México',
+  'méxico': 'México',
+  ar: 'Argentina',
+  arg: 'Argentina',
+  argentina: 'Argentina',
+  cl: 'Chile',
+  chl: 'Chile',
+  chile: 'Chile',
+  co: 'Colômbia',
+  col: 'Colômbia',
+  colombia: 'Colômbia',
+  'colômbia': 'Colômbia',
+  in: 'Índia',
+  ind: 'Índia',
+  india: 'Índia',
+  'índia': 'Índia',
+  th: 'Tailândia',
+  tha: 'Tailândia',
+  thailand: 'Tailândia',
+  'tailândia': 'Tailândia',
+  tailandia: 'Tailândia',
+  vn: 'Vietnã',
+  vnm: 'Vietnã',
+  vietnam: 'Vietnã',
+  'viet nam': 'Vietnã',
+  'vietnã': 'Vietnã',
+  id: 'Indonésia',
+  idn: 'Indonésia',
+  indonesia: 'Indonésia',
+  'indonésia': 'Indonésia',
+  my: 'Malásia',
+  mys: 'Malásia',
+  malaysia: 'Malásia',
+  'malásia': 'Malásia',
+  ph: 'Filipinas',
+  phl: 'Filipinas',
+  philippines: 'Filipinas',
+  filipinas: 'Filipinas',
+  sg: 'Singapura',
+  sgp: 'Singapura',
+  singapore: 'Singapura',
+  singapura: 'Singapura',
+  cingapura: 'Singapura',
+  tr: 'Turquia',
+  tur: 'Turquia',
+  turkey: 'Turquia',
+  'türkiye': 'Turquia',
+  turquia: 'Turquia',
+  pl: 'Polônia',
+  pol: 'Polônia',
+  poland: 'Polônia',
+  'polônia': 'Polônia',
+  polonia: 'Polônia',
+  nl: 'Países Baixos',
+  nld: 'Países Baixos',
+  netherlands: 'Países Baixos',
+  'the netherlands': 'Países Baixos',
+  holland: 'Países Baixos',
+  'países baixos': 'Países Baixos',
+  holanda: 'Países Baixos',
+  be: 'Bélgica',
+  bel: 'Bélgica',
+  belgium: 'Bélgica',
+  'bélgica': 'Bélgica',
+  belgica: 'Bélgica',
+  ch: 'Suíça',
+  che: 'Suíça',
+  switzerland: 'Suíça',
+  'suíça': 'Suíça',
+  suica: 'Suíça',
+  at: 'Áustria',
+  aut: 'Áustria',
+  austria: 'Áustria',
+  'áustria': 'Áustria',
+  se: 'Suécia',
+  swe: 'Suécia',
+  sweden: 'Suécia',
+  'suécia': 'Suécia',
+  suecia: 'Suécia',
+  no: 'Noruega',
+  nor: 'Noruega',
+  norway: 'Noruega',
+  noruega: 'Noruega',
+  dk: 'Dinamarca',
+  dnk: 'Dinamarca',
+  denmark: 'Dinamarca',
+  dinamarca: 'Dinamarca',
+  fi: 'Finlândia',
+  fin: 'Finlândia',
+  finland: 'Finlândia',
+  'finlândia': 'Finlândia',
+  finlandia: 'Finlândia',
+  ie: 'Irlanda',
+  irl: 'Irlanda',
+  ireland: 'Irlanda',
+  irlanda: 'Irlanda',
+  za: 'África do Sul',
+  zaf: 'África do Sul',
+  'south africa': 'África do Sul',
+  'áfrica do sul': 'África do Sul',
+  eg: 'Egito',
+  egy: 'Egito',
+  egypt: 'Egito',
+  egito: 'Egito',
+  il: 'Israel',
+  isr: 'Israel',
+  israel: 'Israel',
+  ua: 'Ucrânia',
+  ukr: 'Ucrânia',
+  ukraine: 'Ucrânia',
+  'ucrânia': 'Ucrânia',
+  ucrania: 'Ucrânia',
+  cz: 'República Tcheca',
+  cze: 'República Tcheca',
+  'czech republic': 'República Tcheca',
+  czechia: 'República Tcheca',
+  'república tcheca': 'República Tcheca',
+  'tchéquia': 'República Tcheca',
+  hu: 'Hungria',
+  hun: 'Hungria',
+  hungary: 'Hungria',
+  hungria: 'Hungria',
+  ro: 'Romênia',
+  rou: 'Romênia',
+  romania: 'Romênia',
+  'romênia': 'Romênia',
+  romenia: 'Romênia',
+  gr: 'Grécia',
+  grc: 'Grécia',
+  greece: 'Grécia',
+  'grécia': 'Grécia',
+  grecia: 'Grécia',
+  su: 'União Soviética',
+  ussr: 'União Soviética',
+  'soviet union': 'União Soviética',
+  'união soviética': 'União Soviética',
+};
+
+let cachedPtBrLanguageNames: Intl.DisplayNames | null | undefined;
+let cachedPtBrRegionNames: Intl.DisplayNames | null | undefined;
+
+function getPtBrDisplayNames(type: 'language' | 'region'): Intl.DisplayNames | null {
+  if (type === 'language') {
+    if (cachedPtBrLanguageNames !== undefined) return cachedPtBrLanguageNames;
+    try {
+      cachedPtBrLanguageNames = new Intl.DisplayNames(['pt-BR'], { type: 'language', fallback: 'none' });
+    } catch {
+      cachedPtBrLanguageNames = null;
+    }
+    return cachedPtBrLanguageNames;
+  }
+  if (cachedPtBrRegionNames !== undefined) return cachedPtBrRegionNames;
+  try {
+    cachedPtBrRegionNames = new Intl.DisplayNames(['pt-BR'], { type: 'region', fallback: 'none' });
+  } catch {
+    cachedPtBrRegionNames = null;
+  }
+  return cachedPtBrRegionNames;
+}
+
+function capitalizePtBrLabel(label: string): string {
+  const clean = label.trim();
+  if (!clean) return '';
+  return clean.charAt(0).toLocaleUpperCase('pt-BR') + clean.slice(1);
+}
+
+export function translateLanguageToPtBr(raw: string): string {
+  const clean = raw.replace(/\s+/g, ' ').trim();
+  if (!clean) return '';
+  const direct = LANGUAGE_PT_BR_MAP[clean.toLowerCase()];
+  if (direct) return direct;
+  if (/^[a-z]{2,3}(?:-[a-z]{2,4})?$/i.test(clean)) {
+    try {
+      const resolved = getPtBrDisplayNames('language')?.of(clean.toLowerCase());
+      if (resolved && resolved.toLowerCase() !== clean.toLowerCase()) {
+        return capitalizePtBrLabel(resolved);
+      }
+    } catch {
+      // ignore invalid language tags
+    }
+  }
+  return clean;
+}
+
+export function translateCountryToPtBr(raw: string): string {
+  const clean = raw.replace(/\s+/g, ' ').trim();
+  if (!clean) return '';
+  const direct = COUNTRY_PT_BR_MAP[clean.toLowerCase()];
+  if (direct) return direct;
+  if (/^[a-z]{2}$/i.test(clean)) {
+    try {
+      const resolved = getPtBrDisplayNames('region')?.of(clean.toUpperCase());
+      if (resolved && resolved.toLowerCase() !== clean.toLowerCase()) {
+        return capitalizePtBrLabel(resolved);
+      }
+    } catch {
+      // ignore invalid region codes
+    }
+  }
+  return clean;
+}
+
+function translateMetaList(
+  raw: string | undefined,
+  translator: (item: string) => string
+): string[] {
+  const parsed = parseMetaValueList(raw);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of parsed) {
+    const translated = translator(item);
+    if (!translated) continue;
+    const key = translated.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(translated);
+  }
+  return out;
+}
+
+export function translateLanguageValueToPtBr(raw?: string): string | undefined {
+  const items = translateMetaList(raw, translateLanguageToPtBr);
+  return items.length > 0 ? items.join(', ') : undefined;
+}
+
+export function translateCountryValueToPtBr(raw?: string): string | undefined {
+  const items = translateMetaList(raw, translateCountryToPtBr);
+  return items.length > 0 ? items.join(', ') : undefined;
+}
+
 export type AnimeMetaKind =
   | 'status'
   | 'rating'
@@ -189,7 +693,7 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
     });
   }
 
-  const languages = parseMetaValueList(anime.originalLanguage);
+  const languages = translateMetaList(anime.originalLanguage, translateLanguageToPtBr);
   if (languages.length > 0) {
     const isMulti = languages.length > 1;
     const joined = languages.join(', ');
@@ -203,7 +707,7 @@ export function buildAnimeInfoMetaItems(anime: AnimeDetails): AnimeInfoMetaItem[
     });
   }
 
-  const countries = parseMetaValueList(anime.originalCountry);
+  const countries = translateMetaList(anime.originalCountry, translateCountryToPtBr);
   if (countries.length > 0) {
     const isMulti = countries.length > 1;
     const joined = countries.join(', ');

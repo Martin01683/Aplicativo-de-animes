@@ -10,6 +10,10 @@ import {
   resolveEpisodeAudioBadges,
   resolveEpisodeMediaKind,
   resolveVisibleGenres,
+  translateCountryToPtBr,
+  translateCountryValueToPtBr,
+  translateLanguageToPtBr,
+  translateLanguageValueToPtBr,
 } from './animeInfoMeta';
 import type { AnimeDetails } from './types';
 
@@ -326,6 +330,36 @@ test('buildAnimeInfoMetaItems expands multi-value studios/networks to fullWidth 
     items.slice(firstFullIdx).every((i) => i.fullWidth),
     true
   );
+});
+
+test('localizes originalLanguage and originalCountry from English names and ISO codes to PT-BR', () => {
+  assert.equal(translateLanguageToPtBr('Japanese'), 'Japonês');
+  assert.equal(translateLanguageToPtBr('jpn'), 'Japonês');
+  assert.equal(translateLanguageToPtBr('zho'), 'Chinês');
+  assert.equal(translateLanguageToPtBr('Korean'), 'Coreano');
+  assert.equal(translateLanguageToPtBr('English'), 'Inglês');
+
+  assert.equal(translateCountryToPtBr('Japan'), 'Japão');
+  assert.equal(translateCountryToPtBr('jpn'), 'Japão');
+  assert.equal(translateCountryToPtBr('South Korea'), 'Coreia do Sul');
+  assert.equal(translateCountryToPtBr('United States'), 'Estados Unidos');
+  assert.equal(translateCountryToPtBr('chn'), 'China');
+
+  assert.equal(translateLanguageValueToPtBr('Japanese, jpn, English'), 'Japonês, Inglês');
+  assert.equal(translateCountryValueToPtBr('Japan, United States'), 'Japão, Estados Unidos');
+
+  const items = buildAnimeInfoMetaItems(
+    makeAnime({
+      originalLanguage: 'Japanese',
+      originalCountry: 'Japan',
+    })
+  );
+  const langItem = items.find((i) => i.id === 'language');
+  const countryItem = items.find((i) => i.id === 'country');
+  assert.equal(langItem?.value, 'Japonês');
+  assert.deepEqual(langItem?.items, ['Japonês']);
+  assert.equal(countryItem?.value, 'Japão');
+  assert.deepEqual(countryItem?.items, ['Japão']);
 });
 
 

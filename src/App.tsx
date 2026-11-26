@@ -511,6 +511,8 @@ export default function App() {
   routeRef.current = route;
   routeStackRef.current = routeStack;
 
+  const activeRouteUrl = route.view === 'catalog' ? '' : route.url;
+
   // Preserve exact scroll position when leaving/returning to CatalogView (zero re-mount)
   useEffect(() => {
     const prevView = prevRouteViewRef.current;
@@ -524,7 +526,7 @@ export default function App() {
     } else if (route.view !== 'catalog') {
       window.scrollTo(0, 0);
     }
-  }, [route.view, route.view === 'catalog' ? '' : route.url]);
+  }, [route.view, activeRouteUrl]);
 
   useEffect(() => {
     saveActiveRouteSession({ routeStack, activeSection });

@@ -446,22 +446,28 @@ export function AnimeDetailView({
     [anime.episodes, anime.title, effectivePoster]
   );
 
-  const latestEpisode = pickLatestAnimeEpisode(playableEpisodes, displayTitle, effectivePoster);
+  const latestEpisode = useMemo(
+    () => pickLatestAnimeEpisode(playableEpisodes, displayTitle, effectivePoster),
+    [playableEpisodes, displayTitle, effectivePoster]
+  );
   const firstEpisode = playableEpisodes[0];
   const lastEpisodeItem =
     playableEpisodes.length > 1 ? playableEpisodes[playableEpisodes.length - 1] : null;
-  const quickLastEpisode =
-    !isMovie && latestEpisode && firstEpisode && latestEpisode.episodeUrl !== firstEpisode.url
-      ? {
-          url: latestEpisode.episodeUrl,
-          label: latestEpisode.episodeLabel || latestEpisode.episodeTitle,
-        }
-      : !isMovie && lastEpisodeItem && firstEpisode && lastEpisodeItem.url !== firstEpisode.url
+  const quickLastEpisode = useMemo(
+    () =>
+      !isMovie && latestEpisode && firstEpisode && latestEpisode.episodeUrl !== firstEpisode.url
         ? {
-            url: lastEpisodeItem.url,
-            label: formatEpisodeCardBadge(lastEpisodeItem, isMovie),
+            url: latestEpisode.episodeUrl,
+            label: latestEpisode.episodeLabel || latestEpisode.episodeTitle,
           }
-        : null;
+        : !isMovie && lastEpisodeItem && firstEpisode && lastEpisodeItem.url !== firstEpisode.url
+          ? {
+              url: lastEpisodeItem.url,
+              label: formatEpisodeCardBadge(lastEpisodeItem, isMovie),
+            }
+          : null,
+    [firstEpisode, isMovie, lastEpisodeItem, latestEpisode]
+  );
 
   const baseSeasonGroups = useMemo(() => groupEpisodesBySeason(activeEpisodes), [activeEpisodes]);
 

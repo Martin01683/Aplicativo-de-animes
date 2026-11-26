@@ -6,12 +6,15 @@ import { fileURLToPath } from 'node:url';
 import {
   addManualTvCastDevice,
   buildCastMediaPayload,
+  computeCastSeekPositionMs,
+  computeCastVolumeLevel,
   dedupeCastDevices,
   formatCastDeliveryLabel,
   formatCastDurationMs,
   formatCastProtocolLabel,
   formatCastStatusLabel,
   IDLE_TV_CAST_STATE,
+  resolveCastDisplayedPositionMs,
   sanitizeCastStateSnapshot,
   type TvCastDevice,
 } from './tvCast.ts';
@@ -98,6 +101,53 @@ describe('tvCast helpers', () => {
     assert.equal(sanitized.active, true);
     assert.equal(sanitized.volume, 1);
     assert.deepEqual(sanitizeCastStateSnapshot(null), IDLE_TV_CAST_STATE);
+  });
+
+  it('computes clamped seek/volume positions and preserves drag/pending seek targets without snapping back', () => {
+    // 23:39 = 1,419,000 ms on a 200px wide track starting at x=50
+    assert.equal(computeCastSeekPositionMs(50, 50, 200, 1_419_000), 0);
+    assert.equal(computeCastSeekPositionMs(150, 50, 200, 1_419_000), 710_000);
+    assert.equal(computeCastSeekPositionMs(300, 50, 200, 1_419_000), 1_419_000);
+    assert.equal(computeCastSeekPositionMs(-20, 50, 200, 1_419_000), 0);
+
+    assert.equal(computeCastVolumeLevel(50, 50, 200), 0);
+    assert.equal(computeCastVolumeLevel(150, 50, 200), 0.5);
+    assert.equal(computeCastVolumeLevel(260, 50, 200), 1);
+
+    // While user holds/drags, scrubPositionMs owns the bar even if live TV poll is still at 0:00
+    assert.equal(
+      resolveCastDisplayedPositionMs({
+        livePositionMs: 0,
+        durationMs: 1_419_000,
+        scrubPositionMs: 600_000,
+        pendingSeekMs: 300_000,
+      }),
+      600_000
+    );
+
+    // After release, pendingSeekMs holds until TV catches up or expires
+    assert.equal(
+      resolveCastDisplayedPositionMs({
+        livePositionMs: 0,
+        durationMs: 1_419_000,
+        scrubPositionMs: null,
+        pendingSeekMs: 600_000,
+        pendingSeekExpired: false,
+      }),
+      600_000
+    );
+
+    // Once expired/settled, live TV position takes over cleanly
+    assert.equal(
+      resolveCastDisplayedPositionMs({
+        livePositionMs: 602_000,
+        durationMs: 1_419_000,
+        scrubPositionMs: null,
+        pendingSeekMs: 600_000,
+        pendingSeekExpired: true,
+      }),
+      602_000
+    );
   });
 });
 
@@ -210,6 +260,13 @@ describe('Android background TV Cast architecture & UI wiring guards', () => {
     assert.match(modalTsx, /data-cast-wifi-discovery="true"/);
     assert.match(modalTsx, /canAutoDiscover\s*=\s*isNativeAndroid\s*\|\|\s*lanDiscoverySupported/);
     assert.match(modalTsx, /discoverTvCastDevicesDetailed/);
+
+    // Seekbar must support touch press-hold-drag-release without flooding tvCastSeek on every drag pixel
+    assert.match(modalTsx, /data-cast-seekbar="true"/);
+    assert.match(modalTsx, /touch-none/);
+    assert.match(modalTsx, /setPointerCapture/);
+    assert.match(modalTsx, /onPointerUp=\{handleSeekPointerUp\}/);
+    assert.doesNotMatch(modalTsx, /onChange=\{\(e\) => void tvCastSeek/);
   });
 });
 

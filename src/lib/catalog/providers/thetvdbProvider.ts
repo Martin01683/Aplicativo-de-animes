@@ -1,5 +1,9 @@
 import * as cheerio from 'cheerio';
 import {
+  translateCountryValueToPtBr,
+  translateLanguageValueToPtBr,
+} from '../../animeInfoMeta.ts';
+import {
   adjustBatchReleaseAirDates,
   adjustMultiEpisodeAirTimes,
   inferSeriesFinaleType,
@@ -252,8 +256,8 @@ function inferTvdbMediaType(
 ): CanonicalMediaType {
   if (rawType && /movie/i.test(rawType)) return 'movie';
   const isAnime =
-    /^(?:jpn|ja|japan)$/i.test(country || '') ||
-    /^(?:jpn|ja|japanese)$/i.test(language || '') ||
+    /^(?:jpn|ja|jp|japan|jap[aã]o)$/i.test(country || '') ||
+    /^(?:jpn|ja|japanese|japon[eê]s)$/i.test(language || '') ||
     Boolean(genres?.some((g) => /anime/i.test(g)));
   return isAnime ? 'anime' : 'series';
 }
@@ -431,8 +435,8 @@ export function parseTvdbWebSearchHit(hit: TvdbWebSearchHit): TvdbRichMatch | nu
     studio,
     network,
     genres,
-    originalCountry: cleanText(hit.country) || undefined,
-    originalLanguage: cleanText(hit.primary_language) || undefined,
+    originalCountry: translateCountryValueToPtBr(cleanText(hit.country)) || undefined,
+    originalLanguage: translateLanguageValueToPtBr(cleanText(hit.primary_language)) || undefined,
     externalIds,
     score: 0,
   };
@@ -1199,8 +1203,8 @@ export function parseTvdbPublicHtml(
     ...(Object.keys(seasonNames).length > 0 ? { seasonNames } : {}),
     studio,
     network,
-    originalCountry,
-    originalLanguage,
+    originalCountry: translateCountryValueToPtBr(originalCountry),
+    originalLanguage: translateLanguageValueToPtBr(originalLanguage),
     genres,
     audioType: null,
     episodes,
@@ -1962,8 +1966,8 @@ export async function fetchTheTvdbDetails(
             ...(Object.keys(v4SeasonNames).length > 0 ? { seasonNames: v4SeasonNames } : {}),
             studio,
             network,
-            originalCountry: d.originalCountry,
-            originalLanguage: d.originalLanguage,
+            originalCountry: translateCountryValueToPtBr(d.originalCountry),
+            originalLanguage: translateLanguageValueToPtBr(d.originalLanguage),
             genres: Array.from(
               new Set((d.genres || []).map((g) => translateGenre(g.name || '')).filter(Boolean))
             ),
