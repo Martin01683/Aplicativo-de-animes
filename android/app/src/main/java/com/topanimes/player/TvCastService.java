@@ -44,6 +44,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -155,8 +156,9 @@ public class TvCastService extends Service {
             o.put("lanStreamUrl", "");
             o.put("positionMs", 0L);
             o.put("durationMs", 0L);
-            o.put("volume", 1.0);
+            o.put("volume", 0.0);
             o.put("muted", false);
+            o.put("volumeSynced", false);
             o.put("hasPrev", false);
             o.put("hasNext", false);
             o.put("errorMessage", "");
@@ -227,8 +229,10 @@ public class TvCastService extends Service {
 
     private volatile long positionMs = 0L;
     private volatile long durationMs = 0L;
-    private volatile double volume = 1.0;
+    private volatile double volume = 0.0;
     private volatile boolean muted = false;
+    private volatile boolean volumeSynced = false;
+    private volatile long lastVolumeSetAtMs = 0L;
     private volatile long lastProgressPersistMs = 0L;
     private volatile long lastSeekTargetMs = -1L;
     private volatile long lastSeekRequestedAtMs = 0L;
@@ -386,6 +390,10 @@ public class TvCastService extends Service {
         sessionActive = true;
         status = "connecting";
         errorMessage = "";
+        volume = 0.0;
+        muted = false;
+        volumeSynced = false;
+        lastVolumeSetAtMs = 0L;
         lastSeekTargetMs = -1L;
         lastSeekRequestedAtMs = 0L;
         handledCompletionForEpisode = false;
@@ -503,6 +511,11 @@ public class TvCastService extends Service {
                 DlnaController dlna = new DlnaController(activeDevice);
                 synchronized (sessionLock) {
                     dlnaController = dlna;
+                }
+                // Sync the TV's actual volume & mute BEFORE loading or playing media
+                // so the app matches the TV instead of assuming 100%.
+                if (dlna.syncVolumeFromTv()) {
+                    publishCurrentState();
                 }
                 try {
                     dlna.loadAndPlay(targetUrl, mimeType, episodeTitle, seriesTitle, posterUrl, positionMs);
@@ -626,6 +639,7 @@ public class TvCastService extends Service {
 
     private void performSetVolume(double level) {
         try {
+            lastVolumeSetAtMs = System.currentTimeMillis();
             if (chromecastController != null) {
                 chromecastController.setVolume(level);
             } else if (dlnaController != null) {
@@ -633,6 +647,7 @@ public class TvCastService extends Service {
             }
             volume = level;
             muted = level <= 0.001;
+            volumeSynced = true;
             publishCurrentState();
         } catch (Exception e) {
             Log.w(TAG, "SetVolume failed: " + e.getMessage());
@@ -959,14 +974,17 @@ public class TvCastService extends Service {
             }
 
             String rangeHeader = reqHeaders.get("range");
+            boolean isHeadRequest = "HEAD".equals(method);
+            boolean likelyPlaylistRequest = pathOnly.endsWith(".m3u8") || TvCastProtocol.isHlsStreamUrl(targetUrl, "");
             HttpURLConnection conn = null;
             try {
                 LocalProxyPlugin.RedirectResult upstream = LocalProxyPlugin.openWithRedirects(
                     targetUrl,
                     safeRef,
                     "*/*",
-                    rangeHeader,
-                    20000
+                    isHeadRequest ? null : rangeHeader,
+                    20000,
+                    (isHeadRequest && !likelyPlaylistRequest) ? "HEAD" : "GET"
                 );
                 conn = upstream.connection;
                 int code = conn.getResponseCode();
@@ -1178,8 +1196,11 @@ public class TvCastService extends Service {
         sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
         sb.append("Access-Control-Allow-Headers: Range, Origin, Content-Type, Accept\r\n");
         sb.append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n");
+        boolean isHlsCt = contentType != null && contentType.toLowerCase(Locale.ROOT).contains("mpegurl");
         sb.append("transferMode.dlna.org: Streaming\r\n");
-        sb.append("contentFeatures.dlna.org: DLNA.ORG_OP=01;DLNA.ORG_CI=0\r\n");
+        sb.append("contentFeatures.dlna.org: DLNA.ORG_OP=")
+            .append(isHlsCt ? "10" : "01")
+            .append(";DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n");
         sb.append("Connection: close\r\n");
         if (contentType != null && !contentType.isEmpty()) {
             sb.append("Content-Type: ").append(contentType).append("\r\n");
@@ -1222,6 +1243,7 @@ public class TvCastService extends Service {
         private volatile String transportId = "";
         private volatile long mediaSessionId = -1L;
         private volatile boolean mediaLoaded = false;
+        private final CountDownLatch initialVolumeLatch = new CountDownLatch(1);
 
         private String pendingMediaUrl = "";
         private String pendingMimeType = "video/mp4";
@@ -1273,11 +1295,25 @@ public class TvCastService extends Service {
             reader.start();
 
             sendJson("receiver-0", TvCastProtocol.CAST_NS_CONNECTION, "{\"type\":\"CONNECT\",\"origin\":{}}");
-            JSONObject launch = new JSONObject();
-            launch.put("type", "LAUNCH");
-            launch.put("appId", TvCastProtocol.CHROMECAST_DEFAULT_MEDIA_RECEIVER_APP_ID);
-            launch.put("requestId", requestIdSeq.getAndIncrement());
-            sendJson("receiver-0", TvCastProtocol.CAST_NS_RECEIVER, launch.toString());
+            // Query receiver status first so the TV's real volume & mute are synced BEFORE launching/loading media.
+            JSONObject statusReq = new JSONObject();
+            statusReq.put("type", "GET_STATUS");
+            statusReq.put("requestId", requestIdSeq.getAndIncrement());
+            sendJson("receiver-0", TvCastProtocol.CAST_NS_RECEIVER, statusReq.toString());
+            try {
+                initialVolumeLatch.await(1500L, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            if (closed || gen != castSessionGen.get()) return;
+
+            if (transportId.isEmpty() && !mediaLoaded) {
+                JSONObject launch = new JSONObject();
+                launch.put("type", "LAUNCH");
+                launch.put("appId", TvCastProtocol.CHROMECAST_DEFAULT_MEDIA_RECEIVER_APP_ID);
+                launch.put("requestId", requestIdSeq.getAndIncrement());
+                sendJson("receiver-0", TvCastProtocol.CAST_NS_RECEIVER, launch.toString());
+            }
         }
 
         private void readLoop() {
@@ -1320,14 +1356,22 @@ public class TvCastService extends Service {
                 if (TvCastProtocol.CAST_NS_RECEIVER.equals(ns) && "RECEIVER_STATUS".equals(type)) {
                     JSONObject st = json.optJSONObject("status");
                     if (st == null) return;
+                    boolean volumeUpdated = false;
                     JSONObject volObj = st.optJSONObject("volume");
                     if (volObj != null) {
                         if (volObj.has("level")) {
                             volume = Math.max(0.0, Math.min(1.0, volObj.optDouble("level", volume)));
+                            volumeSynced = true;
+                            volumeUpdated = true;
                         }
                         if (volObj.has("muted")) {
                             muted = volObj.optBoolean("muted", muted);
+                            volumeUpdated = true;
                         }
+                    }
+                    initialVolumeLatch.countDown();
+                    if (volumeUpdated) {
+                        publishCurrentState();
                     }
 
                     JSONArray apps = st.optJSONArray("applications");
@@ -1528,6 +1572,7 @@ public class TvCastService extends Service {
         void stopAndClose() {
             if (closed) return;
             closed = true;
+            initialVolumeLatch.countDown();
             try {
                 if (!transportId.isEmpty() && mediaSessionId >= 0L) {
                     JSONObject stop = new JSONObject();
@@ -1584,6 +1629,7 @@ public class TvCastService extends Service {
     private final class DlnaController {
         private final TvCastProtocol.CastDevice device;
         private boolean sawPlaying = false;
+        private int pollCount = 0;
 
         DlnaController(TvCastProtocol.CastDevice device) {
             this.device = device;
@@ -1643,7 +1689,25 @@ public class TvCastService extends Service {
 
             if (startPosMs > 2000L) {
                 try {
-                    Thread.sleep(900L);
+                    long deadline = System.currentTimeMillis() + 4000L;
+                    while (System.currentTimeMillis() < deadline) {
+                        Thread.sleep(350L);
+                        try {
+                            String tXml = sendSoap(
+                                device.avTransportControlUrl,
+                                TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                                "GetTransportInfo",
+                                singletonInstanceArgs()
+                            );
+                            String tState = TvCastProtocol.extractXmlTagValue(tXml, "CurrentTransportState")
+                                .toUpperCase(Locale.ROOT);
+                            if ("PLAYING".equals(tState)) {
+                                break;
+                            }
+                        } catch (Exception ignored) {
+                            break;
+                        }
+                    }
                     seek(startPosMs);
                 } catch (Exception ignored) {
                 }
@@ -1667,16 +1731,83 @@ public class TvCastService extends Service {
         }
 
         void seek(long targetMs) throws IOException {
+            String formatted = TvCastProtocol.formatDlnaTime(targetMs);
             Map<String, String> args = new LinkedHashMap<>();
             args.put("InstanceID", "0");
             args.put("Unit", "REL_TIME");
-            args.put("Target", TvCastProtocol.formatDlnaTime(targetMs));
-            sendSoap(device.avTransportControlUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", args);
+            args.put("Target", formatted);
+            try {
+                sendSoap(device.avTransportControlUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", args);
+            } catch (IOException relErr) {
+                // Some DLNA Smart TVs reject REL_TIME (SOAP 710) and require ABS_TIME.
+                Map<String, String> absArgs = new LinkedHashMap<>();
+                absArgs.put("InstanceID", "0");
+                absArgs.put("Unit", "ABS_TIME");
+                absArgs.put("Target", formatted);
+                try {
+                    sendSoap(device.avTransportControlUrl, TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE, "Seek", absArgs);
+                } catch (IOException absErr) {
+                    throw relErr;
+                }
+            }
+        }
+
+        boolean syncVolumeFromTv() {
+            if (device.renderingControlUrl.isEmpty()) return false;
+            boolean syncedAny = false;
+            try {
+                Map<String, String> volArgs = new LinkedHashMap<>();
+                volArgs.put("InstanceID", "0");
+                volArgs.put("Channel", "Master");
+                String volXml = sendSoap(
+                    device.renderingControlUrl,
+                    TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE,
+                    "GetVolume",
+                    volArgs
+                );
+                double parsedVol = TvCastProtocol.parseDlnaVolumeLevel(volXml);
+                if (parsedVol >= 0.0) {
+                    volume = parsedVol;
+                    volumeSynced = true;
+                    syncedAny = true;
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "DLNA GetVolume failed: " + e.getMessage());
+            }
+            try {
+                Map<String, String> muteArgs = new LinkedHashMap<>();
+                muteArgs.put("InstanceID", "0");
+                muteArgs.put("Channel", "Master");
+                String muteXml = sendSoap(
+                    device.renderingControlUrl,
+                    TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE,
+                    "GetMute",
+                    muteArgs
+                );
+                Boolean parsedMute = TvCastProtocol.parseDlnaMuteState(muteXml);
+                if (parsedMute != null) {
+                    muted = parsedMute;
+                } else if (syncedAny) {
+                    muted = volume <= 0.001;
+                }
+            } catch (Exception ignored) {
+            }
+            return syncedAny;
         }
 
         void setVolume(double level) throws IOException {
             if (device.renderingControlUrl.isEmpty()) return;
             int volInt = (int) Math.round(Math.max(0.0, Math.min(1.0, level)) * 100.0);
+            if (volInt > 0 && muted) {
+                try {
+                    Map<String, String> unmuteArgs = new LinkedHashMap<>();
+                    unmuteArgs.put("InstanceID", "0");
+                    unmuteArgs.put("Channel", "Master");
+                    unmuteArgs.put("DesiredMute", "0");
+                    sendSoap(device.renderingControlUrl, TvCastProtocol.UPNP_RENDERING_CONTROL_SERVICE, "SetMute", unmuteArgs);
+                } catch (Exception ignored) {
+                }
+            }
             Map<String, String> args = new LinkedHashMap<>();
             args.put("InstanceID", "0");
             args.put("Channel", "Master");
@@ -1745,6 +1876,10 @@ public class TvCastService extends Service {
                     handleNaturalEpisodeCompleted(gen);
                     return;
                 }
+            }
+            pollCount++;
+            if ((!volumeSynced || (pollCount % 2 == 0)) && (System.currentTimeMillis() - lastVolumeSetAtMs) >= 2500L) {
+                syncVolumeFromTv();
             }
             persistProgressIfNeeded(false, false);
             updateNotification();
@@ -2136,6 +2271,7 @@ public class TvCastService extends Service {
             o.put("durationMs", Math.max(0L, durationMs));
             o.put("volume", volume);
             o.put("muted", muted);
+            o.put("volumeSynced", volumeSynced);
             o.put("hasPrev", prevUrl != null && !prevUrl.isEmpty());
             o.put("hasNext", nextUrl != null && !nextUrl.isEmpty());
             o.put("errorMessage", errorMessage != null ? errorMessage : "");

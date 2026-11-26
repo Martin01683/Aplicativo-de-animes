@@ -397,9 +397,10 @@ export function buildDidlLiteMetadata(params: {
   if (params.poster?.trim()) {
     xml += `<upnp:albumArtURI>${escapeXml(params.poster.trim())}</upnp:albumArtURI>`;
   }
+  const dlnaOp = /mpegurl/i.test(safeMime) ? '10' : '01';
   xml +=
     '<upnp:class>object.item.videoItem.movie</upnp:class>' +
-    `<res protocolInfo="http-get:*:${safeMime}:DLNA.ORG_OP=01;DLNA.ORG_CI=0">${safeUrl}</res>` +
+    `<res protocolInfo="http-get:*:${safeMime}:DLNA.ORG_OP=${dlnaOp};DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000">${safeUrl}</res>` +
     '</item></DIDL-Lite>';
   return xml;
 }
@@ -440,6 +441,23 @@ export function parseDlnaTimeMs(raw: string): number {
     return -1;
   }
   return Math.round((h * 3600 + m * 60 + s) * 1000);
+}
+
+export function parseDlnaVolumeLevel(xml: string): number | null {
+  const raw = extractXmlTagValue(xml, 'CurrentVolume').trim();
+  if (!raw) return null;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  const clamped = Math.max(0, Math.min(100, parsed));
+  return Math.round(clamped) / 100;
+}
+
+export function parseDlnaMuteState(xml: string): boolean | null {
+  const raw = extractXmlTagValue(xml, 'CurrentMute').trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === '1' || raw === 'true' || raw === 'yes') return true;
+  if (raw === '0' || raw === 'false' || raw === 'no') return false;
+  return null;
 }
 
 export function convertSrtToVtt(raw: string): string {
@@ -859,8 +877,11 @@ interface ActiveServerCastSession {
   mediaSessionId?: number;
   mediaLoaded?: boolean;
   lastPingMs?: number;
-  // DLNA state
+  initialVolumeResolve?: () => void;
+  // DLNA / volume sync state
   dlnaSawPlaying?: boolean;
+  dlnaPollCount?: number;
+  lastVolumeSetAtMs?: number;
 }
 
 let activeSession: ActiveServerCastSession | null = null;
@@ -988,8 +1009,48 @@ async function sendDlnaSoap(
   return text;
 }
 
+async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<boolean> {
+  const renderingUrl = sess.device.renderingControlUrl;
+  if (!renderingUrl) return false;
+  let syncedAny = false;
+  try {
+    const volXml = await sendDlnaSoap(renderingUrl, UPNP_RENDERING_CONTROL_SERVICE, 'GetVolume', {
+      InstanceID: '0',
+      Channel: 'Master',
+    });
+    const parsedVol = parseDlnaVolumeLevel(volXml);
+    if (parsedVol !== null) {
+      sess.state.volume = parsedVol;
+      sess.state.volumeSynced = true;
+      syncedAny = true;
+    }
+  } catch {
+    // ignore TVs that do not implement GetVolume
+  }
+  try {
+    const muteXml = await sendDlnaSoap(renderingUrl, UPNP_RENDERING_CONTROL_SERVICE, 'GetMute', {
+      InstanceID: '0',
+      Channel: 'Master',
+    });
+    const parsedMute = parseDlnaMuteState(muteXml);
+    if (parsedMute !== null) {
+      sess.state.muted = parsedMute;
+    } else if (syncedAny) {
+      sess.state.muted = sess.state.volume <= 0.001;
+    }
+  } catch {
+    // ignore TVs that do not implement GetMute
+  }
+  return syncedAny;
+}
+
 function teardownSession(sess: ActiveServerCastSession | null, sendStopToTv: boolean): void {
   if (!sess) return;
+  if (sess.initialVolumeResolve) {
+    const resolve = sess.initialVolumeResolve;
+    sess.initialVolumeResolve = undefined;
+    resolve();
+  }
   if (sess.pollTimer) {
     clearInterval(sess.pollTimer);
     sess.pollTimer = undefined;
@@ -1119,8 +1180,9 @@ export async function startServerTvCast(params: {
       lanStreamUrl,
       positionMs: Math.max(0, media.startPositionMs || 0),
       durationMs: Math.max(0, media.durationMs || 0),
-      volume: 1,
+      volume: 0,
       muted: false,
+      volumeSynced: false,
       hasPrev: Boolean(media.prevUrl),
       hasNext: Boolean(media.nextUrl),
       errorMessage: '',
@@ -1134,6 +1196,9 @@ export async function startServerTvCast(params: {
       throw new Error('URL de controle DLNA indisponível para esta TV.');
     }
     try {
+      // Sync the TV's real volume & mute BEFORE loading/starting playback so the UI never starts at 100%.
+      await syncServerDlnaVolume(sess);
+
       await sendDlnaSoap(device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Stop', {
         InstanceID: '0',
       }).catch(() => {});
@@ -1235,6 +1300,15 @@ export async function startServerTvCast(params: {
               sess.state.status = 'stopped';
               sess.state.active = false;
               teardownSession(sess, false);
+              return;
+            }
+
+            sess.dlnaPollCount = (sess.dlnaPollCount || 0) + 1;
+            if (
+              (!sess.state.volumeSynced || sess.dlnaPollCount % 2 === 0) &&
+              Date.now() - (sess.lastVolumeSetAtMs || 0) >= 2500
+            ) {
+              await syncServerDlnaVolume(sess);
             }
           } catch {
             // ignore transient poll hiccups
@@ -1315,11 +1389,37 @@ export async function startServerTvCast(params: {
 
   sess.tlsSocket?.setTimeout(0);
   sendCastJson(sess, 'receiver-0', CAST_NS_CONNECTION, { type: 'CONNECT', origin: {} });
-  sendCastJson(sess, 'receiver-0', CAST_NS_RECEIVER, {
-    type: 'LAUNCH',
-    appId: CHROMECAST_DEFAULT_APP_ID,
-    requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+
+  // Query receiver status first so the TV's real volume & mute are synced BEFORE launching/loading media.
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      if (sess.initialVolumeResolve) {
+        sess.initialVolumeResolve = undefined;
+        resolve();
+      }
+    }, 1500);
+    sess.initialVolumeResolve = () => {
+      clearTimeout(timer);
+      sess.initialVolumeResolve = undefined;
+      resolve();
+    };
+    sendCastJson(sess, 'receiver-0', CAST_NS_RECEIVER, {
+      type: 'GET_STATUS',
+      requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+    });
   });
+
+  if (activeSession?.gen !== gen || !sess.tlsSocket || sess.tlsSocket.destroyed) {
+    return { ...sess.state };
+  }
+
+  if (!sess.transportId && !sess.mediaLoaded) {
+    sendCastJson(sess, 'receiver-0', CAST_NS_RECEIVER, {
+      type: 'LAUNCH',
+      appId: CHROMECAST_DEFAULT_APP_ID,
+      requestId: (sess.reqSeq = (sess.reqSeq || 1) + 1),
+    });
+  }
   sess.state.status = 'buffering';
 
   sess.pollTimer = setInterval(() => {
@@ -1372,9 +1472,15 @@ function handleChromecastPacket(
       if (!st) return;
       if (typeof st.volume?.level === 'number') {
         sess.state.volume = Math.max(0, Math.min(1, st.volume.level));
+        sess.state.volumeSynced = true;
       }
       if (typeof st.volume?.muted === 'boolean') {
         sess.state.muted = st.volume.muted;
+      }
+      if (sess.initialVolumeResolve) {
+        const resolve = sess.initialVolumeResolve;
+        sess.initialVolumeResolve = undefined;
+        resolve();
       }
       const app = st.applications?.find((a) => a.appId === CHROMECAST_DEFAULT_APP_ID);
       if (app?.transportId && app.transportId !== sess.transportId) {
@@ -1505,7 +1611,8 @@ export async function controlServerTvCast(command: {
       });
       sess.state.positionMs = target;
     } else if (effectiveAction === 'volume') {
-      const level = Math.max(0, Math.min(1, Number(command.volume ?? 1)));
+      const level = Math.max(0, Math.min(1, Number(command.volume ?? sess.state.volume)));
+      sess.lastVolumeSetAtMs = Date.now();
       sendCastJson(sess, 'receiver-0', CAST_NS_RECEIVER, {
         type: 'SET_VOLUME',
         volume: { level, muted: level <= 0.001 },
@@ -1513,6 +1620,7 @@ export async function controlServerTvCast(command: {
       });
       sess.state.volume = level;
       sess.state.muted = level <= 0.001;
+      sess.state.volumeSynced = true;
     }
   } else if (sess.device.protocol === 'dlna' && sess.device.avTransportControlUrl) {
     if (effectiveAction === 'play') {
@@ -1531,21 +1639,44 @@ export async function controlServerTvCast(command: {
         effectiveAction === 'seekBy'
           ? Math.max(0, sess.state.positionMs + (command.deltaMs || 0))
           : Math.max(0, command.positionMs || 0);
-      await sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
-        InstanceID: '0',
-        Unit: 'REL_TIME',
-        Target: formatDlnaTime(target),
-      });
+      const formatted = formatDlnaTime(target);
+      try {
+        await sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
+          InstanceID: '0',
+          Unit: 'REL_TIME',
+          Target: formatted,
+        });
+      } catch (relErr) {
+        try {
+          await sendDlnaSoap(sess.device.avTransportControlUrl, UPNP_AV_TRANSPORT_SERVICE, 'Seek', {
+            InstanceID: '0',
+            Unit: 'ABS_TIME',
+            Target: formatted,
+          });
+        } catch {
+          throw relErr;
+        }
+      }
       sess.state.positionMs = target;
     } else if (effectiveAction === 'volume' && sess.device.renderingControlUrl) {
-      const level = Math.max(0, Math.min(1, Number(command.volume ?? 1)));
+      const level = Math.max(0, Math.min(1, Number(command.volume ?? sess.state.volume)));
+      const volInt = Math.round(level * 100);
+      sess.lastVolumeSetAtMs = Date.now();
+      if (volInt > 0 && sess.state.muted) {
+        await sendDlnaSoap(sess.device.renderingControlUrl, UPNP_RENDERING_CONTROL_SERVICE, 'SetMute', {
+          InstanceID: '0',
+          Channel: 'Master',
+          DesiredMute: '0',
+        }).catch(() => {});
+      }
       await sendDlnaSoap(sess.device.renderingControlUrl, UPNP_RENDERING_CONTROL_SERVICE, 'SetVolume', {
         InstanceID: '0',
         Channel: 'Master',
-        DesiredVolume: String(Math.round(level * 100)),
+        DesiredVolume: String(volInt),
       });
       sess.state.volume = level;
-      sess.state.muted = level <= 0.001;
+      sess.state.muted = volInt === 0;
+      sess.state.volumeSynced = true;
     }
   }
 

@@ -26,6 +26,7 @@ import {
   Square,
   Tv,
   Volume2,
+  VolumeX,
   Wifi,
   X,
 } from 'lucide-react';
@@ -286,14 +287,21 @@ export function TvCastModal({
   const seekProgressPct = Math.max(0, Math.min(100, (displayedPositionMs / seekMaxMs) * 100));
   const previewBubblePct = Math.max(8, Math.min(92, seekProgressPct));
 
+  const volumeSynced =
+    Boolean(castState.volumeSynced) || dragVolume !== null || pendingVolume !== null;
+  const volumeControlsBusy =
+    !volumeSynced && (castState.status === 'connecting' || castState.status === 'buffering');
   const displayedVolume =
     dragVolume !== null
       ? dragVolume
       : pendingVolume !== null
         ? pendingVolume.level
-        : castState.volume;
+        : volumeSynced
+          ? castState.volume
+          : 0;
   const isDraggingVolume = dragVolume !== null;
-  const volumePct = Math.max(0, Math.min(100, displayedVolume * 100));
+  const volumePct = volumeSynced ? Math.max(0, Math.min(100, displayedVolume * 100)) : 0;
+  const isEffectivelyMuted = volumeSynced && (castState.muted || Math.round(volumePct) === 0);
 
   const commitSeekPosition = (targetMs: number) => {
     const clamped = Math.max(0, Math.min(seekMaxMs, Math.round(targetMs)));
@@ -417,6 +425,7 @@ export function TvCastModal({
   };
 
   const handleVolumePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (volumeControlsBusy) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
@@ -475,6 +484,7 @@ export function TvCastModal({
   };
 
   const handleVolumeKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!volumeSynced) return;
     if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
       e.preventDefault();
       commitVolumeLevel(stepCastVolumePercent(displayedVolume, 1));
@@ -488,6 +498,7 @@ export function TvCastModal({
     deltaPercent: -1 | 1,
     e: ReactPointerEvent<HTMLButtonElement>
   ) => {
+    if (!volumeSynced) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
@@ -552,6 +563,7 @@ export function TvCastModal({
     deltaPercent: -1 | 1,
     e: ReactKeyboardEvent<HTMLButtonElement>
   ) => {
+    if (!volumeSynced) return;
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       commitVolumeLevel(stepCastVolumePercent(displayedVolume, deltaPercent));
@@ -884,37 +896,51 @@ export function TvCastModal({
 
                   {/* Volume Slider + 1% press-and-hold fine buttons */}
                   <div className="flex items-center gap-2 pt-1">
-                    <Volume2 className="h-4 w-4 shrink-0 text-slate-400" />
+                    {isEffectivelyMuted ? (
+                      <VolumeX className="h-4 w-4 shrink-0 text-amber-400" />
+                    ) : (
+                      <Volume2 className="h-4 w-4 shrink-0 text-slate-400" />
+                    )}
                     <button
                       type="button"
                       data-cast-volume-dec="true"
+                      disabled={!volumeSynced}
                       aria-label="Diminuir volume da TV em 1%"
-                      title="Diminuir 1% (segure para diminuir continuamente)"
+                      title={
+                        volumeSynced
+                          ? 'Diminuir 1% (segure para diminuir continuamente)'
+                          : 'Aguardando sincronização do volume atual da TV'
+                      }
                       onPointerDown={(e) => handleVolumeStepPointerDown(-1, e)}
                       onPointerUp={(e) => finishVolumeStepHold(e, true)}
                       onPointerCancel={(e) => finishVolumeStepHold(e, false)}
                       onKeyDown={(e) => handleVolumeStepKeyDown(-1, e)}
                       onContextMenu={(e) => e.preventDefault()}
-                      className="flex h-8 w-8 shrink-0 touch-none select-none items-center justify-center rounded-lg border border-white/12 bg-white/5 text-slate-200 transition-colors hover:border-[#f97316]/50 hover:bg-white/10 active:bg-[#f97316]/20 active:text-[#fb923c]"
+                      className="flex h-8 w-8 shrink-0 touch-none select-none items-center justify-center rounded-lg border border-white/12 bg-white/5 text-slate-200 transition-colors hover:border-[#f97316]/50 hover:bg-white/10 active:bg-[#f97316]/20 active:text-[#fb923c] disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       <Minus className="h-3.5 w-3.5" />
                     </button>
                     <div
                       ref={volumeTrackRef}
                       role="slider"
-                      tabIndex={0}
+                      tabIndex={volumeControlsBusy ? -1 : 0}
                       data-cast-volume-slider="true"
                       aria-label="Volume da TV"
+                      aria-disabled={volumeControlsBusy}
                       aria-valuemin={0}
                       aria-valuemax={100}
-                      aria-valuenow={Math.round(volumePct)}
-                      aria-valuetext={`${Math.round(volumePct)}%`}
+                      aria-valuenow={volumeSynced ? Math.round(volumePct) : 0}
+                      aria-valuetext={
+                        volumeSynced ? `${Math.round(volumePct)}%` : 'Sincronizando volume da TV'
+                      }
                       onPointerDown={handleVolumePointerDown}
                       onPointerMove={handleVolumePointerMove}
                       onPointerUp={handleVolumePointerUp}
                       onPointerCancel={handleVolumePointerCancel}
                       onKeyDown={handleVolumeKeyDown}
-                      className="group relative flex h-8 flex-1 touch-none select-none cursor-pointer items-center focus:outline-none"
+                      className={`group relative flex h-8 flex-1 touch-none select-none items-center focus:outline-none ${
+                        volumeControlsBusy ? 'cursor-wait opacity-50' : 'cursor-pointer'
+                      }`}
                     >
                       <div className="relative h-1.5 w-full rounded-full bg-white/15">
                         <div
@@ -934,23 +960,29 @@ export function TvCastModal({
                     <button
                       type="button"
                       data-cast-volume-inc="true"
+                      disabled={!volumeSynced}
                       aria-label="Aumentar volume da TV em 1%"
-                      title="Aumentar 1% (segure para aumentar continuamente)"
+                      title={
+                        volumeSynced
+                          ? 'Aumentar 1% (segure para aumentar continuamente)'
+                          : 'Aguardando sincronização do volume atual da TV'
+                      }
                       onPointerDown={(e) => handleVolumeStepPointerDown(1, e)}
                       onPointerUp={(e) => finishVolumeStepHold(e, true)}
                       onPointerCancel={(e) => finishVolumeStepHold(e, false)}
                       onKeyDown={(e) => handleVolumeStepKeyDown(1, e)}
                       onContextMenu={(e) => e.preventDefault()}
-                      className="flex h-8 w-8 shrink-0 touch-none select-none items-center justify-center rounded-lg border border-white/12 bg-white/5 text-slate-200 transition-colors hover:border-[#f97316]/50 hover:bg-white/10 active:bg-[#f97316]/20 active:text-[#fb923c]"
+                      className="flex h-8 w-8 shrink-0 touch-none select-none items-center justify-center rounded-lg border border-white/12 bg-white/5 text-slate-200 transition-colors hover:border-[#f97316]/50 hover:bg-white/10 active:bg-[#f97316]/20 active:text-[#fb923c] disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       <Plus className="h-3.5 w-3.5" />
                     </button>
                     <span
+                      data-cast-volume-value="true"
                       className={`w-9 text-right font-mono text-[11px] tabular-nums ${
                         isDraggingVolume ? 'font-semibold text-[#fb923c]' : 'text-slate-400'
                       }`}
                     >
-                      {Math.round(volumePct)}%
+                      {volumeSynced ? `${Math.round(volumePct)}%` : '--'}
                     </span>
                   </div>
                 </>

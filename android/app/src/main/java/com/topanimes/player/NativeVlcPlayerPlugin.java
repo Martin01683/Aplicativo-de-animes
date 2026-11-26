@@ -19,6 +19,21 @@ import org.json.JSONObject;
 @CapacitorPlugin(name = "NativeVlcPlayer")
 public class NativeVlcPlayerPlugin extends Plugin {
 
+    private static long readLongParam(PluginCall call, String key, long defaultValue) {
+        if (call == null || call.getData() == null) return defaultValue;
+        Object raw = call.getData().opt(key);
+        if (raw instanceof Number) {
+            return Math.round(((Number) raw).doubleValue());
+        }
+        if (raw instanceof String) {
+            try {
+                return Math.round(Double.parseDouble(((String) raw).trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return defaultValue;
+    }
+
     @PluginMethod
     public void play(PluginCall call) {
         JSArray streams = call.getArray("streams");
@@ -41,7 +56,7 @@ public class NativeVlcPlayerPlugin extends Plugin {
         String selectedServerNume = call.getString("selectedServerNume", "");
         String referer = call.getString("referer", "https://topanimes.net/");
         boolean preferDirect = Boolean.TRUE.equals(call.getBoolean("preferDirect", false));
-        long startPositionMs = call.getLong("startPositionMs", 0L);
+        long startPositionMs = Math.max(0L, readLongParam(call, "startPositionMs", 0L));
         boolean forceStartPosition = Boolean.TRUE.equals(call.getBoolean("forceStartPosition", false));
         int streamIndex = call.getInt("streamIndex", 0);
         String videoScale = call.getString("videoScale", "");

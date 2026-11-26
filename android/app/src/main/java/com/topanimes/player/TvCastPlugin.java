@@ -59,7 +59,7 @@ public class TvCastPlugin extends Plugin {
         resolvePendingDiscoveryCall(discovery.getDiscoveredDevices());
         pendingDiscoveryCall = call;
 
-        long timeoutMs = call.getLong("timeoutMs", 5500L);
+        long timeoutMs = readLongParam(call, "timeoutMs", 5500L);
         discovery.startDiscovery(timeoutMs, new TvCastDiscovery.Listener() {
             @Override
             public void onDevicesChanged(List<TvCastProtocol.CastDevice> devices) {
@@ -248,7 +248,7 @@ public class TvCastPlugin extends Plugin {
 
     @PluginMethod
     public void seek(PluginCall call) {
-        long positionMs = Math.max(0L, call.getLong("positionMs", 0L));
+        long positionMs = Math.max(0L, readLongParam(call, "positionMs", 0L));
         Intent intent = new Intent(getContext(), TvCastService.class);
         intent.setAction(TvCastService.ACTION_SEEK_TO);
         intent.putExtra(TvCastService.EXTRA_POSITION_MS, positionMs);
@@ -258,12 +258,32 @@ public class TvCastPlugin extends Plugin {
 
     @PluginMethod
     public void seekBy(PluginCall call) {
-        long deltaMs = call.getLong("deltaMs", 0L);
+        long deltaMs = readLongParam(call, "deltaMs", 0L);
         Intent intent = new Intent(getContext(), TvCastService.class);
         intent.setAction(TvCastService.ACTION_SEEK_BY);
         intent.putExtra(TvCastService.EXTRA_DELTA_MS, deltaMs);
         ContextCompat.startForegroundService(getContext(), intent);
         call.resolve();
+    }
+
+    /**
+     * Capacitor's PluginCall.getLong() only checks `value instanceof Long` and returns the
+     * default (0L!) for JSON numbers deserialized by org.json.JSONObject as Integer (< 2^31)
+     * or Double. Reading via Number handles Integer, Long, Double, Float, and numeric Strings.
+     */
+    private static long readLongParam(PluginCall call, String key, long defaultValue) {
+        if (call == null || call.getData() == null) return defaultValue;
+        Object raw = call.getData().opt(key);
+        if (raw instanceof Number) {
+            return Math.round(((Number) raw).doubleValue());
+        }
+        if (raw instanceof String) {
+            try {
+                return Math.round(Double.parseDouble(((String) raw).trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return defaultValue;
     }
 
     @PluginMethod

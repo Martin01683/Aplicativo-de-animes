@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -35,7 +35,9 @@ import {
   formatDlnaTime,
   frameCastV2Message,
   isChromecastVideoCapable,
+  parseDlnaMuteState,
   parseDlnaTimeMs,
+  parseDlnaVolumeLevel,
   parseMdnsResponsePacket,
   parseSsdpHeaders,
   parseUpnpDeviceXml,
@@ -106,6 +108,21 @@ describe('tvCast helpers', () => {
     const sanitized = sanitizeCastStateSnapshot({ active: true, status: 'playing', volume: 2.5 });
     assert.equal(sanitized.active, true);
     assert.equal(sanitized.volume, 1);
+    assert.equal(sanitized.volumeSynced, false);
+    assert.equal(IDLE_TV_CAST_STATE.volume, 0);
+    assert.equal(IDLE_TV_CAST_STATE.volumeSynced, false);
+    const unsyncedDefault = sanitizeCastStateSnapshot({ active: true, status: 'connecting' });
+    assert.equal(unsyncedDefault.volume, 0);
+    assert.equal(unsyncedDefault.volumeSynced, false);
+    const syncedSnapshot = sanitizeCastStateSnapshot({
+      active: true,
+      status: 'playing',
+      volume: 0.28,
+      muted: false,
+      volumeSynced: true,
+    });
+    assert.equal(syncedSnapshot.volume, 0.28);
+    assert.equal(syncedSnapshot.volumeSynced, true);
     assert.deepEqual(sanitizeCastStateSnapshot(null), IDLE_TV_CAST_STATE);
   });
 
@@ -377,6 +394,98 @@ describe('Android background TV Cast architecture & UI wiring guards', () => {
     assert.match(modalTsx, /data-cast-server-switcher="true"/);
     assert.match(episodeWorkspaceTsx, /onSwitchTvCastServer/);
   });
+
+  it('syncs real TV volume & mute BEFORE starting playback on Android, Server, and UI (never defaults to 100%)', () => {
+    const castService = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/TvCastService.java'
+    );
+    const castProtocol = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/TvCastProtocol.java'
+    );
+    const serverCast = readRepoFile('src/lib/serverTvCast.ts');
+    const modalTsx = readRepoFile('src/components/TvCastModal.tsx');
+
+    // Android protocol parses UPnP RenderingControl GetVolume / GetMute
+    assert.match(castProtocol, /public static double parseDlnaVolumeLevel\(String xml\)/);
+    assert.match(castProtocol, /public static Boolean parseDlnaMuteState\(String xml\)/);
+
+    // Android TvCastService defaults volume to 0.0 (unsynced) and queries TV BEFORE loading media
+    assert.match(castService, /private volatile double volume = 0\.0;/);
+    assert.match(castService, /private volatile boolean volumeSynced = false;/);
+    const androidSyncIdx = castService.indexOf('dlna.syncVolumeFromTv()');
+    const androidLoadIdx = castService.indexOf('dlna.loadAndPlay(');
+    assert.ok(androidSyncIdx > 0 && androidLoadIdx > androidSyncIdx, 'Android DLNA must sync volume before loadAndPlay');
+    assert.match(castService, /pollCount\+\+;[\s\S]*?syncVolumeFromTv\(\);/);
+    const androidGetStatusIdx = castService.indexOf('statusReq.put("type", "GET_STATUS");');
+    const androidLaunchIdx = castService.indexOf('launch.put("type", "LAUNCH");');
+    assert.ok(
+      androidGetStatusIdx > 0 && androidLaunchIdx > androidGetStatusIdx,
+      'Android Chromecast must query GET_STATUS before LAUNCH'
+    );
+
+    // Server Node TV Cast defaults volume to 0 (unsynced) and queries TV BEFORE starting playback
+    assert.match(serverCast, /volume:\s*0,\s*\r?\n\s*muted:\s*false,\s*\r?\n\s*volumeSynced:\s*false/);
+    const serverDlnaSyncIdx = serverCast.indexOf('await syncServerDlnaVolume(sess);');
+    const serverDlnaPlayIdx = serverCast.indexOf("await sendDlnaSoap(device.avTransportControlUrl!, UPNP_AV_TRANSPORT_SERVICE, 'Play'");
+    assert.ok(
+      serverDlnaSyncIdx > 0 && serverDlnaPlayIdx > serverDlnaSyncIdx,
+      'Server DLNA must sync volume before Play'
+    );
+    const serverCastGetStatusIdx = serverCast.indexOf("type: 'GET_STATUS',\r\n      requestId:");
+    const serverCastGetStatusAltIdx = serverCast.indexOf("type: 'GET_STATUS',\n      requestId:");
+    const serverCastStatusPos = serverCastGetStatusIdx > 0 ? serverCastGetStatusIdx : serverCastGetStatusAltIdx;
+    const serverCastLaunchIdx = serverCast.indexOf("type: 'LAUNCH',");
+    assert.ok(
+      serverCastStatusPos > 0 && serverCastLaunchIdx > serverCastStatusPos,
+      'Server Chromecast must query GET_STATUS before LAUNCH'
+    );
+
+    // UI guards relative -1%/+1% buttons and displays "--" instead of 100% until synced
+    assert.match(modalTsx, /disabled=\{!volumeSynced\}/);
+    assert.match(modalTsx, /data-cast-volume-value="true"/);
+    assert.match(modalTsx, /volumeSynced \? `\$\{Math\.round\(volumePct\)\}%` : '--'/);
+  });
+
+  it('never uses Capacitor PluginCall.getLong() (which returns 0L for JSON Integer timestamps) and hardens DLNA seeking', () => {
+    const javaDir = resolve(ROOT, 'android/app/src/main/java/com/topanimes/player');
+    const javaFiles = readdirSync(javaDir).filter((f) => f.endsWith('.java'));
+    for (const file of javaFiles) {
+      const content = readFileSync(resolve(javaDir, file), 'utf8');
+      assert.doesNotMatch(
+        content,
+        /\bcall\.getLong\(/,
+        `${file} must not call Capacitor PluginCall.getLong() — org.json deserializes numbers < 2^31 as Integer, causing PluginCall.getLong() to silently return default 0L and restart TV/VLC playback from 00:00:00!`
+      );
+    }
+
+    const castPlugin = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/TvCastPlugin.java'
+    );
+    assert.match(castPlugin, /readLongParam\(call,\s*"positionMs",\s*0L\)/);
+    assert.match(castPlugin, /readLongParam\(call,\s*"deltaMs",\s*0L\)/);
+    assert.match(castPlugin, /readLongParam\(call,\s*"timeoutMs",\s*5500L\)/);
+
+    const vlcPlugin = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/NativeVlcPlayerPlugin.java'
+    );
+    assert.match(vlcPlugin, /readLongParam\(call,\s*"startPositionMs",\s*0L\)/);
+
+    const localProxy = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/LocalProxyPlugin.java'
+    );
+    assert.match(localProxy, /"HEAD"\.equalsIgnoreCase\(initialMethod\)/);
+    assert.match(localProxy, /conn\.setRequestProperty\("Accept-Encoding",\s*"identity"\)/);
+
+    const castProtocol = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/TvCastProtocol.java'
+    );
+    const castService = readRepoFile(
+      'android/app/src/main/java/com/topanimes/player/TvCastService.java'
+    );
+    assert.match(castProtocol, /DLNA\.ORG_FLAGS=01700000000000000000000000000000/);
+    assert.match(castService, /DLNA\.ORG_FLAGS=01700000000000000000000000000000/);
+    assert.match(castService, /absArgs\.put\("Unit",\s*"ABS_TIME"\)/);
+  });
 });
 
 describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
@@ -522,6 +631,29 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     assert.equal(formatDlnaTime(3_725_000), '01:02:05');
     assert.equal(parseDlnaTimeMs('01:02:05'), 3_725_000);
     assert.equal(parseDlnaTimeMs('NOT_IMPLEMENTED'), -1);
+
+    assert.equal(
+      parseDlnaVolumeLevel('<GetVolumeResponse><CurrentVolume>0</CurrentVolume></GetVolumeResponse>'),
+      0
+    );
+    assert.equal(
+      parseDlnaVolumeLevel('<GetVolumeResponse><CurrentVolume>37</CurrentVolume></GetVolumeResponse>'),
+      0.37
+    );
+    assert.equal(
+      parseDlnaVolumeLevel('<GetVolumeResponse><CurrentVolume>120</CurrentVolume></GetVolumeResponse>'),
+      1
+    );
+    assert.equal(parseDlnaVolumeLevel('<GetVolumeResponse></GetVolumeResponse>'), null);
+    assert.equal(
+      parseDlnaMuteState('<GetMuteResponse><CurrentMute>1</CurrentMute></GetMuteResponse>'),
+      true
+    );
+    assert.equal(
+      parseDlnaMuteState('<GetMuteResponse><CurrentMute>false</CurrentMute></GetMuteResponse>'),
+      false
+    );
+    assert.equal(parseDlnaMuteState('<GetMuteResponse></GetMuteResponse>'), null);
 
     const rewritten = rewriteM3u8ForServerLanProxy(
       '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n#EXTINF:6,\nseg1.png\n',

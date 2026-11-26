@@ -421,9 +421,12 @@ public final class TvCastProtocol {
         if (posterUrl != null && !posterUrl.trim().isEmpty()) {
             sb.append("<upnp:albumArtURI>").append(escapeXml(posterUrl.trim())).append("</upnp:albumArtURI>");
         }
+        String dlnaOp = safeMime.toLowerCase(Locale.ROOT).contains("mpegurl") ? "10" : "01";
         sb.append("<upnp:class>object.item.videoItem.movie</upnp:class>")
             .append("<res protocolInfo=\"http-get:*:").append(escapeXml(safeMime))
-            .append(":DLNA.ORG_OP=01;DLNA.ORG_CI=0\">").append(safeUrl).append("</res>")
+            .append(":DLNA.ORG_OP=").append(dlnaOp)
+            .append(";DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\">")
+            .append(safeUrl).append("</res>")
             .append("</item></DIDL-Lite>");
         return sb.toString();
     }
@@ -473,6 +476,27 @@ public final class TvCastProtocol {
         } catch (NumberFormatException e) {
             return -1L;
         }
+    }
+
+    public static double parseDlnaVolumeLevel(String xml) {
+        if (xml == null || xml.isEmpty()) return -1.0;
+        String raw = extractXmlTagValue(xml, "CurrentVolume").trim();
+        if (raw.isEmpty()) return -1.0;
+        try {
+            double pct = Double.parseDouble(raw);
+            if (!Double.isFinite(pct) || pct < 0.0) return -1.0;
+            return Math.max(0.0, Math.min(1.0, pct / 100.0));
+        } catch (NumberFormatException e) {
+            return -1.0;
+        }
+    }
+
+    public static Boolean parseDlnaMuteState(String xml) {
+        if (xml == null || xml.isEmpty()) return null;
+        String raw = extractXmlTagValue(xml, "CurrentMute").trim().toLowerCase(Locale.ROOT);
+        if ("1".equals(raw) || "true".equals(raw)) return Boolean.TRUE;
+        if ("0".equals(raw) || "false".equals(raw)) return Boolean.FALSE;
+        return null;
     }
 
     public static String escapeXml(String raw) {

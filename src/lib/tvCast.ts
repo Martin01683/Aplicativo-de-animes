@@ -65,6 +65,7 @@ export interface TvCastStateSnapshot {
   durationMs: number;
   volume: number;
   muted: boolean;
+  volumeSynced?: boolean;
   hasPrev: boolean;
   hasNext: boolean;
   errorMessage: string;
@@ -134,8 +135,9 @@ export const IDLE_TV_CAST_STATE: TvCastStateSnapshot = {
   lanStreamUrl: '',
   positionMs: 0,
   durationMs: 0,
-  volume: 1,
+  volume: 0,
   muted: false,
+  volumeSynced: false,
   hasPrev: false,
   hasNext: false,
   errorMessage: '',
@@ -519,8 +521,9 @@ export function sanitizeCastStateSnapshot(raw: Partial<TvCastStateSnapshot> | nu
     lanStreamUrl: raw.lanStreamUrl || '',
     positionMs: Math.max(0, Number(raw.positionMs) || 0),
     durationMs: Math.max(0, Number(raw.durationMs) || 0),
-    volume: typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : 1,
+    volume: typeof raw.volume === 'number' && Number.isFinite(raw.volume) ? Math.max(0, Math.min(1, raw.volume)) : 0,
     muted: Boolean(raw.muted),
+    volumeSynced: Boolean(raw.volumeSynced),
     hasPrev: Boolean(raw.hasPrev),
     hasNext: Boolean(raw.hasNext),
     errorMessage: raw.errorMessage || '',
