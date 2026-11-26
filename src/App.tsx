@@ -111,6 +111,8 @@ import {
   getCompletedOfflineDownload,
   getOfflineDownloadsSnapshot,
   hydrateOfflineDownloads,
+  setOfflineDownloadConcurrency,
+  startBatchEpisodeOfflineDownloads,
   startEpisodeOfflineDownload,
   subscribeOfflineDownloads,
   type OfflineDownloadInput,
@@ -667,9 +669,14 @@ export default function App() {
     prevOfflineStatusRef.current = initialMap;
 
     const unsubscribe = subscribeOfflineDownloads(sync);
+    setOfflineDownloadConcurrency(settingsRef.current.maxConcurrentDownloads);
     void hydrateOfflineDownloads();
     return unsubscribe;
   }, [showToast]);
+
+  useEffect(() => {
+    setOfflineDownloadConcurrency(settings.maxConcurrentDownloads);
+  }, [settings.maxConcurrentDownloads]);
 
   const handleStartOfflineDownload = useCallback(
     async (input: OfflineDownloadInput) => {
@@ -693,6 +700,43 @@ export default function App() {
           err instanceof Error && err.message
             ? err.message
             : 'Não foi possível baixar este episódio.';
+        showToast(msg, { kind: 'warning' });
+      }
+    },
+    [showToast]
+  );
+
+  const handleStartBatchOfflineDownload = useCallback(
+    async (inputs: OfflineDownloadInput[], label?: string) => {
+      if (!inputs.length) return;
+      try {
+        const enriched = inputs.map((item) => ({
+          ...item,
+          sources: settingsRef.current.episodeSources,
+          audioPreference: settingsRef.current.defaultAudioFilter,
+        }));
+        const res = await startBatchEpisodeOfflineDownloads(enriched);
+        const added = res.started + res.queued;
+        if (added === 0) {
+          showToast(
+            label
+              ? `${label} já está salva ou em andamento.`
+              : 'Todos os episódios já estão salvos ou em andamento.'
+          );
+          return;
+        }
+        const limit = settingsRef.current.maxConcurrentDownloads;
+        const modeHint = limit > 1 ? `até ${limit} simultâneos` : 'em fila, 1 por vez';
+        const prefix = label ? `${label}: ` : '';
+        showToast(
+          `${prefix}${added} ${added === 1 ? 'episódio adicionado' : 'episódios adicionados'} aos downloads (${modeHint}).`,
+          { kind: 'success' }
+        );
+      } catch (err) {
+        const msg =
+          err instanceof Error && err.message
+            ? err.message
+            : 'Não foi possível iniciar o download da temporada.';
         showToast(msg, { kind: 'warning' });
       }
     },
@@ -735,6 +779,9 @@ export default function App() {
     if (patch.videoScale) {
       void setNativeVlcVideoScale(sanitizeVideoScaleMode(patch.videoScale));
     }
+    if (typeof patch.maxConcurrentDownloads === 'number') {
+      setOfflineDownloadConcurrency(patch.maxConcurrentDownloads);
+    }
     if (patch.episodeSources || patch.defaultAudioFilter) {
       clearPrefetchCaches('episodes');
     }
@@ -764,6 +811,7 @@ export default function App() {
     setSettings(defaults);
     saveAppSettings(defaults);
     void setNativeVlcVideoScale(defaults.videoScale);
+    setOfflineDownloadConcurrency(defaults.maxConcurrentDownloads);
     showToast('Configurações restauradas para o padrão.');
   }, [showToast]);
 
@@ -3813,6 +3861,7 @@ export default function App() {
                   onPrefetchAnime={handlePrefetchAnime}
                   offlineDownloadsByKey={offlineDownloadsByKey}
                   onStartOfflineDownload={handleStartOfflineDownload}
+                  onStartBatchOfflineDownload={handleStartBatchOfflineDownload}
                   onCancelOfflineDownload={handleCancelOfflineDownload}
                   onDeleteOfflineDownload={handleDeleteOfflineDownload}
                   onLoadingStateChange={setAnimeViewHydrating}

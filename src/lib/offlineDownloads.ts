@@ -169,6 +169,7 @@ interface OfflineDownloadsNativePlugin {
     record?: Partial<OfflineDownloadRecord>;
   }>;
   getEngineInfo(): Promise<DownloadEnginesInfo>;
+  setMaxConcurrentDownloads(options: { limit: number }): Promise<{ limit: number }>;
   updateYtDlp(): Promise<YtDlpUpdateResponse>;
   resolveEmbedWithYtDlp(options: {
     embedUrl: string;
@@ -452,7 +453,16 @@ export async function resolveEmbedFallbackWithYtDlp(
   }
 }
 
-// ── Strict FIFO Serial Download Queue (1 active download at a time) ──────────
+// ── Configurable FIFO Download Queue (default: 1 active download at a time) ──
+
+export const MIN_CONCURRENT_DOWNLOADS = 1;
+export const MAX_CONCURRENT_DOWNLOADS = 5;
+
+export function clampConcurrentDownloadLimit(limit: number): number {
+  const n = Number(limit);
+  if (!Number.isFinite(n)) return MIN_CONCURRENT_DOWNLOADS;
+  return Math.max(MIN_CONCURRENT_DOWNLOADS, Math.min(MAX_CONCURRENT_DOWNLOADS, Math.floor(n)));
+}
 
 export interface SerialQueueEntry<T> {
   id: string;
@@ -460,27 +470,42 @@ export interface SerialQueueEntry<T> {
 }
 
 /**
- * Enforces strict single-concurrency FIFO execution even when dozens (e.g. 50+)
- * of downloads are enqueued simultaneously. Removing a queued item cancels it
- * without interrupting the active download; errors on one item never stall the rest.
+ * Enforces bounded FIFO execution (default concurrency = 1, configurable up to 5)
+ * even when dozens (e.g. 50+) of downloads are enqueued simultaneously.
+ * Raising concurrency dynamically wakes waiting FIFO items immediately; removing a
+ * queued item cancels it without interrupting active downloads; errors never stall the rest.
  */
 export class SerialDownloadQueue<T> {
   private readonly pending: SerialQueueEntry<T>[] = [];
-  private activeId: string | null = null;
-  private pumping = false;
+  private readonly activeIds = new Set<string>();
+  private maxConcurrency: number;
   private readonly runner: (entry: SerialQueueEntry<T>) => Promise<void>;
   private readonly onQueueChange?: () => void;
 
   constructor(
     runner: (entry: SerialQueueEntry<T>) => Promise<void>,
-    onQueueChange?: () => void
+    onQueueChange?: () => void,
+    maxConcurrency = MIN_CONCURRENT_DOWNLOADS
   ) {
     this.runner = runner;
     this.onQueueChange = onQueueChange;
+    this.maxConcurrency = clampConcurrentDownloadLimit(maxConcurrency);
+  }
+
+  getMaxConcurrency(): number {
+    return this.maxConcurrency;
+  }
+
+  setMaxConcurrency(limit: number): void {
+    const next = clampConcurrentDownloadLimit(limit);
+    if (next === this.maxConcurrency) return;
+    this.maxConcurrency = next;
+    this.onQueueChange?.();
+    this.pump();
   }
 
   enqueue(id: string, payload: T): { enqueued: boolean; position: number; alreadyActiveOrQueued: boolean } {
-    if (this.activeId === id) {
+    if (this.activeIds.has(id)) {
       return { enqueued: false, position: 0, alreadyActiveOrQueued: true };
     }
     const existingIdx = this.pending.findIndex((item) => item.id === id);
@@ -488,9 +513,10 @@ export class SerialDownloadQueue<T> {
       return { enqueued: false, position: existingIdx + 1, alreadyActiveOrQueued: true };
     }
     this.pending.push({ id, payload });
-    const position = this.pending.length;
+    const willRunImmediately = this.activeIds.size < this.maxConcurrency && this.pending.length === 1;
+    const position = willRunImmediately ? 0 : this.pending.length;
     this.onQueueChange?.();
-    void this.pump();
+    this.pump();
     return { enqueued: true, position, alreadyActiveOrQueued: false };
   }
 
@@ -511,7 +537,18 @@ export class SerialDownloadQueue<T> {
   }
 
   getActiveId(): string | null {
-    return this.activeId;
+    for (const id of this.activeIds) {
+      return id;
+    }
+    return null;
+  }
+
+  getActiveIds(): string[] {
+    return Array.from(this.activeIds);
+  }
+
+  getActiveCount(): number {
+    return this.activeIds.size;
   }
 
   getPendingIds(): string[] {
@@ -523,27 +560,22 @@ export class SerialDownloadQueue<T> {
     return idx >= 0 ? idx + 1 : undefined;
   }
 
-  private async pump(): Promise<void> {
-    if (this.pumping) return;
-    this.pumping = true;
-    try {
-      while (this.pending.length > 0) {
-        const next = this.pending.shift()!;
-        this.activeId = next.id;
-        this.onQueueChange?.();
+  private pump(): void {
+    while (this.activeIds.size < this.maxConcurrency && this.pending.length > 0) {
+      const next = this.pending.shift()!;
+      this.activeIds.add(next.id);
+      this.onQueueChange?.();
+      void (async () => {
         try {
           await this.runner(next);
         } catch {
           // Individual item failure is handled by the runner; always continue FIFO queue.
         } finally {
-          if (this.activeId === next.id) {
-            this.activeId = null;
-          }
+          this.activeIds.delete(next.id);
           this.onQueueChange?.();
+          this.pump();
         }
-      }
-    } finally {
-      this.pumping = false;
+      })();
     }
   }
 }
@@ -1471,6 +1503,21 @@ export function getOfflineDownloadQueueLength(): number {
   return offlineDownloadQueue.getPendingIds().length;
 }
 
+export function getOfflineDownloadConcurrency(): number {
+  return offlineDownloadQueue.getMaxConcurrency();
+}
+
+export function setOfflineDownloadConcurrency(limit: number): number {
+  const clamped = clampConcurrentDownloadLimit(limit);
+  offlineDownloadQueue.setMaxConcurrency(clamped);
+  if (isNativeAndroidApp()) {
+    void OfflineDownloadsNative.setMaxConcurrentDownloads({ limit: clamped }).catch(() => {
+      // Best-effort sync with Android native thread pool
+    });
+  }
+  return clamped;
+}
+
 export async function startEpisodeOfflineDownload(
   input: OfflineDownloadInput
 ): Promise<OfflineDownloadRecord> {
@@ -1491,8 +1538,8 @@ export async function startEpisodeOfflineDownload(
     await attachNativeProgressListenerOnce();
   }
 
-  const hasActiveOrPending =
-    offlineDownloadQueue.getActiveId() !== null ||
+  const slotsFull =
+    offlineDownloadQueue.getActiveCount() >= offlineDownloadQueue.getMaxConcurrency() ||
     offlineDownloadQueue.getPendingIds().length > 0;
 
   const initial: OfflineDownloadRecord = {
@@ -1510,7 +1557,7 @@ export async function startEpisodeOfflineDownload(
     prevUrl: input.prevUrl,
     nextUrl: input.nextUrl,
     status: 'queued',
-    queuePosition: hasActiveOrPending ? offlineDownloadQueue.getPendingIds().length + 1 : undefined,
+    queuePosition: slotsFull ? offlineDownloadQueue.getPendingIds().length + 1 : undefined,
     progress: 0,
     downloadedBytes: 0,
     totalBytes: 0,
@@ -1525,6 +1572,35 @@ export async function startEpisodeOfflineDownload(
   recordsById.set(id, initial);
   offlineDownloadQueue.enqueue(id, input);
   return recordsById.get(id) || initial;
+}
+
+export async function startBatchEpisodeOfflineDownloads(
+  inputs: readonly OfflineDownloadInput[]
+): Promise<{ started: number; queued: number; skipped: number }> {
+  let started = 0;
+  let queued = 0;
+  let skipped = 0;
+  for (const input of inputs) {
+    const id = buildOfflineDownloadId(input.episodeUrl);
+    const existing = recordsById.get(id);
+    if (
+      existing &&
+      (existing.status === 'completed' ||
+        existing.status === 'queued' ||
+        existing.status === 'resolving' ||
+        existing.status === 'downloading')
+    ) {
+      skipped += 1;
+      continue;
+    }
+    const rec = await startEpisodeOfflineDownload(input);
+    if (rec.status === 'queued' && rec.queuePosition) {
+      queued += 1;
+    } else {
+      started += 1;
+    }
+  }
+  return { started, queued, skipped };
 }
 
 export function clearOfflineDownloadQueue(): number {

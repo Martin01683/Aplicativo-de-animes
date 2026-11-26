@@ -55,11 +55,13 @@ import {
   APP_UPDATE_INTERVAL_OPTIONS,
   EPISODE_CHECK_INTERVAL_OPTIONS,
   formatRelativeTimestamp,
+  MAX_CONCURRENT_DOWNLOADS_OPTIONS,
   type AppSettings,
   type AppSettingsMeta,
   type AppUpdateIntervalHours,
   type DefaultAudioFilter,
   type EpisodeCheckIntervalMinutes,
+  type MaxConcurrentDownloads,
 } from '../lib/settings';
 import type { EpisodeSourceConfig, SourceTestResult } from '../lib/sources/types';
 import type { CatalogSourceCredentials } from '../lib/types';
@@ -1399,7 +1401,10 @@ export function SettingsModal({
                   </div>
                   <p className="mt-1 text-xs leading-relaxed text-slate-400">
                     Episódios baixados são reproduzidos direto do celular automaticamente, sem
-                    gastar internet. Múltiplos downloads rodam em fila (1 por vez) na velocidade máxima.
+                    gastar internet.{' '}
+                    {settings.maxConcurrentDownloads === 1
+                      ? 'Múltiplos downloads rodam em fila (1 por vez) na velocidade máxima.'
+                      : `Até ${settings.maxConcurrentDownloads} downloads simultâneos; os demais aguardam automaticamente na fila.`}
                   </p>
                 </div>
 
@@ -1437,6 +1442,47 @@ export function SettingsModal({
                       <span>{confirmClearAllOffline ? 'Confirmar exclusão?' : 'Apagar todos'}</span>
                     </button>
                   )}
+                </div>
+              </div>
+
+              <div
+                data-offline-concurrency-selector="true"
+                className="flex flex-col items-start gap-2.5 rounded-lg border border-white/8 bg-[#151921]/90 px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between"
+              >
+                <div className="min-w-0">
+                  <span className="block text-xs font-semibold text-slate-200">
+                    Downloads simultâneos
+                  </span>
+                  <span className="mt-0.5 block text-[11px] text-slate-400">
+                    {settings.maxConcurrentDownloads === 1
+                      ? 'Fila sequencial (1 por vez · padrão recomendado)'
+                      : `Até ${settings.maxConcurrentDownloads} episódios baixando ao mesmo tempo`}
+                  </span>
+                </div>
+                <div
+                  role="group"
+                  aria-label="Quantidade de downloads simultâneos"
+                  className="grid w-full shrink-0 grid-cols-5 gap-1 rounded-lg border border-white/10 bg-[#0d0f12] p-1 sm:flex sm:w-auto sm:items-center"
+                >
+                  {MAX_CONCURRENT_DOWNLOADS_OPTIONS.map((count: MaxConcurrentDownloads) => {
+                    const active = settings.maxConcurrentDownloads === count;
+                    return (
+                      <button
+                        key={count}
+                        type="button"
+                        data-offline-concurrency-option={count}
+                        aria-pressed={active}
+                        onClick={() => onUpdateSettings({ maxConcurrentDownloads: count })}
+                        className={`min-h-[32px] min-w-[36px] rounded-md px-2.5 py-1 text-center font-mono text-xs font-semibold tabular-nums transition-colors ${
+                          active
+                            ? 'bg-[#f97316] text-[#0d0f12]'
+                            : 'text-slate-300 hover:bg-white/5 hover:text-white'
+                        }`}
+                      >
+                        {count}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 

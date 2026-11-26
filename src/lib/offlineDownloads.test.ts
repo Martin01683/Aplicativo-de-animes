@@ -353,15 +353,23 @@ describe('offline video download engine helpers', () => {
     assert.match(serverTs, /app\.post\('\/api\/download-engines\/resolve-embed'/);
     assert.match(serverTs, /app\.get\('\/api\/download-engines\/fast-download'/);
 
-    // Strict FIFO single-download queue wiring across Android native + UI
-    assert.match(offlinePlugin, /downloadExecutor = Executors\.newSingleThreadExecutor\(\)/);
+    // Configurable FIFO worker pool (defaults to 1, resizable up to 5) across Android native + UI
+    assert.match(offlinePlugin, /DEFAULT_MAX_CONCURRENT_DOWNLOADS = 1/);
+    assert.match(offlinePlugin, /ThreadPoolExecutor downloadExecutor = createDownloadExecutor\(\)/);
+    assert.match(offlinePlugin, /public void setMaxConcurrentDownloads\(/);
     const animeDetail = readRepoFile('src/components/AnimeDetailView.tsx');
     assert.match(animeDetail, /data-episode-download-queued="true"/);
+    assert.match(animeDetail, /data-season-download-desktop=\{group\.seasonNumber\}/);
+    assert.match(animeDetail, /data-season-download-mobile=\{group\.seasonNumber\}/);
+    assert.match(animeDetail, /Baixar temporada/);
+    assert.match(animeDetail, /Temporada salva/);
     const workspace = readRepoFile('src/components/EpisodeWorkspace.tsx');
     assert.match(workspace, /data-episode-download-queued="true"/);
     const settings = readRepoFile('src/components/SettingsModal.tsx');
     assert.match(settings, /data-offline-queue-badge="true"/);
     assert.match(settings, /data-offline-clear-queue-btn="true"/);
+    assert.match(settings, /data-offline-concurrency-selector="true"/);
+    assert.match(settings, /data-offline-concurrency-option=\{count\}/);
   });
 
   it('executes 50 simultaneously enqueued downloads strictly in FIFO queue (max 1 concurrent) with cancellation and error resilience', async () => {
@@ -432,5 +440,67 @@ describe('offline video download engine helpers', () => {
     holdResolvers.forEach((fn) => fn());
     await new Promise((r) => setTimeout(r, 5));
     assert.equal(clearQueue.getActiveId(), null);
+  });
+
+  it('supports configurable concurrent downloads (default 1, up to 5) and wakes waiting items when limit increases', async () => {
+    let activeNow = 0;
+    let peakActive = 0;
+    const startedIds: string[] = [];
+    const resolvers = new Map<string, () => void>();
+
+    const queue = new SerialDownloadQueue<number>(async (entry) => {
+      activeNow += 1;
+      peakActive = Math.max(peakActive, activeNow);
+      startedIds.push(entry.id);
+      try {
+        await new Promise<void>((resolve) => {
+          resolvers.set(entry.id, resolve);
+        });
+      } finally {
+        activeNow -= 1;
+      }
+    });
+
+    assert.equal(queue.getMaxConcurrency(), 1, 'Default concurrency must be 1');
+
+    for (let i = 1; i <= 6; i += 1) {
+      queue.enqueue(`ep_${i}`, i);
+    }
+    assert.equal(queue.getActiveCount(), 1);
+    assert.deepEqual(queue.getPendingIds(), ['ep_2', 'ep_3', 'ep_4', 'ep_5', 'ep_6']);
+
+    // Raising concurrency from 1 to 3 immediately wakes ep_2 and ep_3 in FIFO order!
+    queue.setMaxConcurrency(3);
+    assert.equal(queue.getMaxConcurrency(), 3);
+    assert.equal(queue.getActiveCount(), 3);
+    assert.deepEqual(queue.getActiveIds(), ['ep_1', 'ep_2', 'ep_3']);
+    assert.deepEqual(queue.getPendingIds(), ['ep_4', 'ep_5', 'ep_6']);
+    assert.equal(peakActive, 3);
+
+    // Lowering concurrency back to 1 does not kill running tasks, and waits before starting ep_4
+    queue.setMaxConcurrency(1);
+    resolvers.get('ep_1')?.();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(queue.getActiveCount(), 2, 'Still 2 active (ep_2, ep_3); ep_4 waits for slot');
+    assert.deepEqual(queue.getPendingIds(), ['ep_4', 'ep_5', 'ep_6']);
+
+    // Raise to 2 -> ep_4 stays queued while 2 are active; finish ep_2 -> ep_4 starts
+    queue.setMaxConcurrency(2);
+    resolvers.get('ep_2')?.();
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(queue.getActiveCount(), 2);
+    assert.ok(startedIds.includes('ep_4'));
+
+    // Drain remaining
+    while (queue.getActiveCount() > 0 || queue.getPendingIds().length > 0) {
+      for (const [id, done] of Array.from(resolvers.entries())) {
+        resolvers.delete(id);
+        done();
+      }
+      await new Promise((r) => setTimeout(r, 3));
+    }
+
+    assert.equal(peakActive, 3, 'Never exceeded configured peak concurrency of 3');
+    assert.deepEqual(startedIds, ['ep_1', 'ep_2', 'ep_3', 'ep_4', 'ep_5', 'ep_6']);
   });
 });

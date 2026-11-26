@@ -82,6 +82,11 @@ test('sanitizeAppSettings preserves valid user values and migrates legacy remove
   assert.equal(result.skipIntroSeconds, 90);
   assert.equal(result.autoPlayNextEpisode, true);
   assert.equal(result.videoScale, 'fill');
+  assert.equal(DEFAULT_APP_SETTINGS.maxConcurrentDownloads, 1);
+  assert.equal(sanitizeAppSettings({ maxConcurrentDownloads: 3 }).maxConcurrentDownloads, 3);
+  assert.equal(sanitizeAppSettings({ maxConcurrentDownloads: 0 }).maxConcurrentDownloads, 1);
+  assert.equal(sanitizeAppSettings({ maxConcurrentDownloads: 99 }).maxConcurrentDownloads, 5);
+  assert.equal(sanitizeAppSettings({ maxConcurrentDownloads: 'bad' }).maxConcurrentDownloads, 1);
 
   // Legacy 1 min and 5 min intervals migrate safely to 15 min
   assert.equal(sanitizeAppSettings({ episodeCheckIntervalMinutes: 1 }).episodeCheckIntervalMinutes, 15);

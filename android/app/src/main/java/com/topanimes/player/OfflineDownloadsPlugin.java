@@ -52,6 +52,9 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,6 +71,8 @@ public class OfflineDownloadsPlugin extends Plugin {
     private static final int SEGMENT_MAX_ATTEMPTS = 3;
     private static final int JAVA_MP4_PARALLEL_CHUNKS = 8;
     private static final int JAVA_HLS_PARALLEL_THREADS = 12;
+    private static final int DEFAULT_MAX_CONCURRENT_DOWNLOADS = 1;
+    private static final int MAX_CONCURRENT_DOWNLOADS_CAP = 5;
     private static final Pattern ARIA2_PERCENT_PATTERN = Pattern.compile("\\((\\d{1,3})%\\)");
     private static final Pattern ARIA2_SPEED_PATTERN = Pattern.compile("DL:([0-9.]+)(KiB|MiB|GiB|B)", Pattern.CASE_INSENSITIVE);
     private static final Pattern SAFE_ID_PATTERN = Pattern.compile("^[a-zA-Z0-9_-]{4,64}$");
@@ -366,11 +371,50 @@ public class OfflineDownloadsPlugin extends Plugin {
         }
     }
 
-    // Strict FIFO single-thread queue: guarantees only 1 episode downloads at a time
-    // so aria2c's 16 parallel connections dedicate 100% of bandwidth to each episode.
-    private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
+    // Configurable FIFO worker pool: defaults to 1 active download at a time so aria2c dedicates
+    // 100% of bandwidth to each episode, and can be raised up to 5 simultaneous downloads from Settings.
+    private final Object poolResizeLock = new Object();
+    private volatile int maxConcurrentDownloads = DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+    private final ThreadPoolExecutor downloadExecutor = createDownloadExecutor();
     private final ExecutorService ioExecutor = Executors.newSingleThreadExecutor();
     private final ConcurrentHashMap<String, ActiveDownloadTask> activeTasks = new ConcurrentHashMap<>();
+
+    private static ThreadPoolExecutor createDownloadExecutor() {
+        ThreadPoolExecutor exec = new ThreadPoolExecutor(
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+            60L,
+            TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>()
+        );
+        exec.allowCoreThreadTimeOut(true);
+        return exec;
+    }
+
+    private int applyMaxConcurrentDownloads(int requested) {
+        int clamped = Math.max(DEFAULT_MAX_CONCURRENT_DOWNLOADS, Math.min(MAX_CONCURRENT_DOWNLOADS_CAP, requested));
+        synchronized (poolResizeLock) {
+            if (clamped > maxConcurrentDownloads) {
+                downloadExecutor.setMaximumPoolSize(clamped);
+                downloadExecutor.setCorePoolSize(clamped);
+                downloadExecutor.prestartAllCoreThreads();
+            } else if (clamped < maxConcurrentDownloads) {
+                downloadExecutor.setCorePoolSize(clamped);
+                downloadExecutor.setMaximumPoolSize(clamped);
+            }
+            maxConcurrentDownloads = clamped;
+        }
+        return clamped;
+    }
+
+    @PluginMethod
+    public void setMaxConcurrentDownloads(PluginCall call) {
+        Integer raw = call.getInt("limit", DEFAULT_MAX_CONCURRENT_DOWNLOADS);
+        int applied = applyMaxConcurrentDownloads(raw != null ? raw : DEFAULT_MAX_CONCURRENT_DOWNLOADS);
+        JSObject ret = new JSObject();
+        ret.put("limit", applied);
+        call.resolve(ret);
+    }
 
     @Override
     public void load() {

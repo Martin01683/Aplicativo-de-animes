@@ -110,6 +110,10 @@ interface AnimeDetailViewProps {
   onPrefetchAnime?: (animeUrl: string, seed?: MediaNavigationSeed) => void;
   offlineDownloadsByKey?: Map<string, OfflineDownloadRecord>;
   onStartOfflineDownload?: (input: OfflineDownloadInput) => Promise<void> | void;
+  onStartBatchOfflineDownload?: (
+    inputs: OfflineDownloadInput[],
+    label?: string
+  ) => Promise<void> | void;
   onCancelOfflineDownload?: (idOrUrl: string) => Promise<void> | void;
   onDeleteOfflineDownload?: (idOrUrl: string) => Promise<void> | void;
   onLoadingStateChange?: (loading: boolean) => void;
@@ -132,6 +136,7 @@ export function AnimeDetailView({
   onPrefetchEpisode,
   offlineDownloadsByKey,
   onStartOfflineDownload,
+  onStartBatchOfflineDownload,
   onCancelOfflineDownload,
   onDeleteOfflineDownload,
   onLoadingStateChange,
@@ -1724,6 +1729,88 @@ export function AnimeDetailView({
               const seasonDisplayTitle = isMovie
                 ? group.label
                 : formatSeasonDisplayHeading(group.seasonNumber, group.label, anime.seasonNames);
+              const canDownloadSeason =
+                !isMovie &&
+                seasonPlayableEpisodes.length > 0 &&
+                Boolean(onStartBatchOfflineDownload || onStartOfflineDownload);
+              const seasonOfflineSavedCount = seasonPlayableEpisodes.filter((ep) => {
+                const rec = offlineDownloadsByKey?.get(canonicalOfflineEpisodeUrl(ep.url));
+                return rec?.status === 'completed';
+              }).length;
+              const seasonOfflineActiveRecs = seasonPlayableEpisodes
+                .map((ep) => offlineDownloadsByKey?.get(canonicalOfflineEpisodeUrl(ep.url)))
+                .filter(
+                  (rec): rec is OfflineDownloadRecord =>
+                    rec !== undefined &&
+                    (rec.status === 'queued' ||
+                      rec.status === 'resolving' ||
+                      rec.status === 'downloading')
+                );
+              const seasonOfflineRemainingEps = seasonPlayableEpisodes.filter((ep) => {
+                const rec = offlineDownloadsByKey?.get(canonicalOfflineEpisodeUrl(ep.url));
+                return (
+                  !rec ||
+                  (rec.status !== 'completed' &&
+                    rec.status !== 'queued' &&
+                    rec.status !== 'resolving' &&
+                    rec.status !== 'downloading')
+                );
+              });
+              const seasonAllSavedOffline =
+                seasonPlayableEpisodes.length > 0 &&
+                seasonOfflineSavedCount === seasonPlayableEpisodes.length;
+              const handleDownloadSeasonClick = () => {
+                if (seasonAllSavedOffline) return;
+                if (seasonOfflineRemainingEps.length === 0 && seasonOfflineActiveRecs.length > 0) {
+                  if (onCancelOfflineDownload) {
+                    for (const rec of seasonOfflineActiveRecs) {
+                      void onCancelOfflineDownload(rec.id);
+                    }
+                  }
+                  return;
+                }
+                const inputs: OfflineDownloadInput[] = seasonOfflineRemainingEps.map((ep) => {
+                  const seed = buildSeedFromAnimeEpisode(anime, ep, activeEpisodes);
+                  const epBadge = formatEpisodeCardBadge(ep, isMovie);
+                  const hydratedTitle =
+                    ep.tvdbEpisodeId && hydratedTitlesById[ep.tvdbEpisodeId]
+                      ? hydratedTitlesById[ep.tvdbEpisodeId]
+                      : '';
+                  const epTitle = hydratedTitle || formatEpisodeCardTitle(ep, isMovie);
+                  return {
+                    episodeUrl: ep.url,
+                    title: epTitle,
+                    seriesTitle: anime.title,
+                    seriesUrl: anime.url,
+                    episodeLabel: epBadge,
+                    poster: ep.thumb || anime.backdrop || anime.poster,
+                    isMovie: false,
+                    seasonNumber: ep.seasonNumber,
+                    episodeNumber: ep.episodeNumber ?? undefined,
+                    prevUrl: seed.prevUrl,
+                    nextUrl: seed.nextUrl,
+                  };
+                });
+                if (onStartBatchOfflineDownload) {
+                  void onStartBatchOfflineDownload(inputs, group.label);
+                } else if (onStartOfflineDownload) {
+                  for (const item of inputs) {
+                    void onStartOfflineDownload(item);
+                  }
+                }
+              };
+              const seasonDownloadLabel = seasonAllSavedOffline
+                ? 'Temporada salva'
+                : seasonOfflineRemainingEps.length === 0 && seasonOfflineActiveRecs.length > 0
+                  ? `Baixando (${seasonOfflineSavedCount}/${seasonPlayableEpisodes.length})`
+                  : seasonOfflineSavedCount > 0 || seasonOfflineActiveRecs.length > 0
+                    ? `Baixar restantes (${seasonOfflineRemainingEps.length})`
+                    : `Baixar temporada (${seasonPlayableEpisodes.length})`;
+              const seasonDownloadClass = seasonAllSavedOffline
+                ? 'border-emerald-500/45 bg-emerald-500/15 text-emerald-300'
+                : seasonOfflineRemainingEps.length === 0 && seasonOfflineActiveRecs.length > 0
+                  ? 'border-[#f97316]/50 bg-[#f97316]/15 text-[#fb923c] hover:bg-[#f97316]/25'
+                  : 'border-white/12 bg-[#151921] text-slate-200 hover:border-emerald-500/50 hover:text-white';
 
               return (
                 <div
@@ -1806,6 +1893,38 @@ export function AnimeDetailView({
                     )}
 
                     <div className="flex shrink-0 items-center gap-2">
+                      {canDownloadSeason && (
+                        <button
+                          type="button"
+                          data-season-download-desktop={group.seasonNumber}
+                          disabled={seasonAllSavedOffline}
+                          onClick={handleDownloadSeasonClick}
+                          title={
+                            seasonAllSavedOffline
+                              ? `Todos os episódios de ${group.label} já estão salvos offline`
+                              : seasonOfflineRemainingEps.length === 0 &&
+                                  seasonOfflineActiveRecs.length > 0
+                                ? `Toque para cancelar os downloads em andamento/na fila de ${group.label}`
+                                : `Baixar todos os episódios disponíveis de ${group.label} para assistir offline`
+                          }
+                          className={`hidden sm:inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium tabular-nums transition-colors disabled:cursor-default ${seasonDownloadClass}`}
+                        >
+                          {seasonAllSavedOffline ? (
+                            <HardDrive className="h-3.5 w-3.5 shrink-0 text-emerald-300" />
+                          ) : seasonOfflineRemainingEps.length === 0 &&
+                            seasonOfflineActiveRecs.length > 0 ? (
+                            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                          ) : (
+                            <Download className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                          )}
+                          <span>{seasonDownloadLabel}</span>
+                          {seasonOfflineRemainingEps.length === 0 &&
+                            seasonOfflineActiveRecs.length > 0 && (
+                              <X className="h-3 w-3 shrink-0 opacity-80" />
+                            )}
+                        </button>
+                      )}
+
                       {seasonPlayableEpisodes.length > 0 && (
                         <button
                           type="button"
@@ -1872,8 +1991,39 @@ export function AnimeDetailView({
                     {seasonPlayableEpisodes.length > 0 && (
                       <div
                         data-season-mobile-actions={group.seasonNumber}
-                        className="flex items-center justify-end bg-[#0d0f12]/30 px-4 py-2 sm:hidden"
+                        className="flex flex-wrap items-center justify-end gap-2 bg-[#0d0f12]/30 px-4 py-2 sm:hidden"
                       >
+                        {canDownloadSeason && (
+                          <button
+                            type="button"
+                            data-season-download-mobile={group.seasonNumber}
+                            disabled={seasonAllSavedOffline}
+                            onClick={handleDownloadSeasonClick}
+                            title={
+                              seasonAllSavedOffline
+                                ? `Todos os episódios de ${group.label} já estão salvos offline`
+                                : seasonOfflineRemainingEps.length === 0 &&
+                                    seasonOfflineActiveRecs.length > 0
+                                  ? `Toque para cancelar os downloads em andamento/na fila de ${group.label}`
+                                  : `Baixar todos os episódios disponíveis de ${group.label} para assistir offline`
+                            }
+                            className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium tabular-nums transition-colors disabled:cursor-default ${seasonDownloadClass}`}
+                          >
+                            {seasonAllSavedOffline ? (
+                              <HardDrive className="h-3.5 w-3.5 shrink-0 text-emerald-300" />
+                            ) : seasonOfflineRemainingEps.length === 0 &&
+                              seasonOfflineActiveRecs.length > 0 ? (
+                              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                            ) : (
+                              <Download className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                            )}
+                            <span>{seasonDownloadLabel}</span>
+                            {seasonOfflineRemainingEps.length === 0 &&
+                              seasonOfflineActiveRecs.length > 0 && (
+                                <X className="h-3 w-3 shrink-0 opacity-80" />
+                              )}
+                          </button>
+                        )}
                         <button
                           type="button"
                           data-season-mark-mobile={group.seasonNumber}

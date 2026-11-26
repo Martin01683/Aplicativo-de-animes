@@ -19,6 +19,17 @@ export type EpisodeCheckIntervalMinutes = 0 | 15 | 30 | 60;
 export type AppUpdateIntervalHours = 6 | 24 | 168;
 export type DefaultAudioFilter = 'ALL' | 'DUB' | 'LEG';
 export type SkipIntroSeconds = 30 | 60 | 85 | 90;
+export type MaxConcurrentDownloads = 1 | 2 | 3 | 4 | 5;
+
+export const MAX_CONCURRENT_DOWNLOADS_OPTIONS: MaxConcurrentDownloads[] = [1, 2, 3, 4, 5];
+export const DEFAULT_MAX_CONCURRENT_DOWNLOADS: MaxConcurrentDownloads = 1;
+
+export function sanitizeMaxConcurrentDownloads(raw: unknown): MaxConcurrentDownloads {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_MAX_CONCURRENT_DOWNLOADS;
+  const clamped = Math.max(1, Math.min(5, Math.floor(n)));
+  return clamped as MaxConcurrentDownloads;
+}
 
 export interface AppSettings {
   episodeCheckIntervalMinutes: EpisodeCheckIntervalMinutes;
@@ -41,6 +52,7 @@ export interface AppSettings {
   skipIntroSeconds: SkipIntroSeconds;
   autoPlayNextEpisode: boolean;
   videoScale: VideoScaleMode;
+  maxConcurrentDownloads: MaxConcurrentDownloads;
   episodeSources: EpisodeSourceConfig[];
   catalogCredentials: CatalogSourceCredentials;
 }
@@ -71,6 +83,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   skipIntroSeconds: 85,
   autoPlayNextEpisode: false,
   videoScale: DEFAULT_VIDEO_SCALE,
+  maxConcurrentDownloads: DEFAULT_MAX_CONCURRENT_DOWNLOADS,
   episodeSources: DEFAULT_EPISODE_SOURCES.map((s) => ({
     ...s,
     supportsMedia: [...s.supportsMedia],
@@ -236,6 +249,7 @@ export function sanitizeAppSettings(raw: unknown): AppSettings {
         ? input.autoPlayNextEpisode
         : DEFAULT_APP_SETTINGS.autoPlayNextEpisode,
     videoScale: sanitizeVideoScaleMode(input.videoScale),
+    maxConcurrentDownloads: sanitizeMaxConcurrentDownloads(input.maxConcurrentDownloads),
     episodeSources: sanitizeEpisodeSources(input.episodeSources)
       .filter((s) => s.builtIn)
       .map((s) => ({
