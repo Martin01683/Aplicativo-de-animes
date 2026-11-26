@@ -879,5 +879,11 @@ describe('Android LibVLC audio stability & TheTVDB UI layout guards', () => {
     assert.match(detailTsx, /data-episode-titles-loading="true"/);
     assert.match(detailTsx, /data-episode-title-loading="true"/);
     assert.match(detailTsx, /Buscando títulos dos episódios no TheTVDB\.\.\./);
+
+    const workspaceTsx = readRepoFile('src/components/EpisodeWorkspace.tsx');
+    assert.match(workspaceTsx, /resolveLocalizedEpisodeDisplayTitle\(/);
+    assert.match(workspaceTsx, /data-episode-heading-title="true"/);
+    assert.match(workspaceTsx, /title=\{resolvedEpisodeTitleInfo\.playerTitle\}/);
+    assert.match(workspaceTsx, /findUpcomingNextEpisode\(localizedSeriesEpisodes/);
   });
 });

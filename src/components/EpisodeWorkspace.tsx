@@ -32,13 +32,16 @@ import {
 import {
   applyLocalizedEpisodeTitles,
   collectUnlocalizedEpisodeIds,
+  extractExplicitSeasonNumber,
   formatEpisodeCountdown,
+  formatEpisodeFinaleBadge,
   formatEpisodeReleaseDate,
   formatUpcomingEpisodeNotice,
   formatUpcomingEpisodeShortLabel,
   isEpisodeAvailableOnServer,
   isEpisodeUncensored,
   isUncensoredEpisodeTitle,
+  resolveLocalizedEpisodeDisplayTitle,
 } from '../lib/episodeAvailability';
 import { extractEpisodeNumber, normalizeTopAnimesUrl } from '../lib/favoriteAlerts';
 import {
@@ -737,9 +740,35 @@ export function EpisodeWorkspace({
       .map((s) => Number.parseInt(s, 10))
       .filter((id) => Number.isFinite(id) && id > 0);
     const { missingIds } = readCachedEpisodeTitles(parsedIds);
-    const idsToFetch = missingIds.filter(
+    const currentSeriesEpMatch =
+      seriesEpisodes.find((ep) => isSameEpisodeUrl(ep.url, episode.url)) ||
+      (() => {
+        const epNum =
+          episode.episodeNumber ??
+          extractEpisodeNumber(episode.episodeLabel || '') ??
+          extractEpisodeNumber(episode.title) ??
+          extractEpisodeNumber(episode.url);
+        if (!epNum) return undefined;
+        const seasonNum =
+          episode.seasonNumber ||
+          extractExplicitSeasonNumber(episode.episodeLabel || '') ||
+          extractExplicitSeasonNumber(episode.title) ||
+          extractExplicitSeasonNumber(episode.seriesTitle) ||
+          1;
+        return (
+          seriesEpisodes.find(
+            (ep) => (ep.seasonNumber || 1) === seasonNum && ep.episodeNumber === epNum
+          ) || seriesEpisodes.find((ep) => ep.episodeNumber === epNum)
+        );
+      })();
+    const prioritizedId = currentSeriesEpMatch?.tvdbEpisodeId;
+    const rawIdsToFetch = missingIds.filter(
       (id) => !settledSeriesTitleIdsRef.current.ids.has(id)
     );
+    const idsToFetch =
+      prioritizedId && rawIdsToFetch.includes(prioritizedId)
+        ? [prioritizedId, ...rawIdsToFetch.filter((id) => id !== prioritizedId)]
+        : rawIdsToFetch;
     if (idsToFetch.length === 0) return;
 
     const batches: number[][] = [];
@@ -815,9 +844,16 @@ export function EpisodeWorkspace({
       cancelled = true;
     };
   }, [
+    episode.episodeLabel,
+    episode.episodeNumber,
     episode.externalIds?.tvdbId,
     episode.externalIds?.tvdbSlug,
     episode.isMovie,
+    episode.seasonNumber,
+    episode.seriesTitle,
+    episode.title,
+    episode.url,
+    seriesEpisodes,
     seriesExternalIds?.tvdbId,
     seriesExternalIds?.tvdbSlug,
     seriesTitlesScopeKey,
@@ -839,13 +875,26 @@ export function EpisodeWorkspace({
       extractEpisodeNumber(episode.title) ??
       extractEpisodeNumber(episode.url);
     if (!targetEpNum) return undefined;
-    const targetSeason = episode.seasonNumber || 1;
+    const targetSeason =
+      episode.seasonNumber ||
+      extractExplicitSeasonNumber(episode.episodeLabel || '') ||
+      extractExplicitSeasonNumber(episode.title) ||
+      extractExplicitSeasonNumber(episode.seriesTitle) ||
+      1;
     return (
       localizedSeriesEpisodes.find(
         (ep) => (ep.seasonNumber || 1) === targetSeason && ep.episodeNumber === targetEpNum
       ) || localizedSeriesEpisodes.find((ep) => ep.episodeNumber === targetEpNum)
     );
-  }, [episode.episodeLabel, episode.episodeNumber, episode.seasonNumber, episode.title, episode.url, localizedSeriesEpisodes]);
+  }, [
+    episode.episodeLabel,
+    episode.episodeNumber,
+    episode.seasonNumber,
+    episode.seriesTitle,
+    episode.title,
+    episode.url,
+    localizedSeriesEpisodes,
+  ]);
 
   // Fetch TheTVDB episode/movie synopsis & artwork (PT-BR -> DeepL -> Google Translate -> EN fallback) asynchronously
   useEffect(() => {
@@ -1234,13 +1283,13 @@ export function EpisodeWorkspace({
   }, [episode.url, playableOptions]);
 
   const adjacent = useMemo(
-    () => resolveSeriesPrevNext(seriesEpisodes, episode.url),
-    [seriesEpisodes, episode.url]
+    () => resolveSeriesPrevNext(localizedSeriesEpisodes, episode.url),
+    [localizedSeriesEpisodes, episode.url]
   );
 
   const upcomingNextEpisode = useMemo(
-    () => findUpcomingNextEpisode(seriesEpisodes, episode.url),
-    [seriesEpisodes, episode.url]
+    () => findUpcomingNextEpisode(localizedSeriesEpisodes, episode.url),
+    [localizedSeriesEpisodes, episode.url]
   );
 
   const isUrlMarkedUnavailable = useCallback(
@@ -1352,6 +1401,35 @@ export function EpisodeWorkspace({
     };
   }, [onLoadingStateChange]);
   const tvdbSynopsis = scopedSynopsis.result;
+  const resolvedEpisodeTitleInfo = useMemo(
+    () =>
+      resolveLocalizedEpisodeDisplayTitle({
+        episodeTitle: episode.title,
+        episodeLabel: episode.episodeLabel,
+        episodeNumber: episode.episodeNumber,
+        seasonNumber: episode.seasonNumber,
+        isMovie: episode.isMovie,
+        matchedSeriesEpisode,
+        tvdbEpisodeTitle: tvdbSynopsis?.episodeTitle,
+      }),
+    [
+      episode.episodeLabel,
+      episode.episodeNumber,
+      episode.isMovie,
+      episode.seasonNumber,
+      episode.title,
+      matchedSeriesEpisode,
+      tvdbSynopsis?.episodeTitle,
+    ]
+  );
+  const episodeFinaleBadge = !episode.isMovie
+    ? formatEpisodeFinaleBadge(matchedSeriesEpisode?.finaleType)
+    : null;
+  const showSynopsisSubtitle = Boolean(
+    tvdbSynopsis?.episodeTitle &&
+      tvdbSynopsis.episodeTitle.trim().toLowerCase() !==
+        resolvedEpisodeTitleInfo.headingTitle.trim().toLowerCase()
+  );
   const displaySynopsis = tvdbSynopsis?.synopsis || episode.synopsis;
   const synopsisSourceCaption =
     tvdbSynopsis?.source === 'thetvdb-pt-br'
@@ -1491,10 +1569,12 @@ export function EpisodeWorkspace({
               </button>
             </>
           )}
-          {episode.episodeLabel && (
+          {(resolvedEpisodeTitleInfo.badge || episode.episodeLabel) && (
             <>
               <span>/</span>
-              <span className="text-slate-200">{episode.episodeLabel}</span>
+              <span className="text-slate-200">
+                {resolvedEpisodeTitleInfo.badge || episode.episodeLabel}
+              </span>
             </>
           )}
         </div>
@@ -1631,7 +1711,7 @@ export function EpisodeWorkspace({
       <div className="min-w-0 space-y-5">
         {showPlayer ? (
           <AnimePlayer
-            title={episode.title}
+            title={resolvedEpisodeTitleInfo.playerTitle}
             episodeUrl={episode.url}
             seriesUrl={episode.seriesUrl}
             seriesTitle={episode.seriesTitle}
@@ -1702,10 +1782,10 @@ export function EpisodeWorkspace({
                 ? () => {
                     void onStartOfflineDownload({
                       episodeUrl: episode.url,
-                      title: episode.title,
+                      title: resolvedEpisodeTitleInfo.playerTitle,
                       seriesTitle: episode.seriesTitle,
                       seriesUrl: episode.seriesUrl,
-                      episodeLabel: episode.episodeLabel,
+                      episodeLabel: resolvedEpisodeTitleInfo.badge || episode.episodeLabel,
                       poster: effectiveEpisodePoster,
                       isMovie: episode.isMovie,
                       seasonNumber: episode.seasonNumber,
@@ -1763,8 +1843,31 @@ export function EpisodeWorkspace({
         <section className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
           <div className="space-y-3.5 border-b border-white/8 pb-4">
             <div className="min-w-0">
-              <h1 className="text-lg font-bold text-white sm:text-2xl">
-                {episode.title}
+              {!episode.isMovie && (resolvedEpisodeTitleInfo.badge || episodeFinaleBadge) && (
+                <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                  {resolvedEpisodeTitleInfo.badge && (
+                    <span
+                      data-episode-heading-badge="true"
+                      className="font-mono text-xs font-semibold uppercase tracking-wide tabular-nums text-[#fb923c]"
+                    >
+                      {resolvedEpisodeTitleInfo.badge}
+                    </span>
+                  )}
+                  {episodeFinaleBadge && (
+                    <span
+                      data-episode-finale-badge="true"
+                      className="inline-flex items-center rounded border border-amber-400/35 bg-amber-500/12 px-1.5 py-0.5 text-[10px] font-semibold text-amber-200"
+                    >
+                      {episodeFinaleBadge}
+                    </span>
+                  )}
+                </div>
+              )}
+              <h1
+                data-episode-heading-title="true"
+                className="text-lg font-bold text-white sm:text-2xl"
+              >
+                {resolvedEpisodeTitleInfo.headingTitle}
               </h1>
               <div
                 data-episode-badges="true"
@@ -1840,7 +1943,7 @@ export function EpisodeWorkspace({
                 data-synopsis-source={tvdbSynopsis?.source || 'fallback'}
                 className="space-y-1.5"
               >
-                {tvdbSynopsis?.episodeTitle && (
+                {showSynopsisSubtitle && tvdbSynopsis?.episodeTitle && (
                   <p className="text-xs font-semibold text-slate-200 sm:text-sm">
                     {tvdbSynopsis.episodeTitle}
                   </p>
@@ -1922,8 +2025,9 @@ export function EpisodeWorkspace({
                       ? null
                       : {
                           episodeUrl: normalizeTopAnimesUrl(episode.url),
-                          episodeTitle: episode.title,
+                          episodeTitle: resolvedEpisodeTitleInfo.playerTitle,
                           episodeLabel:
+                            resolvedEpisodeTitleInfo.badge ||
                             episode.episodeLabel ||
                             (epNum !== null ? `EP ${epNum}` : 'Episódio atual'),
                           episodeNumber: epNum,
@@ -2087,10 +2191,10 @@ export function EpisodeWorkspace({
                     onClick={() =>
                       void onStartOfflineDownload({
                         episodeUrl: episode.url,
-                        title: episode.title,
+                        title: resolvedEpisodeTitleInfo.playerTitle,
                         seriesTitle: episode.seriesTitle,
                         seriesUrl: episode.seriesUrl,
-                        episodeLabel: episode.episodeLabel,
+                        episodeLabel: resolvedEpisodeTitleInfo.badge || episode.episodeLabel,
                         poster: effectiveEpisodePoster,
                         isMovie: episode.isMovie,
                         seasonNumber: episode.seasonNumber,
@@ -2159,7 +2263,7 @@ export function EpisodeWorkspace({
                             referer: resolved.referer || 'https://topanimes.net/',
                             preferDirect: resolved.preferDirect,
                             episodeUrl: episode.url,
-                            title: episode.title,
+                            title: resolvedEpisodeTitleInfo.playerTitle,
                             seriesTitle: episode.seriesTitle,
                             seriesUrl: episode.seriesUrl,
                             poster: effectiveEpisodePoster,

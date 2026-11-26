@@ -16,6 +16,7 @@ import {
   mergeServerAndCatalogEpisodes,
   parseEpisodeDateToTimestampSec,
   pickImageWithFallback,
+  resolveLocalizedEpisodeDisplayTitle,
   stripUncensoredTag,
 } from './episodeAvailability';
 import { pickLatestAnimeEpisode } from './favoriteAlerts';
@@ -748,6 +749,218 @@ test('pickImageWithFallback prioritizes TheTVDB artwork and falls back cleanly t
     ),
     ''
   );
+});
+
+test('mergeServerAndCatalogEpisodes ignores mismatched future LiveChart hints on ended seasons and never synthesizes episodes past a finale', () => {
+  const serverEpisodes: AnimeEpisodeLink[] = [
+    {
+      numberLabel: '3 - 8',
+      episodeNumber: 8,
+      seasonNumber: 3,
+      title: 'Episódio 8',
+      url: 'https://topanimes.net/episodio/konosuba-3-ep-8/',
+    },
+    {
+      numberLabel: '3 - 9',
+      episodeNumber: 9,
+      seasonNumber: 3,
+      title: 'Episódio 9',
+      url: 'https://topanimes.net/episodio/konosuba-3-ep-9/',
+    },
+    {
+      numberLabel: '3 - 10',
+      episodeNumber: 10,
+      seasonNumber: 3,
+      title: 'Episódio 10',
+      url: 'https://topanimes.net/episodio/konosuba-3-ep-10/',
+    },
+    {
+      numberLabel: '3 - 11',
+      episodeNumber: 11,
+      seasonNumber: 3,
+      title: 'Episódio 11',
+      url: 'https://topanimes.net/episodio/konosuba-3-ep-11/',
+    },
+  ];
+
+  const catalogEpisodes: AnimeEpisodeLink[] = [
+    {
+      numberLabel: 'T3 · EP 8',
+      episodeNumber: 8,
+      seasonNumber: 3,
+      seasonLabel: 'Temporada 3',
+      title: 'Um descanso eterno para o mestre deste lago!',
+      titleLocalized: true,
+      url: 'anisync://episode/anime/thetvdb/303867/s3/e8',
+      date: '2024-05-29',
+    },
+    {
+      numberLabel: 'T3 · EP 9',
+      episodeNumber: 9,
+      seasonNumber: 3,
+      seasonLabel: 'Temporada 3',
+      title: 'Uma conversa para este fugitivo!',
+      titleLocalized: true,
+      url: 'anisync://episode/anime/thetvdb/303867/s3/e9',
+      date: '2024-06-05',
+    },
+    {
+      numberLabel: 'T3 · EP 10',
+      episodeNumber: 10,
+      seasonNumber: 3,
+      seasonLabel: 'Temporada 3',
+      title: 'Bênçãos para esta noiva egoísta!',
+      titleLocalized: true,
+      url: 'anisync://episode/anime/thetvdb/303867/s3/e10',
+      date: '2024-06-12',
+    },
+    {
+      numberLabel: 'T3 · EP 11',
+      episodeNumber: 11,
+      seasonNumber: 3,
+      seasonLabel: 'Temporada 3',
+      title: 'Bênçãos Divinas Para Esses Dias Sem Mudanças!',
+      titleLocalized: true,
+      finaleType: 'series',
+      url: 'anisync://episode/anime/thetvdb/303867/s3/e11',
+      date: '2024-06-19',
+    },
+  ];
+
+  // Mismatched 2026 LiveChart schedule hint (e.g. another show / spin-off / different season)
+  const mismatchedMerged = mergeServerAndCatalogEpisodes({
+    serverTitle: 'KonoSuba',
+    serverUrl: 'https://topanimes.net/animes/konosuba/',
+    serverEpisodes,
+    catalogEpisodes,
+    liveChartHint: {
+      livechartId: 77777,
+      episodeNumber: 9,
+      airingAt: Math.floor(Date.UTC(2026, 10, 26, 15, 30, 0) / 1000),
+      totalEpisodes: 13,
+    },
+    serverMatched: true,
+    tvdbId: 303867,
+    unifyAllSeasons: true,
+  });
+
+  // Must NOT overwrite EP 9's 2024 date with 2026 and must NOT synthesize phantom EP 12 / EP 13 after Final da série!
+  assert.equal(mismatchedMerged.length, 4);
+  const ep9 = mismatchedMerged.find((e) => e.episodeNumber === 9);
+  assert.ok(ep9);
+  assert.equal(ep9.date, '2024-06-05');
+  assert.equal(ep9.hasExactAiringTime, false);
+  const ep11 = mismatchedMerged.find((e) => e.episodeNumber === 11);
+  assert.equal(ep11?.finaleType, 'series');
+  assert.equal(mismatchedMerged.some((e) => (e.episodeNumber || 0) > 11), false);
+
+  // Even for a genuinely currently-airing season whose finale is marked at EP 11,
+  // LiveChart may upgrade EP 9..11 timestamps, but must STILL cap at EP 11 (never synthesize EP 12/13).
+  const activeSeasonCatalog: AnimeEpisodeLink[] = [
+    {
+      numberLabel: 'EP 9',
+      episodeNumber: 9,
+      seasonNumber: 1,
+      seasonLabel: 'Temporada 1',
+      title: 'Episódio 9 — Clímax',
+      url: 'anisync://episode/anime/thetvdb/500/s1/e9',
+      date: '2026-11-26',
+    },
+    {
+      numberLabel: 'EP 10',
+      episodeNumber: 10,
+      seasonNumber: 1,
+      seasonLabel: 'Temporada 1',
+      title: 'Episódio 10 — Quase lá',
+      url: 'anisync://episode/anime/thetvdb/500/s1/e10',
+      date: '2026-12-03',
+    },
+    {
+      numberLabel: 'EP 11',
+      episodeNumber: 11,
+      seasonNumber: 1,
+      seasonLabel: 'Temporada 1',
+      title: 'Episódio 11 — Epílogo',
+      finaleType: 'season',
+      url: 'anisync://episode/anime/thetvdb/500/s1/e11',
+      date: '2026-12-10',
+    },
+  ];
+  const ep9Live = Math.floor(Date.UTC(2026, 10, 26, 15, 30, 0) / 1000);
+  const cappedAiring = mergeServerAndCatalogEpisodes({
+    serverTitle: 'Anime Atual',
+    serverUrl: 'https://topanimes.net/animes/anime-atual/',
+    serverEpisodes: [],
+    catalogEpisodes: activeSeasonCatalog,
+    liveChartHint: {
+      livechartId: 88888,
+      episodeNumber: 9,
+      airingAt: ep9Live,
+      totalEpisodes: 13,
+    },
+    serverMatched: false,
+    tvdbId: 500,
+  });
+  assert.equal(cappedAiring.length, 11);
+  assert.equal(cappedAiring.some((e) => (e.episodeNumber || 0) > 11), false);
+  const cappedEp9 = cappedAiring.find((e) => e.episodeNumber === 9);
+  const cappedEp11 = cappedAiring.find((e) => e.episodeNumber === 11);
+  assert.equal(cappedEp9?.airingAt, ep9Live);
+  assert.equal(cappedEp9?.hasExactAiringTime, true);
+  assert.equal(cappedEp11?.episodeNumber, 11);
+  assert.equal(cappedEp11?.airingAt, ep9Live + 14 * 86400);
+});
+
+test('resolveLocalizedEpisodeDisplayTitle aligns EpisodeWorkspace headings & player titles with TheTVDB PT-BR titles', () => {
+  const localized = resolveLocalizedEpisodeDisplayTitle({
+    episodeTitle: 'KonoSuba 3 Episódio 8',
+    episodeLabel: 'Episódio 8',
+    episodeNumber: 8,
+    seasonNumber: 3,
+    matchedSeriesEpisode: {
+      numberLabel: 'T3 · EP 8',
+      episodeNumber: 8,
+      seasonNumber: 3,
+      title: 'Episódio 8 — Um descanso eterno para o mestre deste lago!',
+      titleLocalized: true,
+    },
+  });
+  assert.equal(localized.usedCatalogTitle, true);
+  assert.equal(localized.badge, 'T3 · EP 8');
+  assert.equal(localized.headingTitle, 'Um descanso eterno para o mestre deste lago!');
+  assert.equal(
+    localized.playerTitle,
+    'T3 · EP 8 — Um descanso eterno para o mestre deste lago!'
+  );
+
+  // Falls back to /api/episode-synopsis localized title before series list finishes hydrating
+  const fromSynopsis = resolveLocalizedEpisodeDisplayTitle({
+    episodeTitle: 'KonoSuba 3 Episódio 9',
+    episodeLabel: '3 - 9',
+    episodeNumber: 9,
+    seasonNumber: 3,
+    matchedSeriesEpisode: {
+      numberLabel: 'T3 · EP 9',
+      episodeNumber: 9,
+      seasonNumber: 3,
+      title: 'Episódio 9',
+      titleLocalized: false,
+    },
+    tvdbEpisodeTitle: 'Uma conversa para este fugitivo!',
+  });
+  assert.equal(fromSynopsis.usedCatalogTitle, true);
+  assert.equal(fromSynopsis.headingTitle, 'Uma conversa para este fugitivo!');
+  assert.equal(fromSynopsis.playerTitle, 'T3 · EP 9 — Uma conversa para este fugitivo!');
+
+  // Movies preserve their original movie title without injecting an episode prefix
+  const movie = resolveLocalizedEpisodeDisplayTitle({
+    episodeTitle: 'KonoSuba: Legend of Crimson',
+    isMovie: true,
+    tvdbEpisodeTitle: 'Ignored',
+  });
+  assert.equal(movie.usedCatalogTitle, false);
+  assert.equal(movie.headingTitle, 'KonoSuba: Legend of Crimson');
+  assert.equal(movie.playerTitle, 'KonoSuba: Legend of Crimson');
 });
 
 

@@ -624,23 +624,25 @@ export async function findLiveChartScheduleHint(
 
   let bestItem: CatalogMediaItem | null = null;
   let bestScore = 0;
+  let bestSeason: number | null = null;
 
   for (const item of items) {
     if (!item.airingAt || item.airingAt <= 0) continue;
-    if (options.livechartId && item.externalIds?.livechartId === options.livechartId) {
-      bestItem = item;
-      break;
-    }
-
     const candidates = [
       item.title,
       item.scheduleMeta?.englishTitle,
       item.scheduleMeta?.nativeTitle,
     ].filter((c): c is string => Boolean(c && c.trim()));
-
     const candSeason = candidates
       .map((c) => extractExplicitSeasonNumber(c))
       .find((s): s is number => s !== null);
+
+    if (options.livechartId && item.externalIds?.livechartId === options.livechartId) {
+      bestItem = item;
+      bestSeason = candSeason ?? null;
+      break;
+    }
+
     if (querySeason && candSeason && querySeason !== candSeason) continue;
 
     let sim = 0;
@@ -652,6 +654,7 @@ export async function findLiveChartScheduleHint(
     if (sim >= 0.84 && sim > bestScore) {
       bestScore = sim;
       bestItem = item;
+      bestSeason = candSeason ?? null;
     }
   }
 
@@ -664,6 +667,7 @@ export async function findLiveChartScheduleHint(
     episodeNumber: epNum,
     airingAt: bestItem.airingAt,
     totalEpisodes: bestItem.scheduleMeta?.totalEpisodes,
+    ...(bestSeason ? { seasonNumber: bestSeason } : {}),
     serviceName: bestItem.scheduleMeta?.serviceName,
     poster: bestItem.poster || undefined,
   };

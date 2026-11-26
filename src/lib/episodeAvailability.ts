@@ -6,6 +6,7 @@ export interface LiveChartAnimeScheduleHint {
   episodeNumber: number;
   airingAt: number;
   totalEpisodes?: number;
+  seasonNumber?: number;
   serviceName?: string;
   poster?: string;
 }
@@ -638,6 +639,191 @@ function isGenericEpisodeTitle(title: string): boolean {
   return /^(?:epis[oó]dio|episode|ep\.?)\s*\d+(?:\s*[-–—:]?\s*(?:final)?)?$/i.test(cleaned);
 }
 
+export interface LocalizedEpisodeTitleResult {
+  badge: string;
+  headingTitle: string;
+  playerTitle: string;
+  localizedName: string;
+  usedCatalogTitle: boolean;
+}
+
+/**
+ * Resolves the canonical localized episode title (matching AnimeDetailView's TheTVDB PT-BR /
+ * DeepL / Google Translate / EN hierarchy) for EpisodeWorkspace headings, AnimePlayer headers,
+ * offline downloads, and TV Cast metadata.
+ */
+export function resolveLocalizedEpisodeDisplayTitle(params: {
+  episodeTitle: string;
+  episodeLabel?: string;
+  episodeNumber?: number | null;
+  seasonNumber?: number | null;
+  isMovie?: boolean;
+  matchedSeriesEpisode?: Pick<
+    AnimeEpisodeLink,
+    'title' | 'titleLocalized' | 'episodeNumber' | 'seasonNumber' | 'numberLabel'
+  > | null;
+  tvdbEpisodeTitle?: string | null;
+}): LocalizedEpisodeTitleResult {
+  const {
+    episodeTitle,
+    episodeLabel,
+    episodeNumber,
+    seasonNumber,
+    isMovie = false,
+    matchedSeriesEpisode,
+    tvdbEpisodeTitle,
+  } = params;
+
+  const fallbackTitle = (episodeTitle || '').trim() || 'Episódio';
+  const effectiveEpNum = matchedSeriesEpisode?.episodeNumber ?? episodeNumber ?? null;
+  const effectiveSeasonNum = matchedSeriesEpisode?.seasonNumber ?? seasonNumber ?? undefined;
+  const hasBadgeSource = Boolean(
+    isMovie ||
+      matchedSeriesEpisode ||
+      (effectiveEpNum !== null && Number.isFinite(effectiveEpNum) && effectiveEpNum > 0) ||
+      (episodeLabel && episodeLabel.trim())
+  );
+  const badge = hasBadgeSource
+    ? formatEpisodeCardBadge(
+        {
+          episodeNumber: effectiveEpNum,
+          seasonNumber: effectiveSeasonNum,
+          numberLabel: matchedSeriesEpisode?.numberLabel || episodeLabel || '',
+        },
+        isMovie
+      )
+    : '';
+
+  if (isMovie) {
+    return {
+      badge,
+      headingTitle: fallbackTitle,
+      playerTitle: fallbackTitle,
+      localizedName: '',
+      usedCatalogTitle: false,
+    };
+  }
+
+  const pickNonGenericTitle = (raw?: string | null): string => {
+    if (!raw || !raw.trim()) return '';
+    const formatted = formatEpisodeCardTitle(
+      { title: raw, episodeNumber: effectiveEpNum },
+      false
+    ).trim();
+    if (!formatted || isGenericEpisodeTitle(formatted)) return '';
+    return formatted;
+  };
+
+  const localizedName =
+    (matchedSeriesEpisode?.titleLocalized
+      ? pickNonGenericTitle(matchedSeriesEpisode.title)
+      : '') ||
+    pickNonGenericTitle(tvdbEpisodeTitle) ||
+    pickNonGenericTitle(matchedSeriesEpisode?.title);
+
+  if (localizedName) {
+    const playerTitle =
+      badge && !localizedName.toLowerCase().startsWith(badge.toLowerCase())
+        ? `${badge} — ${localizedName}`
+        : localizedName;
+    return {
+      badge,
+      headingTitle: localizedName,
+      playerTitle,
+      localizedName,
+      usedCatalogTitle: true,
+    };
+  }
+
+  return {
+    badge,
+    headingTitle: fallbackTitle,
+    playerTitle: fallbackTitle,
+    localizedName: '',
+    usedCatalogTitle: false,
+  };
+}
+
+const MAX_LIVECHART_EXACT_EP_DRIFT_SEC = 14 * 86400;
+const MAX_LIVECHART_NEIGHBOR_DRIFT_SEC = 45 * 86400;
+
+function findSeasonFinaleEpisode(episodes: readonly AnimeEpisodeLink[]): AnimeEpisodeLink | null {
+  let finale: AnimeEpisodeLink | null = null;
+  for (const ep of episodes) {
+    if (ep.finaleType !== 'series' && ep.finaleType !== 'season') continue;
+    if (!finale || (ep.episodeNumber || 0) >= (finale.episodeNumber || 0)) {
+      finale = ep;
+    }
+  }
+  return finale;
+}
+
+/**
+ * Verifies that a LiveChart.me weekly schedule hint actually belongs to the target catalog
+ * season before upgrading dates or synthesizing upcoming episodes.
+ * Prevents a newer season/spin-off/fuzzy match from overwriting historical episode dates
+ * (e.g. turning a 2024 episode into 2026) or appending phantom episodes after a season/series finale.
+ */
+function isLiveChartHintCompatibleWithSeason(
+  targetSeasonEps: readonly AnimeEpisodeLink[],
+  targetSeasonNumber: number,
+  liveChartHint: LiveChartAnimeScheduleHint
+): boolean {
+  if (targetSeasonEps.length === 0) return true;
+
+  if (
+    liveChartHint.seasonNumber &&
+    liveChartHint.seasonNumber > 0 &&
+    liveChartHint.seasonNumber !== targetSeasonNumber
+  ) {
+    return false;
+  }
+
+  const exactEp = targetSeasonEps.find((ep) => ep.episodeNumber === liveChartHint.episodeNumber);
+  if (
+    exactEp?.airingAt &&
+    exactEp.airingAt > 0 &&
+    Math.abs(exactEp.airingAt - liveChartHint.airingAt) > MAX_LIVECHART_EXACT_EP_DRIFT_SEC
+  ) {
+    return false;
+  }
+
+  const finaleEp = findSeasonFinaleEpisode(targetSeasonEps);
+  if (finaleEp) {
+    if (finaleEp.episodeNumber && liveChartHint.episodeNumber > finaleEp.episodeNumber) {
+      return false;
+    }
+    if (
+      finaleEp.airingAt &&
+      finaleEp.airingAt > 0 &&
+      liveChartHint.airingAt > finaleEp.airingAt + MAX_LIVECHART_EXACT_EP_DRIFT_SEC
+    ) {
+      return false;
+    }
+  }
+
+  let nearestDated: AnimeEpisodeLink | null = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+  for (const ep of targetSeasonEps) {
+    if (!ep.episodeNumber || ep.episodeNumber <= 0 || !ep.airingAt || ep.airingAt <= 0) continue;
+    const dist = Math.abs(ep.episodeNumber - liveChartHint.episodeNumber);
+    if (dist < nearestDistance) {
+      nearestDistance = dist;
+      nearestDated = ep;
+    }
+  }
+  if (nearestDated && nearestDated.episodeNumber && nearestDated.airingAt) {
+    const expectedNearestTs =
+      liveChartHint.airingAt +
+      (nearestDated.episodeNumber - liveChartHint.episodeNumber) * WEEK_SECONDS;
+    if (Math.abs(nearestDated.airingAt - expectedNearestTs) > MAX_LIVECHART_NEIGHBOR_DRIFT_SEC) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function formatIsoDateFromSec(sec: number): string {
   const d = new Date(sec * 1000);
   const yyyy = d.getUTCFullYear();
@@ -736,6 +922,9 @@ export function mergeServerAndCatalogEpisodes(params: {
   // Upgrade catalog timestamps with LiveChart exact airing time (and project exact weekly time to subsequent episodes in the same season)
   const targetLiveChartSeason = (() => {
     if (!liveChartHint) return mappedServerSeason;
+    if (liveChartHint.seasonNumber && liveChartHint.seasonNumber > 0) {
+      return liveChartHint.seasonNumber;
+    }
     if (singleServerSeason && singleServerSeason > 1) return singleServerSeason;
     if (explicitSeason && explicitSeason > 1) return explicitSeason;
     // If catalog has multiple seasons, prefer the highest/latest season that contains or precedes liveChartHint.episodeNumber
@@ -753,7 +942,30 @@ export function mergeServerAndCatalogEpisodes(params: {
     return distinctSeasons[0] || 1;
   })();
 
-  if (liveChartHint && liveChartHint.airingAt > 0 && liveChartHint.episodeNumber > 0) {
+  const targetSeasonCatalogEps = scopedCatalog.filter(
+    (e) => (e.seasonNumber || 1) === targetLiveChartSeason
+  );
+  const seasonFinaleEp = findSeasonFinaleEpisode(targetSeasonCatalogEps);
+  const canApplyLiveChartHint = Boolean(
+    liveChartHint &&
+      liveChartHint.airingAt > 0 &&
+      liveChartHint.episodeNumber > 0 &&
+      isLiveChartHintCompatibleWithSeason(
+        targetSeasonCatalogEps,
+        targetLiveChartSeason,
+        liveChartHint
+      ) &&
+      // If LiveChart explicitly names a newer season (e.g. Season 4) that does not exist in a
+      // multi-season catalog yet, avoid fabricating an unverified extra season unless catalog is empty.
+      !(
+        liveChartHint.seasonNumber &&
+        liveChartHint.seasonNumber > 1 &&
+        scopedCatalog.length > 0 &&
+        targetSeasonCatalogEps.length === 0
+      )
+  );
+
+  if (canApplyLiveChartHint && liveChartHint) {
     scopedCatalog = scopedCatalog.map((ep) => {
       if ((ep.seasonNumber || 1) !== targetLiveChartSeason || !ep.episodeNumber) return ep;
       if (ep.episodeNumber === liveChartHint.episodeNumber) {
@@ -799,12 +1011,17 @@ export function mergeServerAndCatalogEpisodes(params: {
       return Math.max(max, n);
     }, 0);
 
-    const upperBound = Math.max(
+    const rawUpperBound = Math.max(
       liveChartHint.episodeNumber,
       liveChartHint.totalEpisodes && liveChartHint.totalEpisodes <= 100
         ? liveChartHint.totalEpisodes
         : liveChartHint.episodeNumber
     );
+    // Never synthesize scheduled episodes past an explicit season/series finale in the catalog!
+    const upperBound =
+      seasonFinaleEp?.episodeNumber && seasonFinaleEp.episodeNumber > 0
+        ? Math.min(rawUpperBound, seasonFinaleEp.episodeNumber)
+        : rawUpperBound;
     const startEp = Math.max(1, Math.min(liveChartHint.episodeNumber, maxServerEpInTargetSeason + 1));
 
     for (let epNum = startEp; epNum <= upperBound; epNum++) {
