@@ -2,6 +2,16 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.40] — 2026-11-26
+
+### Novidades
+- Adiciona botão baixar temporada e limite configurável de downloads simultâneos (`58d1cfb`)
+
+### Correções
+- Corrige controles, sincronização em tempo real, reconexão, cast offline e buffer local, e adiciona qualidade/áudio/legendas na TV e seleção automática de episódio baixado (`ff85fed`)
+- Remove tag redundante Offline nos cards de episódio que já exibem Salvo (`f0eb71b`)
+- Bloqueia episódios futuros após final de temporada e exibe títulos TheTVDB na página do episódio (`be100e6`)
+
 ## [v1.0.39] — 2026-11-26
 
 ### Correções
