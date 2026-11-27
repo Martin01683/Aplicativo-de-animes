@@ -3141,6 +3141,7 @@ export default function App() {
           setActiveCastServerNume(payload.selectedServerNume);
         }
       }
+      setCastHlsParsedVariants({ masterUrl: '', variants: [] });
       if (helpers?.availableStreams) {
         setCastAvailableStreams(helpers.availableStreams);
       } else if (payload?.streamUrl) {
@@ -3152,6 +3153,8 @@ export default function App() {
             format: payload.streamFormat,
           },
         ]);
+      } else {
+        setCastAvailableStreams([]);
       }
       if (helpers?.availableSubtitles) {
         setCastAvailableSubtitles(helpers.availableSubtitles);
@@ -3163,6 +3166,8 @@ export default function App() {
             isDefault: Boolean(s.default),
           }))
         );
+      } else {
+        setCastAvailableSubtitles([]);
       }
       setTvCastWebHelpers({
         pauseLocal: helpers?.pauseLocal,
@@ -3221,15 +3226,17 @@ export default function App() {
   const syncedTvCastStateRef = useRef<TvCastStateSnapshot>(syncedTvCastState);
   syncedTvCastStateRef.current = syncedTvCastState;
 
-  // Load episode server options on demand when opening TV Cast controls away from the episode page
+  // Load episode server options on demand when opening TV Cast controls (both pre-cast and active cast)
   useEffect(() => {
-    if (!tvCastModalOpen || !tvCastState.active || !tvCastState.episodeUrl) return;
-    if (episodeDetails && isSameEpisodeUrl(episodeDetails.url, tvCastState.episodeUrl)) {
+    const targetEpisodeUrl =
+      (tvCastState.active && tvCastState.episodeUrl) || tvCastMediaPayload?.episodeUrl || '';
+    if (!tvCastModalOpen || !targetEpisodeUrl) return;
+    if (episodeDetails && isSameEpisodeUrl(episodeDetails.url, targetEpisodeUrl)) {
       return;
     }
     if (
       castEpisodeDetailsFallback &&
-      isSameEpisodeUrl(castEpisodeDetailsFallback.url, tvCastState.episodeUrl) &&
+      isSameEpisodeUrl(castEpisodeDetailsFallback.url, targetEpisodeUrl) &&
       castEpisodeDetailsFallback.options.length > 0
     ) {
       return;
@@ -3237,7 +3244,7 @@ export default function App() {
 
     let cancelled = false;
     setLoadingCastEpisodeServers(true);
-    void fetchEpisodeDetailsFast(tvCastState.episodeUrl)
+    void fetchEpisodeDetailsFast(targetEpisodeUrl)
       .then((ep) => {
         if (cancelled) return;
         setCastEpisodeDetailsFallback(ep);
@@ -3252,7 +3259,14 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [castEpisodeDetailsFallback, episodeDetails, tvCastModalOpen, tvCastState.active, tvCastState.episodeUrl]);
+  }, [
+    castEpisodeDetailsFallback,
+    episodeDetails,
+    tvCastMediaPayload?.episodeUrl,
+    tvCastModalOpen,
+    tvCastState.active,
+    tvCastState.episodeUrl,
+  ]);
 
   const activeCastEpisodeDetails = useMemo(() => {
     const targetUrl = tvCastState.episodeUrl || tvCastMediaPayload?.episodeUrl || '';
@@ -3351,6 +3365,13 @@ export default function App() {
     async (opt: PlayerOption, discoveredDevices?: readonly TvCastDevice[]) => {
       const curState = syncedTvCastStateRef.current;
       const isCasting = curState.active && hasRemoteTvControls(curState);
+      if (
+        opt.nume === activeCastServerNume &&
+        tvCastMediaPayload?.streamUrl &&
+        (!isCasting || !curState.selectedServerNume || curState.selectedServerNume === opt.nume)
+      ) {
+        return;
+      }
 
       setSwitchingCastServerNume(opt.nume);
       try {
@@ -3400,6 +3421,7 @@ export default function App() {
           return;
         }
 
+        setCastHlsParsedVariants({ masterUrl: '', variants: [] });
         setCastAvailableStreams(resolved.streams);
         setCastAvailableSubtitles(resolved.subtitles);
 
@@ -3412,14 +3434,15 @@ export default function App() {
         const ep = activeCastEpisodeDetails;
         const audioLabel =
           opt.audioType === 'DUB'
-            ? 'Dublado'
+            ? 'Português (Dublado)'
             : opt.audioType === 'LEG'
-              ? 'Legendado'
+              ? 'Japonês (Legendado)'
               : opt.label;
         const nextPayload = buildCastMediaPayload({
           stream: bestStream,
           subtitles: resolved.subtitles,
-          subtitleDisabled: tvCastMediaPayload?.subtitleDisabled,
+          subtitleDisabled:
+            resolved.subtitles.length > 0 ? tvCastMediaPayload?.subtitleDisabled : false,
           qualityLabel: bestStream.label,
           audioLabel,
           referer: resolved.referer || 'https://topanimes.net/',
@@ -3463,7 +3486,7 @@ export default function App() {
 
           showToast(`Servidor alterado na TV para ${opt.label}.`);
         } else {
-          showToast(`Servidor selecionado para TV: ${opt.label}.`);
+          showToast(`Servidor selecionado: ${opt.label}.`);
         }
       } catch (err) {
         const msg =
@@ -3478,6 +3501,7 @@ export default function App() {
     [
       activeCastEpisodeDetails,
       activeCastOfflineRecord,
+      activeCastServerNume,
       activeTvCastDevice,
       showToast,
       tvCastDeliveryPref,
@@ -3533,6 +3557,7 @@ export default function App() {
         url: baseStream.url,
         format: baseStream.format,
         height: baseStream.height,
+        readOnly: true,
       },
     ];
   }, [castAvailableStreams, castHlsParsedVariants, tvCastMediaPayload]);
@@ -3548,6 +3573,7 @@ export default function App() {
 
   const handleSelectCastQuality = useCallback(
     async (opt: TvCastQualityOption, discoveredDevices: TvCastDevice[]) => {
+      if (opt.readOnly || opt.id === activeCastQualityId) return;
       const curState = syncedTvCastStateRef.current;
       const basePayload = tvCastMediaPayload;
       const livePosMs = curState.active ? curState.positionMs : basePayload?.startPositionMs || 0;
@@ -3579,7 +3605,7 @@ export default function App() {
       setTvCastMediaPayload(nextPayload);
 
       if (!curState.active || !hasRemoteTvControls(curState)) {
-        showToast(`Qualidade para TV definida: ${opt.label}.`);
+        showToast(`Qualidade definida: ${opt.label}.`);
         return;
       }
 
@@ -3620,52 +3646,52 @@ export default function App() {
         setSwitchingCastQualityId('');
       }
     },
-    [activeCastServerNume, activeTvCastDevice, showToast, tvCastDeliveryPref, tvCastMediaPayload]
+    [
+      activeCastQualityId,
+      activeCastServerNume,
+      activeTvCastDevice,
+      showToast,
+      tvCastDeliveryPref,
+      tvCastMediaPayload,
+    ]
+  );
+
+  const selectedCastServerOption = useMemo(
+    () => castModalServerOptions.find((o) => o.nume === activeCastServerNume) || null,
+    [activeCastServerNume, castModalServerOptions]
   );
 
   const castModalAudioOptions = useMemo<TvCastAudioOption[]>(() => {
     const items: TvCastAudioOption[] = [];
 
-    // 1. Live Chromecast embedded AUDIO tracks (if the stream has multi-audio)
+    // 1. Live Chromecast embedded AUDIO tracks (when the stream itself contains multi-audio)
     if (
       syncedTvCastState.active &&
       syncedTvCastState.deviceProtocol === 'chromecast' &&
       Array.isArray(syncedTvCastState.mediaTracks)
     ) {
-      for (const tr of syncedTvCastState.mediaTracks) {
-        if (tr.type !== 'AUDIO') continue;
-        items.push({
-          id: `cc-audio-${tr.trackId}`,
-          label: tr.name || tr.language || `Áudio ${tr.trackId}`,
-          badge: tr.language || undefined,
-          kind: 'chromecast-track',
-          trackId: tr.trackId,
-        });
+      const embeddedAudio = syncedTvCastState.mediaTracks.filter((tr) => tr.type === 'AUDIO');
+      if (embeddedAudio.length > 0) {
+        for (const tr of embeddedAudio) {
+          items.push({
+            id: `cc-audio-${tr.trackId}`,
+            label: tr.name || tr.language || `Áudio ${tr.trackId}`,
+            badge: tr.language || undefined,
+            kind: 'chromecast-track',
+            trackId: tr.trackId,
+            readOnly: embeddedAudio.length === 1,
+          });
+        }
+        return items;
       }
     }
 
-    // 2. Episode server options with explicit DUB / LEG audio types
-    const dubServer = castModalServerOptions.find((o) => o.audioType === 'DUB');
-    const legServer = castModalServerOptions.find((o) => o.audioType === 'LEG');
-    if (dubServer && legServer) {
-      items.push(
-        {
-          id: `srv-audio-DUB`,
-          label: 'Dublado',
-          badge: 'DUB',
-          kind: 'server-option',
-          serverOption: dubServer,
-        },
-        {
-          id: `srv-audio-LEG`,
-          label: 'Legendado',
-          badge: 'LEG',
-          kind: 'server-option',
-          serverOption: legServer,
-        }
-      );
-    } else {
-      // 3. Parent AnimeDetails DUB / LEG alternate episode audioTracks
+    // 2. If the selected episode itself DOES NOT already list both DUB and LEG servers in Servidor,
+    //    offer sibling AnimeDetails DUB/LEG episode tracks when available.
+    const hasBothServerAudios =
+      castModalServerOptions.some((o) => o.audioType === 'DUB') &&
+      castModalServerOptions.some((o) => o.audioType === 'LEG');
+    if (!hasBothServerAudios) {
       const seriesUrl =
         activeCastEpisodeDetails?.seriesUrl ||
         syncedTvCastState.seriesUrl ||
@@ -3700,49 +3726,54 @@ export default function App() {
         };
         const dubEp = findMatchingEp(dubTrack.episodes);
         const legEp = findMatchingEp(legTrack.episodes);
-        if (dubEp) {
-          items.push({
-            id: 'ver-audio-DUB',
-            label: 'Dublado',
-            badge: 'DUB',
-            kind: 'audio-version',
-            targetEpisodeUrl: dubEp.url,
-          });
-        }
-        if (legEp) {
-          items.push({
-            id: 'ver-audio-LEG',
-            label: 'Legendado',
-            badge: 'LEG',
-            kind: 'audio-version',
-            targetEpisodeUrl: legEp.url,
-          });
+        if (dubEp && legEp && !isSameEpisodeUrl(dubEp.url, legEp.url)) {
+          items.push(
+            {
+              id: 'ver-audio-DUB',
+              label: 'Português (Dublado)',
+              badge: 'DUB',
+              kind: 'audio-version',
+              targetEpisodeUrl: dubEp.url,
+            },
+            {
+              id: 'ver-audio-LEG',
+              label: 'Japonês (Legendado)',
+              badge: 'LEG',
+              kind: 'audio-version',
+              targetEpisodeUrl: legEp.url,
+            }
+          );
+          return items;
         }
       }
     }
 
-    if (items.length === 0 && (tvCastMediaPayload || syncedTvCastState.active)) {
-      const activeServer = castModalServerOptions.find((o) => o.nume === activeCastServerNume);
-      const fallbackLabel =
-        activeServer?.audioType === 'DUB'
-          ? 'Dublado'
-          : activeServer?.audioType === 'LEG'
-            ? 'Legendado'
-            : syncedTvCastState.audioLabel || tvCastMediaPayload?.audioLabel || 'Áudio Padrão';
+    // 3. Otherwise display the real fixed audio language of the currently selected server cleanly (read-only)
+    if (tvCastMediaPayload || syncedTvCastState.active) {
+      const rawAudioType = selectedCastServerOption?.audioType;
+      const rawLabel = syncedTvCastState.audioLabel || tvCastMediaPayload?.audioLabel || '';
+      const isDub = rawAudioType === 'DUB' || /\bdub/i.test(rawLabel);
+      const isLeg = rawAudioType === 'LEG' || /\bleg/i.test(rawLabel);
+      const displayLabel = isDub
+        ? 'Português (Dublado)'
+        : isLeg
+          ? 'Japonês (Legendado)'
+          : rawLabel || 'Áudio padrão';
       items.push({
-        id: 'default-audio',
-        label: fallbackLabel,
+        id: 'server-fixed-audio',
+        label: displayLabel,
+        badge: isDub ? 'DUB' : isLeg ? 'LEG' : undefined,
         kind: 'server-option',
-        serverOption: activeServer,
+        readOnly: true,
       });
     }
 
     return items;
   }, [
     activeCastEpisodeDetails,
-    activeCastServerNume,
     animeDetails,
     castModalServerOptions,
+    selectedCastServerOption?.audioType,
     syncedTvCastState.active,
     syncedTvCastState.audioLabel,
     syncedTvCastState.deviceProtocol,
@@ -3768,15 +3799,6 @@ export default function App() {
         }
       }
     }
-    const activeServer = castModalServerOptions.find((o) => o.nume === activeCastServerNume);
-    if (activeServer?.audioType === 'DUB') {
-      const match = castModalAudioOptions.find((o) => o.id === 'srv-audio-DUB');
-      if (match) return match.id;
-    }
-    if (activeServer?.audioType === 'LEG') {
-      const match = castModalAudioOptions.find((o) => o.id === 'srv-audio-LEG');
-      if (match) return match.id;
-    }
     const curEpUrl =
       activeCastEpisodeDetails?.url ||
       syncedTvCastState.episodeUrl ||
@@ -3789,9 +3811,7 @@ export default function App() {
     return castModalAudioOptions[0]?.id || '';
   }, [
     activeCastEpisodeDetails?.url,
-    activeCastServerNume,
     castModalAudioOptions,
-    castModalServerOptions,
     syncedTvCastState.active,
     syncedTvCastState.activeTrackIds,
     syncedTvCastState.deviceProtocol,
@@ -3801,6 +3821,8 @@ export default function App() {
 
   const handleSelectCastAudio = useCallback(
     async (opt: TvCastAudioOption, discoveredDevices: TvCastDevice[]) => {
+      if (opt.readOnly || opt.id === activeCastAudioId) return;
+
       if (opt.kind === 'chromecast-track' && typeof opt.trackId === 'number') {
         setSwitchingCastAudioId(opt.id);
         try {
@@ -3821,7 +3843,12 @@ export default function App() {
       }
 
       if (opt.kind === 'server-option' && opt.serverOption) {
-        await handleSwitchTvCastServer(opt.serverOption, discoveredDevices);
+        setSwitchingCastAudioId(opt.id);
+        try {
+          await handleSwitchTvCastServer(opt.serverOption, discoveredDevices);
+        } finally {
+          setSwitchingCastAudioId('');
+        }
         return;
       }
 
@@ -3829,24 +3856,37 @@ export default function App() {
         setSwitchingCastAudioId(opt.id);
         try {
           const targetEp = await fetchEpisodeDetailsFast(opt.targetEpisodeUrl);
-          setCastEpisodeDetailsFallback(targetEp);
-          const candidateOpt =
-            targetEp.options.find((o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)) ||
-            targetEp.options[0];
-          if (!candidateOpt) {
+          const candidateOptions = targetEp.options.filter(
+            (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
+          );
+          const orderedOptions = candidateOptions.length > 0 ? candidateOptions : targetEp.options;
+          if (orderedOptions.length === 0) {
             showToast(`Nenhum servidor disponível para ${opt.label}.`);
             return;
           }
-          const resolved = await resolveEmbedCachedGlobal(candidateOpt);
-          if (resolved.status !== 'resolved' || resolved.streams.length === 0) {
+
+          let chosenOpt: PlayerOption | null = null;
+          let chosenResolved: Awaited<ReturnType<typeof resolveEmbedCachedGlobal>> | null = null;
+          for (const candidate of orderedOptions) {
+            const res = await resolveEmbedCachedGlobal(candidate);
+            if (res.status === 'resolved' && res.streams.length > 0) {
+              chosenOpt = candidate;
+              chosenResolved = res;
+              break;
+            }
+          }
+          if (!chosenOpt || !chosenResolved) {
             showToast(`Não foi possível carregar o áudio ${opt.label}.`);
             return;
           }
+
+          setCastEpisodeDetailsFallback(targetEp);
           const bestStream =
-            [...resolved.streams].sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
-            resolved.streams[0];
-          setCastAvailableStreams(resolved.streams);
-          setCastAvailableSubtitles(resolved.subtitles);
+            [...chosenResolved.streams].sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
+            chosenResolved.streams[0];
+          setCastHlsParsedVariants({ masterUrl: '', variants: [] });
+          setCastAvailableStreams(chosenResolved.streams);
+          setCastAvailableSubtitles(chosenResolved.subtitles);
 
           const curState = syncedTvCastStateRef.current;
           const isCasting = curState.active && hasRemoteTvControls(curState);
@@ -3854,19 +3894,20 @@ export default function App() {
           const liveDurMs = isCasting ? curState.durationMs : tvCastMediaPayload?.durationMs || 0;
           const nextPayload = buildCastMediaPayload({
             stream: bestStream,
-            subtitles: resolved.subtitles,
-            subtitleDisabled: tvCastMediaPayload?.subtitleDisabled,
+            subtitles: chosenResolved.subtitles,
+            subtitleDisabled:
+              chosenResolved.subtitles.length > 0 ? tvCastMediaPayload?.subtitleDisabled : false,
             qualityLabel: bestStream.label,
             audioLabel: opt.label,
-            referer: resolved.referer || 'https://topanimes.net/',
-            preferDirect: resolved.preferDirect,
+            referer: chosenResolved.referer || 'https://topanimes.net/',
+            preferDirect: chosenResolved.preferDirect,
             episodeUrl: targetEp.url,
             title: targetEp.title,
             seriesTitle: targetEp.seriesTitle,
             seriesUrl: targetEp.seriesUrl,
             poster: targetEp.backdrop || targetEp.poster || tvCastMediaPayload?.poster || '',
             isMovie: targetEp.isMovie,
-            selectedServerNume: candidateOpt.nume,
+            selectedServerNume: chosenOpt.nume,
             prevUrl: targetEp.prevUrl,
             nextUrl: targetEp.nextUrl,
             autoPlayNextEpisode: settingsRef.current.autoPlayNextEpisode,
@@ -3874,7 +3915,7 @@ export default function App() {
             durationMs: liveDurMs,
           });
           setTvCastMediaPayload(nextPayload);
-          setActiveCastServerNume(candidateOpt.nume);
+          setActiveCastServerNume(chosenOpt.nume);
 
           if (isCasting) {
             const targetDevice = resolveActiveTvCastDevice(
@@ -3893,7 +3934,7 @@ export default function App() {
               showToast(`Áudio alterado na TV para ${opt.label}.`);
             }
           } else {
-            showToast(`Áudio para TV selecionado: ${opt.label}.`);
+            showToast(`Áudio selecionado: ${opt.label}.`);
           }
         } catch {
           showToast(`Não foi possível trocar para ${opt.label}.`);
@@ -3902,7 +3943,14 @@ export default function App() {
         }
       }
     },
-    [activeTvCastDevice, handleSwitchTvCastServer, showToast, tvCastDeliveryPref, tvCastMediaPayload]
+    [
+      activeCastAudioId,
+      activeTvCastDevice,
+      handleSwitchTvCastServer,
+      showToast,
+      tvCastDeliveryPref,
+      tvCastMediaPayload,
+    ]
   );
 
   const castModalSubtitleOptions = useMemo<TvCastSubtitleChoice[]>(() => {
@@ -3911,12 +3959,10 @@ export default function App() {
         ? castAvailableSubtitles.map((s) => ({ label: s.label, url: s.url }))
         : (tvCastMediaPayload?.subtitles || []).map((s) => ({ label: s.label, url: s.url }));
 
-    const list: TvCastSubtitleChoice[] = [
-      { id: 'off', label: 'Desativada', url: '', disabled: true },
-    ];
+    const realTracks: TvCastSubtitleChoice[] = [];
     subsSource.forEach((s, idx) => {
       if (!s.url) return;
-      list.push({
+      realTracks.push({
         id: `sub-${idx}-${s.url}`,
         label: s.label || `Legenda ${idx + 1}`,
         url: s.url,
@@ -3932,8 +3978,8 @@ export default function App() {
     ) {
       for (const tr of syncedTvCastState.mediaTracks) {
         if (tr.type !== 'TEXT') continue;
-        if (list.some((item) => item.trackId === tr.trackId)) continue;
-        list.push({
+        if (realTracks.some((item) => item.trackId === tr.trackId)) continue;
+        realTracks.push({
           id: `cc-sub-${tr.trackId}`,
           label: tr.name || tr.language || `Legenda ${tr.trackId}`,
           url: '',
@@ -3943,7 +3989,11 @@ export default function App() {
       }
     }
 
-    return list;
+    if (realTracks.length === 0) {
+      return [];
+    }
+
+    return [{ id: 'off', label: 'Desativada', url: '', disabled: true }, ...realTracks];
   }, [
     castAvailableSubtitles,
     syncedTvCastState.active,
@@ -3952,7 +4002,18 @@ export default function App() {
     tvCastMediaPayload?.subtitles,
   ]);
 
+  const castModalSubtitleEmptyHint = useMemo(() => {
+    const rawAudioType = selectedCastServerOption?.audioType;
+    const rawLabel = syncedTvCastState.audioLabel || tvCastMediaPayload?.audioLabel || '';
+    const isLeg = rawAudioType === 'LEG' || /\bleg/i.test(rawLabel);
+    if (isLeg) {
+      return 'Legenda embutida no vídeo (hardsub)';
+    }
+    return 'Sem legendas externas neste servidor';
+  }, [selectedCastServerOption?.audioType, syncedTvCastState.audioLabel, tvCastMediaPayload?.audioLabel]);
+
   const activeCastSubtitleId = useMemo(() => {
+    if (castModalSubtitleOptions.length === 0) return '';
     const curState = syncedTvCastState;
     if (curState.active && curState.deviceProtocol === 'chromecast' && Array.isArray(curState.activeTrackIds)) {
       const matchedTrack = castModalSubtitleOptions.find(
@@ -3975,6 +4036,7 @@ export default function App() {
 
   const handleSelectCastSubtitle = useCallback(
     async (opt: TvCastSubtitleChoice, _discoveredDevices: TvCastDevice[]) => {
+      if (opt.id === activeCastSubtitleId) return;
       const disabled = Boolean(opt.disabled);
       setTvCastMediaPayload((prev) =>
         prev
@@ -3989,7 +4051,7 @@ export default function App() {
 
       const curState = syncedTvCastStateRef.current;
       if (!curState.active || !hasRemoteTvControls(curState)) {
-        showToast(disabled ? 'Legendas desativadas para TV.' : `Legenda selecionada: ${opt.label}.`);
+        showToast(disabled ? 'Legendas desativadas.' : `Legenda selecionada: ${opt.label}.`);
         return;
       }
 
@@ -4025,7 +4087,7 @@ export default function App() {
         setSwitchingCastSubtitleId('');
       }
     },
-    [showToast]
+    [activeCastSubtitleId, showToast]
   );
 
   // Sync live native background TV Cast state and persist watch progress even after reopening the app
@@ -4794,6 +4856,7 @@ export default function App() {
         switchingAudioId={switchingCastAudioId}
         onSelectCastAudio={handleSelectCastAudio}
         subtitleOptions={castModalSubtitleOptions}
+        subtitleEmptyHint={castModalSubtitleEmptyHint}
         activeSubtitleId={activeCastSubtitleId}
         switchingSubtitleId={switchingCastSubtitleId}
         onSelectCastSubtitle={handleSelectCastSubtitle}

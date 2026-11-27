@@ -12,6 +12,9 @@ import android.graphics.drawable.Icon;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -424,7 +427,9 @@ public class TvCastService extends Service {
             runningInstance = null;
         }
         latestPreparedLanStreamUrl = "";
-        broadcastState(buildIdleStateJson());
+        if (!"error".equals(status) || errorMessage == null || errorMessage.isEmpty()) {
+            broadcastState(buildIdleStateJson());
+        }
         super.onDestroy();
     }
 
@@ -435,18 +440,12 @@ public class TvCastService extends Service {
     private void handleStartCastRequest(String deviceRaw, String mediaRaw, String modePref) {
         TvCastProtocol.CastDevice parsedDevice = parseDeviceFromJson(deviceRaw);
         if (parsedDevice == null || parsedDevice.host.isEmpty()) {
-            errorMessage = "Dispositivo de TV inválido.";
-            status = "error";
-            publishCurrentState();
-            stopSessionAndService();
+            failSession(castSessionGen.incrementAndGet(), "Dispositivo de TV inválido.");
             return;
         }
 
         if (!applyMediaJson(mediaRaw)) {
-            errorMessage = "Nenhum stream válido disponível para transmitir.";
-            status = "error";
-            publishCurrentState();
-            stopSessionAndService();
+            failSession(castSessionGen.incrementAndGet(), "Nenhum stream válido disponível para transmitir.");
             return;
         }
 
@@ -505,10 +504,10 @@ public class TvCastService extends Service {
         }
 
         if (!applyMediaJson(mediaRaw)) {
-            errorMessage = "Nenhum stream válido disponível para preparar o link de TV.";
-            status = "error";
-            publishCurrentState();
-            stopSessionAndService();
+            failSession(
+                castSessionGen.incrementAndGet(),
+                "Nenhum stream válido disponível para preparar o link de TV."
+            );
             return;
         }
 
@@ -634,11 +633,16 @@ public class TvCastService extends Service {
             : "";
 
         Exception lastError = null;
+        DlnaController pendingDlna = null;
         for (int attempt = 1; attempt <= 2; attempt++) {
             if (gen != castSessionGen.get()) return;
             try {
                 if (TvCastProtocol.PROTOCOL_DLNA.equals(activeDevice.protocol)) {
-                    DlnaController dlna = new DlnaController(activeDevice);
+                    DlnaController dlna = pendingDlna != null ? pendingDlna : new DlnaController(activeDevice);
+                    pendingDlna = dlna;
+                    if (attempt > 1) {
+                        dlna.refreshControlUrlsFromLocation(true);
+                    }
                     synchronized (sessionLock) {
                         dlnaController = dlna;
                     }
@@ -1310,12 +1314,29 @@ public class TvCastService extends Service {
             boolean likelyPlaylistRequest = pathOnly.endsWith(".m3u8") || TvCastProtocol.isHlsStreamUrl(targetUrl, "");
             HttpURLConnection conn = null;
             try {
-                LocalProxyPlugin.RedirectResult upstream = openUpstreamWithRetry(
-                    targetUrl,
-                    safeRef,
-                    isHeadRequest ? null : rangeHeader,
-                    (isHeadRequest && !likelyPlaylistRequest) ? "HEAD" : "GET"
-                );
+                boolean usedRangeProbeForHead = false;
+                LocalProxyPlugin.RedirectResult upstream;
+                if (isHeadRequest && !likelyPlaylistRequest) {
+                    if (TvCastProtocol.shouldAvoidUpstreamHead(targetUrl)) {
+                        usedRangeProbeForHead = true;
+                        upstream = openUpstreamWithRetry(targetUrl, safeRef, "bytes=0-0", "GET");
+                    } else {
+                        upstream = openUpstreamWithRetry(targetUrl, safeRef, null, "HEAD");
+                        int headCode = upstream.connection.getResponseCode();
+                        if (headCode < 200 || headCode >= 300) {
+                            upstream.connection.disconnect();
+                            usedRangeProbeForHead = true;
+                            upstream = openUpstreamWithRetry(targetUrl, safeRef, "bytes=0-0", "GET");
+                        }
+                    }
+                } else {
+                    upstream = openUpstreamWithRetry(
+                        targetUrl,
+                        safeRef,
+                        isHeadRequest ? null : rangeHeader,
+                        "GET"
+                    );
+                }
                 conn = upstream.connection;
                 int code = conn.getResponseCode();
                 String contentType = conn.getContentType();
@@ -1346,6 +1367,24 @@ public class TvCastService extends Service {
                     if (!"HEAD".equals(method)) {
                         out.write(payload);
                     }
+                    out.flush();
+                    return;
+                }
+
+                if (isHeadRequest && usedRangeProbeForHead && code >= 200 && code < 300) {
+                    String cr = conn.getHeaderField("Content-Range");
+                    long fullLen = TvCastProtocol.parseTotalLengthFromContentRange(cr);
+                    if (fullLen < 0L && code == 200) {
+                        try {
+                            String cl = conn.getHeaderField("Content-Length");
+                            if (cl != null) fullLen = Long.parseLong(cl.trim());
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                    String outCt = contentType != null && !contentType.isEmpty()
+                        ? contentType
+                        : TvCastProtocol.inferStreamMimeType(targetUrl, streamFormat);
+                    writeLanHeaders(out, 200, "OK", outCt, fullLen, null, "bytes", captionHeaderUrl);
                     out.flush();
                     return;
                 }
@@ -1780,6 +1819,51 @@ public class TvCastService extends Service {
         out.flush();
     }
 
+    private Network findLanNetwork() {
+        try {
+            ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) return null;
+            Network active = cm.getActiveNetwork();
+            if (active != null) {
+                NetworkCapabilities caps = cm.getNetworkCapabilities(active);
+                if (caps != null
+                    && (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                        || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) {
+                    return active;
+                }
+            }
+            @SuppressWarnings("deprecation")
+            Network[] all = cm.getAllNetworks();
+            if (all != null) {
+                for (Network net : all) {
+                    if (net == null) continue;
+                    NetworkCapabilities caps = cm.getNetworkCapabilities(net);
+                    if (caps != null
+                        && (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)
+                            || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) {
+                        return net;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.d(TAG, "LAN network lookup failed: " + e.getMessage());
+        }
+        return null;
+    }
+
+    private HttpURLConnection openLanHttpConnection(String urlStr) throws IOException {
+        URL url = new URL(urlStr);
+        Network lanNet = findLanNetwork();
+        if (lanNet != null) {
+            try {
+                return (HttpURLConnection) lanNet.openConnection(url);
+            } catch (Exception e) {
+                Log.d(TAG, "Wi-Fi network openConnection fallback: " + e.getMessage());
+            }
+        }
+        return (HttpURLConnection) url.openConnection();
+    }
+
     // -------------------------------------------------------------------------
     // Chromecast V2 TLS Controller (Default Media Receiver CC1AD845)
     // -------------------------------------------------------------------------
@@ -1868,8 +1952,28 @@ public class TvCastService extends Service {
         private void openTlsSocketAndReader() throws Exception {
             SSLContext sslCtx = SSLContext.getInstance("TLS");
             sslCtx.init(null, new TrustManager[] { new LanCastTrustManager() }, new SecureRandom());
-            SSLSocket sslSocket = (SSLSocket) sslCtx.getSocketFactory().createSocket();
-            sslSocket.connect(new InetSocketAddress(device.host, device.port), 8000);
+            SSLSocket sslSocket = null;
+            Network lanNet = findLanNetwork();
+            if (lanNet != null) {
+                Socket raw = null;
+                try {
+                    raw = lanNet.getSocketFactory().createSocket();
+                    raw.connect(new InetSocketAddress(device.host, device.port), 8000);
+                    sslSocket = (SSLSocket) sslCtx.getSocketFactory().createSocket(raw, device.host, device.port, true);
+                } catch (Exception e) {
+                    if (raw != null) {
+                        try {
+                            raw.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    sslSocket = null;
+                }
+            }
+            if (sslSocket == null) {
+                sslSocket = (SSLSocket) sslCtx.getSocketFactory().createSocket();
+                sslSocket.connect(new InetSocketAddress(device.host, device.port), 8000);
+            }
             try {
                 sslSocket.setKeepAlive(true);
                 sslSocket.setTcpNoDelay(true);
@@ -2391,6 +2495,29 @@ public class TvCastService extends Service {
             this.renderingControlUrl = device.renderingControlUrl != null ? device.renderingControlUrl : "";
         }
 
+        private void setUriAndPlayWithMetadata(String mediaUrl, String metadata) throws IOException {
+            Map<String, String> setUriArgs = new LinkedHashMap<>();
+            setUriArgs.put("InstanceID", "0");
+            setUriArgs.put("CurrentURI", mediaUrl);
+            setUriArgs.put("CurrentURIMetaData", metadata != null ? metadata : "");
+            sendSoap(
+                avTransportUrl,
+                TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                "SetAVTransportURI",
+                setUriArgs
+            );
+
+            Map<String, String> playArgs = new LinkedHashMap<>();
+            playArgs.put("InstanceID", "0");
+            playArgs.put("Speed", "1");
+            sendSoap(
+                avTransportUrl,
+                TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                "Play",
+                playArgs
+            );
+        }
+
         void loadAndPlay(
             String mediaUrl,
             String mimeType,
@@ -2409,74 +2536,46 @@ public class TvCastService extends Service {
                     avTransportUrl,
                     TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                     "Stop",
-                    singletonInstanceArgs()
+                    singletonInstanceArgs(),
+                    3000,
+                    3000,
+                    1,
+                    false
                 );
             } catch (Exception ignored) {
             }
 
-            String didl = TvCastProtocol.buildDidlLiteMetadata(
+            boolean hasSub = subtitleSrtUrl != null && !subtitleSrtUrl.isEmpty();
+            String primaryDidl = TvCastProtocol.buildDidlLiteMetadata(
                 title,
                 series,
                 poster,
                 mediaUrl,
                 mimeType,
-                subtitleSrtUrl
+                hasSub ? subtitleSrtUrl : ""
             );
-            Map<String, String> setUriArgs = new LinkedHashMap<>();
-            setUriArgs.put("InstanceID", "0");
-            setUriArgs.put("CurrentURI", mediaUrl);
-            setUriArgs.put("CurrentURIMetaData", didl);
 
             try {
-                sendSoap(
-                    avTransportUrl,
-                    TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                    "SetAVTransportURI",
-                    setUriArgs
-                );
-            } catch (IOException metadataErr) {
-                if (subtitleSrtUrl != null && !subtitleSrtUrl.isEmpty()) {
+                setUriAndPlayWithMetadata(mediaUrl, primaryDidl);
+            } catch (IOException primaryErr) {
+                if (hasSub) {
                     try {
-                        setUriArgs.put(
-                            "CurrentURIMetaData",
-                            TvCastProtocol.buildDidlLiteMetadata(title, series, poster, mediaUrl, mimeType)
+                        String plainDidl = TvCastProtocol.buildDidlLiteMetadata(
+                            title,
+                            series,
+                            poster,
+                            mediaUrl,
+                            mimeType
                         );
-                        sendSoap(
-                            avTransportUrl,
-                            TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                            "SetAVTransportURI",
-                            setUriArgs
-                        );
-                    } catch (IOException plainMetaErr) {
-                        setUriArgs.put("CurrentURIMetaData", "");
-                        sendSoap(
-                            avTransportUrl,
-                            TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                            "SetAVTransportURI",
-                            setUriArgs
-                        );
+                        setUriAndPlayWithMetadata(mediaUrl, plainDidl);
+                    } catch (IOException plainErr) {
+                        setUriAndPlayWithMetadata(mediaUrl, "");
                     }
                 } else {
                     // Some Smart TVs reject DIDL-Lite metadata; retry cleanly with empty metadata
-                    setUriArgs.put("CurrentURIMetaData", "");
-                    sendSoap(
-                        avTransportUrl,
-                        TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                        "SetAVTransportURI",
-                        setUriArgs
-                    );
+                    setUriAndPlayWithMetadata(mediaUrl, "");
                 }
             }
-
-            Map<String, String> playArgs = new LinkedHashMap<>();
-            playArgs.put("InstanceID", "0");
-            playArgs.put("Speed", "1");
-            sendSoap(
-                avTransportUrl,
-                TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
-                "Play",
-                playArgs
-            );
 
             if (startPosMs > 2000L) {
                 // Arm seek guard BEFORE seeking so early 00:00:00 polls cannot reset positionMs to 0
@@ -2494,7 +2593,8 @@ public class TvCastService extends Service {
                                 singletonInstanceArgs(),
                                 2500,
                                 3000,
-                                1
+                                1,
+                                true
                             );
                             String tState = TvCastProtocol.extractXmlTagValue(tXml, "CurrentTransportState")
                                 .toUpperCase(Locale.ROOT);
@@ -2564,7 +2664,8 @@ public class TvCastService extends Service {
                     volArgs,
                     2500,
                     3000,
-                    1
+                    1,
+                    false
                 );
                 double parsedVol = TvCastProtocol.parseDlnaVolumeLevel(volXml);
                 if (parsedVol >= 0.0) {
@@ -2586,7 +2687,8 @@ public class TvCastService extends Service {
                     muteArgs,
                     2500,
                     3000,
-                    1
+                    1,
+                    false
                 );
                 Boolean parsedMute = TvCastProtocol.parseDlnaMuteState(muteXml);
                 if (parsedMute != null) {
@@ -2628,24 +2730,24 @@ public class TvCastService extends Service {
                     singletonInstanceArgs(),
                     2000,
                     2000,
-                    1
+                    1,
+                    false
                 );
             } catch (Exception ignored) {
             }
         }
 
-        private void refreshControlUrlsFromLocation() {
+        void refreshControlUrlsFromLocation(boolean force) {
             if (device.locationUrl == null || device.locationUrl.isEmpty()) return;
             long now = System.currentTimeMillis();
-            if ((now - lastControlRefreshAtMs) < 10_000L) return;
+            if (!force && (now - lastControlRefreshAtMs) < 10_000L) return;
             lastControlRefreshAtMs = now;
             HttpURLConnection conn = null;
             try {
-                conn = (HttpURLConnection) new URL(device.locationUrl).openConnection();
-                conn.setConnectTimeout(2500);
-                conn.setReadTimeout(2500);
+                conn = openLanHttpConnection(device.locationUrl);
+                conn.setConnectTimeout(3000);
+                conn.setReadTimeout(3000);
                 conn.setRequestMethod("GET");
-                conn.setRequestProperty("Connection", "close");
                 int code = conn.getResponseCode();
                 if (code < 200 || code >= 300) return;
                 String xml;
@@ -2682,7 +2784,8 @@ public class TvCastService extends Service {
                     singletonInstanceArgs(),
                     3000,
                     3500,
-                    2
+                    2,
+                    true
                 );
                 transportState = TvCastProtocol.extractXmlTagValue(transportXml, "CurrentTransportState")
                     .toUpperCase(Locale.ROOT);
@@ -2699,7 +2802,8 @@ public class TvCastService extends Service {
                     singletonInstanceArgs(),
                     3000,
                     3500,
-                    2
+                    2,
+                    true
                 );
                 long relRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "RelTime"));
                 long absRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "AbsTime"));
@@ -2729,7 +2833,7 @@ public class TvCastService extends Service {
             if (!transportOk && !posOk) {
                 consecutivePollFailures++;
                 if (consecutivePollFailures >= 4) {
-                    refreshControlUrlsFromLocation();
+                    refreshControlUrlsFromLocation(false);
                 }
                 return;
             }
@@ -2773,7 +2877,7 @@ public class TvCastService extends Service {
             String action,
             Map<String, String> args
         ) throws IOException {
-            return sendSoap(controlUrl, serviceType, action, args, 4500, 5000, 3);
+            return sendSoap(controlUrl, serviceType, action, args, 5000, 8000, 3, false);
         }
 
         private String sendSoap(
@@ -2783,7 +2887,8 @@ public class TvCastService extends Service {
             Map<String, String> args,
             int connectTimeoutMs,
             int readTimeoutMs,
-            int maxAttempts
+            int maxAttempts,
+            boolean forceConnectionClose
         ) throws IOException {
             if (controlUrl == null || controlUrl.isEmpty()) {
                 throw new IOException("Missing DLNA control URL");
@@ -2795,12 +2900,14 @@ public class TvCastService extends Service {
             for (int attempt = 1; attempt <= attempts; attempt++) {
                 HttpURLConnection conn = null;
                 try {
-                    conn = (HttpURLConnection) new URL(controlUrl).openConnection();
+                    conn = openLanHttpConnection(controlUrl);
                     conn.setConnectTimeout(connectTimeoutMs);
                     conn.setReadTimeout(readTimeoutMs);
                     conn.setRequestMethod("POST");
                     conn.setDoOutput(true);
-                    conn.setRequestProperty("Connection", "close");
+                    if (forceConnectionClose || attempt > 1) {
+                        conn.setRequestProperty("Connection", "close");
+                    }
                     conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
                     conn.setRequestProperty("SOAPACTION", "\"" + serviceType + "#" + action + "\"");
                     conn.setFixedLengthStreamingMode(payload.length);

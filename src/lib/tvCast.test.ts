@@ -785,9 +785,14 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     // Static architecture guards across Android & UI
     const modal = readFileSync(resolve(ROOT, 'src/components/TvCastModal.tsx'), 'utf8');
     assert.match(modal, /hasRemoteTvControls\(castState\)/);
+    assert.match(modal, /data-cast-server-selector="true"/);
     assert.match(modal, /data-cast-quality-selector="true"/);
     assert.match(modal, /data-cast-audio-selector="true"/);
     assert.match(modal, /data-cast-subtitle-selector="true"/);
+    assert.ok(
+      (modal.match(/data-cast-server-selector="true"/g) || []).length >= 2,
+      'TvCastModal must show Servidor selector both before casting and during active cast'
+    );
 
     const bar = readFileSync(resolve(ROOT, 'src/components/ActiveCastBar.tsx'), 'utf8');
     assert.match(bar, /hasRemoteTvControls\(castState\)/);
@@ -803,6 +808,10 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     assert.match(svc, /rewriteOfflineM3u8ForLanProxy/);
     assert.match(svc, /isGenuineDlnaCompletion/);
     assert.match(svc, /setKeepAlive\(true\)/);
+    assert.match(svc, /shouldAvoidUpstreamHead/);
+    assert.match(svc, /"bytes=0-0"/);
+    assert.match(svc, /openLanHttpConnection/);
+    assert.match(svc, /setUriAndPlayWithMetadata/);
 
     const vlc = readFileSync(
       resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/VlcPlayerActivity.java'),

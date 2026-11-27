@@ -3703,14 +3703,12 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 settingsItems.addView(sep);
             }
 
-            // Quality / Audio / Subtitles options for TV casting (usable both before and during casting)
-            if (streams.size() > 1) {
-                String activeQ = (!streams.isEmpty() && currentStreamIdx >= 0 && currentStreamIdx < streams.size())
-                    ? streams.get(currentStreamIdx).label
-                    : "Auto";
-                addSettingsRow("Qualidade na TV", activeQ, false, v -> renderSettingsTab("cast_quality"));
+            String castErrMsg = st.optString("errorMessage", "").trim();
+            if (!isActive && !castErrMsg.isEmpty()) {
+                addSettingsRow("Erro ao conectar à TV", castErrMsg, false, v -> {});
             }
 
+            // Hierarchical options: 1. Servidor / Áudio -> 2. Qualidade -> 3. Legendas
             JSONArray castMediaTracks = st.optJSONArray("mediaTracks");
             boolean hasCastAudioTracks = false;
             boolean hasCastTextTracks = false;
@@ -3723,10 +3721,16 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     if ("TEXT".equalsIgnoreCase(tt)) hasCastTextTracks = true;
                 }
             }
-            if (hasCastAudioTracks || serverOptions.size() > 1) {
+            if (serverOptions.size() > 1 || hasCastAudioTracks) {
                 String audioSummary = getCurrentCastAudioLabel();
                 if (audioSummary.isEmpty()) audioSummary = "Padrão";
-                addSettingsRow("Áudio / Servidor na TV", audioSummary, false, v -> renderSettingsTab("cast_audio"));
+                addSettingsRow("Servidor / Áudio na TV", audioSummary, false, v -> renderSettingsTab("cast_audio"));
+            }
+            if (streams.size() > 1) {
+                String activeQ = (!streams.isEmpty() && currentStreamIdx >= 0 && currentStreamIdx < streams.size())
+                    ? streams.get(currentStreamIdx).label
+                    : "Auto";
+                addSettingsRow("Qualidade na TV", activeQ, false, v -> renderSettingsTab("cast_quality"));
             }
             if (!subtitles.isEmpty() || hasCastTextTracks) {
                 SubtitleItem activeCastSub = resolveActiveCastSubtitle();
@@ -3787,6 +3791,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     active ? "✓" : "",
                     active,
                     v -> {
+                        if (active) {
+                            renderSettingsTab("cast");
+                            return;
+                        }
                         currentStreamIdx = idx;
                         updateQualityLabel();
                         if (isActive) {
@@ -3835,6 +3843,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 ? st.optString("subtitleUrl", "").trim().isEmpty()
                 : (currentSub == null);
             addSettingsRow("Desativada", isOff ? "✓" : "", isOff, v -> {
+                if (isOff) {
+                    renderSettingsTab("cast");
+                    return;
+                }
                 castSubtitleSelectionIdx = -1;
                 if (isActive) {
                     try {
@@ -3861,6 +3873,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
                     ? sub.url.equals(st.optString("subtitleUrl", ""))
                     : (currentSub != null && sub.url.equals(currentSub.url)));
                 addSettingsRow(sub.label, active ? "✓" : "", active, v -> {
+                    if (active) {
+                        renderSettingsTab("cast");
+                        return;
+                    }
                     castSubtitleSelectionIdx = idx;
                     if (isActive) {
                         try {

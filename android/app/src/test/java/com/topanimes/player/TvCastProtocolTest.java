@@ -319,4 +319,18 @@ public class TvCastProtocolTest {
         assertFalse(TvCastProtocol.isGenuineDlnaCompletion(true, 600_000L, 1_440_000L, 5));
         assertTrue(TvCastProtocol.isGenuineDlnaCompletion(true, 1_432_000L, 1_440_000L, 3));
     }
+
+    @Test
+    public void detectsPresignedHeadAvoidanceAndParsesContentRangeLength() {
+        String r2Url = "https://173fe263eae04670ecfcebf237fd6480.r2.cloudflarestorage.com/zful/ep1.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=deadbeef";
+        assertTrue(TvCastProtocol.shouldAvoidUpstreamHead(r2Url));
+        assertTrue(TvCastProtocol.isSafeExternalHttpUrl(r2Url));
+        assertTrue(TvCastProtocol.isSafeExternalHttpUrl("https://cdn.example.com/anime [1080p]/ep 1.mp4"));
+        assertFalse(TvCastProtocol.shouldAvoidUpstreamHead("https://cdn.example.com/ep1.mp4"));
+
+        assertEquals(314572800L, TvCastProtocol.parseTotalLengthFromContentRange("bytes 0-0/314572800"));
+        assertEquals(1024L, TvCastProtocol.parseTotalLengthFromContentRange("bytes 0-511/1024"));
+        assertEquals(-1L, TvCastProtocol.parseTotalLengthFromContentRange("bytes 0-0/*"));
+        assertEquals(-1L, TvCastProtocol.parseTotalLengthFromContentRange(""));
+    }
 }

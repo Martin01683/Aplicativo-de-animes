@@ -596,15 +596,59 @@ public final class TvCastProtocol {
 
     public static boolean isSafeExternalHttpUrl(String rawUrl) {
         if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
+        String trimmed = rawUrl.trim();
         try {
-            URI uri = URI.create(rawUrl.trim());
+            URI uri = URI.create(trimmed);
             String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase(Locale.ROOT) : "";
             if (!"http".equals(scheme) && !"https".equals(scheme)) return false;
             String host = uri.getHost() != null ? uri.getHost().toLowerCase(Locale.ROOT) : "";
+            if (!host.isEmpty()) {
+                return !host.equals("localhost") && !host.equals("127.0.0.1") && !host.equals("::1");
+            }
+        } catch (Exception ignored) {
+        }
+        try {
+            URL url = new URL(trimmed);
+            String scheme = url.getProtocol() != null ? url.getProtocol().toLowerCase(Locale.ROOT) : "";
+            if (!"http".equals(scheme) && !"https".equals(scheme)) return false;
+            String host = url.getHost() != null ? url.getHost().toLowerCase(Locale.ROOT) : "";
             if (host.isEmpty()) return false;
             return !host.equals("localhost") && !host.equals("127.0.0.1") && !host.equals("::1");
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /**
+     * Presigned S3 / Cloudflare R2 GET URLs (such as Hinata Soul's R2 streams) are signed
+     * specifically for the GET verb and reject HEAD with HTTP 403 SignatureDoesNotMatch.
+     * DLNA Smart TVs (notably LG webOS) issue HEAD before playback, so the LAN proxy should
+     * satisfy HEAD via a 1-byte GET Range probe instead of forwarding HEAD upstream.
+     */
+    public static boolean shouldAvoidUpstreamHead(String rawUrl) {
+        if (rawUrl == null || rawUrl.trim().isEmpty()) return false;
+        String lower = rawUrl.trim().toLowerCase(Locale.ROOT);
+        return lower.contains("r2.cloudflarestorage.com")
+            || lower.contains("x-amz-signature=")
+            || lower.contains("x-amz-credential=")
+            || lower.contains("awsaccesskeyid=")
+            || lower.contains("googleaccessid=");
+    }
+
+    /**
+     * Extracts the total byte length from an HTTP Content-Range header (e.g. "bytes 0-0/314572800" -> 314572800).
+     */
+    public static long parseTotalLengthFromContentRange(String contentRange) {
+        if (contentRange == null || contentRange.trim().isEmpty()) return -1L;
+        int slash = contentRange.lastIndexOf('/');
+        if (slash < 0 || slash + 1 >= contentRange.length()) return -1L;
+        String totalPart = contentRange.substring(slash + 1).trim();
+        if (totalPart.isEmpty() || "*".equals(totalPart)) return -1L;
+        try {
+            long val = Long.parseLong(totalPart);
+            return val >= 0L ? val : -1L;
+        } catch (NumberFormatException e) {
+            return -1L;
         }
     }
 

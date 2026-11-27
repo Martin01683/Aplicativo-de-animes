@@ -683,7 +683,14 @@ async function createAppServer(): Promise<void> {
     const lanBase = `http://${reqHost}`;
 
     try {
-      const rangeHeader = typeof req.headers.range === 'string' ? req.headers.range : undefined;
+      const isHeadReq = req.method === 'HEAD';
+      const likelyPlaylist = /\.m3u8(?:$|\?)/i.test(targetUrl) || asset.toLowerCase().endsWith('.m3u8');
+      const rangeHeader =
+        isHeadReq && !likelyPlaylist
+          ? 'bytes=0-0'
+          : typeof req.headers.range === 'string'
+            ? req.headers.range
+            : undefined;
       const upstream = await safeFetch(targetUrl, {
         referer,
         range: rangeHeader,
@@ -708,6 +715,25 @@ async function createAppServer(): Promise<void> {
         res.status(200);
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl; charset=utf-8');
         res.send(rewritten);
+        return;
+      }
+
+      if (isHeadReq && upstream.ok) {
+        await upstream.body?.cancel().catch(() => {});
+        const cr = upstream.headers.get('content-range') || '';
+        const slashIdx = cr.lastIndexOf('/');
+        const parsedTotal = slashIdx >= 0 ? cr.slice(slashIdx + 1).trim() : '';
+        const fullLength =
+          parsedTotal && /^\d+$/.test(parsedTotal)
+            ? parsedTotal
+            : upstream.status === 200
+              ? upstream.headers.get('content-length') || ''
+              : '';
+        res.status(200);
+        res.setHeader('Content-Type', contentType || 'video/mp4');
+        res.setHeader('Accept-Ranges', 'bytes');
+        if (fullLength) res.setHeader('Content-Length', fullLength);
+        res.end();
         return;
       }
 
