@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.42] — 2026-11-27
+
+### Correções
+- Corrige Vidstreaming na TV LG, volume inicial DLNA e servidores do TopAnimes no Hinata Soul (`dc4718e`)
+
 ## [v1.0.41] — 2026-11-27
 
 ### Correções
