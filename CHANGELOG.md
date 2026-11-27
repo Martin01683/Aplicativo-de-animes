@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.43] — 2026-11-27
+
+### Correções
+- Corrige destaque de áudio, parada imediata na TV e seek/sincronia do Vidstreaming e demais servidores (`979d421`)
+
 ## [v1.0.42] — 2026-11-27
 
 ### Correções
