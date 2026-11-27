@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.41] — 2026-11-27
+
+### Correções
+- Corrige conexão DLNA com LG webOS/R2 e restaura menu hierárquico Servidor -> Qualidade/Idioma/Legendas (`50e5d44`)
+
 ## [v1.0.40] — 2026-11-26
 
 ### Novidades
