@@ -333,4 +333,124 @@ public class TvCastProtocolTest {
         assertEquals(-1L, TvCastProtocol.parseTotalLengthFromContentRange("bytes 0-0/*"));
         assertEquals(-1L, TvCastProtocol.parseTotalLengthFromContentRange(""));
     }
+
+    @Test
+    public void normalizesDlnaVideoMimeExtractsSoapFaultsAndDetectsHlsUnsupportedTvs() {
+        assertEquals("video/mp4", TvCastProtocol.normalizeDlnaVideoMimeType("application/octet-stream", "https://cdn.example.com/ep1.mp4", "mp4"));
+        assertEquals("video/mp2t", TvCastProtocol.normalizeDlnaVideoMimeType("image/png", "https://cdn.example.com/seg.ts", "mp4"));
+        assertEquals("video/mp2t", TvCastProtocol.normalizeDlnaVideoMimeType("text/plain", "https://cdn.example.com/master.m3u8", "hls"));
+        assertEquals("video/mp4", TvCastProtocol.normalizeDlnaVideoMimeType("video/mp4; codecs=\"avc1\"", "https://cdn.example.com/ep1", "mp4"));
+
+        String soapFault = "<?xml version=\"1.0\"?><s:Envelope><s:Body><s:Fault><detail>"
+            + "<UPnPError><errorCode>714</errorCode><errorDescription>Illegal MIME-type</errorDescription></UPnPError>"
+            + "</detail></s:Fault></s:Body></s:Envelope>";
+        assertEquals("714: Illegal MIME-type", TvCastProtocol.extractUpnpSoapFaultDetail(soapFault));
+        assertEquals("", TvCastProtocol.extractUpnpSoapFaultDetail("<html>Error</html>"));
+
+        TvCastProtocol.CastDevice lgTv = new TvCastProtocol.CastDevice(
+            "dlna:lg",
+            "[LG] webOS TV UQ7500PSF",
+            "LG Electronics",
+            "LG TV",
+            "192.168.1.25",
+            1952,
+            TvCastProtocol.PROTOCOL_DLNA,
+            "http://192.168.1.25:1952/AVTransport/control",
+            "http://192.168.1.25:1952/RenderingControl/control",
+            "http://192.168.1.25:1952/description.xml"
+        );
+        assertTrue(TvCastProtocol.isLikelyHlsUnsupportedDlnaDevice(lgTv));
+
+        TvCastProtocol.CastDevice chromecast = new TvCastProtocol.CastDevice(
+            "cast:1",
+            "Chromecast Sala",
+            "Google",
+            "Chromecast",
+            "192.168.1.30",
+            8009,
+            TvCastProtocol.PROTOCOL_CHROMECAST,
+            "",
+            "",
+            ""
+        );
+        assertFalse(TvCastProtocol.isLikelyHlsUnsupportedDlnaDevice(chromecast));
+
+        String relayDidl = TvCastProtocol.buildDidlLiteMetadata(
+            "Frieren Ep 1",
+            "Sousou no Frieren",
+            "",
+            "http://192.168.1.10:49152/cast/tok/m1/s1/video.ts",
+            "video/mp2t",
+            "",
+            1_440_000L,
+            true
+        );
+        assertTrue(relayDidl.contains("DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"));
+        assertTrue(relayDidl.contains("duration=\"00:24:00\""));
+
+        String minimalDidl = TvCastProtocol.buildMinimalDidlLiteMetadata(
+            "Frieren Ep 1",
+            "http://192.168.1.10:49152/cast/tok/m1/s1/video.ts",
+            "video/mp2t",
+            1_440_000L
+        );
+        assertTrue(minimalDidl.contains("protocolInfo=\"http-get:*:video/mp2t:*\""));
+        assertTrue(minimalDidl.contains("<upnp:class>object.item.videoItem</upnp:class>"));
+        assertTrue(minimalDidl.contains("duration=\"00:24:00\""));
+    }
+
+    @Test
+    public void parsesHlsPlaylistsForDlnaContinuousRelayAndSegmentSeeking() {
+        String master = "#EXTM3U\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n"
+            + "360p/index.m3u8\n"
+            + "#EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1280x720\n"
+            + "720p/index.m3u8\n";
+        TvCastProtocol.HlsPlaylistInfo masterInfo = TvCastProtocol.parseHlsPlaylistForDlna(
+            master,
+            "https://vid.example.com/hls/master.m3u8"
+        );
+        assertTrue(masterInfo.isMaster);
+        assertEquals("https://vid.example.com/hls/720p/index.m3u8", masterInfo.bestVariantUrl);
+
+        String media = "#EXTM3U\n"
+            + "#EXT-X-VERSION:3\n"
+            + "#EXT-X-MEDIA-SEQUENCE:10\n"
+            + "#EXT-X-MAP:URI=\"init.mp4\"\n"
+            + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x0000000000000000000000000000000a\n"
+            + "#EXTINF:6.0,\n"
+            + "seg0.m4s\n"
+            + "#EXTINF:6.0,\n"
+            + "seg1.m4s\n"
+            + "#EXTINF:4.5,\n"
+            + "seg2.m4s\n"
+            + "#EXT-X-ENDLIST\n";
+        TvCastProtocol.HlsPlaylistInfo mediaInfo = TvCastProtocol.parseHlsPlaylistForDlna(
+            media,
+            "https://vid.example.com/hls/720p/index.m3u8"
+        );
+        assertFalse(mediaInfo.isMaster);
+        assertEquals("https://vid.example.com/hls/720p/init.mp4", mediaInfo.initMapUrl);
+        assertEquals(3, mediaInfo.segments.size());
+        assertEquals(16_500L, mediaInfo.totalDurationMs);
+        assertEquals("AES-128", mediaInfo.segments.get(0).keyMethod);
+        assertEquals("https://vid.example.com/hls/720p/key.bin", mediaInfo.segments.get(0).keyUri);
+        assertEquals(10L, mediaInfo.segments.get(0).mediaSequence);
+        assertEquals(11L, mediaInfo.segments.get(1).mediaSequence);
+        assertEquals(6000L, mediaInfo.segments.get(1).startMs);
+        assertEquals(12000L, mediaInfo.segments.get(2).startMs);
+
+        assertEquals(0, TvCastProtocol.findHlsSegmentIndexForTimeMs(mediaInfo.segments, 0L));
+        assertEquals(1, TvCastProtocol.findHlsSegmentIndexForTimeMs(mediaInfo.segments, 7500L));
+        assertEquals(2, TvCastProtocol.findHlsSegmentIndexForTimeMs(mediaInfo.segments, 13000L));
+
+        byte[] ivHex = TvCastProtocol.buildAes128IvBytes("0x0000000000000000000000000000000a", 99L);
+        assertEquals(16, ivHex.length);
+        assertEquals(10, ivHex[15] & 0xFF);
+
+        byte[] ivSeq = TvCastProtocol.buildAes128IvBytes("", 258L);
+        assertEquals(16, ivSeq.length);
+        assertEquals(1, ivSeq[14] & 0xFF);
+        assertEquals(2, ivSeq[15] & 0xFF);
+    }
 }

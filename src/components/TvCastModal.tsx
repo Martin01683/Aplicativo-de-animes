@@ -119,6 +119,7 @@ interface TvCastModalProps {
   switchingSubtitleId?: string;
   onSelectCastSubtitle?: (opt: TvCastSubtitleChoice, discoveredDevices: TvCastDevice[]) => Promise<void> | void;
   onRefreshCastState?: () => Promise<void> | void;
+  onDismissError?: () => void;
   onDeviceConnected?: (device: TvCastDevice) => void;
   onSeekCommitted?: (targetMs: number) => void;
   skipIntroSeconds?: number;
@@ -154,6 +155,7 @@ export function TvCastModal({
   switchingSubtitleId = '',
   onSelectCastSubtitle,
   onRefreshCastState,
+  onDismissError,
   onDeviceConnected,
   onSeekCommitted,
   skipIntroSeconds = 85,
@@ -363,7 +365,11 @@ export function TvCastModal({
           : 0;
   const isDraggingVolume = dragVolume !== null;
   const volumePct = volumeSynced ? Math.max(0, Math.min(100, displayedVolume * 100)) : 0;
-  const isEffectivelyMuted = volumeSynced && (castState.muted || Math.round(volumePct) === 0);
+  const isEffectivelyMuted =
+    volumeSynced &&
+    (dragVolume !== null || pendingVolume !== null
+      ? Math.round(volumePct) === 0
+      : castState.muted || Math.round(volumePct) === 0);
 
   const commitSeekPosition = (targetMs: number) => {
     const clamped = Math.max(0, Math.min(seekMaxMs, Math.round(targetMs)));
@@ -802,8 +808,21 @@ export function TvCastModal({
           </div>
 
           {castState.errorMessage && (
-            <div className="rounded-xl border border-rose-500/35 bg-rose-500/12 px-3.5 py-2.5 text-xs text-rose-200">
-              {castState.errorMessage}
+            <div
+              data-cast-error-banner="true"
+              className="flex items-start justify-between gap-2.5 rounded-xl border border-rose-500/35 bg-rose-500/12 px-3.5 py-2.5 text-xs text-rose-200"
+            >
+              <span className="min-w-0 flex-1 leading-relaxed">{castState.errorMessage}</span>
+              {onDismissError && (
+                <button
+                  type="button"
+                  onClick={onDismissError}
+                  aria-label="Dispensar erro de transmissão"
+                  className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-rose-200/80 transition-colors hover:bg-rose-500/20 hover:text-white"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
           )}
 

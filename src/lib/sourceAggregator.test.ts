@@ -425,3 +425,144 @@ test('resolveEmbedByUrl resolves MixDrop packed embeds with origin referer and p
   );
 });
 
+test('TopAnimes resolves Season 1 and Season 2 (LEG + DUB) when queried from Hinata Soul titles like "Sousou no Frieren 2nd Season - Dublado"', async () => {
+  const searchedKeywords: string[] = [];
+  const mockFetcher: HttpFetcher = async (url) => {
+    if (url === 'https://topanimes.net/') {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: '<script>var dtGonza = {"nonce":"testnonce123"};</script>',
+      };
+    }
+    if (url.includes('/wp-json/dooplay/search/')) {
+      const kw = decodeURIComponent((url.split('keyword=')[1] || '').split('&')[0] || '');
+      searchedKeywords.push(kw);
+      // Simulate real WordPress search: fails if hyphenated "- Dublado" or "2nd Season" is sent,
+      // succeeds cleanly for "Sousou no Frieren" and "Sousou no Frieren 2".
+      if (/-|2nd season/i.test(kw)) {
+        return { status: 200, ok: true, finalUrl: url, body: '{}' };
+      }
+      if (/sousou no frieren 2/i.test(kw)) {
+        return {
+          status: 200,
+          ok: true,
+          finalUrl: url,
+          body: JSON.stringify({
+            '101': {
+              title: 'Sousou no Frieren 2',
+              url: 'https://topanimes.net/animes/sousou-no-frieren-2/',
+            },
+            '102': {
+              title: 'Sousou no Frieren 2 Dublado',
+              url: 'https://topanimes.net/animes/sousou-no-frieren-2-dublado/',
+            },
+          }),
+        };
+      }
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: JSON.stringify({
+          '1': {
+            title: 'Sousou no Frieren',
+            url: 'https://topanimes.net/animes/sousou-no-frieren/',
+          },
+          '2': {
+            title: 'Sousou no Frieren Dublado',
+            url: 'https://topanimes.net/animes/sousou-no-frieren-dublado/',
+          },
+          '101': {
+            title: 'Sousou no Frieren 2',
+            url: 'https://topanimes.net/animes/sousou-no-frieren-2/',
+          },
+          '102': {
+            title: 'Sousou no Frieren 2 Dublado',
+            url: 'https://topanimes.net/animes/sousou-no-frieren-2-dublado/',
+          },
+        }),
+      };
+    }
+    if (url.includes('/animes/sousou-no-frieren-2-dublado/')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `<div id="seasons"><div class="se-c"><ul class="episodios"><li><div class="epnumber">1</div><div class="episodiotitle"><a href="https://topanimes.net/episodio/frieren-2-dub-ep-1/">Ep 1</a></div></li></ul></div></div>`,
+      };
+    }
+    if (url.includes('/animes/sousou-no-frieren-2/')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `<div id="seasons"><div class="se-c"><ul class="episodios"><li><div class="epnumber">1</div><div class="episodiotitle"><a href="https://topanimes.net/episodio/frieren-2-leg-ep-1/">Ep 1</a></div></li></ul></div></div>`,
+      };
+    }
+    if (url.includes('/animes/sousou-no-frieren-dublado/')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `<div id="seasons"><div class="se-c"><ul class="episodios"><li><div class="epnumber">1</div><div class="episodiotitle"><a href="https://topanimes.net/episodio/frieren-1-dub-ep-1/">Ep 1</a></div></li></ul></div></div>`,
+      };
+    }
+    if (url.includes('/animes/sousou-no-frieren/')) {
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `<div id="seasons"><div class="se-c"><ul class="episodios"><li><div class="epnumber">1</div><div class="episodiotitle"><a href="https://topanimes.net/episodio/frieren-1-leg-ep-1/">Ep 1</a></div></li></ul></div></div>`,
+      };
+    }
+    if (url.includes('/episodio/frieren-')) {
+      const slug = url.split('/episodio/')[1].replace('/', '');
+      return {
+        status: 200,
+        ok: true,
+        finalUrl: url,
+        body: `
+          <ul id="playeroptionsul">
+            <li class="dooplay_player_option" data-post="500" data-type="tv" data-nume="1"><span class="title">Vidstreaming</span></li>
+          </ul>
+          <div id="source-player-1"><iframe src="https://vid.example.com/e/${slug}"></iframe></div>`,
+      };
+    }
+    return { status: 404, ok: false, finalUrl: url, body: '' };
+  };
+
+  // 1. Hinata Soul Season 1 Dublado page -> must resolve TopAnimes Season 1 (LEG + DUB) without sending "- Dublado"
+  const s1Res = await resolveFromTopAnimesSource(mockFetcher, TOPANIMES_BUILTIN_SOURCE, {
+    title: 'Sousou no Frieren - Dublado',
+    mediaType: 'anime',
+    seasonNumber: 1,
+    episodeNumber: 1,
+    audioPreference: 'ALL',
+  });
+  assert.equal(s1Res.options.length, 2);
+  assert.ok(s1Res.options.some((o) => o.embedUrl.includes('frieren-1-dub-ep-1') && o.audioType === 'DUB'));
+  assert.ok(s1Res.options.some((o) => o.embedUrl.includes('frieren-1-leg-ep-1') && o.audioType === 'LEG'));
+  assert.ok(
+    searchedKeywords.every((k) => !/-\s*dublado/i.test(k)),
+    `Should strip "- Dublado" from WordPress query, got: ${JSON.stringify(searchedKeywords)}`
+  );
+
+  // 2. Hinata Soul Season 2 Dublado page -> must prioritize "Sousou no Frieren 2" and match BOTH S2 LEG and S2 DUB
+  const s2Res = await resolveFromTopAnimesSource(mockFetcher, TOPANIMES_BUILTIN_SOURCE, {
+    title: 'Sousou no Frieren 2nd Season - Dublado',
+    mediaType: 'anime',
+    seasonNumber: 2,
+    episodeNumber: 1,
+    audioPreference: 'ALL',
+  });
+  assert.equal(s2Res.options.length, 2);
+  assert.ok(s2Res.options.some((o) => o.embedUrl.includes('frieren-2-dub-ep-1') && o.audioType === 'DUB'));
+  assert.ok(s2Res.options.some((o) => o.embedUrl.includes('frieren-2-leg-ep-1') && o.audioType === 'LEG'));
+  assert.ok(
+    searchedKeywords.some((k) => k.toLowerCase() === 'sousou no frieren 2'),
+    `Expected "Sousou no Frieren 2" search query, got: ${JSON.stringify(searchedKeywords)}`
+  );
+});
+

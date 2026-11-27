@@ -1209,7 +1209,20 @@ async function sendDlnaSoap(
       });
       const text = await res.text();
       if (!res.ok) {
-        throw new DlnaSoapHttpError(res.status, `TV DLNA retornou HTTP ${res.status} (${action})`);
+        const faultCode = extractXmlTagValue(text, 'errorCode');
+        const faultDesc = extractXmlTagValue(text, 'errorDescription');
+        const faultSuffix =
+          faultCode && faultDesc
+            ? ` (${faultCode}: ${faultDesc})`
+            : faultCode
+              ? ` (UPnP ${faultCode})`
+              : faultDesc
+                ? ` (${faultDesc})`
+                : '';
+        throw new DlnaSoapHttpError(
+          res.status,
+          `TV DLNA retornou HTTP ${res.status} (${action})${faultSuffix}`
+        );
       }
       return text;
     } catch (err) {
@@ -1225,10 +1238,13 @@ async function sendDlnaSoap(
   throw lastErr instanceof Error ? lastErr : new Error(`Falha DLNA SOAP (${action})`);
 }
 
-async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<boolean> {
+async function syncServerDlnaVolume(
+  sess: ActiveServerCastSession,
+  allowZeroAsSynced = false
+): Promise<boolean> {
   const renderingUrl = sess.device.renderingControlUrl;
   if (!renderingUrl) return false;
-  let syncedAny = false;
+  let parsedVol: number | null = null;
   try {
     const volXml = await sendDlnaSoap(
       renderingUrl,
@@ -1236,17 +1252,13 @@ async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<bool
       'GetVolume',
       { InstanceID: '0', Channel: 'Master' },
       2800,
-      1
+      2
     );
-    const parsedVol = parseDlnaVolumeLevel(volXml);
-    if (parsedVol !== null) {
-      sess.state.volume = parsedVol;
-      sess.state.volumeSynced = true;
-      syncedAny = true;
-    }
+    parsedVol = parseDlnaVolumeLevel(volXml);
   } catch {
     // ignore TVs that do not implement GetVolume
   }
+  let parsedMute: boolean | null = null;
   try {
     const muteXml = await sendDlnaSoap(
       renderingUrl,
@@ -1254,18 +1266,26 @@ async function syncServerDlnaVolume(sess: ActiveServerCastSession): Promise<bool
       'GetMute',
       { InstanceID: '0', Channel: 'Master' },
       2800,
-      1
+      2
     );
-    const parsedMute = parseDlnaMuteState(muteXml);
-    if (parsedMute !== null) {
-      sess.state.muted = parsedMute;
-    } else if (syncedAny) {
-      sess.state.muted = sess.state.volume <= 0.001;
-    }
+    parsedMute = parseDlnaMuteState(muteXml);
   } catch {
     // ignore TVs that do not implement GetMute
   }
-  return syncedAny;
+  if (parsedVol !== null) {
+    const effectiveMuted = parsedMute !== null ? parsedMute : parsedVol <= 0.001;
+    if (!allowZeroAsSynced && (parsedVol <= 0.001 || effectiveMuted)) {
+      return false;
+    }
+    sess.state.volume = parsedVol;
+    sess.state.muted = effectiveMuted;
+    sess.state.volumeSynced = true;
+    return true;
+  }
+  if (sess.state.volumeSynced && parsedMute !== null) {
+    sess.state.muted = parsedMute;
+  }
+  return false;
 }
 
 function teardownSession(sess: ActiveServerCastSession | null, sendStopToTv: boolean): void {
@@ -1516,7 +1536,9 @@ export async function startServerTvCast(params: {
   }
 
   const prev = activeSession;
-  const preserveVolume = Boolean(prev && prev.device.id === device.id && prev.state.volumeSynced);
+  const preserveVolume = Boolean(
+    prev && prev.state.active && prev.device.id === device.id && prev.state.volumeSynced
+  );
   const prevVolume = preserveVolume && prev ? prev.state.volume : 0;
   const prevMuted = preserveVolume && prev ? prev.state.muted : false;
   activeSession = null;
@@ -1661,6 +1683,9 @@ export async function startServerTvCast(params: {
         }
       }
 
+      // Re-query TV volume immediately after Play (LG webOS DMR reports real volume once playback opens)
+      await syncServerDlnaVolume(sess, false);
+
       if (media.startPositionMs && media.startPositionMs > 2000) {
         sess.lastSeekTargetMs = media.startPositionMs;
         sess.lastSeekRequestedAtMs = Date.now();
@@ -1749,6 +1774,7 @@ export async function startServerTvCast(params: {
           if (!anyOk) return;
           sess.state.stateTimestampMs = Date.now();
 
+          const justStartedPlaying = !sess.dlnaSawPlaying && tState === 'PLAYING';
           if (tState === 'PLAYING') {
             sess.dlnaSawPlaying = true;
             sess.dlnaConsecutiveStoppedPolls = 0;
@@ -1778,10 +1804,13 @@ export async function startServerTvCast(params: {
 
           sess.dlnaPollCount = (sess.dlnaPollCount || 0) + 1;
           if (
-            (!sess.state.volumeSynced || sess.dlnaPollCount % 4 === 0) &&
+            (justStartedPlaying ||
+              !sess.state.volumeSynced ||
+              sess.dlnaPollCount <= 6 ||
+              sess.dlnaPollCount % 3 === 0) &&
             Date.now() - (sess.lastVolumeSetAtMs || 0) >= 2500
           ) {
-            await syncServerDlnaVolume(sess);
+            await syncServerDlnaVolume(sess, Boolean(sess.dlnaSawPlaying) || sess.dlnaPollCount >= 3);
           }
         })();
       }, 1000);

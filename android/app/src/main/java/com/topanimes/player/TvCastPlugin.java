@@ -337,6 +337,12 @@ public class TvCastPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void clearError(PluginCall call) {
+        TvCastService.clearErrorState();
+        call.resolve();
+    }
+
+    @PluginMethod
     public void getCastState(PluginCall call) {
         try {
             JSONObject snap = TvCastService.getCurrentStateJson();

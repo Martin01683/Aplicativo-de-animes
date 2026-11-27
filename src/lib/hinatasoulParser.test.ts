@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+  cleanHinataSoulSeriesTitle,
   deriveHinataSoulR2Candidates,
   extractHinataSoulEpisodeNumber,
   extractHinataSoulSeasonNumber,
@@ -267,5 +268,25 @@ describe('hinatasoulParser', () => {
     const catalog = parseHinataSoulCatalogHtml(searchHtml, 'anime', null, 1);
     assert.equal(catalog.items.length, 1);
     assert.equal(catalog.totalPages, 3);
+  });
+
+  it('extracts season 2 from space-separated TopAnimes Dublado titles and strips trailing Online/subtitles from series titles', () => {
+    assert.equal(extractHinataSoulSeasonNumber('Sousou no Frieren 2 Dublado'), 2);
+    assert.equal(extractHinataSoulSeasonNumber('Sousou no Frieren 2 Legendado'), 2);
+    assert.equal(extractHinataSoulSeasonNumber('Sousou no Frieren 2nd Season - Dublado'), 2);
+    assert.equal(extractHinataSoulSeasonNumber('Sousou no Frieren Dublado'), 1);
+
+    assert.equal(
+      cleanHinataSoulSeriesTitle('Sousou no Frieren Episódio 1 Online'),
+      'Sousou no Frieren'
+    );
+    assert.equal(
+      cleanHinataSoulSeriesTitle('Sousou no Frieren - Dublado Episódio 1 Full HD'),
+      'Sousou no Frieren - Dublado'
+    );
+    assert.equal(
+      cleanHinataSoulSeriesTitle('Sousou no Frieren Episódio 1 - O fim da aventura'),
+      'Sousou no Frieren'
+    );
   });
 });

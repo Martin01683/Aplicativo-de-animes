@@ -2316,11 +2316,15 @@ export function EpisodeWorkspace({
                       const livePosMs = liveHelpers?.getCurrentTimeMs() || 0;
                       const liveDurMs = liveHelpers?.getDurationMs() || 0;
                       const audioLabel =
-                        selectedOption?.audioType === 'DUB'
-                          ? 'Dublado'
-                          : selectedOption?.audioType === 'LEG'
-                            ? 'Legendado'
-                            : selectedOption?.label || '';
+                        selectedOption?.audioType === 'DUB' ||
+                        /\bdublad[oa]\b/i.test(`${episode.seriesTitle || ''} ${episode.title || ''}`)
+                          ? 'Português (Dublado)'
+                          : selectedOption?.audioType === 'LEG' ||
+                              /\blegendad[oa]\b/i.test(
+                                `${episode.seriesTitle || ''} ${episode.title || ''}`
+                              )
+                            ? 'Japonês (Legendado)'
+                            : '';
                       const payload = bestStream
                         ? buildCastMediaPayload({
                             stream: bestStream,

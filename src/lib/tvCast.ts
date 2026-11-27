@@ -140,6 +140,7 @@ interface TvCastNativePlugin {
   nextEpisode(): Promise<void>;
   prevEpisode(): Promise<void>;
   stopCast(): Promise<void>;
+  clearError(): Promise<void>;
   getCastState(): Promise<TvCastStateSnapshot>;
   addListener(
     eventName: 'castDevicesUpdated',
@@ -1147,6 +1148,18 @@ export async function tvCastStop(): Promise<void> {
     return;
   }
   await TvCastNative.stopCast();
+}
+
+export async function clearTvCastError(): Promise<void> {
+  if (!isNativeAndroidCastSupported()) {
+    notifyWebCastState(IDLE_TV_CAST_STATE);
+    return;
+  }
+  try {
+    await TvCastNative.clearError();
+  } catch {
+    // ignore if running against an older native shell
+  }
 }
 
 export async function addTvCastStateListener(

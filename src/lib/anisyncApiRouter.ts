@@ -415,13 +415,44 @@ async function resolveEmbedCachedInRouter(
   }
 }
 
-function getCachedSeriesGenres(seriesUrl?: string): string[] | undefined {
-  if (!seriesUrl) return undefined;
+function getCachedSeriesMeta(seriesUrl?: string): {
+  genres?: string[];
+  originalTitle?: string;
+  alternativeTitles?: string[];
+} {
+  if (!seriesUrl) return {};
   const normSeries = isHinataSoulUrl(seriesUrl)
     ? normalizeHinataSoulUrl(seriesUrl) || seriesUrl
     : normalizeTopAnimesUrl(seriesUrl) || seriesUrl;
-  const cachedMedia = mediaDetailsCache.get(normSeries);
-  return cachedMedia?.genres?.length ? cachedMedia.genres : undefined;
+  const cachedMedia =
+    mediaDetailsCache.get(normSeries) || rawServerDetailsCache.get(normSeries) || null;
+  if (!cachedMedia) return {};
+  const seen = new Set<string>();
+  const alts: string[] = [];
+  const push = (raw?: string) => {
+    for (const part of splitAlternativeTitleString(raw)) {
+      if (part.length < 2) continue;
+      const key = part.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      alts.push(part);
+    }
+  };
+  push(cachedMedia.title);
+  push(cachedMedia.originalTitle);
+  push(cachedMedia.alternativeTitle);
+  if (cachedMedia.alternativeTitles?.length) {
+    for (const alt of cachedMedia.alternativeTitles) push(alt);
+  }
+  return {
+    genres: cachedMedia.genres?.length ? cachedMedia.genres : undefined,
+    originalTitle: cachedMedia.originalTitle?.trim() || undefined,
+    alternativeTitles: alts.length ? alts : undefined,
+  };
+}
+
+function getCachedSeriesGenres(seriesUrl?: string): string[] | undefined {
+  return getCachedSeriesMeta(seriesUrl).genres;
 }
 
 async function resolveCrossSourceAliasesForEpisode(
@@ -1427,10 +1458,14 @@ export async function dispatchAnisyncApiRequest(
             };
 
             if (deferCrossSources && primaryOptions.length > 0) {
-              const cachedGenres = getCachedSeriesGenres(parsed.seriesUrl);
+              const cachedMeta = getCachedSeriesMeta(parsed.seriesUrl);
               return {
                 ...parsed,
-                genres: cachedGenres?.length ? cachedGenres : parsed.genres,
+                genres: cachedMeta.genres?.length ? cachedMeta.genres : parsed.genres,
+                originalTitle: parsed.originalTitle || cachedMeta.originalTitle,
+                alternativeTitles: parsed.alternativeTitles?.length
+                  ? parsed.alternativeTitles
+                  : cachedMeta.alternativeTitles,
                 options: primaryOptions,
                 sourceReports: [primaryReport],
                 sourceMode: 'live' as const,
@@ -1547,10 +1582,14 @@ export async function dispatchAnisyncApiRequest(
             };
 
             if (primaryOptions.length > 0) {
-              const cachedGenres = getCachedSeriesGenres(parsed.seriesUrl);
+              const cachedMeta = getCachedSeriesMeta(parsed.seriesUrl);
               return {
                 ...parsed,
-                genres: cachedGenres?.length ? cachedGenres : parsed.genres,
+                genres: cachedMeta.genres?.length ? cachedMeta.genres : parsed.genres,
+                originalTitle: parsed.originalTitle || cachedMeta.originalTitle,
+                alternativeTitles: parsed.alternativeTitles?.length
+                  ? parsed.alternativeTitles
+                  : cachedMeta.alternativeTitles,
                 episodeNumber: inferredEpNum,
                 seasonNumber: inferredSeason,
                 options: primaryOptions,
@@ -1704,7 +1743,30 @@ export async function dispatchAnisyncApiRequest(
     if (!bodyObj?.query?.title) {
       return { status: 400, body: { error: 'Informe query.title para consultar o servidor.' } };
     }
-    const result = await aggregateEpisodeServers(fetchHttp, bodyObj.query, {
+    const crossAliases = await resolveCrossSourceAliasesForEpisode(fetchHttp, {
+      seriesTitle: bodyObj.query.title,
+      seriesUrl: bodyObj.query.seriesUrl,
+      mediaType: bodyObj.query.mediaType || 'anime',
+      originalTitle: bodyObj.query.originalTitle,
+      alternativeTitles: bodyObj.query.alternativeTitles,
+    }).catch(() => ({
+      originalTitle: bodyObj.query?.originalTitle,
+      alternativeTitles: bodyObj.query?.alternativeTitles || [],
+    }));
+    const enrichedQuery: EpisodeSourceLookupQuery = {
+      ...bodyObj.query,
+      originalTitle: bodyObj.query.originalTitle || crossAliases.originalTitle,
+      alternativeTitles:
+        crossAliases.alternativeTitles.length > 0
+          ? Array.from(
+              new Set([
+                ...(bodyObj.query.alternativeTitles || []),
+                ...crossAliases.alternativeTitles,
+              ])
+            )
+          : bodyObj.query.alternativeTitles,
+    };
+    const result = await aggregateEpisodeServers(fetchHttp, enrichedQuery, {
       excludeSourceIds: Array.isArray(bodyObj.excludeSourceIds)
         ? bodyObj.excludeSourceIds.filter((s): s is string => typeof s === 'string')
         : undefined,

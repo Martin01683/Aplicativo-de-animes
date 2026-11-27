@@ -29,6 +29,7 @@ export interface EpisodeSourceLookupQuery {
   title: string;
   originalTitle?: string;
   alternativeTitles?: string[];
+  seriesUrl?: string;
   mediaType: SupportedMediaScope;
   seasonNumber?: number;
   episodeNumber?: number;

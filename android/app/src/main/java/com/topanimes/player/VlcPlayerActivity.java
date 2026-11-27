@@ -3705,7 +3705,10 @@ public class VlcPlayerActivity extends AppCompatActivity {
 
             String castErrMsg = st.optString("errorMessage", "").trim();
             if (!isActive && !castErrMsg.isEmpty()) {
-                addSettingsRow("Erro ao conectar à TV", castErrMsg, false, v -> {});
+                addSettingsRow("Erro ao conectar à TV (toque para limpar)", castErrMsg, false, v -> {
+                    TvCastService.clearErrorState();
+                    renderSettingsTab("cast");
+                });
             }
 
             // Hierarchical options: 1. Servidor / Áudio -> 2. Qualidade -> 3. Legendas
@@ -3804,6 +3807,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                                 startCastToDeviceAt(targetDev, livePos);
                                 return;
                             }
+                        } else {
+                            TvCastService.clearErrorState();
                         }
                         renderSettingsTab("cast");
                     }
@@ -3862,6 +3867,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         sendCastSetTracks(req);
                     } catch (Exception ignored) {
                     }
+                } else {
+                    TvCastService.clearErrorState();
                 }
                 renderSettingsTab("cast");
             });
@@ -3893,6 +3900,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                             sendCastSetTracks(req);
                         } catch (Exception ignored) {
                         }
+                    } else {
+                        TvCastService.clearErrorState();
                     }
                     renderSettingsTab("cast");
                 });
@@ -3961,6 +3970,9 @@ public class VlcPlayerActivity extends AppCompatActivity {
                 addSettingsRow(opt.label, active ? "✓" : "", active, v -> {
                     closeSettingsMenu();
                     if (!active) {
+                        if (!isActive) {
+                            TvCastService.clearErrorState();
+                        }
                         switchServerInFullscreen(opt);
                     }
                 });

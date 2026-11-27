@@ -1615,11 +1615,13 @@ export function AnimePlayer({
       activeSubId !== 'off' ? subEntries.find((s) => s.id === activeSubId) : undefined;
     const selectedServerOpt = playerOptions.find((o) => o.nume === selectedServerNume);
     const audioLabel =
-      selectedServerOpt?.audioType === 'DUB'
-        ? 'Dublado'
-        : selectedServerOpt?.audioType === 'LEG'
-          ? 'Legendado'
-          : selectedServerOpt?.label || '';
+      selectedServerOpt?.audioType === 'DUB' ||
+      /\bdublad[oa]\b/i.test(`${seriesTitle || ''} ${title || ''}`)
+        ? 'Português (Dublado)'
+        : selectedServerOpt?.audioType === 'LEG' ||
+            /\blegendad[oa]\b/i.test(`${seriesTitle || ''} ${title || ''}`)
+          ? 'Japonês (Legendado)'
+          : '';
     const payload = activeStream
       ? buildCastMediaPayload({
           stream: activeStream,

@@ -420,7 +420,7 @@ public final class TvCastProtocol {
         String mediaUrl,
         String mimeType
     ) {
-        return buildDidlLiteMetadata(title, seriesTitle, posterUrl, mediaUrl, mimeType, "");
+        return buildDidlLiteMetadata(title, seriesTitle, posterUrl, mediaUrl, mimeType, "", 0L, false);
     }
 
     public static String buildDidlLiteMetadata(
@@ -430,6 +430,19 @@ public final class TvCastProtocol {
         String mediaUrl,
         String mimeType,
         String subtitleUrl
+    ) {
+        return buildDidlLiteMetadata(title, seriesTitle, posterUrl, mediaUrl, mimeType, subtitleUrl, 0L, false);
+    }
+
+    public static String buildDidlLiteMetadata(
+        String title,
+        String seriesTitle,
+        String posterUrl,
+        String mediaUrl,
+        String mimeType,
+        String subtitleUrl,
+        long durationMs,
+        boolean continuousRelay
     ) {
         String safeTitle = escapeXml(safeStr(title).isEmpty() ? "Anisync" : title.trim());
         String safeSeries = escapeXml(safeStr(seriesTitle));
@@ -451,12 +464,19 @@ public final class TvCastProtocol {
         if (posterUrl != null && !posterUrl.trim().isEmpty()) {
             sb.append("<upnp:albumArtURI>").append(escapeXml(posterUrl.trim())).append("</upnp:albumArtURI>");
         }
-        String dlnaOp = safeMime.toLowerCase(Locale.ROOT).contains("mpegurl") ? "10" : "01";
+        String dlnaOp = continuousRelay
+            ? "00"
+            : (safeMime.toLowerCase(Locale.ROOT).contains("mpegurl") ? "10" : "01");
+        String dlnaCi = continuousRelay ? "1" : "0";
         sb.append("<upnp:class>object.item.videoItem.movie</upnp:class>")
             .append("<res protocolInfo=\"http-get:*:").append(escapeXml(safeMime))
             .append(":DLNA.ORG_OP=").append(dlnaOp)
-            .append(";DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\">")
-            .append(safeUrl).append("</res>");
+            .append(";DLNA.ORG_CI=").append(dlnaCi)
+            .append(";DLNA.ORG_FLAGS=01700000000000000000000000000000\"");
+        if (durationMs > 0L) {
+            sb.append(" duration=\"").append(formatDlnaTime(durationMs)).append('"');
+        }
+        sb.append('>').append(safeUrl).append("</res>");
         if (!safeSubUrl.isEmpty()) {
             String subMime = safeSubUrl.toLowerCase(Locale.ROOT).endsWith(".vtt") ? "text/vtt" : "text/srt";
             String secType = "text/vtt".equals(subMime) ? "vtt" : "srt";
@@ -469,6 +489,74 @@ public final class TvCastProtocol {
         }
         sb.append("</item></DIDL-Lite>");
         return sb.toString();
+    }
+
+    /**
+     * Minimal UPnP DIDL-Lite metadata without strict DLNA.ORG_* flags or vendor extensions,
+     * used as a fallback when a Smart TV rejects full DLNA flags on SetAVTransportURI.
+     */
+    public static String buildMinimalDidlLiteMetadata(
+        String title,
+        String mediaUrl,
+        String mimeType,
+        long durationMs
+    ) {
+        String safeTitle = escapeXml(safeStr(title).isEmpty() ? "Anisync" : title.trim());
+        String safeMime = safeStr(mimeType).isEmpty() ? "video/mp4" : mimeType.trim();
+        String safeUrl = escapeXml(safeStr(mediaUrl));
+        StringBuilder sb = new StringBuilder(320);
+        sb.append("<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" ")
+            .append("xmlns:dc=\"http://purl.org/dc/elements/1.1/\" ")
+            .append("xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">")
+            .append("<item id=\"0\" parentID=\"-1\" restricted=\"1\">")
+            .append("<dc:title>").append(safeTitle).append("</dc:title>")
+            .append("<upnp:class>object.item.videoItem</upnp:class>")
+            .append("<res protocolInfo=\"http-get:*:").append(escapeXml(safeMime)).append(":*\"");
+        if (durationMs > 0L) {
+            sb.append(" duration=\"").append(formatDlnaTime(durationMs)).append('"');
+        }
+        sb.append('>').append(safeUrl).append("</res>")
+            .append("</item></DIDL-Lite>");
+        return sb.toString();
+    }
+
+    /**
+     * Extracts UPnP SOAP fault details (e.g. "714: Illegal MIME-type") from a TV HTTP 500 error body.
+     */
+    public static String extractUpnpSoapFaultDetail(String responseXml) {
+        if (responseXml == null || responseXml.trim().isEmpty()) return "";
+        String code = extractXmlTagValue(responseXml, "errorCode");
+        String desc = unescapeXml(extractXmlTagValue(responseXml, "errorDescription"));
+        if (!code.isEmpty() && !desc.isEmpty()) {
+            return code + ": " + desc;
+        }
+        if (!code.isEmpty()) return "UPnP " + code;
+        if (!desc.isEmpty()) return desc;
+        return "";
+    }
+
+    /**
+     * Smart TV built-in DLNA MediaRenderers (notably LG webOS, Samsung Tizen, Sony BRAVIA,
+     * Philips, and Panasonic) reject HLS (.m3u8 / application/x-mpegurl) in SetAVTransportURI
+     * with HTTP 500 / UPnP 714 (Illegal MIME-type), while natively playing MPEG-TS (video/mp2t)
+     * and MP4 (video/mp4).
+     */
+    public static boolean isLikelyHlsUnsupportedDlnaDevice(CastDevice device) {
+        if (device == null || !PROTOCOL_DLNA.equalsIgnoreCase(device.protocol)) return false;
+        String combined = (safeStr(device.name) + " " + safeStr(device.manufacturer) + " " + safeStr(device.model))
+            .toLowerCase(Locale.ROOT);
+        return combined.contains("lg")
+            || combined.contains("webos")
+            || combined.contains("netcast")
+            || combined.contains("samsung")
+            || combined.contains("tizen")
+            || combined.contains("bravia")
+            || combined.contains("sony")
+            || combined.contains("philips")
+            || combined.contains("panasonic")
+            || combined.contains("vizio")
+            || combined.contains("hisense")
+            || combined.contains("vidaa");
     }
 
     public static String buildSoapEnvelope(
@@ -591,7 +679,266 @@ public final class TvCastProtocol {
         if (isHlsStreamUrl(url, format)) {
             return "application/x-mpegurl";
         }
+        String lowerUrl = safeStr(url).toLowerCase(Locale.ROOT);
+        int q = lowerUrl.indexOf('?');
+        String path = q >= 0 ? lowerUrl.substring(0, q) : lowerUrl;
+        if (path.endsWith(".ts") || path.endsWith(".m2ts")) return "video/mp2t";
+        if (path.endsWith(".mkv")) return "video/x-matroska";
+        if (path.endsWith(".webm")) return "video/webm";
         return "video/mp4";
+    }
+
+    /**
+     * Normalizes upstream HTTP Content-Type headers so DLNA Smart TVs (such as LG webOS)
+     * never reject a valid video stream due to generic/disguised MIME types like
+     * application/octet-stream, binary/octet-stream, text/plain, or image/*.
+     */
+    public static String normalizeDlnaVideoMimeType(String rawContentType, String url, String format) {
+        if (rawContentType != null && !rawContentType.trim().isEmpty()) {
+            String base = rawContentType.trim().toLowerCase(Locale.ROOT);
+            int semi = base.indexOf(';');
+            if (semi >= 0) {
+                base = base.substring(0, semi).trim();
+            }
+            if (base.startsWith("video/") && !"video/unknown".equals(base)) {
+                return base;
+            }
+        }
+        String inferred = inferStreamMimeType(url, format);
+        if ("application/x-mpegurl".equalsIgnoreCase(inferred)) {
+            return "video/mp2t";
+        }
+        return inferred;
+    }
+
+    public static final class HlsSegmentEntry {
+        public final String url;
+        public final long startMs;
+        public final long durationMs;
+        public final long mediaSequence;
+        public final String keyMethod;
+        public final String keyUri;
+        public final String keyIvHex;
+
+        public HlsSegmentEntry(
+            String url,
+            long startMs,
+            long durationMs,
+            long mediaSequence,
+            String keyMethod,
+            String keyUri,
+            String keyIvHex
+        ) {
+            this.url = safeStr(url);
+            this.startMs = Math.max(0L, startMs);
+            this.durationMs = Math.max(0L, durationMs);
+            this.mediaSequence = Math.max(0L, mediaSequence);
+            this.keyMethod = safeStr(keyMethod);
+            this.keyUri = safeStr(keyUri);
+            this.keyIvHex = safeStr(keyIvHex);
+        }
+    }
+
+    public static final class HlsPlaylistInfo {
+        public final boolean isMaster;
+        public final String bestVariantUrl;
+        public final String initMapUrl;
+        public final long totalDurationMs;
+        public final List<HlsSegmentEntry> segments;
+
+        public HlsPlaylistInfo(
+            boolean isMaster,
+            String bestVariantUrl,
+            String initMapUrl,
+            long totalDurationMs,
+            List<HlsSegmentEntry> segments
+        ) {
+            this.isMaster = isMaster;
+            this.bestVariantUrl = safeStr(bestVariantUrl);
+            this.initMapUrl = safeStr(initMapUrl);
+            this.totalDurationMs = Math.max(0L, totalDurationMs);
+            this.segments = segments != null ? segments : new ArrayList<>();
+        }
+    }
+
+    /**
+     * Parses an HLS master or media playlist into either its best variant URL (master)
+     * or ordered segment timeline with #EXTINF durations, #EXT-X-KEY metadata, and optional
+     * #EXT-X-MAP init segment so DLNA TVs without native .m3u8 support can play it as a
+     * continuous MPEG-TS (video/mp2t) or fragmented MP4 (video/mp4) stream.
+     */
+    public static HlsPlaylistInfo parseHlsPlaylistForDlna(String manifest, String baseUrl) {
+        List<HlsSegmentEntry> segments = new ArrayList<>();
+        if (manifest == null || manifest.trim().isEmpty()) {
+            return new HlsPlaylistInfo(false, "", "", 0L, segments);
+        }
+        String[] lines = manifest.split("\\r?\\n");
+        if (manifest.contains("#EXT-X-STREAM-INF")) {
+            String bestUrl = "";
+            long bestScore = -1L;
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i].trim();
+                if (!line.startsWith("#EXT-X-STREAM-INF:")) continue;
+                long bw = 0L;
+                long height = 0L;
+                Matcher bwM = Pattern.compile("BANDWIDTH=\\s*(\\d+)", Pattern.CASE_INSENSITIVE).matcher(line);
+                if (bwM.find()) {
+                    try {
+                        bw = Long.parseLong(bwM.group(1));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                Matcher resM = Pattern.compile("RESOLUTION=\\s*\\d+x(\\d+)", Pattern.CASE_INSENSITIVE).matcher(line);
+                if (resM.find()) {
+                    try {
+                        height = Long.parseLong(resM.group(1));
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                String nextUri = "";
+                for (int j = i + 1; j < lines.length; j++) {
+                    String cand = lines[j].trim();
+                    if (cand.isEmpty()) continue;
+                    if (cand.startsWith("#")) {
+                        if (cand.startsWith("#EXT-X-STREAM-INF:")) break;
+                        continue;
+                    }
+                    nextUri = cand;
+                    i = j;
+                    break;
+                }
+                if (nextUri.isEmpty()) continue;
+                String abs = resolvePlaylistUri(baseUrl, nextUri);
+                if (abs.isEmpty()) continue;
+                long score = (height * 100_000_000L) + bw;
+                if (bestUrl.isEmpty() || score > bestScore) {
+                    bestUrl = abs;
+                    bestScore = score;
+                }
+            }
+            return new HlsPlaylistInfo(true, bestUrl, "", 0L, segments);
+        }
+
+        long mediaSeq = 0L;
+        long cursorMs = 0L;
+        long pendingDurMs = 0L;
+        String currentKeyMethod = "";
+        String currentKeyUri = "";
+        String currentKeyIv = "";
+        String initMapUrl = "";
+
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+            if (line.isEmpty()) continue;
+            if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+                String num = line.substring("#EXT-X-MEDIA-SEQUENCE:".length()).trim();
+                try {
+                    mediaSeq = Math.max(0L, Long.parseLong(num));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (line.startsWith("#EXT-X-MAP:")) {
+                Matcher uriM = URI_ATTR_PATTERN.matcher(line);
+                if (uriM.find() && initMapUrl.isEmpty()) {
+                    initMapUrl = resolvePlaylistUri(baseUrl, uriM.group(1));
+                }
+            } else if (line.startsWith("#EXT-X-KEY:")) {
+                Matcher methodM = Pattern.compile("METHOD=([^,\\s]+)", Pattern.CASE_INSENSITIVE).matcher(line);
+                String method = methodM.find() ? methodM.group(1).trim().toUpperCase(Locale.ROOT) : "";
+                if ("NONE".equals(method) || method.isEmpty()) {
+                    currentKeyMethod = "";
+                    currentKeyUri = "";
+                    currentKeyIv = "";
+                } else {
+                    currentKeyMethod = method;
+                    Matcher uriM = URI_ATTR_PATTERN.matcher(line);
+                    currentKeyUri = uriM.find() ? resolvePlaylistUri(baseUrl, uriM.group(1)) : "";
+                    Matcher ivM = Pattern.compile("IV=0x([0-9a-fA-F]+)", Pattern.CASE_INSENSITIVE).matcher(line);
+                    currentKeyIv = ivM.find() ? ivM.group(1).trim() : "";
+                }
+            } else if (line.startsWith("#EXTINF:")) {
+                String rest = line.substring("#EXTINF:".length()).trim();
+                int comma = rest.indexOf(',');
+                if (comma >= 0) rest = rest.substring(0, comma).trim();
+                try {
+                    double sec = Double.parseDouble(rest);
+                    if (Double.isFinite(sec) && sec > 0.0) {
+                        pendingDurMs = Math.round(sec * 1000.0);
+                    }
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (!line.startsWith("#")) {
+                String segUrl = resolvePlaylistUri(baseUrl, line);
+                if (!segUrl.isEmpty()) {
+                    long seq = mediaSeq + segments.size();
+                    long dur = pendingDurMs > 0L ? pendingDurMs : 4000L;
+                    segments.add(new HlsSegmentEntry(
+                        segUrl,
+                        cursorMs,
+                        dur,
+                        seq,
+                        currentKeyMethod,
+                        currentKeyUri,
+                        currentKeyIv
+                    ));
+                    cursorMs += dur;
+                    pendingDurMs = 0L;
+                }
+            }
+        }
+
+        return new HlsPlaylistInfo(false, "", initMapUrl, cursorMs, segments);
+    }
+
+    private static String resolvePlaylistUri(String baseUrl, String rawUri) {
+        String clean = safeStr(rawUri);
+        if (clean.isEmpty()) return "";
+        if (isSupportedCastSourceUrl(clean)) return clean;
+        try {
+            String abs = new URL(new URL(baseUrl), clean).toString();
+            return isSupportedCastSourceUrl(abs) ? abs : "";
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    public static int findHlsSegmentIndexForTimeMs(List<HlsSegmentEntry> segments, long targetMs) {
+        if (segments == null || segments.isEmpty() || targetMs <= 0L) return 0;
+        for (int i = 0; i < segments.size(); i++) {
+            HlsSegmentEntry seg = segments.get(i);
+            if (targetMs < seg.startMs + seg.durationMs) {
+                return i;
+            }
+        }
+        return segments.size() - 1;
+    }
+
+    public static byte[] buildAes128IvBytes(String keyIvHex, long mediaSequence) {
+        byte[] iv = new byte[16];
+        String hex = safeStr(keyIvHex);
+        if (!hex.isEmpty()) {
+            if (hex.startsWith("0x") || hex.startsWith("0X")) {
+                hex = hex.substring(2);
+            }
+            if (hex.length() > 32) {
+                hex = hex.substring(hex.length() - 32);
+            }
+            while (hex.length() < 32) {
+                hex = "0" + hex;
+            }
+            try {
+                for (int i = 0; i < 16; i++) {
+                    iv[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+                }
+                return iv;
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        long seq = Math.max(0L, mediaSequence);
+        for (int i = 15; i >= 8; i--) {
+            iv[i] = (byte) (seq & 0xFFL);
+            seq >>>= 8;
+        }
+        return iv;
     }
 
     public static boolean isSafeExternalHttpUrl(String rawUrl) {

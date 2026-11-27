@@ -820,5 +820,32 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     assert.match(vlc, /currentStreamIsLocalOffline/);
     assert.match(vlc, /resolveEffectiveBufferedPositionMs/);
     assert.match(vlc, /!currentStreamIsLocalOffline && !hasProxyBufferTelemetry/);
+    assert.match(vlc, /TvCastService\.clearErrorState\(\)/);
+
+    // Follow-up regressions: Vidstreaming HLS->TS DLNA relay, stale error clearing, active-guarded menus, & LG volume resync
+    assert.match(svc, /resolveDlnaHlsPlanIfApplicable/);
+    assert.match(svc, /serveLanHlsContinuousRelay/);
+    assert.match(svc, /normalizeDlnaVideoMimeType/);
+    assert.match(svc, /clearErrorState\(\)/);
+    assert.match(svc, /boolean justStartedPlaying = !sawPlaying && "PLAYING"\.equals\(transportState\)/);
+    assert.match(svc, /dlna\.syncVolumeFromTv\(false\)/);
+    assert.match(svc, /boolean sameDeviceReconnect = sessionActive/);
+
+    const plugin = readFileSync(
+      resolve(ROOT, 'android/app/src/main/java/com/topanimes/player/TvCastPlugin.java'),
+      'utf8'
+    );
+    assert.match(plugin, /public void clearError\(PluginCall call\)/);
+
+    const appTsx = readFileSync(resolve(ROOT, 'src/App.tsx'), 'utf8');
+    assert.match(appTsx, /const clearStaleCastError = useCallback/);
+    assert.match(appTsx, /\(tvCastState\.active && tvCastState\.episodeUrl\)/);
+    assert.match(appTsx, /\(syncedTvCastState\.active \? syncedTvCastState\.audioLabel : ''\)/);
+    assert.match(appTsx, /onDismissError=\{clearStaleCastError\}/);
+    assert.match(modal, /data-cast-error-banner="true"/);
+
+    const serverCast = readFileSync(resolve(ROOT, 'src/lib/serverTvCast.ts'), 'utf8');
+    assert.match(serverCast, /await syncServerDlnaVolume\(sess, false\)/);
+    assert.match(serverCast, /const justStartedPlaying = !sess\.dlnaSawPlaying && tState === 'PLAYING'/);
   });
 });

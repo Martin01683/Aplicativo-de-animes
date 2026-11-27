@@ -184,6 +184,7 @@ import {
 import {
   addTvCastStateListener,
   buildCastMediaPayload,
+  clearTvCastError,
   computeSyncedCastPositionMs,
   discoverTvCastDevicesDetailed,
   getNativeTvCastState,
@@ -493,6 +494,7 @@ export default function App() {
     gen: number;
   } | null>(null);
   const extraServersGenRef = useRef(0);
+  const inFlightExtraServersRef = useRef<Set<string>>(new Set());
   const [detailError, setDetailError] = useState('');
 
   const [favorites, setFavorites] = useState<CatalogMediaItem[]>(() => loadFavorites());
@@ -2102,6 +2104,134 @@ export default function App() {
     return null;
   }, []);
 
+  const augmentSecondaryEpisodeSources = useCallback(
+    (
+      ep: EpisodeDetails,
+      cacheUrl: string,
+      opts?: { bypassCache?: boolean }
+    ) => {
+      if (opts?.bypassCache) return;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      if (!ep.url || ep.url.startsWith('anisync://') || !ep.seriesTitle) return;
+
+      const reportedIds = new Set((ep.sourceReports || []).map((r) => r.sourceId));
+      if (reportedIds.size === 0) {
+        for (const opt of ep.options || []) {
+          if (opt.sourceId) reportedIds.add(opt.sourceId);
+        }
+      }
+      const pendingSourceNames = settingsRef.current.episodeSources
+        .filter((s) => s.enabled && !reportedIds.has(s.id))
+        .map((s) => s.name);
+      if (pendingSourceNames.length === 0) return;
+
+      const inFlightKey = canonicalEpisodeKey(ep.url) || ep.url;
+      if (inFlightExtraServersRef.current.has(inFlightKey)) return;
+      inFlightExtraServersRef.current.add(inFlightKey);
+
+      const extraGen = ++extraServersGenRef.current;
+      const excludeSourceIds = Array.from(reportedIds);
+      const pageAudioHint: 'DUB' | 'LEG' | null =
+        ep.options.length > 0 && ep.options.every((o) => o.audioType === 'DUB')
+          ? 'DUB'
+          : ep.options.length > 0 && ep.options.every((o) => o.audioType === 'LEG')
+            ? 'LEG'
+            : null;
+      const effectiveAudioPref =
+        settingsRef.current.defaultAudioFilter === 'ALL'
+          ? 'ALL'
+          : pageAudioHint || settingsRef.current.defaultAudioFilter;
+
+      setLoadingExtraServers({
+        episodeUrl: ep.url,
+        sourceNames: pendingSourceNames,
+        gen: extraGen,
+      });
+
+      void apiFetch('/api/sources/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          excludeSourceIds,
+          query: {
+            title: ep.seriesTitle,
+            originalTitle: ep.originalTitle,
+            alternativeTitles: ep.alternativeTitles,
+            seriesUrl: ep.seriesUrl,
+            mediaType: ep.isMovie ? 'movie' : ep.mediaType || 'anime',
+            seasonNumber: ep.seasonNumber || 1,
+            episodeNumber: ep.episodeNumber || 1,
+            audioPreference: effectiveAudioPref,
+          },
+        }),
+      })
+        .then((extraRes) => (extraRes.ok ? extraRes.json() : null))
+        .then(
+          (
+            extraData: {
+              options?: EpisodeDetails['options'];
+              reports?: EpisodeDetails['sourceReports'];
+            } | null
+          ) => {
+            if (!extraData) return;
+            const extraOpts = Array.isArray(extraData.options) ? extraData.options : [];
+            const extraReports = Array.isArray(extraData.reports) ? extraData.reports : [];
+            if (!extraOpts.length && !extraReports.length) return;
+
+            const mergeEpisode = (base: EpisodeDetails): EpisodeDetails => {
+              const seenKeys = new Set(
+                base.options.map(
+                  (o) => `${o.sourceId || ''}::${o.directStreamUrl || o.embedUrl}`
+                )
+              );
+              const mergedOptions = [...base.options];
+              for (const opt of extraOpts) {
+                const key = `${opt.sourceId || ''}::${opt.directStreamUrl || opt.embedUrl}`;
+                if (seenKeys.has(key)) continue;
+                seenKeys.add(key);
+                mergedOptions.push(opt);
+              }
+              const seenReportIds = new Set(
+                (base.sourceReports || []).map((r) => r.sourceId)
+              );
+              const mergedReports = [...(base.sourceReports || [])];
+              for (const rep of extraReports) {
+                if (seenReportIds.has(rep.sourceId)) continue;
+                seenReportIds.add(rep.sourceId);
+                mergedReports.push(rep);
+              }
+              return {
+                ...base,
+                options: mergedOptions,
+                sourceReports: mergedReports,
+              };
+            };
+
+            const cachedNow = getCachedEpisodeDetails(cacheUrl);
+            if (cachedNow) {
+              setCachedEpisodeDetails(cacheUrl, mergeEpisode(cachedNow));
+            }
+            setEpisodeDetails((prev) =>
+              prev && isSameEpisodeUrl(prev.url, ep.url) ? mergeEpisode(prev) : prev
+            );
+            setCastEpisodeDetailsFallback((prev) =>
+              prev && isSameEpisodeUrl(prev.url, ep.url) ? mergeEpisode(prev) : prev
+            );
+          }
+        )
+        .catch(() => {
+          // Secondary background augmentation is best-effort
+        })
+        .finally(() => {
+          inFlightExtraServersRef.current.delete(inFlightKey);
+          setLoadingExtraServers((current) =>
+            current && current.gen === extraGen ? null : current
+          );
+        });
+    },
+    []
+  );
+
   const loadEpisodeDetailsForRoute = useCallback(
     async (
       url: string,
@@ -2137,6 +2267,7 @@ export default function App() {
             setEpisodeDetails(cachedEp);
             setLoadingDetail(false);
             setDetailError('');
+            augmentSecondaryEpisodeSources(cachedEp, url);
             return;
           }
           const matchedSeriesEps = resolveSeriesEpisodesForEpisode(
@@ -2195,6 +2326,7 @@ export default function App() {
                 setEpisodeDetails((prev) =>
                   prev && isSameEpisodeUrl(prev.url, url) ? enriched : prev
                 );
+                augmentSecondaryEpisodeSources(enriched, url, { bypassCache: options.bypassCache });
               })
               .catch(() => {
                 // Offline or network unreachable — local video keeps playing seamlessly
@@ -2210,6 +2342,8 @@ export default function App() {
           setEpisodeDetails(cachedEp);
           setLoadingDetail(false);
           setDetailError('');
+          // Prefetched episodes only load the primary source; always trigger secondary source augmentation!
+          augmentSecondaryEpisodeSources(cachedEp, url);
           return;
         }
       } else {
@@ -2277,103 +2411,9 @@ export default function App() {
         setCachedEpisodeDetails(url, ep);
         setEpisodeDetails(ep);
 
-        // Augment with secondary integrated servers (e.g. Hinata Soul) in the background
+        // Augment with secondary integrated servers (TopAnimes / Hinata Soul) in the background
         // while showing an explicit loading indicator next to the server list.
-        const reportedIds = new Set((ep.sourceReports || []).map((r) => r.sourceId));
-        const pendingSourceNames = settingsRef.current.episodeSources
-          .filter((s) => s.enabled && !reportedIds.has(s.id))
-          .map((s) => s.name);
-        const hasPendingSecondarySource =
-          !options.bypassCache &&
-          !ep.url.startsWith('anisync://') &&
-          Boolean(ep.seriesTitle) &&
-          reportedIds.size === 1 &&
-          pendingSourceNames.length > 0;
-
-        if (hasPendingSecondarySource) {
-          const extraGen = ++extraServersGenRef.current;
-          const excludeSourceIds = Array.from(reportedIds);
-          setLoadingExtraServers({
-            episodeUrl: ep.url,
-            sourceNames: pendingSourceNames,
-            gen: extraGen,
-          });
-          void apiFetch('/api/sources/resolve', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              excludeSourceIds,
-              query: {
-                title: ep.seriesTitle,
-                originalTitle: ep.originalTitle,
-                alternativeTitles: ep.alternativeTitles,
-                mediaType: ep.isMovie ? 'movie' : ep.mediaType || 'anime',
-                seasonNumber: ep.seasonNumber || 1,
-                episodeNumber: ep.episodeNumber || 1,
-                audioPreference: settingsRef.current.defaultAudioFilter,
-              },
-            }),
-          })
-            .then((extraRes) => (extraRes.ok ? extraRes.json() : null))
-            .then(
-              (
-                extraData: {
-                  options?: EpisodeDetails['options'];
-                  reports?: EpisodeDetails['sourceReports'];
-                } | null
-              ) => {
-                if (!extraData) return;
-                const extraOpts = Array.isArray(extraData.options) ? extraData.options : [];
-                const extraReports = Array.isArray(extraData.reports) ? extraData.reports : [];
-                if (!extraOpts.length && !extraReports.length) return;
-
-                const mergeEpisode = (base: EpisodeDetails): EpisodeDetails => {
-                  const seenKeys = new Set(
-                    base.options.map(
-                      (o) => `${o.sourceId || ''}::${o.directStreamUrl || o.embedUrl}`
-                    )
-                  );
-                  const mergedOptions = [...base.options];
-                  for (const opt of extraOpts) {
-                    const key = `${opt.sourceId || ''}::${opt.directStreamUrl || opt.embedUrl}`;
-                    if (seenKeys.has(key)) continue;
-                    seenKeys.add(key);
-                    mergedOptions.push(opt);
-                  }
-                  const seenReportIds = new Set(
-                    (base.sourceReports || []).map((r) => r.sourceId)
-                  );
-                  const mergedReports = [...(base.sourceReports || [])];
-                  for (const rep of extraReports) {
-                    if (seenReportIds.has(rep.sourceId)) continue;
-                    seenReportIds.add(rep.sourceId);
-                    mergedReports.push(rep);
-                  }
-                  return {
-                    ...base,
-                    options: mergedOptions,
-                    sourceReports: mergedReports,
-                  };
-                };
-
-                const cachedNow = getCachedEpisodeDetails(url);
-                if (cachedNow) {
-                  setCachedEpisodeDetails(url, mergeEpisode(cachedNow));
-                }
-                setEpisodeDetails((prev) =>
-                  prev && isSameEpisodeUrl(prev.url, ep.url) ? mergeEpisode(prev) : prev
-                );
-              }
-            )
-            .catch(() => {
-              // Secondary background augmentation is best-effort
-            })
-            .finally(() => {
-              setLoadingExtraServers((current) =>
-                current && current.gen === extraGen ? null : current
-              );
-            });
-        }
+        augmentSecondaryEpisodeSources(ep, url, { bypassCache: options.bypassCache });
       } catch (err) {
         if (navRequestGenRef.current !== reqGen) return;
         setDetailError(
@@ -2385,7 +2425,7 @@ export default function App() {
         }
       }
     },
-    [resolveKnownEpisodeMeta]
+    [augmentSecondaryEpisodeSources, resolveKnownEpisodeMeta]
   );
 
   const syncNativeSessionResult = useCallback(
@@ -3124,6 +3164,14 @@ export default function App() {
   const navigateBackStepRef = useRef(navigateBackStep);
   navigateBackStepRef.current = navigateBackStep;
 
+  const clearStaleCastError = useCallback(() => {
+    const cur = tvCastStateRef.current;
+    if (!cur.active && (cur.errorMessage || cur.status === 'error')) {
+      setTvCastState({ ...IDLE_TV_CAST_STATE });
+      void clearTvCastError();
+    }
+  }, []);
+
   const handleOpenTvCast = useCallback(
     (
       payload: TvCastMediaPayload | null,
@@ -3136,6 +3184,17 @@ export default function App() {
       }
     ) => {
       if (payload) {
+        const cur = tvCastStateRef.current;
+        if (
+          !cur.active &&
+          (cur.errorMessage || cur.status === 'error') &&
+          (!cur.episodeUrl ||
+            !payload.episodeUrl ||
+            !isSameEpisodeUrl(cur.episodeUrl, payload.episodeUrl) ||
+            (payload.selectedServerNume && payload.selectedServerNume !== cur.selectedServerNume))
+        ) {
+          clearStaleCastError();
+        }
         setTvCastMediaPayload(payload);
         if (payload.selectedServerNume) {
           setActiveCastServerNume(payload.selectedServerNume);
@@ -3176,7 +3235,7 @@ export default function App() {
       });
       setTvCastModalOpen(true);
     },
-    []
+    [clearStaleCastError]
   );
 
   const handleCastSeekCommitted = useCallback((targetMs: number) => {
@@ -3232,6 +3291,7 @@ export default function App() {
       (tvCastState.active && tvCastState.episodeUrl) || tvCastMediaPayload?.episodeUrl || '';
     if (!tvCastModalOpen || !targetEpisodeUrl) return;
     if (episodeDetails && isSameEpisodeUrl(episodeDetails.url, targetEpisodeUrl)) {
+      augmentSecondaryEpisodeSources(episodeDetails, targetEpisodeUrl);
       return;
     }
     if (
@@ -3239,15 +3299,21 @@ export default function App() {
       isSameEpisodeUrl(castEpisodeDetailsFallback.url, targetEpisodeUrl) &&
       castEpisodeDetailsFallback.options.length > 0
     ) {
+      augmentSecondaryEpisodeSources(castEpisodeDetailsFallback, targetEpisodeUrl);
       return;
     }
 
     let cancelled = false;
     setLoadingCastEpisodeServers(true);
-    void fetchEpisodeDetailsFast(targetEpisodeUrl)
+    void fetchEpisodeDetailsFast(targetEpisodeUrl, {
+      sources: settingsRef.current.episodeSources,
+      audioPreference: settingsRef.current.defaultAudioFilter,
+      deferCrossSources: false,
+    })
       .then((ep) => {
         if (cancelled) return;
         setCastEpisodeDetailsFallback(ep);
+        augmentSecondaryEpisodeSources(ep, targetEpisodeUrl);
       })
       .catch(() => {
         // ignore if offline or unreachable
@@ -3260,6 +3326,7 @@ export default function App() {
       cancelled = true;
     };
   }, [
+    augmentSecondaryEpisodeSources,
     castEpisodeDetailsFallback,
     episodeDetails,
     tvCastMediaPayload?.episodeUrl,
@@ -3269,7 +3336,8 @@ export default function App() {
   ]);
 
   const activeCastEpisodeDetails = useMemo(() => {
-    const targetUrl = tvCastState.episodeUrl || tvCastMediaPayload?.episodeUrl || '';
+    const targetUrl =
+      (tvCastState.active && tvCastState.episodeUrl) || tvCastMediaPayload?.episodeUrl || '';
     if (!targetUrl) return episodeDetails;
     if (episodeDetails && isSameEpisodeUrl(episodeDetails.url, targetUrl)) {
       return episodeDetails;
@@ -3281,12 +3349,18 @@ export default function App() {
       return castEpisodeDetailsFallback;
     }
     return null;
-  }, [castEpisodeDetailsFallback, episodeDetails, tvCastMediaPayload?.episodeUrl, tvCastState.episodeUrl]);
+  }, [
+    castEpisodeDetailsFallback,
+    episodeDetails,
+    tvCastMediaPayload?.episodeUrl,
+    tvCastState.active,
+    tvCastState.episodeUrl,
+  ]);
 
   const activeCastOfflineRecord = useMemo(() => {
     const targetUrl =
       activeCastEpisodeDetails?.url ||
-      tvCastState.episodeUrl ||
+      (tvCastState.active && tvCastState.episodeUrl) ||
       tvCastMediaPayload?.episodeUrl ||
       '';
     if (!targetUrl) return null;
@@ -3296,6 +3370,7 @@ export default function App() {
     activeCastEpisodeDetails?.url,
     offlineDownloadsByKey,
     tvCastMediaPayload?.episodeUrl,
+    tvCastState.active,
     tvCastState.episodeUrl,
   ]);
 
@@ -3363,6 +3438,7 @@ export default function App() {
 
   const handleSwitchTvCastServer = useCallback(
     async (opt: PlayerOption, discoveredDevices?: readonly TvCastDevice[]) => {
+      clearStaleCastError();
       const curState = syncedTvCastStateRef.current;
       const isCasting = curState.active && hasRemoteTvControls(curState);
       if (
@@ -3432,12 +3508,13 @@ export default function App() {
           ? syncedTvCastStateRef.current.durationMs
           : tvCastMediaPayload?.durationMs || 0;
         const ep = activeCastEpisodeDetails;
+        const epAudioHintText = `${ep?.seriesTitle || ''} ${ep?.title || ''}`;
         const audioLabel =
-          opt.audioType === 'DUB'
+          opt.audioType === 'DUB' || /\bdublad[oa]\b/i.test(epAudioHintText)
             ? 'Português (Dublado)'
-            : opt.audioType === 'LEG'
+            : opt.audioType === 'LEG' || /\blegendad[oa]\b/i.test(epAudioHintText)
               ? 'Japonês (Legendado)'
-              : opt.label;
+              : '';
         const nextPayload = buildCastMediaPayload({
           stream: bestStream,
           subtitles: resolved.subtitles,
@@ -3447,14 +3524,25 @@ export default function App() {
           audioLabel,
           referer: resolved.referer || 'https://topanimes.net/',
           preferDirect: resolved.preferDirect,
-          episodeUrl: ep?.url || curState.episodeUrl || tvCastMediaPayload?.episodeUrl,
-          title: ep?.title || curState.episodeTitle || tvCastMediaPayload?.title || 'Episódio',
-          seriesTitle: ep?.seriesTitle || curState.seriesTitle || tvCastMediaPayload?.seriesTitle,
-          seriesUrl: ep?.seriesUrl || curState.seriesUrl || tvCastMediaPayload?.seriesUrl,
+          episodeUrl:
+            ep?.url || (curState.active ? curState.episodeUrl : '') || tvCastMediaPayload?.episodeUrl,
+          title:
+            ep?.title ||
+            (curState.active ? curState.episodeTitle : '') ||
+            tvCastMediaPayload?.title ||
+            'Episódio',
+          seriesTitle:
+            ep?.seriesTitle ||
+            (curState.active ? curState.seriesTitle : '') ||
+            tvCastMediaPayload?.seriesTitle,
+          seriesUrl:
+            ep?.seriesUrl ||
+            (curState.active ? curState.seriesUrl : '') ||
+            tvCastMediaPayload?.seriesUrl,
           poster:
             ep?.backdrop ||
             ep?.poster ||
-            curState.poster ||
+            (curState.active ? curState.poster : '') ||
             tvCastMediaPayload?.poster ||
             '',
           isMovie: ep?.isMovie ?? tvCastMediaPayload?.isMovie,
@@ -3503,6 +3591,7 @@ export default function App() {
       activeCastOfflineRecord,
       activeCastServerNume,
       activeTvCastDevice,
+      clearStaleCastError,
       showToast,
       tvCastDeliveryPref,
       tvCastMediaPayload,
@@ -3574,6 +3663,7 @@ export default function App() {
   const handleSelectCastQuality = useCallback(
     async (opt: TvCastQualityOption, discoveredDevices: TvCastDevice[]) => {
       if (opt.readOnly || opt.id === activeCastQualityId) return;
+      clearStaleCastError();
       const curState = syncedTvCastStateRef.current;
       const basePayload = tvCastMediaPayload;
       const livePosMs = curState.active ? curState.positionMs : basePayload?.startPositionMs || 0;
@@ -3583,11 +3673,12 @@ export default function App() {
         streamFormat: opt.format,
         referer: basePayload?.referer || 'https://topanimes.net/',
         preferDirect: basePayload?.preferDirect,
-        episodeUrl: basePayload?.episodeUrl || curState.episodeUrl,
-        title: basePayload?.title || curState.episodeTitle || 'Episódio',
-        seriesTitle: basePayload?.seriesTitle || curState.seriesTitle,
-        seriesUrl: basePayload?.seriesUrl || curState.seriesUrl,
-        poster: basePayload?.poster || curState.poster,
+        episodeUrl: basePayload?.episodeUrl || (curState.active ? curState.episodeUrl : ''),
+        title:
+          basePayload?.title || (curState.active ? curState.episodeTitle : '') || 'Episódio',
+        seriesTitle: basePayload?.seriesTitle || (curState.active ? curState.seriesTitle : ''),
+        seriesUrl: basePayload?.seriesUrl || (curState.active ? curState.seriesUrl : ''),
+        poster: basePayload?.poster || (curState.active ? curState.poster : ''),
         isMovie: basePayload?.isMovie,
         subtitleUrl: basePayload?.subtitleUrl,
         subtitleLabel: basePayload?.subtitleLabel,
@@ -3650,6 +3741,7 @@ export default function App() {
       activeCastQualityId,
       activeCastServerNume,
       activeTvCastDevice,
+      clearStaleCastError,
       showToast,
       tvCastDeliveryPref,
       tvCastMediaPayload,
@@ -3694,7 +3786,7 @@ export default function App() {
     if (!hasBothServerAudios) {
       const seriesUrl =
         activeCastEpisodeDetails?.seriesUrl ||
-        syncedTvCastState.seriesUrl ||
+        (syncedTvCastState.active ? syncedTvCastState.seriesUrl : '') ||
         tvCastMediaPayload?.seriesUrl ||
         '';
       const parentAnime =
@@ -3707,7 +3799,7 @@ export default function App() {
       const legTrack = parentAnime?.audioTracks?.LEG;
       const curEpUrl =
         activeCastEpisodeDetails?.url ||
-        syncedTvCastState.episodeUrl ||
+        (syncedTvCastState.active ? syncedTvCastState.episodeUrl : '') ||
         tvCastMediaPayload?.episodeUrl ||
         '';
       if (dubTrack && legTrack && curEpUrl) {
@@ -3751,14 +3843,27 @@ export default function App() {
     // 3. Otherwise display the real fixed audio language of the currently selected server cleanly (read-only)
     if (tvCastMediaPayload || syncedTvCastState.active) {
       const rawAudioType = selectedCastServerOption?.audioType;
-      const rawLabel = syncedTvCastState.audioLabel || tvCastMediaPayload?.audioLabel || '';
-      const isDub = rawAudioType === 'DUB' || /\bdub/i.test(rawLabel);
-      const isLeg = rawAudioType === 'LEG' || /\bleg/i.test(rawLabel);
+      const rawLabel =
+        (syncedTvCastState.active ? syncedTvCastState.audioLabel : '') ||
+        tvCastMediaPayload?.audioLabel ||
+        '';
+      const epTextHint = `${activeCastEpisodeDetails?.seriesTitle || ''} ${activeCastEpisodeDetails?.title || ''}`;
+      const isDub =
+        rawAudioType === 'DUB' || /\bdub/i.test(rawLabel) || /\bdublad[oa]\b/i.test(epTextHint);
+      const isLeg =
+        rawAudioType === 'LEG' || /\bleg/i.test(rawLabel) || /\blegendad[oa]\b/i.test(epTextHint);
+      const looksLikeServerName =
+        Boolean(rawLabel) &&
+        castModalServerOptions.some(
+          (o) => o.label.trim().toLowerCase() === rawLabel.trim().toLowerCase()
+        );
       const displayLabel = isDub
         ? 'Português (Dublado)'
         : isLeg
           ? 'Japonês (Legendado)'
-          : rawLabel || 'Áudio padrão';
+          : !looksLikeServerName && rawLabel
+            ? rawLabel
+            : 'Áudio padrão';
       items.push({
         id: 'server-fixed-audio',
         label: displayLabel,
@@ -3801,7 +3906,7 @@ export default function App() {
     }
     const curEpUrl =
       activeCastEpisodeDetails?.url ||
-      syncedTvCastState.episodeUrl ||
+      (syncedTvCastState.active ? syncedTvCastState.episodeUrl : '') ||
       tvCastMediaPayload?.episodeUrl ||
       '';
     const verMatch = castModalAudioOptions.find(
@@ -3822,6 +3927,7 @@ export default function App() {
   const handleSelectCastAudio = useCallback(
     async (opt: TvCastAudioOption, discoveredDevices: TvCastDevice[]) => {
       if (opt.readOnly || opt.id === activeCastAudioId) return;
+      clearStaleCastError();
 
       if (opt.kind === 'chromecast-track' && typeof opt.trackId === 'number') {
         setSwitchingCastAudioId(opt.id);
@@ -3855,7 +3961,12 @@ export default function App() {
       if (opt.kind === 'audio-version' && opt.targetEpisodeUrl) {
         setSwitchingCastAudioId(opt.id);
         try {
-          const targetEp = await fetchEpisodeDetailsFast(opt.targetEpisodeUrl);
+          const targetEp = await fetchEpisodeDetailsFast(opt.targetEpisodeUrl, {
+            sources: settingsRef.current.episodeSources,
+            audioPreference: settingsRef.current.defaultAudioFilter,
+            deferCrossSources: false,
+          });
+          augmentSecondaryEpisodeSources(targetEp, opt.targetEpisodeUrl);
           const candidateOptions = targetEp.options.filter(
             (o) => o.providerKind !== 'abyss' && !/aniplay/i.test(o.label)
           );
@@ -3946,6 +4057,8 @@ export default function App() {
     [
       activeCastAudioId,
       activeTvCastDevice,
+      augmentSecondaryEpisodeSources,
+      clearStaleCastError,
       handleSwitchTvCastServer,
       showToast,
       tvCastDeliveryPref,
@@ -4004,13 +4117,21 @@ export default function App() {
 
   const castModalSubtitleEmptyHint = useMemo(() => {
     const rawAudioType = selectedCastServerOption?.audioType;
-    const rawLabel = syncedTvCastState.audioLabel || tvCastMediaPayload?.audioLabel || '';
+    const rawLabel =
+      (syncedTvCastState.active ? syncedTvCastState.audioLabel : '') ||
+      tvCastMediaPayload?.audioLabel ||
+      '';
     const isLeg = rawAudioType === 'LEG' || /\bleg/i.test(rawLabel);
     if (isLeg) {
       return 'Legenda embutida no vídeo (hardsub)';
     }
     return 'Sem legendas externas neste servidor';
-  }, [selectedCastServerOption?.audioType, syncedTvCastState.audioLabel, tvCastMediaPayload?.audioLabel]);
+  }, [
+    selectedCastServerOption?.audioType,
+    syncedTvCastState.active,
+    syncedTvCastState.audioLabel,
+    tvCastMediaPayload?.audioLabel,
+  ]);
 
   const activeCastSubtitleId = useMemo(() => {
     if (castModalSubtitleOptions.length === 0) return '';
@@ -4037,6 +4158,7 @@ export default function App() {
   const handleSelectCastSubtitle = useCallback(
     async (opt: TvCastSubtitleChoice, _discoveredDevices: TvCastDevice[]) => {
       if (opt.id === activeCastSubtitleId) return;
+      clearStaleCastError();
       const disabled = Boolean(opt.disabled);
       setTvCastMediaPayload((prev) =>
         prev
@@ -4087,7 +4209,7 @@ export default function App() {
         setSwitchingCastSubtitleId('');
       }
     },
-    [activeCastSubtitleId, showToast]
+    [activeCastSubtitleId, clearStaleCastError, showToast]
   );
 
   // Sync live native background TV Cast state and persist watch progress even after reopening the app
@@ -4837,7 +4959,10 @@ export default function App() {
 
       <TvCastModal
         open={tvCastModalOpen}
-        onClose={() => setTvCastModalOpen(false)}
+        onClose={() => {
+          setTvCastModalOpen(false);
+          clearStaleCastError();
+        }}
         castState={syncedTvCastState}
         mediaPayload={tvCastMediaPayload}
         deliveryPref={tvCastDeliveryPref}
@@ -4861,6 +4986,7 @@ export default function App() {
         switchingSubtitleId={switchingCastSubtitleId}
         onSelectCastSubtitle={handleSelectCastSubtitle}
         onRefreshCastState={handleRefreshLiveTvCastState}
+        onDismissError={clearStaleCastError}
         onDeviceConnected={(device) => {
           setActiveTvCastDevice(device);
           if (tvCastMediaPayload?.selectedServerNume) {

@@ -148,8 +148,9 @@ export function inferHinataSoulMediaKind(
 
 export function cleanHinataSoulSeriesTitle(rawTitle: string): string {
   return cleanText(rawTitle)
-    .replace(/\s*[-–—]\s*(?:EP|Epis[oó]dio)\s*\d+(?:\s*[-–]\s*\d+)?(?:\.\d+)?(?:\s*Final)?\s*$/i, '')
-    .replace(/\s+(?:ep\.?|epis[oó]dio)\s*\d+(?:\s*[-–]\s*\d+)?(?:\.\d+)?(?:\s*(?:final|ova|especial))?\s*$/i, '')
+    .replace(/\s*[-–—]\s*(?:ep\.?|epis[oó]dio)\s*\d+(?:\s*[-–]\s*\d+)?(?:\.\d+)?.*$/i, '')
+    .replace(/\s+(?:ep\.?|epis[oó]dio)\s*\d+(?:\s*[-–]\s*\d+)?(?:\.\d+)?.*$/i, '')
+    .replace(/\s+(?:online|full\s*hd)\s*$/i, '')
     .trim();
 }
 
@@ -171,8 +172,9 @@ export function extractHinataSoulEpisodeNumber(text: string): number | null {
 
 export function extractHinataSoulSeasonNumber(title: string): number {
   const cleaned = cleanText(title)
-    .replace(/\s*[-–—]\s*dublado\s*$/i, '')
-    .replace(/\s*\(dublado\)\s*$/i, '')
+    .replace(/\s*[-–—]\s*(?:dublad[oa]|legendad[oa]|dub|leg|online|full\s*hd)\s*$/i, '')
+    .replace(/\s*\((?:dublad[oa]|legendad[oa]|dub|leg|pt[\s-]?br|dual[\s-]?audio)\)\s*$/i, '')
+    .replace(/\s+(?:dublad[oa]|legendad[oa]|dub|leg|online|full\s*hd)\s*$/i, '')
     .trim();
   if (!cleaned) return 1;
 
@@ -197,7 +199,7 @@ export function extractHinataSoulSeasonNumber(title: string): number {
     return map[romanMatch[1]] || 1;
   }
 
-  // Trailing season integer (e.g. "Yuru Camp 2" or "Kimetsu no Yaiba 2: Yuukaku-hen")
+  // Trailing season integer (e.g. "Yuru Camp 2", "Sousou no Frieren 2 Dublado", or "Kimetsu no Yaiba 2: Yuukaku-hen")
   const trailingNum = cleaned.match(/\s+([2-9]|1[0-5])(?:\s*[:\-–]|$)/);
   if (trailingNum?.[1]) {
     const n = Number.parseInt(trailingNum[1], 10);

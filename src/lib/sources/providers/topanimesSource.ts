@@ -18,6 +18,7 @@ import { extractHinataSoulSeasonNumber } from '../../hinatasoulParser.ts';
 import type { AnimeEpisodeLink, PlayerOption, ResolvedEmbed } from '../../types.ts';
 import { isSafeExternalHttpUrl, unwrapAvisoUrl } from '../../urlSafety.ts';
 import {
+  expandTitleVariantsForMatch,
   scoreTitleSimilarity,
   splitAlternativeTitleString,
   stripSeasonFromTitle,
@@ -228,6 +229,41 @@ function pickMatchingEpisodeFromList(
   return null;
 }
 
+function stripAudioTagsForTopAnimesSearch(raw: string): string {
+  return (raw || '')
+    .replace(/\s*\((?:dublad[oa]|legendad[oa]|dub|leg|pt[\s-]?br|dual[\s-]?audio|hd|full\s*hd)\)\s*/gi, ' ')
+    .replace(/\s*[-–—]\s*(?:dublad[oa]|legendad[oa]|dub|leg|online|full\s*hd)\s*$/i, '')
+    .replace(/\s+\b(?:dublad[oa]|legendad[oa]|dub|leg|online|full\s*hd)\b\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function searchTopAnimesHtmlCandidates(
+  fetchHttp: HttpFetcher,
+  origin: string,
+  clean: string
+): Promise<TopAnimesSearchCandidate[]> {
+  try {
+    const res = await fetchHttp(`${origin}/?s=${encodeURIComponent(clean)}`, {
+      referer: `${origin}/`,
+      timeoutMs: 6500,
+    });
+    if (res.ok) {
+      rememberNonce(origin, res.body);
+      const parsed = parseSearchPageHtml(res.body);
+      return parsed.results.map((r) => ({
+        title: r.title,
+        url: r.url,
+        kind: r.kind,
+        audioType: r.audioType,
+      }));
+    }
+  } catch {
+    // ignore
+  }
+  return [];
+}
+
 async function searchTopAnimesCandidates(
   fetchHttp: HttpFetcher,
   origin: string,
@@ -244,6 +280,8 @@ async function searchTopAnimesCandidates(
   }
 
   const storeResult = (items: TopAnimesSearchCandidate[]) => {
+    // Never cache empty arrays for 10 minutes so transient WordPress/nonce hiccups recover immediately
+    if (items.length === 0) return items;
     if (cache.size > 60) {
       const oldest = cache.keys().next().value;
       if (oldest) cache.delete(oldest);
@@ -294,27 +332,8 @@ async function searchTopAnimesCandidates(
   }
 
   // Fallback to HTML search page
-  try {
-    const res = await fetchHttp(`${origin}/?s=${encodeURIComponent(clean)}`, {
-      referer: `${origin}/`,
-      timeoutMs: 6500,
-    });
-    if (res.ok) {
-      rememberNonce(origin, res.body);
-      const parsed = parseSearchPageHtml(res.body);
-      return storeResult(
-        parsed.results.map((r) => ({
-          title: r.title,
-          url: r.url,
-          kind: r.kind,
-          audioType: r.audioType,
-        }))
-      );
-    }
-  } catch {
-    // ignore
-  }
-  return [];
+  const htmlResults = await searchTopAnimesHtmlCandidates(fetchHttp, origin, clean);
+  return storeResult(htmlResults);
 }
 
 async function fetchTopAnimesAnimeEpisodesCached(
@@ -399,28 +418,40 @@ export async function resolveFromTopAnimesSource(
     }
   }
 
+  if (!rawTerms.length) return { options: [] };
+
   const titleSeason = extractHinataSoulSeasonNumber(query.title || '');
   const targetSeason =
     query.seasonNumber && query.seasonNumber > 1 ? query.seasonNumber : titleSeason;
 
   const searchTerms: string[] = [];
   const pushTerm = (candidate: string) => {
-    const clean = candidate.trim();
+    const clean = stripAudioTagsForTopAnimesSearch(candidate);
     if (clean.length < 2) return;
     if (searchTerms.some((s) => s.toLowerCase() === clean.toLowerCase())) return;
     searchTerms.push(clean);
   };
+
   for (const term of rawTerms) {
-    pushTerm(term);
     const stripped = stripSeasonFromTitle(term);
-    if (stripped && stripped.toLowerCase() !== term.toLowerCase()) {
-      pushTerm(stripped);
+    if (targetSeason > 1) {
+      // TopAnimes names sequels as "<Title> 2" / "<Title> 2 Dublado" rather than "2nd Season"
+      if (stripped && stripped.length >= 2) {
+        pushTerm(`${stripped} ${targetSeason}`);
+        pushTerm(stripped);
+      }
+      pushTerm(term);
+    } else {
+      pushTerm(term);
+      if (stripped && stripped.toLowerCase() !== term.toLowerCase()) {
+        pushTerm(stripped);
+      }
     }
-    if (term.includes(':') && searchTerms.length < 4) {
+    if (term.includes(':') && searchTerms.length < 5) {
       const short = term.split(':')[0].trim();
       if (short.length >= 3) pushTerm(short);
     }
-    if (searchTerms.length >= 4) break;
+    if (searchTerms.length >= 5) break;
   }
 
   const candidateMap = new Map<
@@ -438,22 +469,44 @@ export async function resolveFromTopAnimesSource(
     for (const item of found) {
       if (query.mediaType === 'movie' && item.kind === 'episode') continue;
       if (query.mediaType !== 'movie' && item.kind === 'movie') continue;
-      const candBase = stripSeasonFromTitle(item.title) || item.title;
-      const bestFull = Math.max(...rawTerms.map((ref) => scoreTitleSimilarity(ref, item.title)));
-      const bestBase = Math.max(
-        ...rawTerms.map((ref) => scoreTitleSimilarity(stripSeasonFromTitle(ref) || ref, candBase))
+      const candSeason = extractHinataSoulSeasonNumber(item.title);
+      const candVariants = expandTitleVariantsForMatch(item.title);
+      const candBaseVariants = Array.from(
+        new Set(candVariants.map((v) => stripSeasonFromTitle(v) || v))
       );
+
+      let bestFull = 0;
+      let bestBase = 0;
+      let matchedSeasonSpecificRef = false;
+      for (const ref of rawTerms) {
+        const refBase = stripSeasonFromTitle(ref) || ref;
+        const refSeason = extractHinataSoulSeasonNumber(ref);
+        for (const cv of candVariants) {
+          const full = scoreTitleSimilarity(ref, cv);
+          if (full > bestFull) {
+            bestFull = full;
+            if (targetSeason > 1 && refSeason === targetSeason && full >= 0.8) {
+              matchedSeasonSpecificRef = true;
+            }
+          }
+        }
+        for (const cb of candBaseVariants) {
+          const base = scoreTitleSimilarity(refBase, cb);
+          if (base > bestBase) bestBase = base;
+        }
+      }
       const baseSim = Math.max(bestFull, bestBase);
       if (baseSim < 0.35) continue;
 
-      const candSeason = extractHinataSoulSeasonNumber(item.title);
       let adjustedScore = baseSim;
       if (targetSeason > 1) {
-        if (candSeason === targetSeason) adjustedScore += 0.3;
+        if (candSeason === targetSeason || matchedSeasonSpecificRef) adjustedScore += 0.3;
         else if (candSeason === 1) adjustedScore -= 0.25;
         else adjustedScore -= 0.4;
       } else if (candSeason > 1) {
-        adjustedScore -= 0.3;
+        adjustedScore -= 0.35;
+      } else {
+        adjustedScore += 0.1;
       }
 
       if (adjustedScore < 0.35) continue;
@@ -464,10 +517,10 @@ export async function resolveFromTopAnimesSource(
     }
   };
 
-  const limitedTerms = searchTerms.slice(0, 3);
+  const limitedTerms = searchTerms.slice(0, 4);
   if (limitedTerms.length > 0) {
     ingestFound(await searchTopAnimesCandidates(fetchHttp, origin, limitedTerms[0]));
-    const strongThreshold = targetSeason > 1 ? 1.05 : 0.85;
+    const strongThreshold = targetSeason > 1 ? 1.05 : 0.95;
     const hasStrongMatch = Array.from(candidateMap.values()).some(
       (c) => c.score >= strongThreshold
     );
@@ -477,6 +530,14 @@ export async function resolveFromTopAnimesSource(
       );
       for (const found of rest) {
         ingestFound(found);
+      }
+    }
+    // If wp-json returned only unrelated noise (0 scored candidates), retry HTML search directly
+    if (candidateMap.size === 0) {
+      const htmlFallbackTerm =
+        stripSeasonFromTitle(rawTerms[0]) || stripAudioTagsForTopAnimesSearch(rawTerms[0]);
+      if (htmlFallbackTerm.length >= 2) {
+        ingestFound(await searchTopAnimesHtmlCandidates(fetchHttp, origin, htmlFallbackTerm));
       }
     }
   }
@@ -532,9 +593,8 @@ export async function resolveFromTopAnimesSource(
           parsedEp.options
         );
 
-        const audioTag =
-          target.audioType === 'DUB' ? 'DUB' : target.audioType === 'LEG' ? 'LEG' : null;
-        const audioSuffix = audioTag ? ` [${audioTag}]` : '';
+        const audioTag = target.audioType === 'DUB' ? 'DUB' : 'LEG';
+        const audioSuffix = ` [${audioTag}]`;
         const targetOptions: AggregatedServerOption[] = [];
         for (const opt of hydrated) {
           if (opt.providerKind === 'abyss' || /aniplay/i.test(opt.label)) continue;
