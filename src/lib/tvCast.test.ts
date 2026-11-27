@@ -847,5 +847,52 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     const serverCast = readFileSync(resolve(ROOT, 'src/lib/serverTvCast.ts'), 'utf8');
     assert.match(serverCast, /await syncServerDlnaVolume\(sess, false\)/);
     assert.match(serverCast, /const justStartedPlaying = !sess\.dlnaSawPlaying && tState === 'PLAYING'/);
+
+    // Off-main-thread remote Stop (prevents NetworkOnMainThreadException swallowing AVTransport#Stop) + selected readOnly chips
+    assert.match(svc, /Looper\.myLooper\(\) == Looper\.getMainLooper\(\)/);
+    assert.match(svc, /AnisyncCastRemoteStop/);
+    assert.match(svc, /activeLanClientSockets/);
+    assert.match(svc, /public static void requestStopImmediately\(\)/);
+    assert.match(plugin, /TvCastService\.requestStopImmediately\(\)/);
+    assert.ok(
+      (modal.match(/data-selected="true"/g) || []).length >= 4,
+      'TvCastModal must mark readOnly Quality and Audio chips as selected (orange) both before and during cast'
+    );
+
+    // Vidstreaming seek & playback time sync guards: frozen RelTime must never snap playing clock backwards
+    let frozenClock = reconcileCastClock(
+      null,
+      { ...tsBase, status: 'playing', positionMs: 300_000, stateTimestampMs: 200_000 },
+      200_000
+    );
+    assert.ok(frozenClock);
+    frozenClock = reconcileCastClock(
+      frozenClock,
+      { ...tsBase, status: 'playing', positionMs: 300_000, stateTimestampMs: 203_000 },
+      203_000
+    );
+    assert.ok(frozenClock);
+    assert.equal(computeSyncedCastPositionMs(frozenClock, tsBase.durationMs, 203_000), 303_000);
+    frozenClock = reconcileCastClock(
+      frozenClock,
+      { ...tsBase, status: 'playing', positionMs: 300_000, stateTimestampMs: 206_000 },
+      206_000
+    );
+    assert.ok(frozenClock);
+    assert.equal(computeSyncedCastPositionMs(frozenClock, tsBase.durationMs, 206_000), 306_000);
+    frozenClock = reconcileCastClock(
+      frozenClock,
+      { ...tsBase, status: 'paused', positionMs: 306_000, stateTimestampMs: 206_500 },
+      206_500
+    );
+    assert.ok(frozenClock);
+    assert.equal(computeSyncedCastPositionMs(frozenClock, tsBase.durationMs, 210_000), 306_000);
+
+    assert.match(svc, /findHlsSegmentIndexForSeek/);
+    assert.match(svc, /resolveHlsRelayPositionMs/);
+    assert.match(svc, /parseHttpByteRangeHeader/);
+    assert.match(svc, /hlsRelaySwitching/);
+    assert.match(svc, /seekRequestGen/);
+    assert.match(svc, /activeHlsRelaySockets/);
   });
 });

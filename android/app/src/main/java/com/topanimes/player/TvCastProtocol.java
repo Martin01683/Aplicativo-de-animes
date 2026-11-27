@@ -912,6 +912,129 @@ public final class TvCastProtocol {
         return segments.size() - 1;
     }
 
+    /**
+     * Direction-aware HLS segment index lookup for DLNA continuous relay seeking.
+     * Prevents small forward skips (+5s) inside a 6-10s segment from flooring back
+     * to the start of the current segment (or jumping all the way back to 0:00).
+     */
+    public static int findHlsSegmentIndexForSeek(
+        List<HlsSegmentEntry> segments,
+        long currentPosMs,
+        long targetMs
+    ) {
+        if (segments == null || segments.isEmpty() || targetMs <= 1500L) return 0;
+        int lastIdx = segments.size() - 1;
+        int baseIdx = findHlsSegmentIndexForTimeMs(segments, targetMs);
+        long safeCur = Math.max(0L, currentPosMs);
+        int curIdx = findHlsSegmentIndexForTimeMs(segments, safeCur);
+        long deltaMs = targetMs - safeCur;
+
+        if (deltaMs > 0L && deltaMs <= 20_000L) {
+            // Forward skip (+5s / +10s / +15s): always advance to a segment AFTER currentPosMs when possible
+            int candidate = baseIdx;
+            if (candidate <= curIdx && curIdx < lastIdx) {
+                candidate = curIdx + 1;
+            }
+            while (candidate < lastIdx && segments.get(candidate).startMs < safeCur) {
+                candidate++;
+            }
+            return Math.min(lastIdx, Math.max(0, candidate));
+        }
+
+        if (deltaMs < 0L && -deltaMs <= 20_000L) {
+            // Backward skip (-5s / -10s / -15s): step to an earlier segment when floored start isn't actually earlier
+            int candidate = baseIdx;
+            if (candidate >= curIdx && curIdx > 0 && segments.get(candidate).startMs >= safeCur - 1500L) {
+                candidate = curIdx - 1;
+            }
+            return Math.min(lastIdx, Math.max(0, candidate));
+        }
+
+        // Scrub / large jump (+85s or slider drag): pick the nearest segment boundary
+        if (baseIdx < lastIdx) {
+            long distCurr = Math.abs(targetMs - segments.get(baseIdx).startMs);
+            long distNext = Math.abs(segments.get(baseIdx + 1).startMs - targetMs);
+            if (distNext < distCurr) {
+                return baseIdx + 1;
+            }
+        }
+        return Math.min(lastIdx, Math.max(0, baseIdx));
+    }
+
+    /**
+     * Computes real playback position for a continuous HLS -> MPEG-TS/fMP4 DLNA relay across all TV quirks:
+     * 1. TVs reporting original MPEG-TS PTS (e.g. 00:05:02 after seeking to 00:05:00):
+     *    `baseOffsetMs + (rawTvPosMs - firstRawTvPosMs)` avoids double-counting baseOffsetMs.
+     * 2. TVs reporting relative stream time (00:00:00, 00:00:01, ...):
+     *    `firstRawTvPosMs` is ~0, so `baseOffsetMs + (rawTvPosMs - firstRawTvPosMs)` equals `baseOffsetMs + rawTvPosMs`.
+     * 3. TVs reporting 00:00:00 or NOT_IMPLEMENTED on chunked TS streams:
+     *    falls back smoothly to our synchronized wall clock while PLAYING and freezes on PAUSED/BUFFERING.
+     */
+    public static long resolveHlsRelayPositionMs(
+        long baseOffsetMs,
+        long rawTvPosMs,
+        long firstRawTvPosMs,
+        boolean rawPosAdvancing,
+        long anchorPosMs,
+        long anchorWallMs,
+        long nowMs,
+        long totalDurationMs,
+        boolean isPlaying
+    ) {
+        long safeBase = Math.max(0L, baseOffsetMs);
+        long computed;
+        if (rawPosAdvancing && rawTvPosMs >= 0L && firstRawTvPosMs >= 0L) {
+            long delta = Math.max(0L, rawTvPosMs - firstRawTvPosMs);
+            computed = safeBase + delta;
+        } else if (isPlaying && anchorWallMs > 0L && nowMs >= anchorWallMs) {
+            computed = Math.max(safeBase, anchorPosMs) + (nowMs - anchorWallMs);
+        } else {
+            computed = Math.max(safeBase, anchorPosMs);
+        }
+        if (totalDurationMs > 0L && computed > totalDurationMs) {
+            return totalDurationMs;
+        }
+        return Math.max(0L, computed);
+    }
+
+    /**
+     * Parses a single HTTP `Range: bytes=start-end` header against a known total length.
+     * Returns `{ start, end }` inclusive, or `null` if absent/invalid.
+     */
+    public static long[] parseHttpByteRangeHeader(String rangeHeader, long totalLength) {
+        if (rangeHeader == null || totalLength <= 0L) return null;
+        String clean = rangeHeader.trim();
+        if (!clean.toLowerCase(Locale.ROOT).startsWith("bytes=")) return null;
+        String spec = clean.substring(6).trim();
+        int comma = spec.indexOf(',');
+        if (comma > 0) spec = spec.substring(0, comma).trim();
+        int dash = spec.indexOf('-');
+        if (dash < 0) return null;
+        String startPart = spec.substring(0, dash).trim();
+        String endPart = spec.substring(dash + 1).trim();
+        try {
+            long start;
+            long end;
+            if (!startPart.isEmpty()) {
+                start = Long.parseLong(startPart);
+                end = !endPart.isEmpty()
+                    ? Math.min(Long.parseLong(endPart), totalLength - 1L)
+                    : (totalLength - 1L);
+            } else if (!endPart.isEmpty()) {
+                long suffix = Long.parseLong(endPart);
+                if (suffix <= 0L) return null;
+                start = Math.max(0L, totalLength - suffix);
+                end = totalLength - 1L;
+            } else {
+                return null;
+            }
+            if (start < 0L || start >= totalLength || start > end) return null;
+            return new long[] { start, end };
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
     public static byte[] buildAes128IvBytes(String keyIvHex, long mediaSequence) {
         byte[] iv = new byte[16];
         String hex = safeStr(keyIvHex);

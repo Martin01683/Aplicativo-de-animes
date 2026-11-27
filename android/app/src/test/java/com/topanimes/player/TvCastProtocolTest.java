@@ -3,6 +3,7 @@ package com.topanimes.player;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -452,5 +453,78 @@ public class TvCastProtocolTest {
         assertEquals(16, ivSeq.length);
         assertEquals(1, ivSeq[14] & 0xFF);
         assertEquals(2, ivSeq[15] & 0xFF);
+    }
+
+    @Test
+    public void directionAwareHlsSeekRelayClockAndHttpRangeParsingPreventJumpToZero() {
+        // 10-second segments (typical Vidstreaming HLS): 0..10s, 10..20s, 20..30s, 30..40s, 40..50s
+        String playlist = "#EXTM3U\n"
+            + "#EXT-X-VERSION:3\n"
+            + "#EXTINF:10.0,\nseg0.ts\n"
+            + "#EXTINF:10.0,\nseg1.ts\n"
+            + "#EXTINF:10.0,\nseg2.ts\n"
+            + "#EXTINF:10.0,\nseg3.ts\n"
+            + "#EXTINF:10.0,\nseg4.ts\n"
+            + "#EXT-X-ENDLIST\n";
+        TvCastProtocol.HlsPlaylistInfo info = TvCastProtocol.parseHlsPlaylistForDlna(
+            playlist,
+            "https://vid.example.com/hls/index.m3u8"
+        );
+        assertEquals(5, info.segments.size());
+
+        // Forward +5s from 0:04 (target 0:09 inside seg 0) MUST advance to seg 1 (0:10), NOT jump back to 0:00!
+        assertEquals(1, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 4_000L, 9_000L));
+        // Forward +5s from 0:12 (target 0:17 inside seg 1) MUST advance to seg 2 (0:20), NOT jump back to 0:10!
+        assertEquals(2, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 12_000L, 17_000L));
+        // Backward -5s from 0:21 (target 0:16) moves back to seg 1 (0:10)
+        assertEquals(1, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 21_000L, 16_000L));
+        // Backward -5s from 0:26 (target 0:21) lands cleanly on seg 2 start (0:20, 6s back)
+        assertEquals(2, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 26_000L, 21_000L));
+        // Backward near segment start (0:21 -> 0:20.2) steps back to seg 1 (0:10) instead of repeating seg 2
+        assertEquals(1, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 21_000L, 20_200L));
+        // Large scrub to 0:38 picks nearest boundary seg 4 (0:40) vs seg 3 (0:30)
+        assertEquals(4, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 4_000L, 38_000L));
+        // Explicit seek to 0:00 returns seg 0
+        assertEquals(0, TvCastProtocol.findHlsSegmentIndexForSeek(info.segments, 25_000L, 0L));
+
+        // Relay clock Mode 1: TV reports original MPEG-TS PTS (300s -> 305s) — must return 305s, NEVER double-count 605s!
+        assertEquals(
+            305_000L,
+            TvCastProtocol.resolveHlsRelayPositionMs(300_000L, 305_000L, 300_000L, true, 300_000L, 10_000L, 15_000L, 1_440_000L, true)
+        );
+        // Relay clock Mode 2: TV reports relative time from 0 (0 -> 5s) — returns 305s
+        assertEquals(
+            305_000L,
+            TvCastProtocol.resolveHlsRelayPositionMs(300_000L, 5_000L, 0L, true, 300_000L, 10_000L, 15_000L, 1_440_000L, true)
+        );
+        // Relay clock Mode 3: TV reports frozen 00:00:00 on chunked TS — advances smoothly by wall clock while playing
+        assertEquals(
+            305_000L,
+            TvCastProtocol.resolveHlsRelayPositionMs(300_000L, 0L, 0L, false, 300_000L, 10_000L, 15_000L, 1_440_000L, true)
+        );
+        // Relay clock Mode 3 paused: freezes cleanly instead of advancing
+        assertEquals(
+            305_000L,
+            TvCastProtocol.resolveHlsRelayPositionMs(300_000L, 0L, 0L, false, 305_000L, 15_000L, 25_000L, 1_440_000L, false)
+        );
+
+        // HTTP byte-range parser for MP4 206 Partial Content emulation
+        long[] openEnd = TvCastProtocol.parseHttpByteRangeHeader("bytes=1000-", 5000L);
+        assertNotNull(openEnd);
+        assertEquals(1000L, openEnd[0]);
+        assertEquals(4999L, openEnd[1]);
+
+        long[] bounded = TvCastProtocol.parseHttpByteRangeHeader("bytes=500-999", 5000L);
+        assertNotNull(bounded);
+        assertEquals(500L, bounded[0]);
+        assertEquals(999L, bounded[1]);
+
+        long[] suffix = TvCastProtocol.parseHttpByteRangeHeader("bytes=-200", 5000L);
+        assertNotNull(suffix);
+        assertEquals(4800L, suffix[0]);
+        assertEquals(4999L, suffix[1]);
+
+        assertNull(TvCastProtocol.parseHttpByteRangeHeader("bytes=6000-", 5000L));
+        assertNull(TvCastProtocol.parseHttpByteRangeHeader(null, 5000L));
     }
 }

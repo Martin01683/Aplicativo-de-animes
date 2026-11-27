@@ -436,7 +436,7 @@ export function reconcileCastClock(
   if (
     reported <= 2000 &&
     !userSoughtNearStart &&
-    currentEstMs >= 8000 &&
+    (currentEstMs >= 8000 || (prev.seekPendingTargetMs !== null && prev.seekPendingTargetMs >= 4000)) &&
     (isTransitioning || next.status === 'playing' || prev.seekPendingTargetMs !== null)
   ) {
     return {
@@ -512,10 +512,10 @@ export function reconcileCastClock(
   }
 
   // Rule C: Normal real-time playback reconciliation.
+  // Never snap a playing clock backwards to a frozen/unchanged TV RelTime report.
   const reportedChanged = reported !== prev.lastReportedPositionMs;
-  const significantDrift = next.status === 'playing' && reported > 0 && Math.abs(reported - currentEstMs) >= 1500;
   if (
-    (reported > 0 && (reportedChanged || significantDrift || next.status === 'paused')) ||
+    (reported > 0 && (reportedChanged || next.status === 'paused')) ||
     (reported === 0 && next.status === 'paused')
   ) {
     return {

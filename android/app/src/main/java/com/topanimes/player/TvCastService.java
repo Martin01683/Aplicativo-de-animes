@@ -18,6 +18,7 @@ import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.util.Log;
 
@@ -250,6 +251,13 @@ public class TvCastService extends Service {
         return o;
     }
 
+    public static void requestStopImmediately() {
+        TvCastService inst = runningInstance;
+        if (inst != null) {
+            inst.stopSessionAndService();
+        }
+    }
+
     private static void broadcastState(JSONObject nextState) {
         synchronized (STATE_LOCK) {
             latestStateJson = nextState;
@@ -272,6 +280,7 @@ public class TvCastService extends Service {
     private ScheduledFuture<?> pollFuture;
 
     private ServerSocket lanServerSocket;
+    private final Set<Socket> activeLanClientSockets = ConcurrentHashMap.newKeySet();
     private volatile int lanServerPort = -1;
     private volatile boolean lanServerRunning = false;
     private volatile String lanSecretToken = "";
@@ -329,9 +338,18 @@ public class TvCastService extends Service {
     private volatile boolean attemptedDirectFallback = false;
     private volatile TvCastProtocol.HlsPlaylistInfo activeDlnaHlsPlan = null;
     private volatile boolean hlsTsRelayActive = false;
+    private volatile boolean hlsRelaySwitching = false;
     private volatile long hlsTsBaseOffsetMs = 0L;
     private volatile long hlsTsRelayStartMs = 0L;
+    private volatile long hlsRelayFirstRawPosMs = -1L;
+    private volatile long hlsRelayLastRawPosMs = -1L;
+    private volatile boolean hlsRelayRawPosAdvancing = false;
+    private volatile long hlsRelayAnchorPosMs = 0L;
+    private volatile long hlsRelayAnchorWallMs = 0L;
     private final AtomicInteger hlsRelaySeekSeq = new AtomicInteger(0);
+    private final AtomicInteger seekRequestGen = new AtomicInteger(0);
+    private volatile long pendingSeekTargetMs = -1L;
+    private final Set<Socket> activeHlsRelaySockets = ConcurrentHashMap.newKeySet();
     private final Map<String, byte[]> hlsAesKeyCache = new ConcurrentHashMap<>();
     private volatile boolean dlnaNeedsPostPlayVolumeResync = false;
 
@@ -398,12 +416,18 @@ public class TvCastService extends Service {
                 break;
             case ACTION_SEEK_TO: {
                 long targetMs = Math.max(0L, intent.getLongExtra(EXTRA_POSITION_MS, 0L));
-                ioExecutor.execute(() -> performSeekTo(targetMs));
+                int seq = seekRequestGen.incrementAndGet();
+                pendingSeekTargetMs = targetMs;
+                ioExecutor.execute(() -> performSeekTo(targetMs, seq));
                 break;
             }
             case ACTION_SEEK_BY: {
                 long deltaMs = intent.getLongExtra(EXTRA_DELTA_MS, 0L);
-                ioExecutor.execute(() -> performSeekTo(Math.max(0L, positionMs + deltaMs)));
+                long baseMs = pendingSeekTargetMs >= 0L ? pendingSeekTargetMs : getEffectiveLivePositionMs();
+                long targetMs = Math.max(0L, baseMs + deltaMs);
+                int seq = seekRequestGen.incrementAndGet();
+                pendingSeekTargetMs = targetMs;
+                ioExecutor.execute(() -> performSeekTo(targetMs, seq));
                 break;
             }
             case ACTION_SET_VOLUME: {
@@ -506,9 +530,7 @@ public class TvCastService extends Service {
         }
         dlnaNeedsPostPlayVolumeResync = true;
         activeDlnaHlsPlan = null;
-        hlsTsRelayActive = false;
-        hlsTsBaseOffsetMs = 0L;
-        hlsTsRelayStartMs = 0L;
+        resetHlsRelayState();
         hlsAesKeyCache.clear();
         activeMediaTracksJson = new JSONArray();
         activeTrackIdsJson = new JSONArray();
@@ -613,11 +635,51 @@ public class TvCastService extends Service {
         return base + "/cast/" + lanSecretToken + "/m" + gen + "/" + (asPlaylist ? "playlist.m3u8" : "video.mp4");
     }
 
-    private String buildActiveLanRelayUrl(int gen, int seekSeq, boolean isFmp4) {
+    private String buildActiveLanRelayUrl(int gen, int seekSeq, int startIdx, boolean isFmp4) {
         String base = ensureLanProxyBaseUrl();
         if (base.isEmpty() || lanSecretToken.isEmpty()) return "";
-        return base + "/cast/" + lanSecretToken + "/m" + gen + "/s" + seekSeq + "/"
+        return base + "/cast/" + lanSecretToken + "/m" + gen + "/s" + seekSeq + "/i" + Math.max(0, startIdx) + "/"
             + (isFmp4 ? "video-fmp4.mp4" : "video.ts");
+    }
+
+    private void resetHlsRelayState() {
+        hlsRelaySwitching = false;
+        hlsTsRelayActive = false;
+        hlsTsBaseOffsetMs = 0L;
+        hlsTsRelayStartMs = 0L;
+        hlsRelayFirstRawPosMs = -1L;
+        hlsRelayLastRawPosMs = -1L;
+        hlsRelayRawPosAdvancing = false;
+        hlsRelayAnchorPosMs = 0L;
+        hlsRelayAnchorWallMs = 0L;
+        pendingSeekTargetMs = -1L;
+    }
+
+    private void closeActiveHlsRelaySockets() {
+        for (Socket s : activeHlsRelaySockets) {
+            try {
+                s.close();
+            } catch (Exception ignored) {
+            }
+        }
+        activeHlsRelaySockets.clear();
+    }
+
+    private long getEffectiveLivePositionMs() {
+        if (hlsTsRelayActive) {
+            return TvCastProtocol.resolveHlsRelayPositionMs(
+                hlsTsBaseOffsetMs,
+                hlsRelayLastRawPosMs,
+                hlsRelayFirstRawPosMs,
+                hlsRelayRawPosAdvancing,
+                hlsRelayAnchorPosMs,
+                hlsRelayAnchorWallMs,
+                System.currentTimeMillis(),
+                durationMs,
+                "playing".equals(status)
+            );
+        }
+        return Math.max(0L, positionMs);
     }
 
     private TvCastProtocol.HlsPlaylistInfo resolveDlnaHlsPlanIfApplicable(int gen, boolean knownHls) {
@@ -707,9 +769,7 @@ public class TvCastService extends Service {
 
         closeActiveRemoteControllers();
         activeDlnaHlsPlan = null;
-        hlsTsRelayActive = false;
-        hlsTsBaseOffsetMs = 0L;
-        hlsTsRelayStartMs = 0L;
+        resetHlsRelayState();
 
         TvCastProtocol.LocalOfflineAsset localOffline = TvCastProtocol.parseLocalOfflineAsset(streamUrl);
         boolean isLocalOffline = localOffline != null;
@@ -834,9 +894,7 @@ public class TvCastService extends Service {
                             loadedViaRelay = true;
                         } catch (Exception relayErr) {
                             Log.w(TAG, "DLNA HLS->TS relay failed, falling back to m3u8: " + relayErr.getMessage());
-                            hlsTsRelayActive = false;
-                            hlsTsBaseOffsetMs = 0L;
-                            hlsTsRelayStartMs = 0L;
+                            resetHlsRelayState();
                         }
                     }
 
@@ -944,37 +1002,60 @@ public class TvCastService extends Service {
         long startPosMs,
         String lanSubtitleSrtUrl
     ) throws IOException {
+        loadDlnaViaHlsContinuousRelay(dlna, gen, plan, startPosMs, -1, lanSubtitleSrtUrl);
+    }
+
+    private void loadDlnaViaHlsContinuousRelay(
+        DlnaController dlna,
+        int gen,
+        TvCastProtocol.HlsPlaylistInfo plan,
+        long startPosMs,
+        int explicitSegIdx,
+        String lanSubtitleSrtUrl
+    ) throws IOException {
         boolean isFmp4 = !plan.initMapUrl.isEmpty();
         String relayMime = isFmp4 ? "video/mp4" : "video/mp2t";
-        int segIdx = TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, startPosMs);
+        int segIdx = explicitSegIdx >= 0
+            ? Math.min(plan.segments.size() - 1, explicitSegIdx)
+            : TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, startPosMs);
         long snappedStartMs = segIdx > 0 ? plan.segments.get(segIdx).startMs : 0L;
         int seekSeq = hlsRelaySeekSeq.incrementAndGet();
-        String relayUrl = buildActiveLanRelayUrl(gen, seekSeq, isFmp4);
+        String relayUrl = buildActiveLanRelayUrl(gen, seekSeq, segIdx, isFmp4);
         if (relayUrl.isEmpty()) {
             throw new IOException("Proxy Wi-Fi indisponível para stream HLS.");
         }
-        hlsTsRelayActive = true;
-        hlsTsBaseOffsetMs = snappedStartMs;
-        hlsTsRelayStartMs = snappedStartMs;
-        if (plan.totalDurationMs > 0L) {
-            durationMs = plan.totalDurationMs;
-        }
-        lanStreamUrl = relayUrl;
-        dlna.loadAndPlay(
-            relayUrl,
-            relayMime,
-            episodeTitle,
-            seriesTitle,
-            posterUrl,
-            0L,
-            lanSubtitleSrtUrl,
-            plan.totalDurationMs,
-            true
-        );
-        if (snappedStartMs > 0L) {
+        hlsRelaySwitching = true;
+        try {
+            closeActiveHlsRelaySockets();
+            hlsTsRelayActive = true;
+            hlsTsBaseOffsetMs = snappedStartMs;
+            hlsTsRelayStartMs = snappedStartMs;
+            hlsRelayFirstRawPosMs = -1L;
+            hlsRelayLastRawPosMs = -1L;
+            hlsRelayRawPosAdvancing = false;
+            hlsRelayAnchorPosMs = snappedStartMs;
+            hlsRelayAnchorWallMs = 0L;
             positionMs = snappedStartMs;
             lastSeekTargetMs = snappedStartMs;
             lastSeekRequestedAtMs = System.currentTimeMillis();
+            if (plan.totalDurationMs > 0L) {
+                durationMs = plan.totalDurationMs;
+            }
+            lanStreamUrl = relayUrl;
+            dlna.loadAndPlay(
+                relayUrl,
+                relayMime,
+                episodeTitle,
+                seriesTitle,
+                posterUrl,
+                0L,
+                lanSubtitleSrtUrl,
+                plan.totalDurationMs,
+                true
+            );
+            lastSeekRequestedAtMs = System.currentTimeMillis();
+        } finally {
+            hlsRelaySwitching = false;
         }
     }
 
@@ -998,6 +1079,10 @@ public class TvCastService extends Service {
             } else if (dlnaController != null) {
                 dlnaController.play();
             }
+            if (hlsTsRelayActive) {
+                hlsRelayAnchorPosMs = Math.max(hlsTsBaseOffsetMs, positionMs);
+                hlsRelayAnchorWallMs = System.currentTimeMillis();
+            }
             status = "playing";
             updateNotification();
             publishCurrentState();
@@ -1008,6 +1093,12 @@ public class TvCastService extends Service {
 
     private void performPause() {
         try {
+            if (hlsTsRelayActive) {
+                long livePos = getEffectiveLivePositionMs();
+                positionMs = livePos;
+                hlsRelayAnchorPosMs = livePos;
+                hlsRelayAnchorWallMs = 0L;
+            }
             if (chromecastController != null) {
                 chromecastController.pause();
             } else if (dlnaController != null) {
@@ -1031,10 +1122,16 @@ public class TvCastService extends Service {
     }
 
     private void performSeekTo(long targetMs) {
+        performSeekTo(targetMs, seekRequestGen.incrementAndGet());
+    }
+
+    private void performSeekTo(long targetMs, int reqSeq) {
+        if (reqSeq != seekRequestGen.get()) return;
         long clamped = Math.max(0L, targetMs);
         if (durationMs > 0L && clamped > durationMs) {
             clamped = Math.max(0L, durationMs - 1000L);
         }
+        long currentLivePosMs = getEffectiveLivePositionMs();
         lastSeekTargetMs = clamped;
         lastSeekRequestedAtMs = System.currentTimeMillis();
         try {
@@ -1043,6 +1140,17 @@ public class TvCastService extends Service {
             } else if (dlnaController != null) {
                 TvCastProtocol.HlsPlaylistInfo plan = activeDlnaHlsPlan;
                 if (hlsTsRelayActive && plan != null && !plan.segments.isEmpty()) {
+                    int targetSegIdx = TvCastProtocol.findHlsSegmentIndexForSeek(
+                        plan.segments,
+                        currentLivePosMs,
+                        clamped
+                    );
+                    long snappedPreviewMs = targetSegIdx > 0 ? plan.segments.get(targetSegIdx).startMs : 0L;
+                    positionMs = snappedPreviewMs;
+                    lastSeekTargetMs = snappedPreviewMs;
+                    status = "buffering";
+                    publishCurrentState();
+
                     String lanSubSrt = (!subtitleDisabled && !subtitleUrl.isEmpty())
                         ? buildLanSubtitleSrtUrl()
                         : "";
@@ -1051,19 +1159,29 @@ public class TvCastService extends Service {
                         castSessionGen.get(),
                         plan,
                         clamped,
+                        targetSegIdx,
                         lanSubSrt
                     );
+                    if (reqSeq != seekRequestGen.get()) return;
                     clamped = hlsTsBaseOffsetMs;
+                    status = "buffering";
                 } else {
                     dlnaController.seek(clamped);
                 }
             }
+            if (reqSeq != seekRequestGen.get()) return;
             positionMs = clamped;
+            if (reqSeq == seekRequestGen.get()) {
+                pendingSeekTargetMs = -1L;
+            }
             persistProgressIfNeeded(true, false);
             updateNotification();
             publishCurrentState();
         } catch (Exception e) {
             Log.w(TAG, "Seek failed: " + e.getMessage());
+            if (reqSeq == seekRequestGen.get()) {
+                pendingSeekTargetMs = -1L;
+            }
         }
     }
 
@@ -1256,16 +1374,58 @@ public class TvCastService extends Service {
     }
 
     private void stopSessionAndService() {
-        castSessionGen.incrementAndGet();
+        final int stopGen = castSessionGen.incrementAndGet();
         persistProgressIfNeeded(true, false);
         sessionActive = false;
         status = "idle";
         latestPreparedLanStreamUrl = "";
-        teardownControllersAndServer();
-        releaseLocks();
+        resetHlsRelayState();
+        stopPollingLoop();
+
+        final ChromecastController cc;
+        final DlnaController dc;
+        synchronized (sessionLock) {
+            cc = chromecastController;
+            chromecastController = null;
+            dc = dlnaController;
+            dlnaController = null;
+        }
+
+        // Update app UI & remove foreground notification immediately
         broadcastState(buildIdleStateJson());
         stopForegroundCompat();
-        stopSelf();
+
+        Runnable remoteStopAndCleanup = () -> {
+            try {
+                // Send Stop to TV FIRST while Wi-Fi lock is still held so LG webOS / Chromecast
+                // exits the video cleanly and immediately without a network-drop error dialog.
+                if (cc != null) {
+                    cc.stopAndClose();
+                }
+                if (dc != null) {
+                    dc.stopQuietly();
+                }
+            } finally {
+                if (castSessionGen.get() == stopGen) {
+                    stopLanProxyServer();
+                    releaseLocks();
+                    stopSelf();
+                }
+            }
+        };
+
+        if (cc != null || dc != null) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                Thread stopThread = new Thread(remoteStopAndCleanup, "AnisyncCastRemoteStop");
+                stopThread.start();
+            } else {
+                remoteStopAndCleanup.run();
+            }
+        } else {
+            stopLanProxyServer();
+            releaseLocks();
+            stopSelf();
+        }
     }
 
     private void teardownControllersAndServer() {
@@ -1275,19 +1435,28 @@ public class TvCastService extends Service {
     }
 
     private void closeActiveRemoteControllers() {
-        ChromecastController cc;
-        DlnaController dc;
+        final ChromecastController cc;
+        final DlnaController dc;
         synchronized (sessionLock) {
             cc = chromecastController;
             chromecastController = null;
             dc = dlnaController;
             dlnaController = null;
         }
-        if (cc != null) {
-            cc.stopAndClose();
-        }
-        if (dc != null) {
-            dc.stopQuietly();
+        if (cc == null && dc == null) return;
+        Runnable stopTask = () -> {
+            if (cc != null) {
+                cc.stopAndClose();
+            }
+            if (dc != null) {
+                dc.stopQuietly();
+            }
+        };
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Thread stopThread = new Thread(stopTask, "AnisyncCastCloseRemote");
+            stopThread.start();
+        } else {
+            stopTask.run();
         }
     }
 
@@ -1427,6 +1596,14 @@ public class TvCastService extends Service {
             } catch (Exception ignored) {
             }
         }
+        for (Socket client : activeLanClientSockets) {
+            try {
+                client.close();
+            } catch (Exception ignored) {
+            }
+        }
+        activeLanClientSockets.clear();
+        activeHlsRelaySockets.clear();
     }
 
     private String ensureLanStreamUrlForCurrentMedia() {
@@ -1461,6 +1638,7 @@ public class TvCastService extends Service {
     }
 
     private void handleLanClientSocket(Socket client) {
+        activeLanClientSockets.add(client);
         try (Socket sock = client) {
             sock.setSoTimeout(30000);
             try {
@@ -1547,7 +1725,23 @@ public class TvCastService extends Service {
 
             if (relPath.endsWith("/video.ts") || relPath.endsWith("/video-fmp4.mp4")) {
                 boolean isFmp4 = relPath.endsWith("/video-fmp4.mp4");
-                serveLanHlsContinuousRelay(out, method, lanBase, isFmp4);
+                int reqSeekSeq = -1;
+                int reqStartIdx = -1;
+                String[] relayParts = relPath.split("/");
+                for (String part : relayParts) {
+                    if (part.length() > 1 && part.charAt(0) == 's') {
+                        try {
+                            reqSeekSeq = Integer.parseInt(part.substring(1));
+                        } catch (NumberFormatException ignored) {
+                        }
+                    } else if (part.length() > 1 && part.charAt(0) == 'i') {
+                        try {
+                            reqStartIdx = Integer.parseInt(part.substring(1));
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                }
+                serveLanHlsContinuousRelay(client, out, method, lanBase, isFmp4, reqSeekSeq, reqStartIdx);
                 return;
             }
 
@@ -1674,7 +1868,8 @@ public class TvCastService extends Service {
                 }
                 String contentRange = conn.getHeaderField("Content-Range");
                 String acceptRanges = conn.getHeaderField("Accept-Ranges");
-                if (acceptRanges == null || acceptRanges.trim().isEmpty()) {
+                if (acceptRanges == null || acceptRanges.trim().isEmpty()
+                    || ("none".equalsIgnoreCase(acceptRanges.trim()) && contentLength > 0L && !isHlsSegment && !isPlaylist)) {
                     acceptRanges = "bytes";
                 }
 
@@ -1776,6 +1971,36 @@ public class TvCastService extends Service {
                 }
 
                 String outCt = TvCastProtocol.normalizeDlnaVideoMimeType(contentType, targetUrl, streamFormat);
+                if (!isHeadRequest && rangeHeader != null && code == 200 && bodyStream != null && contentLength > 0L) {
+                    long[] byteRange = TvCastProtocol.parseHttpByteRangeHeader(rangeHeader, contentLength);
+                    if (byteRange != null && (byteRange[0] > 0L || byteRange[1] < contentLength - 1L)) {
+                        long rangeStart = byteRange[0];
+                        long rangeEnd = byteRange[1];
+                        long toSkip = rangeStart;
+                        byte[] skipBuf = new byte[65536];
+                        while (toSkip > 0L && lanServerRunning && sessionActive) {
+                            int rn = bodyStream.read(skipBuf, 0, (int) Math.min(skipBuf.length, toSkip));
+                            if (rn == -1) break;
+                            toSkip -= rn;
+                        }
+                        if (toSkip == 0L) {
+                            long partLen = (rangeEnd - rangeStart) + 1L;
+                            String emuContentRange = "bytes " + rangeStart + "-" + rangeEnd + "/" + contentLength;
+                            writeLanHeaders(out, 206, "Partial Content", outCt, partLen, emuContentRange, "bytes", captionHeaderUrl);
+                            long remaining = partLen;
+                            byte[] buf = new byte[65536];
+                            while (remaining > 0L && lanServerRunning && sessionActive) {
+                                int rn = bodyStream.read(buf, 0, (int) Math.min(buf.length, remaining));
+                                if (rn == -1) break;
+                                out.write(buf, 0, rn);
+                                remaining -= rn;
+                            }
+                            out.flush();
+                            return;
+                        }
+                    }
+                }
+
                 writeLanHeaders(out, code, statusText, outCt, contentLength, contentRange, acceptRanges, captionHeaderUrl);
                 if (bodyStream != null && !"HEAD".equals(method)) {
                     byte[] buf = new byte[65536];
@@ -1790,6 +2015,8 @@ public class TvCastService extends Service {
             }
         } catch (Exception e) {
             Log.d(TAG, "LAN proxy socket closed: " + e.getMessage());
+        } finally {
+            activeLanClientSockets.remove(client);
         }
     }
 
@@ -1800,14 +2027,21 @@ public class TvCastService extends Service {
      * streams natively without HTTP 500 / UPnP 714 Illegal MIME-type errors.
      */
     private void serveLanHlsContinuousRelay(
+        Socket client,
         OutputStream out,
         String method,
         String lanBase,
-        boolean isFmp4
+        boolean isFmp4,
+        int reqSeekSeq,
+        int reqStartIdx
     ) throws IOException {
         TvCastProtocol.HlsPlaylistInfo plan = activeDlnaHlsPlan;
         if (plan == null || plan.segments.isEmpty()) {
             writeLanSimpleError(out, 404, "Not Found", "No active HLS relay plan");
+            return;
+        }
+        if (reqSeekSeq > 0 && hlsRelaySeekSeq.get() != reqSeekSeq) {
+            writeLanSimpleError(out, 410, "Gone", "Superseded HLS relay seek");
             return;
         }
         String mime = isFmp4 ? "video/mp4" : "video/mp2t";
@@ -1821,44 +2055,51 @@ public class TvCastService extends Service {
         }
 
         final int startGen = castSessionGen.get();
-        final int startSeq = hlsRelaySeekSeq.get();
+        final int startSeq = reqSeekSeq > 0 ? reqSeekSeq : hlsRelaySeekSeq.get();
         final String safeRef = LocalProxyPlugin.isSafeHttpUrl(referer) ? referer : "https://topanimes.net/";
 
-        if (isFmp4 && !plan.initMapUrl.isEmpty()) {
-            byte[] initBytes = fetchRelaySegmentBytes(plan.initMapUrl, safeRef);
-            if (initBytes != null && initBytes.length > 0) {
-                out.write(initBytes);
+        activeHlsRelaySockets.add(client);
+        try {
+            if (isFmp4 && !plan.initMapUrl.isEmpty()) {
+                byte[] initBytes = fetchRelaySegmentBytes(plan.initMapUrl, safeRef);
+                if (initBytes != null && initBytes.length > 0) {
+                    out.write(initBytes);
+                    out.flush();
+                }
+            }
+
+            int startIdx = reqStartIdx >= 0
+                ? Math.min(plan.segments.size() - 1, reqStartIdx)
+                : TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, hlsTsRelayStartMs);
+            for (int i = startIdx; i < plan.segments.size(); i++) {
+                if (!lanServerRunning || !sessionActive
+                    || castSessionGen.get() != startGen
+                    || hlsRelaySeekSeq.get() != startSeq) {
+                    break;
+                }
+                TvCastProtocol.HlsSegmentEntry seg = plan.segments.get(i);
+                byte[] segBytes = fetchRelaySegmentBytes(seg.url, safeRef);
+                if (segBytes == null || segBytes.length == 0) {
+                    continue;
+                }
+                if ("AES-128".equalsIgnoreCase(seg.keyMethod) && !seg.keyUri.isEmpty()) {
+                    byte[] decrypted = decryptHlsAes128Segment(segBytes, seg.keyUri, seg.keyIvHex, seg.mediaSequence, safeRef);
+                    if (decrypted != null) {
+                        segBytes = decrypted;
+                    }
+                }
+                int writeOffset = 0;
+                if (!isFmp4) {
+                    int tsOffset = LocalProxyPlugin.findMpegTsSyncOffset(segBytes, segBytes.length, true);
+                    if (tsOffset > 0 && tsOffset < segBytes.length) {
+                        writeOffset = tsOffset;
+                    }
+                }
+                out.write(segBytes, writeOffset, segBytes.length - writeOffset);
                 out.flush();
             }
-        }
-
-        int startIdx = TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, hlsTsRelayStartMs);
-        for (int i = startIdx; i < plan.segments.size(); i++) {
-            if (!lanServerRunning || !sessionActive
-                || castSessionGen.get() != startGen
-                || hlsRelaySeekSeq.get() != startSeq) {
-                break;
-            }
-            TvCastProtocol.HlsSegmentEntry seg = plan.segments.get(i);
-            byte[] segBytes = fetchRelaySegmentBytes(seg.url, safeRef);
-            if (segBytes == null || segBytes.length == 0) {
-                continue;
-            }
-            if ("AES-128".equalsIgnoreCase(seg.keyMethod) && !seg.keyUri.isEmpty()) {
-                byte[] decrypted = decryptHlsAes128Segment(segBytes, seg.keyUri, seg.keyIvHex, seg.mediaSequence, safeRef);
-                if (decrypted != null) {
-                    segBytes = decrypted;
-                }
-            }
-            int writeOffset = 0;
-            if (!isFmp4) {
-                int tsOffset = LocalProxyPlugin.findMpegTsSyncOffset(segBytes, segBytes.length, true);
-                if (tsOffset > 0 && tsOffset < segBytes.length) {
-                    writeOffset = tsOffset;
-                }
-            }
-            out.write(segBytes, writeOffset, segBytes.length - writeOffset);
-            out.flush();
+        } finally {
+            activeHlsRelaySockets.remove(client);
         }
     }
 
@@ -3228,12 +3469,28 @@ public class TvCastService extends Service {
                     TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
                     "Stop",
                     singletonInstanceArgs(),
-                    2000,
-                    2000,
-                    1,
-                    false
+                    2500,
+                    2500,
+                    2,
+                    true
                 );
-            } catch (Exception ignored) {
+            } catch (Exception firstErr) {
+                Log.w(TAG, "DLNA Stop failed (" + firstErr.getMessage() + "); refreshing control URL and retrying");
+                try {
+                    refreshControlUrlsFromLocation(true);
+                    sendSoap(
+                        avTransportUrl,
+                        TvCastProtocol.UPNP_AV_TRANSPORT_SERVICE,
+                        "Stop",
+                        singletonInstanceArgs(),
+                        2500,
+                        2500,
+                        1,
+                        true
+                    );
+                } catch (Exception secondErr) {
+                    Log.w(TAG, "DLNA Stop retry failed: " + secondErr.getMessage());
+                }
             }
         }
 
@@ -3272,9 +3529,12 @@ public class TvCastService extends Service {
         }
 
         void pollStatus(int gen) {
+            if (hlsRelaySwitching) return;
             String transportState = "";
             boolean transportOk = false;
             boolean posOk = false;
+            long rawReportedPos = -1L;
+            long durMs = -1L;
 
             try {
                 String transportXml = sendSoap(
@@ -3294,6 +3554,8 @@ public class TvCastService extends Service {
                 Log.d(TAG, "DLNA GetTransportInfo error: " + e.getMessage());
             }
 
+            if (hlsRelaySwitching || gen != castSessionGen.get()) return;
+
             try {
                 String posXml = sendSoap(
                     avTransportUrl,
@@ -3307,36 +3569,14 @@ public class TvCastService extends Service {
                 );
                 long relRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "RelTime"));
                 long absRaw = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "AbsTime"));
-                long rawReportedPos = relRaw > 0L ? relRaw : (absRaw > 0L ? absRaw : relRaw);
-                long reportedPos = (hlsTsRelayActive && rawReportedPos >= 0L)
-                    ? (hlsTsBaseOffsetMs + rawReportedPos)
-                    : rawReportedPos;
-                long durMs = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "TrackDuration"));
-                long nowMs = System.currentTimeMillis();
-                boolean withinSeekGrace = lastSeekTargetMs >= 0L && (nowMs - lastSeekRequestedAtMs) < 8000L;
-                boolean userSoughtNearStart = lastSeekTargetMs >= 0L && lastSeekTargetMs <= 2000L;
-                boolean ignoreZeroReset = reportedPos <= 2000L
-                    && !userSoughtNearStart
-                    && positionMs >= 8000L
-                    && ("TRANSITIONING".equals(transportState) || "PLAYING".equals(transportState) || withinSeekGrace);
-                boolean ignoreStaleSeekPoll = withinSeekGrace
-                    && Math.abs(reportedPos - lastSeekTargetMs) > 12_000L;
-                if (reportedPos >= 0L && !ignoreZeroReset && !ignoreStaleSeekPoll) {
-                    positionMs = reportedPos;
-                    if (withinSeekGrace && Math.abs(reportedPos - lastSeekTargetMs) <= 8000L) {
-                        lastSeekTargetMs = -1L;
-                    }
-                }
-                TvCastProtocol.HlsPlaylistInfo hlsPlan = activeDlnaHlsPlan;
-                if (hlsTsRelayActive && hlsPlan != null && hlsPlan.totalDurationMs > 0L) {
-                    durationMs = hlsPlan.totalDurationMs;
-                } else if (durMs > 0L) {
-                    durationMs = durMs;
-                }
+                rawReportedPos = relRaw > 0L ? relRaw : (absRaw > 0L ? absRaw : relRaw);
+                durMs = TvCastProtocol.parseDlnaTimeMs(TvCastProtocol.extractXmlTagValue(posXml, "TrackDuration"));
                 posOk = true;
             } catch (Exception e) {
                 Log.d(TAG, "DLNA GetPositionInfo error: " + e.getMessage());
             }
+
+            if (hlsRelaySwitching || gen != castSessionGen.get()) return;
 
             if (!transportOk && !posOk) {
                 consecutivePollFailures++;
@@ -3346,6 +3586,11 @@ public class TvCastService extends Service {
                 return;
             }
             consecutivePollFailures = 0;
+
+            long nowMs = System.currentTimeMillis();
+            if (!transportOk && posOk && "buffering".equals(status) && (nowMs - lastSeekRequestedAtMs) > 2500L) {
+                transportState = "PLAYING";
+            }
 
             boolean justStartedPlaying = !sawPlaying && "PLAYING".equals(transportState);
             if ("PLAYING".equals(transportState)) {
@@ -3365,6 +3610,86 @@ public class TvCastService extends Service {
                     return;
                 }
             }
+
+            if (hlsTsRelayActive) {
+                TvCastProtocol.HlsPlaylistInfo hlsPlan = activeDlnaHlsPlan;
+                if (hlsPlan != null && hlsPlan.totalDurationMs > 0L) {
+                    durationMs = hlsPlan.totalDurationMs;
+                }
+                if ("playing".equals(status)) {
+                    if (hlsRelayAnchorWallMs == 0L) {
+                        hlsRelayAnchorPosMs = Math.max(hlsTsBaseOffsetMs, positionMs);
+                        hlsRelayAnchorWallMs = nowMs;
+                    }
+                    boolean validRawSample = rawReportedPos >= 0L;
+                    if (validRawSample && hlsRelayRawPosAdvancing && hlsRelayLastRawPosMs >= 5000L
+                        && rawReportedPos < hlsRelayLastRawPosMs - 3000L) {
+                        // Ignore sudden bogus reset-to-zero mid-playback glitches on LG webOS
+                        validRawSample = false;
+                    }
+                    if (validRawSample) {
+                        if (hlsRelayFirstRawPosMs < 0L) {
+                            if (rawReportedPos <= 5_000L) {
+                                // TV reports relative stream time starting near 00:00:00
+                                hlsRelayFirstRawPosMs = 0L;
+                            } else if (Math.abs(rawReportedPos - hlsTsBaseOffsetMs) <= 15_000L) {
+                                // TV reports original episode MPEG-TS PTS matching our segment offset
+                                hlsRelayFirstRawPosMs = hlsTsBaseOffsetMs;
+                            } else {
+                                // TV reports arbitrary non-zero muxer PTS
+                                hlsRelayFirstRawPosMs = rawReportedPos;
+                            }
+                        }
+                        if (hlsRelayLastRawPosMs >= 0L
+                            && rawReportedPos > hlsRelayLastRawPosMs
+                            && (rawReportedPos - hlsRelayLastRawPosMs) <= 15_000L) {
+                            hlsRelayRawPosAdvancing = true;
+                        }
+                        hlsRelayLastRawPosMs = rawReportedPos;
+                    }
+                    long effectiveRaw = validRawSample ? rawReportedPos : -1L;
+                    long nextPos = TvCastProtocol.resolveHlsRelayPositionMs(
+                        hlsTsBaseOffsetMs,
+                        effectiveRaw,
+                        hlsRelayFirstRawPosMs,
+                        hlsRelayRawPosAdvancing && validRawSample,
+                        hlsRelayAnchorPosMs,
+                        hlsRelayAnchorWallMs,
+                        nowMs,
+                        durationMs,
+                        true
+                    );
+                    positionMs = nextPos;
+                    hlsRelayAnchorPosMs = nextPos;
+                    hlsRelayAnchorWallMs = nowMs;
+                    if (lastSeekTargetMs >= 0L && Math.abs(nextPos - lastSeekTargetMs) <= 8000L) {
+                        lastSeekTargetMs = -1L;
+                    }
+                } else if ("paused".equals(status) || "buffering".equals(status)) {
+                    hlsRelayAnchorPosMs = Math.max(hlsTsBaseOffsetMs, positionMs);
+                    hlsRelayAnchorWallMs = 0L;
+                }
+            } else if (posOk) {
+                long reportedPos = rawReportedPos;
+                boolean withinSeekGrace = lastSeekTargetMs >= 0L && (nowMs - lastSeekRequestedAtMs) < 8000L;
+                boolean userSoughtNearStart = lastSeekTargetMs >= 0L && lastSeekTargetMs <= 2000L;
+                boolean ignoreZeroReset = reportedPos <= 2000L
+                    && !userSoughtNearStart
+                    && (positionMs >= 8000L || (withinSeekGrace && lastSeekTargetMs >= 4000L))
+                    && ("TRANSITIONING".equals(transportState) || "PLAYING".equals(transportState) || withinSeekGrace);
+                boolean ignoreStaleSeekPoll = withinSeekGrace
+                    && Math.abs(reportedPos - lastSeekTargetMs) > 12_000L;
+                if (reportedPos >= 0L && !ignoreZeroReset && !ignoreStaleSeekPoll) {
+                    positionMs = reportedPos;
+                    if (withinSeekGrace && Math.abs(reportedPos - lastSeekTargetMs) <= 8000L) {
+                        lastSeekTargetMs = -1L;
+                    }
+                }
+                if (durMs > 0L) {
+                    durationMs = durMs;
+                }
+            }
+
             pollCount++;
             if ((justStartedPlaying || dlnaNeedsPostPlayVolumeResync || !volumeSynced || pollCount <= 6 || (pollCount % 3 == 0))
                 && (System.currentTimeMillis() - lastVolumeSetAtMs) >= 2500L) {
@@ -3493,17 +3818,28 @@ public class TvCastService extends Service {
 
                 @Override
                 public void onSeekTo(long pos) {
-                    ioExecutor.execute(() -> performSeekTo(pos));
+                    long targetMs = Math.max(0L, pos);
+                    int seq = seekRequestGen.incrementAndGet();
+                    pendingSeekTargetMs = targetMs;
+                    ioExecutor.execute(() -> performSeekTo(targetMs, seq));
                 }
 
                 @Override
                 public void onFastForward() {
-                    ioExecutor.execute(() -> performSeekTo(positionMs + 15_000L));
+                    long baseMs = pendingSeekTargetMs >= 0L ? pendingSeekTargetMs : getEffectiveLivePositionMs();
+                    long targetMs = Math.max(0L, baseMs + 15_000L);
+                    int seq = seekRequestGen.incrementAndGet();
+                    pendingSeekTargetMs = targetMs;
+                    ioExecutor.execute(() -> performSeekTo(targetMs, seq));
                 }
 
                 @Override
                 public void onRewind() {
-                    ioExecutor.execute(() -> performSeekTo(Math.max(0L, positionMs - 15_000L)));
+                    long baseMs = pendingSeekTargetMs >= 0L ? pendingSeekTargetMs : getEffectiveLivePositionMs();
+                    long targetMs = Math.max(0L, baseMs - 15_000L);
+                    int seq = seekRequestGen.incrementAndGet();
+                    pendingSeekTargetMs = targetMs;
+                    ioExecutor.execute(() -> performSeekTo(targetMs, seq));
                 }
 
                 @Override
@@ -3762,7 +4098,8 @@ public class TvCastService extends Service {
         if (!force && !completed && (now - lastProgressPersistMs) < 5000L) {
             return;
         }
-        if (!completed && positionMs < 2000L) {
+        long livePosMs = getEffectiveLivePositionMs();
+        if (!completed && livePosMs < 2000L) {
             return;
         }
         lastProgressPersistMs = now;
@@ -3774,7 +4111,7 @@ public class TvCastService extends Service {
             seriesUrl,
             posterUrl,
             isMovie,
-            positionMs,
+            livePosMs,
             durationMs,
             completed
         );
@@ -3796,7 +4133,7 @@ public class TvCastService extends Service {
             o.put("poster", posterUrl);
             o.put("streamUrl", streamUrl);
             o.put("lanStreamUrl", lanStreamUrl);
-            o.put("positionMs", Math.max(0L, positionMs));
+            o.put("positionMs", Math.max(0L, getEffectiveLivePositionMs()));
             o.put("durationMs", Math.max(0L, durationMs));
             o.put("stateTimestampMs", System.currentTimeMillis());
             o.put("volume", volume);

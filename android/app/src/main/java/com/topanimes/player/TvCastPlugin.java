@@ -331,7 +331,8 @@ public class TvCastPlugin extends Plugin {
         intent.setAction(TvCastService.ACTION_STOP_CAST);
         try {
             getContext().startService(intent);
-        } catch (Exception ignored) {
+        } catch (Exception e) {
+            TvCastService.requestStopImmediately();
         }
         call.resolve();
     }

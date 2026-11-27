@@ -1340,7 +1340,19 @@ function teardownSession(sess: ActiveServerCastSession | null, sendStopToTv: boo
 export async function stopServerTvCast(): Promise<TvCastStateSnapshot> {
   const prev = activeSession;
   activeSession = null;
-  teardownSession(prev, true);
+  if (prev?.device.protocol === 'dlna' && prev.device.avTransportControlUrl) {
+    teardownSession(prev, false);
+    await sendDlnaSoap(
+      prev.device.avTransportControlUrl,
+      UPNP_AV_TRANSPORT_SERVICE,
+      'Stop',
+      { InstanceID: '0' },
+      2500,
+      2
+    ).catch(() => {});
+  } else {
+    teardownSession(prev, true);
+  }
   return { ...IDLE_TV_CAST_STATE };
 }
 
@@ -1754,7 +1766,7 @@ export async function startServerTvCast(params: {
             const ignoreZeroReset =
               reportedPos <= 2000 &&
               !userSoughtNearStart &&
-              sess.state.positionMs >= 8000 &&
+              (sess.state.positionMs >= 8000 || (withinSeekGrace && (sess.lastSeekTargetMs || 0) >= 4000)) &&
               (tState === 'TRANSITIONING' || tState === 'PLAYING' || withinSeekGrace);
             const ignoreStaleSeekPoll =
               withinSeekGrace &&

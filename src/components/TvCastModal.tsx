@@ -377,7 +377,7 @@ export function TvCastModal({
     setPendingSeek({
       targetMs: clamped,
       episodeKey: castEpisodeKey,
-      expiresAt: Date.now() + 2500,
+      expiresAt: Date.now() + 4500,
     });
     void tvCastSeek(clamped);
   };
@@ -1168,7 +1168,8 @@ export function TvCastModal({
                                 return (
                                   <span
                                     key={opt.id}
-                                    className="inline-flex min-h-[30px] items-center rounded-lg border border-[#f97316]/45 bg-[#f97316]/12 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c]"
+                                    data-selected="true"
+                                    className="inline-flex min-h-[32px] items-center rounded-lg border border-[#f97316] bg-[#f97316]/18 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c]"
                                   >
                                     {opt.label}
                                   </span>
@@ -1211,7 +1212,8 @@ export function TvCastModal({
                                 return (
                                   <span
                                     key={opt.id}
-                                    className="inline-flex min-h-[30px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1 text-[11px] font-medium text-slate-200"
+                                    data-selected="true"
+                                    className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border border-[#f97316] bg-[#f97316]/18 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c]"
                                   >
                                     <span>{opt.label}</span>
                                     {opt.badge && (
@@ -1403,7 +1405,8 @@ export function TvCastModal({
                                 return (
                                   <span
                                     key={opt.id}
-                                    className="inline-flex min-h-[30px] items-center rounded-lg border border-[#f97316]/45 bg-[#f97316]/12 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c]"
+                                    data-selected="true"
+                                    className="inline-flex min-h-[32px] items-center rounded-lg border border-[#f97316] bg-[#f97316]/18 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c]"
                                   >
                                     {opt.label}
                                   </span>
@@ -1443,7 +1446,8 @@ export function TvCastModal({
                                 return (
                                   <span
                                     key={opt.id}
-                                    className="inline-flex min-h-[30px] items-center gap-1.5 rounded-lg border border-white/12 bg-[#0d0f12] px-2.5 py-1 text-[11px] font-medium text-slate-200"
+                                    data-selected="true"
+                                    className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border border-[#f97316] bg-[#f97316]/18 px-2.5 py-1 text-[11px] font-semibold text-[#fb923c]"
                                   >
                                     <span>{opt.label}</span>
                                     {opt.badge && (

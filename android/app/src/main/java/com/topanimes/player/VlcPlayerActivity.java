@@ -3684,7 +3684,8 @@ public class VlcPlayerActivity extends AppCompatActivity {
                         stopI.setAction(TvCastService.ACTION_STOP_CAST);
                         try {
                             startService(stopI);
-                        } catch (Exception ignored) {
+                        } catch (Exception e) {
+                            TvCastService.requestStopImmediately();
                         }
                         updateCastButtonVisual();
                         renderSettingsTab("cast");
