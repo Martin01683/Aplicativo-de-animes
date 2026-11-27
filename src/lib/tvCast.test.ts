@@ -894,5 +894,15 @@ describe('serverTvCast Node Wi-Fi discovery & protocol codecs', () => {
     assert.match(svc, /hlsRelaySwitching/);
     assert.match(svc, /seekRequestGen/);
     assert.match(svc, /activeHlsRelaySockets/);
+
+    // YouTube-style notification artwork + Stop CustomAction + DLNA TimeSeekRange TV HUD sync guards
+    assert.match(svc, /CUSTOM_ACTION_STOP_CAST/);
+    assert.match(svc, /public void onCustomAction\(String action, Bundle extras\)/);
+    assert.match(svc, /METADATA_KEY_ALBUM_ART/);
+    assert.match(svc, /R\.drawable\.ic_cast_stop/);
+    assert.match(svc, /ensurePosterArtworkLoaded/);
+    assert.match(svc, /TimeSeekRange\.dlna\.org/);
+    assert.match(svc, /parseDlnaTimeSeekRangeStartMs/);
+    assert.match(svc, /formatDlnaTimeSeekRangeHeader/);
   });
 });

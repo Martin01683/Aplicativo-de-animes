@@ -8,6 +8,8 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
@@ -17,6 +19,7 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
@@ -131,16 +134,23 @@ public class TvCastService extends Service {
     private static volatile JSONObject latestStateJson = buildIdleStateJson();
     private static volatile String latestPreparedLanStreamUrl = "";
 
-    private static final long MEDIA_SESSION_ACTIONS =
+    private static final String CUSTOM_ACTION_STOP_CAST = "com.topanimes.player.action.MEDIA_STOP_CAST";
+
+    private static final long MEDIA_SESSION_BASE_ACTIONS =
         PlaybackState.ACTION_PLAY
             | PlaybackState.ACTION_PAUSE
             | PlaybackState.ACTION_PLAY_PAUSE
             | PlaybackState.ACTION_STOP
             | PlaybackState.ACTION_SEEK_TO
             | PlaybackState.ACTION_FAST_FORWARD
-            | PlaybackState.ACTION_REWIND
-            | PlaybackState.ACTION_SKIP_TO_NEXT
-            | PlaybackState.ACTION_SKIP_TO_PREVIOUS;
+            | PlaybackState.ACTION_REWIND;
+
+    private static long buildMediaSessionActions(boolean hasPrev, boolean hasNext) {
+        long actions = MEDIA_SESSION_BASE_ACTIONS;
+        if (hasPrev) actions |= PlaybackState.ACTION_SKIP_TO_PREVIOUS;
+        if (hasNext) actions |= PlaybackState.ACTION_SKIP_TO_NEXT;
+        return actions;
+    }
 
     public static void addStateListener(StateListener listener) {
         if (listener != null) {
@@ -347,11 +357,24 @@ public class TvCastService extends Service {
     private volatile long hlsRelayAnchorPosMs = 0L;
     private volatile long hlsRelayAnchorWallMs = 0L;
     private final AtomicInteger hlsRelaySeekSeq = new AtomicInteger(0);
+    private final AtomicInteger hlsRelayStreamSeq = new AtomicInteger(0);
+    private final AtomicInteger hlsTimeSeekRequestCount = new AtomicInteger(0);
+    private volatile boolean hlsTimeSeekFailedForDevice = false;
+    private volatile long hlsPendingTimeSeekTargetMs = -1L;
+    private volatile int hlsPendingTimeSeekSegIdx = -1;
+    private volatile long hlsPendingTimeSeekAtMs = 0L;
+    private volatile long hlsRelayInitialLoadAtMs = 0L;
     private final AtomicInteger seekRequestGen = new AtomicInteger(0);
     private volatile long pendingSeekTargetMs = -1L;
     private final Set<Socket> activeHlsRelaySockets = ConcurrentHashMap.newKeySet();
     private final Map<String, byte[]> hlsAesKeyCache = new ConcurrentHashMap<>();
     private volatile boolean dlnaNeedsPostPlayVolumeResync = false;
+
+    private volatile String cachedArtworkUrl = "";
+    private volatile Bitmap cachedArtworkBitmap = null;
+    private volatile String loadingArtworkUrl = "";
+    private volatile String lastMetadataSignature = "";
+    private volatile String lastNotificationSignature = "";
 
     private ChromecastController chromecastController = null;
     private DlnaController dlnaController = null;
@@ -527,6 +550,7 @@ public class TvCastService extends Service {
             muted = false;
             volumeSynced = false;
             lastVolumeSetAtMs = 0L;
+            hlsTimeSeekFailedForDevice = false;
         }
         dlnaNeedsPostPlayVolumeResync = true;
         activeDlnaHlsPlan = null;
@@ -540,10 +564,11 @@ public class TvCastService extends Service {
         attemptedDirectFallback = false;
 
         acquireLocks();
-        updateNotification();
+        final int gen = castSessionGen.incrementAndGet();
+        ensurePosterArtworkLoaded(posterUrl, referer, gen);
+        updateNotification(true);
         publishCurrentState();
 
-        final int gen = castSessionGen.incrementAndGet();
         ioExecutor.execute(() -> connectAndLoadMedia(gen, false));
     }
 
@@ -593,6 +618,7 @@ public class TvCastService extends Service {
         acquireLocks();
 
         final int gen = castSessionGen.incrementAndGet();
+        ensurePosterArtworkLoaded(posterUrl, referer, gen);
         ioExecutor.execute(() -> {
             if (gen != castSessionGen.get()) return;
             String lanUrl = ensureLanStreamUrlForCurrentMedia();
@@ -604,7 +630,7 @@ public class TvCastService extends Service {
             }
             lanStreamUrl = lanUrl;
             latestPreparedLanStreamUrl = lanUrl;
-            updateNotification();
+            updateNotification(true);
             publishCurrentState();
         });
     }
@@ -652,6 +678,10 @@ public class TvCastService extends Service {
         hlsRelayRawPosAdvancing = false;
         hlsRelayAnchorPosMs = 0L;
         hlsRelayAnchorWallMs = 0L;
+        hlsPendingTimeSeekTargetMs = -1L;
+        hlsPendingTimeSeekSegIdx = -1;
+        hlsPendingTimeSeekAtMs = 0L;
+        hlsRelayInitialLoadAtMs = 0L;
         pendingSeekTargetMs = -1L;
     }
 
@@ -1020,6 +1050,7 @@ public class TvCastService extends Service {
             : TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, startPosMs);
         long snappedStartMs = segIdx > 0 ? plan.segments.get(segIdx).startMs : 0L;
         int seekSeq = hlsRelaySeekSeq.incrementAndGet();
+        hlsRelayStreamSeq.incrementAndGet();
         String relayUrl = buildActiveLanRelayUrl(gen, seekSeq, segIdx, isFmp4);
         if (relayUrl.isEmpty()) {
             throw new IOException("Proxy Wi-Fi indisponível para stream HLS.");
@@ -1030,6 +1061,7 @@ public class TvCastService extends Service {
             hlsTsRelayActive = true;
             hlsTsBaseOffsetMs = snappedStartMs;
             hlsTsRelayStartMs = snappedStartMs;
+            hlsRelayInitialLoadAtMs = System.currentTimeMillis();
             hlsRelayFirstRawPosMs = -1L;
             hlsRelayLastRawPosMs = -1L;
             hlsRelayRawPosAdvancing = false;
@@ -1151,17 +1183,55 @@ public class TvCastService extends Service {
                     status = "buffering";
                     publishCurrentState();
 
-                    String lanSubSrt = (!subtitleDisabled && !subtitleUrl.isEmpty())
-                        ? buildLanSubtitleSrtUrl()
-                        : "";
-                    loadDlnaViaHlsContinuousRelay(
-                        dlnaController,
-                        castSessionGen.get(),
-                        plan,
-                        clamped,
-                        targetSegIdx,
-                        lanSubSrt
-                    );
+                    boolean handledByTimeSeek = false;
+                    if (!hlsTimeSeekFailedForDevice && plan.totalDurationMs > 0L) {
+                        int beforeCount = hlsTimeSeekRequestCount.get();
+                        hlsPendingTimeSeekTargetMs = snappedPreviewMs;
+                        hlsPendingTimeSeekSegIdx = targetSegIdx;
+                        hlsPendingTimeSeekAtMs = System.currentTimeMillis();
+                        hlsRelaySwitching = true;
+                        try {
+                            dlnaController.seek(snappedPreviewMs);
+                            long deadline = System.currentTimeMillis() + 1800L;
+                            while (System.currentTimeMillis() < deadline && reqSeq == seekRequestGen.get()) {
+                                if (hlsTimeSeekRequestCount.get() > beforeCount) {
+                                    handledByTimeSeek = true;
+                                    break;
+                                }
+                                try {
+                                    Thread.sleep(80L);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                    break;
+                                }
+                            }
+                        } catch (Exception seekErr) {
+                            Log.i(TAG, "DLNA TimeSeekRange seek unsupported (" + seekErr.getMessage() + "); falling back to URI reload");
+                        } finally {
+                            hlsRelaySwitching = false;
+                        }
+                        if (!handledByTimeSeek && reqSeq == seekRequestGen.get()) {
+                            hlsTimeSeekFailedForDevice = true;
+                            hlsPendingTimeSeekTargetMs = -1L;
+                            hlsPendingTimeSeekSegIdx = -1;
+                        }
+                    }
+
+                    if (!handledByTimeSeek) {
+                        if (reqSeq != seekRequestGen.get()) return;
+                        String lanSubSrt = (!subtitleDisabled && !subtitleUrl.isEmpty())
+                            ? buildLanSubtitleSrtUrl()
+                            : "";
+                        loadDlnaViaHlsContinuousRelay(
+                            dlnaController,
+                            castSessionGen.get(),
+                            plan,
+                            clamped,
+                            targetSegIdx,
+                            lanSubSrt
+                        );
+                    }
+
                     if (reqSeq != seekRequestGen.get()) return;
                     clamped = hlsTsBaseOffsetMs;
                     status = "buffering";
@@ -1741,7 +1811,7 @@ public class TvCastService extends Service {
                         }
                     }
                 }
-                serveLanHlsContinuousRelay(client, out, method, lanBase, isFmp4, reqSeekSeq, reqStartIdx);
+                serveLanHlsContinuousRelay(client, out, method, reqHeaders, lanBase, isFmp4, reqSeekSeq, reqStartIdx);
                 return;
             }
 
@@ -2030,6 +2100,7 @@ public class TvCastService extends Service {
         Socket client,
         OutputStream out,
         String method,
+        Map<String, String> reqHeaders,
         String lanBase,
         boolean isFmp4,
         int reqSeekSeq,
@@ -2044,20 +2115,88 @@ public class TvCastService extends Service {
             writeLanSimpleError(out, 410, "Gone", "Superseded HLS relay seek");
             return;
         }
+
+        String rawTimeSeek = reqHeaders != null ? reqHeaders.get("timeseekrange.dlna.org") : null;
+        long reqTimeSeekMs = TvCastProtocol.parseDlnaTimeSeekRangeStartMs(rawTimeSeek);
+        boolean useClockNpt = rawTimeSeek != null && rawTimeSeek.contains(":");
+        long nowMs = System.currentTimeMillis();
+
+        int startIdx;
+        boolean isTimeSeekEvent = false;
+        boolean matchedPhoneSeek = false;
+        if (reqTimeSeekMs >= 0L) {
+            boolean isInitialZeroProbeOnResumedUri = reqStartIdx > 0
+                && reqTimeSeekMs == 0L
+                && (nowMs - hlsRelayInitialLoadAtMs) < 5000L
+                && hlsPendingTimeSeekTargetMs != 0L;
+            if (isInitialZeroProbeOnResumedUri) {
+                startIdx = Math.min(plan.segments.size() - 1, reqStartIdx);
+            } else {
+                isTimeSeekEvent = true;
+                int pendingIdx = hlsPendingTimeSeekSegIdx;
+                long pendingTarget = hlsPendingTimeSeekTargetMs;
+                if (pendingIdx >= 0
+                    && (nowMs - hlsPendingTimeSeekAtMs) < 5000L
+                    && Math.abs(reqTimeSeekMs - pendingTarget) <= 15_000L) {
+                    startIdx = Math.min(plan.segments.size() - 1, pendingIdx);
+                    matchedPhoneSeek = true;
+                } else {
+                    startIdx = TvCastProtocol.findHlsSegmentIndexForSeek(
+                        plan.segments,
+                        getEffectiveLivePositionMs(),
+                        reqTimeSeekMs
+                    );
+                }
+            }
+        } else {
+            startIdx = reqStartIdx >= 0
+                ? Math.min(plan.segments.size() - 1, reqStartIdx)
+                : TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, hlsTsRelayStartMs);
+        }
+
+        long snappedStartMs = startIdx > 0 ? plan.segments.get(startIdx).startMs : 0L;
+        String timeSeekRespHeader = plan.totalDurationMs > 0L
+            ? TvCastProtocol.formatDlnaTimeSeekRangeHeader(snappedStartMs, plan.totalDurationMs, useClockNpt)
+            : "";
+
         String mime = isFmp4 ? "video/mp4" : "video/mp2t";
         String captionHeaderUrl = (!subtitleDisabled && !activeSubtitleSourceUrl.isEmpty())
             ? (lanBase + "/cast/" + lanSecretToken + "/subtitle.srt")
             : null;
-        writeLanHeaders(out, 200, "OK", mime, -1L, null, "none", captionHeaderUrl, true);
+        writeLanHeaders(out, 200, "OK", mime, -1L, null, "none", captionHeaderUrl, true, timeSeekRespHeader);
         out.flush();
         if ("HEAD".equals(method)) {
             return;
         }
 
+        if (isTimeSeekEvent) {
+            hlsTsBaseOffsetMs = snappedStartMs;
+            hlsTsRelayStartMs = snappedStartMs;
+            hlsRelayFirstRawPosMs = -1L;
+            hlsRelayLastRawPosMs = -1L;
+            hlsRelayRawPosAdvancing = false;
+            hlsRelayAnchorPosMs = snappedStartMs;
+            hlsRelayAnchorWallMs = nowMs;
+            positionMs = snappedStartMs;
+            lastSeekTargetMs = snappedStartMs;
+            lastSeekRequestedAtMs = nowMs;
+            hlsTimeSeekRequestCount.incrementAndGet();
+            if (matchedPhoneSeek) {
+                hlsPendingTimeSeekTargetMs = -1L;
+                hlsPendingTimeSeekSegIdx = -1;
+            } else {
+                publishCurrentState();
+            }
+        }
+
         final int startGen = castSessionGen.get();
         final int startSeq = reqSeekSeq > 0 ? reqSeekSeq : hlsRelaySeekSeq.get();
+        final int myStreamSeq = hlsRelayStreamSeq.incrementAndGet();
         final String safeRef = LocalProxyPlugin.isSafeHttpUrl(referer) ? referer : "https://topanimes.net/";
 
+        if (isTimeSeekEvent) {
+            closeActiveHlsRelaySockets();
+        }
         activeHlsRelaySockets.add(client);
         try {
             if (isFmp4 && !plan.initMapUrl.isEmpty()) {
@@ -2068,13 +2207,11 @@ public class TvCastService extends Service {
                 }
             }
 
-            int startIdx = reqStartIdx >= 0
-                ? Math.min(plan.segments.size() - 1, reqStartIdx)
-                : TvCastProtocol.findHlsSegmentIndexForTimeMs(plan.segments, hlsTsRelayStartMs);
             for (int i = startIdx; i < plan.segments.size(); i++) {
                 if (!lanServerRunning || !sessionActive
                     || castSessionGen.get() != startGen
-                    || hlsRelaySeekSeq.get() != startSeq) {
+                    || hlsRelaySeekSeq.get() != startSeq
+                    || hlsRelayStreamSeq.get() != myStreamSeq) {
                     break;
                 }
                 TvCastProtocol.HlsSegmentEntry seg = plan.segments.get(i);
@@ -2450,7 +2587,8 @@ public class TvCastService extends Service {
             contentRange,
             acceptRanges,
             captionInfoUrl,
-            false
+            false,
+            null
         );
     }
 
@@ -2463,16 +2601,18 @@ public class TvCastService extends Service {
         String contentRange,
         String acceptRanges,
         String captionInfoUrl,
-        boolean continuousRelay
+        boolean continuousRelay,
+        String timeSeekRangeHeader
     ) throws IOException {
-        StringBuilder sb = new StringBuilder(384);
+        StringBuilder sb = new StringBuilder(448);
         sb.append("HTTP/1.1 ").append(status).append(' ').append(statusText).append("\r\n");
         sb.append("Access-Control-Allow-Origin: *\r\n");
         sb.append("Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n");
-        sb.append("Access-Control-Allow-Headers: Range, Origin, Content-Type, Accept\r\n");
-        sb.append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges\r\n");
+        sb.append("Access-Control-Allow-Headers: Range, Origin, Content-Type, Accept, TimeSeekRange.dlna.org\r\n");
+        sb.append("Access-Control-Expose-Headers: Content-Length, Content-Range, Accept-Ranges, TimeSeekRange.dlna.org\r\n");
+        boolean hasTimeSeek = timeSeekRangeHeader != null && !timeSeekRangeHeader.isEmpty();
         boolean isHlsCt = contentType != null && contentType.toLowerCase(Locale.ROOT).contains("mpegurl");
-        String dlnaOp = continuousRelay ? "00" : (isHlsCt ? "10" : "01");
+        String dlnaOp = continuousRelay ? (hasTimeSeek ? "10" : "00") : (isHlsCt ? "10" : "01");
         String dlnaCi = continuousRelay ? "1" : "0";
         sb.append("transferMode.dlna.org: Streaming\r\n");
         sb.append("contentFeatures.dlna.org: DLNA.ORG_OP=")
@@ -2480,6 +2620,9 @@ public class TvCastService extends Service {
             .append(";DLNA.ORG_CI=")
             .append(dlnaCi)
             .append(";DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n");
+        if (hasTimeSeek) {
+            sb.append("TimeSeekRange.dlna.org: ").append(timeSeekRangeHeader).append("\r\n");
+        }
         if (captionInfoUrl != null && !captionInfoUrl.isEmpty()) {
             sb.append("CaptionInfo.sec: ").append(captionInfoUrl).append("\r\n");
         }
@@ -3817,6 +3960,13 @@ public class TvCastService extends Service {
                 }
 
                 @Override
+                public void onCustomAction(String action, Bundle extras) {
+                    if (CUSTOM_ACTION_STOP_CAST.equals(action)) {
+                        stopSessionAndService();
+                    }
+                }
+
+                @Override
                 public void onSeekTo(long pos) {
                     long targetMs = Math.max(0L, pos);
                     int seq = seekRequestGen.incrementAndGet();
@@ -3861,6 +4011,8 @@ public class TvCastService extends Service {
     private void releaseMediaSession() {
         MediaSession ms = mediaSession;
         mediaSession = null;
+        lastMetadataSignature = "";
+        lastNotificationSignature = "";
         if (ms != null) {
             try {
                 ms.setActive(false);
@@ -3870,17 +4022,169 @@ public class TvCastService extends Service {
         }
     }
 
+    private void ensurePosterArtworkLoaded(String targetUrl, String refUrl, int gen) {
+        String cleanUrl = targetUrl != null ? targetUrl.trim() : "";
+        if (cleanUrl.isEmpty() || !TvCastProtocol.isSafeExternalHttpUrl(cleanUrl)) {
+            if (!cachedArtworkUrl.isEmpty()) {
+                cachedArtworkUrl = "";
+                cachedArtworkBitmap = null;
+                lastMetadataSignature = "";
+                lastNotificationSignature = "";
+            }
+            return;
+        }
+        if (cleanUrl.equals(cachedArtworkUrl) && cachedArtworkBitmap != null) {
+            return;
+        }
+        if (cleanUrl.equals(loadingArtworkUrl)) {
+            return;
+        }
+        ExecutorService exec = proxyExecutor;
+        if (exec == null || exec.isShutdown()) {
+            return;
+        }
+        loadingArtworkUrl = cleanUrl;
+        final String safeRef = LocalProxyPlugin.isSafeHttpUrl(refUrl) ? refUrl : "https://topanimes.net/";
+        exec.execute(() -> {
+            try {
+                String lower = cleanUrl.toLowerCase(Locale.ROOT);
+                boolean needsSiteRef = lower.contains("topanimes")
+                    || lower.contains("hinatasoul")
+                    || lower.contains("animesonline");
+                byte[] imgBytes = fetchImageBytes(cleanUrl, needsSiteRef ? safeRef : "");
+                if (imgBytes == null && !needsSiteRef) {
+                    imgBytes = fetchImageBytes(cleanUrl, safeRef);
+                }
+                if (imgBytes == null || imgBytes.length == 0) return;
+
+                Bitmap raw = BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.length);
+                if (raw == null) return;
+                Bitmap square = cropArtworkToSquare(raw, 512);
+                if (square == null) return;
+
+                if (cleanUrl.equals(posterUrl != null ? posterUrl.trim() : "")) {
+                    cachedArtworkUrl = cleanUrl;
+                    cachedArtworkBitmap = square;
+                    lastMetadataSignature = "";
+                    lastNotificationSignature = "";
+                    if (gen == castSessionGen.get() && sessionActive) {
+                        updateNotification(true);
+                    }
+                }
+            } catch (Exception e) {
+                Log.d(TAG, "Cast notification artwork load skipped: " + e.getMessage());
+            } finally {
+                if (cleanUrl.equals(loadingArtworkUrl)) {
+                    loadingArtworkUrl = "";
+                }
+            }
+        });
+    }
+
+    private static byte[] fetchImageBytes(String imageUrl, String refHeader) {
+        HttpURLConnection conn = null;
+        try {
+            LocalProxyPlugin.RedirectResult res = LocalProxyPlugin.openWithRedirects(
+                imageUrl,
+                refHeader != null ? refHeader : "",
+                "image/webp,image/jpeg,image/png,image/*,*/*;q=0.8",
+                null,
+                8000,
+                "GET"
+            );
+            conn = res.connection;
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) return null;
+            final int maxBytes = 4 * 1024 * 1024;
+            ByteArrayOutputStream baos = new ByteArrayOutputStream(65536);
+            try (InputStream in = conn.getInputStream()) {
+                byte[] buf = new byte[16384];
+                int n;
+                int total = 0;
+                while ((n = in.read(buf)) != -1) {
+                    total += n;
+                    if (total > maxBytes) return null;
+                    baos.write(buf, 0, n);
+                }
+            }
+            return baos.toByteArray();
+        } catch (Exception e) {
+            return null;
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private static Bitmap cropArtworkToSquare(Bitmap raw, int maxDim) {
+        int w = raw.getWidth();
+        int h = raw.getHeight();
+        if (w <= 0 || h <= 0) return null;
+        int size = Math.min(w, h);
+        int x = Math.max(0, (w - size) / 2);
+        // Upper-center bias on tall portrait anime posters so faces stay framed cleanly
+        int y = h > w ? Math.max(0, (h - size) / 4) : Math.max(0, (h - size) / 2);
+        Bitmap cropped = Bitmap.createBitmap(raw, x, y, size, size);
+        if (cropped != raw) {
+            raw.recycle();
+        }
+        if (size > maxDim) {
+            Bitmap scaled = Bitmap.createScaledBitmap(cropped, maxDim, maxDim, true);
+            if (scaled != cropped) {
+                cropped.recycle();
+            }
+            return scaled;
+        }
+        return cropped;
+    }
+
+    private Bitmap getActiveArtworkBitmap() {
+        String curPoster = posterUrl != null ? posterUrl.trim() : "";
+        if (!curPoster.isEmpty() && curPoster.equals(cachedArtworkUrl)) {
+            return cachedArtworkBitmap;
+        }
+        return null;
+    }
+
     private void updateMediaSessionState() {
         if (mediaSession == null) return;
         try {
-            MediaMetadata.Builder meta = new MediaMetadata.Builder()
-                .putString(MediaMetadata.METADATA_KEY_TITLE, episodeTitle);
-            String sub = activeDevice != null ? ("Transmitindo em " + activeDevice.name) : "Transmitindo para TV";
-            meta.putString(MediaMetadata.METADATA_KEY_ARTIST, sub);
-            if (durationMs > 0L) {
-                meta.putLong(MediaMetadata.METADATA_KEY_DURATION, durationMs);
+            String notifTitle = TvCastProtocol.buildNotificationTitle(episodeTitle, seriesTitle);
+            String deviceName = activeDevice != null ? activeDevice.name : "";
+            String notifSub = TvCastProtocol.buildNotificationSubtitle(
+                seriesTitle,
+                episodeTitle,
+                qualityLabel,
+                audioLabel,
+                deviceName
+            );
+            Bitmap art = getActiveArtworkBitmap();
+            String metaSig = notifTitle + "|" + notifSub + "|" + seriesTitle + "|" + durationMs
+                + "|" + (art != null ? cachedArtworkUrl : "");
+
+            if (!metaSig.equals(lastMetadataSignature)) {
+                MediaMetadata.Builder meta = new MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, notifTitle)
+                    .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, notifTitle)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, notifSub)
+                    .putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, notifSub)
+                    .putString(
+                        MediaMetadata.METADATA_KEY_DISPLAY_DESCRIPTION,
+                        !deviceName.isEmpty() ? ("Transmitindo em " + deviceName) : "Transmitindo para TV"
+                    );
+                if (seriesTitle != null && !seriesTitle.trim().isEmpty()) {
+                    meta.putString(MediaMetadata.METADATA_KEY_ALBUM, seriesTitle.trim());
+                }
+                if (durationMs > 0L) {
+                    meta.putLong(MediaMetadata.METADATA_KEY_DURATION, durationMs);
+                }
+                if (art != null) {
+                    meta.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, art);
+                    meta.putBitmap(MediaMetadata.METADATA_KEY_ART, art);
+                    meta.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, art);
+                }
+                mediaSession.setMetadata(meta.build());
+                lastMetadataSignature = metaSig;
             }
-            mediaSession.setMetadata(meta.build());
 
             int pbState;
             if ("playing".equals(status)) {
@@ -3892,11 +4196,19 @@ public class TvCastService extends Service {
             } else {
                 pbState = PlaybackState.STATE_STOPPED;
             }
-            PlaybackState playbackState = new PlaybackState.Builder()
-                .setActions(MEDIA_SESSION_ACTIONS)
-                .setState(pbState, Math.max(0L, positionMs), "playing".equals(status) ? 1.0f : 0.0f)
-                .build();
-            mediaSession.setPlaybackState(playbackState);
+            boolean hasPrev = prevUrl != null && !prevUrl.trim().isEmpty();
+            boolean hasNext = nextUrl != null && !nextUrl.trim().isEmpty();
+            PlaybackState.Builder pbBuilder = new PlaybackState.Builder()
+                .setActions(buildMediaSessionActions(hasPrev, hasNext))
+                .setState(pbState, Math.max(0L, getEffectiveLivePositionMs()), "playing".equals(status) ? 1.0f : 0.0f)
+                .addCustomAction(
+                    new PlaybackState.CustomAction.Builder(
+                        CUSTOM_ACTION_STOP_CAST,
+                        "Parar transmissão",
+                        R.drawable.ic_cast_stop
+                    ).build()
+                );
+            mediaSession.setPlaybackState(pbBuilder.build());
         } catch (Exception ignored) {
         }
     }
@@ -3918,21 +4230,29 @@ public class TvCastService extends Service {
             false
         );
 
-        String deviceLabel = activeDevice != null ? activeDevice.name : "TV";
-        String modeHint = "direct".equals(deliveryMode)
-            ? "Direto na TV · pode fechar o app"
-            : "lan-link".equals(deliveryMode)
-                ? "Link de TV ativo em segundo plano"
-                : "Em segundo plano · pode fechar o app";
+        String deviceName = activeDevice != null ? activeDevice.name : "";
+        String notifTitle = TvCastProtocol.buildNotificationTitle(episodeTitle, seriesTitle);
+        String notifSub = TvCastProtocol.buildNotificationSubtitle(
+            seriesTitle,
+            episodeTitle,
+            qualityLabel,
+            audioLabel,
+            deviceName
+        );
+        Bitmap art = getActiveArtworkBitmap();
 
         Notification.Builder builder = new Notification.Builder(this, CHANNEL_CAST_ID)
             .setSmallIcon(R.drawable.ic_stat_anisync)
             .setColor(0xFFF97316)
-            .setContentTitle(episodeTitle != null && !episodeTitle.isEmpty() ? episodeTitle : "Transmitindo para TV")
-            .setContentText("TV: " + deviceLabel + " · " + modeHint)
+            .setContentTitle(notifTitle)
+            .setContentText(notifSub)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setVisibility(Notification.VISIBILITY_PUBLIC);
+
+        if (art != null) {
+            builder.setLargeIcon(art);
+        }
 
         if (contentIntent != null) {
             builder.setContentIntent(contentIntent);
@@ -3944,7 +4264,7 @@ public class TvCastService extends Service {
         );
         if (!hasControls) {
             builder.addAction(buildServiceAction(
-                R.drawable.ic_player_close,
+                R.drawable.ic_cast_stop,
                 "Parar servidor",
                 ACTION_STOP_CAST,
                 104,
@@ -3967,7 +4287,7 @@ public class TvCastService extends Service {
                 0L
             ));
             builder.addAction(buildServiceAction(
-                R.drawable.ic_player_close,
+                R.drawable.ic_cast_stop,
                 "Parar",
                 ACTION_STOP_CAST,
                 103,
@@ -4026,7 +4346,30 @@ public class TvCastService extends Service {
     }
 
     private void updateNotification() {
+        updateNotification(false);
+    }
+
+    private void updateNotification(boolean force) {
         try {
+            updateMediaSessionState();
+            String deviceName = activeDevice != null ? activeDevice.name : "";
+            String notifTitle = TvCastProtocol.buildNotificationTitle(episodeTitle, seriesTitle);
+            String notifSub = TvCastProtocol.buildNotificationSubtitle(
+                seriesTitle,
+                episodeTitle,
+                qualityLabel,
+                audioLabel,
+                deviceName
+            );
+            boolean hasPrev = prevUrl != null && !prevUrl.trim().isEmpty();
+            boolean hasNext = nextUrl != null && !nextUrl.trim().isEmpty();
+            Bitmap art = getActiveArtworkBitmap();
+            String sig = status + "|" + notifTitle + "|" + notifSub + "|" + deliveryMode
+                + "|" + hasPrev + "|" + hasNext + "|" + (art != null ? cachedArtworkUrl : "");
+            if (!force && sig.equals(lastNotificationSignature)) {
+                return;
+            }
+            lastNotificationSignature = sig;
             NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (manager != null) {
                 manager.notify(CAST_NOTIFICATION_ID, buildNotification());

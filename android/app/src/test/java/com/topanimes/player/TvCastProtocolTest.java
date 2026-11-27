@@ -386,8 +386,20 @@ public class TvCastProtocolTest {
             1_440_000L,
             true
         );
-        assertTrue(relayDidl.contains("DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"));
+        assertTrue(relayDidl.contains("DLNA.ORG_OP=10;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"));
         assertTrue(relayDidl.contains("duration=\"00:24:00\""));
+
+        String unknownDurRelayDidl = TvCastProtocol.buildDidlLiteMetadata(
+            "Frieren Ep 1",
+            "Sousou no Frieren",
+            "",
+            "http://192.168.1.10:49152/cast/tok/m1/s1/video.ts",
+            "video/mp2t",
+            "",
+            0L,
+            true
+        );
+        assertTrue(unknownDurRelayDidl.contains("DLNA.ORG_OP=00;DLNA.ORG_CI=1;DLNA.ORG_FLAGS=01700000000000000000000000000000"));
 
         String minimalDidl = TvCastProtocol.buildMinimalDidlLiteMetadata(
             "Frieren Ep 1",
@@ -526,5 +538,41 @@ public class TvCastProtocolTest {
 
         assertNull(TvCastProtocol.parseHttpByteRangeHeader("bytes=6000-", 5000L));
         assertNull(TvCastProtocol.parseHttpByteRangeHeader(null, 5000L));
+    }
+
+    @Test
+    public void parsesAndFormatsDlnaTimeSeekRangeAndBuildsRichNotificationMetadata() {
+        assertEquals(557_000L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs("npt=557.000-"));
+        assertEquals(557_500L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs("npt=557.5-1561.000"));
+        assertEquals(557_000L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs("npt=00:09:17-"));
+        assertEquals(557_250L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs("npt=00:09:17.250-00:26:01.000"));
+        assertEquals(0L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs("npt=0-"));
+        assertEquals(-1L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs("invalid"));
+        assertEquals(-1L, TvCastProtocol.parseDlnaTimeSeekRangeStartMs(null));
+
+        assertEquals(
+            "npt=557.000-1561.000/1561.000",
+            TvCastProtocol.formatDlnaTimeSeekRangeHeader(557_000L, 1_561_000L, false)
+        );
+        assertEquals(
+            "npt=00:09:17.000-00:26:01.000/00:26:01.000",
+            TvCastProtocol.formatDlnaTimeSeekRangeHeader(557_000L, 1_561_000L, true)
+        );
+        assertEquals("", TvCastProtocol.formatDlnaTimeSeekRangeHeader(10_000L, 0L, false));
+
+        // Notification title avoids duplicating series name when already embedded
+        assertEquals("Sousou no Frieren ep 1", TvCastProtocol.buildNotificationTitle("Sousou no Frieren ep 1", "Sousou no Frieren"));
+        assertEquals("Sousou no Frieren · Episódio 1", TvCastProtocol.buildNotificationTitle("Episódio 1", "Sousou no Frieren"));
+        assertEquals("Transmitindo para TV", TvCastProtocol.buildNotificationTitle("", ""));
+
+        // Notification subtitle displays quality, compact audio tag, and TV name
+        assertEquals(
+            "SD (480p) · LEG · [LG] webOS TV UQ7500PSF",
+            TvCastProtocol.buildNotificationSubtitle("Sousou no Frieren", "Sousou no Frieren ep 1", "SD (480p)", "Japonês (Legendado)", "[LG] webOS TV UQ7500PSF")
+        );
+        assertEquals(
+            "1080p · DUB · Chromecast Sala",
+            TvCastProtocol.buildNotificationSubtitle("Frieren", "Ep 2", "1080p", "Português (Dublado)", "Chromecast Sala")
+        );
     }
 }

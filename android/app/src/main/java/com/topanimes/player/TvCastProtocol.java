@@ -465,7 +465,7 @@ public final class TvCastProtocol {
             sb.append("<upnp:albumArtURI>").append(escapeXml(posterUrl.trim())).append("</upnp:albumArtURI>");
         }
         String dlnaOp = continuousRelay
-            ? "00"
+            ? (durationMs > 0L ? "10" : "00")
             : (safeMime.toLowerCase(Locale.ROOT).contains("mpegurl") ? "10" : "01");
         String dlnaCi = continuousRelay ? "1" : "0";
         sb.append("<upnp:class>object.item.videoItem.movie</upnp:class>")
@@ -1033,6 +1033,130 @@ public final class TvCastProtocol {
         } catch (NumberFormatException e) {
             return null;
         }
+    }
+
+    /**
+     * Parses a DLNA `TimeSeekRange.dlna.org` request header (e.g. `npt=557.000-`,
+     * `npt=00:09:17.000-00:26:01.000`, `npt=0-`) and returns the requested start time in milliseconds,
+     * or `-1L` if absent or invalid.
+     */
+    public static long parseDlnaTimeSeekRangeStartMs(String headerValue) {
+        if (headerValue == null || headerValue.trim().isEmpty()) return -1L;
+        String clean = headerValue.trim();
+        int eq = clean.toLowerCase(Locale.ROOT).indexOf("npt=");
+        if (eq < 0) return -1L;
+        String spec = clean.substring(eq + 4).trim();
+        int space = spec.indexOf(' ');
+        if (space > 0) spec = spec.substring(0, space).trim();
+        int slash = spec.indexOf('/');
+        if (slash > 0) spec = spec.substring(0, slash).trim();
+        int dash = spec.indexOf('-');
+        String startToken = (dash >= 0 ? spec.substring(0, dash) : spec).trim();
+        if (startToken.isEmpty()) return -1L;
+        if (startToken.contains(":")) {
+            return parseDlnaTimeMs(startToken);
+        }
+        try {
+            double seconds = Double.parseDouble(startToken);
+            if (!Double.isFinite(seconds) || seconds < 0.0) return -1L;
+            return Math.round(seconds * 1000.0);
+        } catch (NumberFormatException e) {
+            return -1L;
+        }
+    }
+
+    /**
+     * Formats a DLNA Guidelines §7.5.4.3.2 `TimeSeekRange.dlna.org` response header
+     * (`npt=557.000-1561.000/1561.000` or `npt=00:09:17.000-00:26:01.000/00:26:01.000`)
+     * so Smart TVs (notably LG webOS) display the exact real playback timestamp on their HUD.
+     */
+    public static String formatDlnaTimeSeekRangeHeader(
+        long startMs,
+        long totalDurationMs,
+        boolean useClockFormat
+    ) {
+        if (totalDurationMs <= 0L) return "";
+        long safeStart = Math.max(0L, Math.min(startMs, totalDurationMs));
+        long safeTotal = Math.max(safeStart, totalDurationMs);
+        if (useClockFormat) {
+            String startStr = formatDlnaNptClock(safeStart);
+            String totalStr = formatDlnaNptClock(safeTotal);
+            return "npt=" + startStr + "-" + totalStr + "/" + totalStr;
+        }
+        String startStr = String.format(Locale.ROOT, "%.3f", safeStart / 1000.0);
+        String totalStr = String.format(Locale.ROOT, "%.3f", safeTotal / 1000.0);
+        return "npt=" + startStr + "-" + totalStr + "/" + totalStr;
+    }
+
+    private static String formatDlnaNptClock(long ms) {
+        long clamped = Math.max(0L, ms);
+        long totalSec = clamped / 1000L;
+        long millis = clamped % 1000L;
+        long hours = totalSec / 3600L;
+        long minutes = (totalSec % 3600L) / 60L;
+        long seconds = totalSec % 60L;
+        return String.format(Locale.ROOT, "%02d:%02d:%02d.%03d", hours, minutes, seconds, millis);
+    }
+
+    /**
+     * Builds the primary notification/MediaSession title showing the anime and episode cleanly
+     * without duplicating the series name when already embedded in episodeTitle.
+     */
+    public static String buildNotificationTitle(String episodeTitle, String seriesTitle) {
+        String ep = safeStr(episodeTitle);
+        String series = safeStr(seriesTitle);
+        if (ep.isEmpty() && series.isEmpty()) return "Transmitindo para TV";
+        if (ep.isEmpty()) return series;
+        if (series.isEmpty()) return ep;
+        if (ep.toLowerCase(Locale.ROOT).contains(series.toLowerCase(Locale.ROOT))) {
+            return ep;
+        }
+        return series + " · " + ep;
+    }
+
+    /**
+     * Builds a concise YouTube-style metadata subtitle showing anime info (quality, audio, TV name).
+     */
+    public static String buildNotificationSubtitle(
+        String seriesTitle,
+        String episodeTitle,
+        String qualityLabel,
+        String audioLabel,
+        String deviceName
+    ) {
+        List<String> parts = new ArrayList<>();
+        String ep = safeStr(episodeTitle);
+        String series = safeStr(seriesTitle);
+        if (!series.isEmpty() && !ep.isEmpty() && ep.toLowerCase(Locale.ROOT).equals(series.toLowerCase(Locale.ROOT))) {
+            // already exact title, skip redundant series
+        }
+        String q = safeStr(qualityLabel);
+        if (!q.isEmpty()) {
+            parts.add(q);
+        }
+        String a = safeStr(audioLabel);
+        if (!a.isEmpty()) {
+            String lowerA = a.toLowerCase(Locale.ROOT);
+            if (lowerA.contains("dublad")) {
+                parts.add("DUB");
+            } else if (lowerA.contains("legendad")) {
+                parts.add("LEG");
+            } else {
+                parts.add(a);
+            }
+        }
+        String dev = safeStr(deviceName);
+        if (!dev.isEmpty()) {
+            parts.add(dev);
+        } else {
+            parts.add("TV");
+        }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.size(); i++) {
+            if (i > 0) sb.append(" · ");
+            sb.append(parts.get(i));
+        }
+        return sb.toString();
     }
 
     public static byte[] buildAes128IvBytes(String keyIvHex, long mediaSequence) {
