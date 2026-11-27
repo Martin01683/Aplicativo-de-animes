@@ -2,6 +2,11 @@
 
 Todas as alterações relevantes do **Anisync** são geradas automaticamente a partir dos commits de cada release.
 
+## [v1.0.44] — 2026-11-27
+
+### Novidades
+- Notificação estilo YouTube com capa e botão Parar e sincronia do tempo na TV via TimeSeekRange DLNA (`ef67c70`)
+
 ## [v1.0.43] — 2026-11-27
 
 ### Correções
