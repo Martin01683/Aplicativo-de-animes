@@ -89,6 +89,7 @@ import {
 } from '../lib/tvCast';
 import type {
   AnimeEpisodeLink,
+  AnimeMediaTag,
   AnimeSynopsisResult,
   AudioType,
   CatalogMediaItem,
@@ -103,6 +104,7 @@ import type {
   SubtitleTrack,
 } from '../lib/types';
 import { AnimePlayer } from './AnimePlayer';
+import { MediaTagsSection } from './MediaTagsSection';
 
 interface EpisodeWorkspaceProps {
   episode: EpisodeDetails;
@@ -114,6 +116,7 @@ interface EpisodeWorkspaceProps {
   initialSeriesArtwork?: { poster?: string; backdrop?: string };
   initialSeriesExternalIds?: ExternalMediaIds;
   initialSeriesGenres?: string[];
+  initialSeriesMediaTags?: AnimeMediaTag[];
   initialSeriesKind?: MediaKind;
   initialSeriesAudioType?: AudioType;
   loadingEpisode?: boolean;
@@ -193,6 +196,7 @@ export function EpisodeWorkspace({
   initialSeriesArtwork,
   initialSeriesExternalIds,
   initialSeriesGenres,
+  initialSeriesMediaTags,
   initialSeriesKind,
   initialSeriesAudioType,
   loadingEpisode = false,
@@ -346,6 +350,24 @@ export function EpisodeWorkspace({
       }
     }
     return { seriesKey: initialKey, genres: [] };
+  });
+  const [seriesMediaTagsState, setSeriesMediaTagsState] = useState<{
+    seriesKey: string;
+    tags: AnimeMediaTag[];
+  }>(() => {
+    const initialKey = episode.seriesUrl
+      ? normalizeTopAnimesUrl(episode.seriesUrl) || episode.seriesUrl
+      : '';
+    if (initialSeriesMediaTags?.length) {
+      return { seriesKey: initialKey, tags: initialSeriesMediaTags };
+    }
+    if (episode.seriesUrl) {
+      const cached = getCachedAnimeDetailsFull(episode.seriesUrl);
+      if (cached?.mediaTags?.length) {
+        return { seriesKey: initialKey, tags: cached.mediaTags };
+      }
+    }
+    return { seriesKey: initialKey, tags: [] };
   });
   const [seriesMetaState, setSeriesMetaState] = useState<{
     seriesKey: string;
@@ -527,6 +549,15 @@ export function EpisodeWorkspace({
               ? movieCached.genres
               : [],
       });
+      setSeriesMediaTagsState({
+        seriesKey,
+        tags:
+          initialSeriesMediaTags?.length
+            ? initialSeriesMediaTags
+            : movieCached?.mediaTags?.length
+              ? movieCached.mediaTags
+              : [],
+      });
       setSeriesMetaState({
         seriesKey,
         kind: initialSeriesKind || movieCached?.kind,
@@ -570,6 +601,12 @@ export function EpisodeWorkspace({
           ? initialSeriesGenres
           : seriesGenresCacheRef.current.get(seriesKey) || cachedFull?.genres || [];
       setSeriesGenresState({ seriesKey, genres: cachedGenres });
+      setSeriesMediaTagsState({
+        seriesKey,
+        tags: initialSeriesMediaTags?.length
+          ? initialSeriesMediaTags
+          : cachedFull?.mediaTags || [],
+      });
       const cachedMeta = seriesMetaCacheRef.current.get(seriesKey);
       setSeriesMetaState({
         seriesKey,
@@ -625,6 +662,12 @@ export function EpisodeWorkspace({
                 ? cachedDetails.genres
                 : seriesGenresCacheRef.current.get(seriesKey) || [],
         });
+        setSeriesMediaTagsState({
+          seriesKey,
+          tags: initialSeriesMediaTags?.length
+            ? initialSeriesMediaTags
+            : cachedDetails.mediaTags || [],
+        });
         setSeriesMetaState({
           seriesKey,
           kind: initialSeriesKind || cachedDetails.kind,
@@ -666,6 +709,9 @@ export function EpisodeWorkspace({
         if (data?.genres?.length) {
           seriesGenresCacheRef.current.set(seriesKey, data.genres);
           setSeriesGenresState({ seriesKey, genres: data.genres });
+        }
+        if (data?.mediaTags?.length) {
+          setSeriesMediaTagsState({ seriesKey, tags: data.mediaTags });
         }
         if (data?.kind || data?.audioType) {
           seriesMetaCacheRef.current.set(seriesKey, {
@@ -715,6 +761,7 @@ export function EpisodeWorkspace({
     initialSeriesEpisodes,
     initialSeriesExternalIds,
     initialSeriesGenres,
+    initialSeriesMediaTags,
     initialSeriesKind,
   ]);
 
@@ -733,6 +780,22 @@ export function EpisodeWorkspace({
     }
     return undefined;
   }, [currentSeriesKey, initialSeriesGenres, seriesGenresState]);
+
+  const effectiveSeriesMediaTags = useMemo(() => {
+    if (episode.mediaTags && episode.mediaTags.length > 0) {
+      return episode.mediaTags;
+    }
+    if (initialSeriesMediaTags && initialSeriesMediaTags.length > 0) {
+      return initialSeriesMediaTags;
+    }
+    if (
+      seriesMediaTagsState.seriesKey === currentSeriesKey &&
+      seriesMediaTagsState.tags.length > 0
+    ) {
+      return seriesMediaTagsState.tags;
+    }
+    return undefined;
+  }, [currentSeriesKey, episode.mediaTags, initialSeriesMediaTags, seriesMediaTagsState]);
 
   const effectiveSeriesKind =
     initialSeriesKind ||
@@ -1774,6 +1837,8 @@ export function EpisodeWorkspace({
             episodeUrl={episode.url}
             seriesUrl={episode.seriesUrl}
             seriesTitle={episode.seriesTitle}
+            seasonNumber={episode.seasonNumber}
+            episodeNumber={episode.episodeNumber}
             isMovie={episode.isMovie}
             seriesEpisodes={localizedSeriesEpisodes}
             watchedUrls={watchedUrls}
@@ -2018,6 +2083,14 @@ export function EpisodeWorkspace({
               </div>
             ) : null}
 
+            {/* AniList Tags (spoiler tags hidden by default with reveal toggle) */}
+            {effectiveSeriesMediaTags && effectiveSeriesMediaTags.length > 0 && (
+              <MediaTagsSection
+                tags={effectiveSeriesMediaTags}
+                resetKey={episode.url}
+              />
+            )}
+
             {/* Ver todos os episódios button — positioned directly above Marcar como visto & Favoritar */}
             {episode.seriesUrl && (
               <div>
@@ -2037,7 +2110,15 @@ export function EpisodeWorkspace({
 
             <div className="flex flex-wrap items-center gap-2 sm:gap-2.5">
               {onToggleEpisodeWatched && (() => {
-                const watched = isEpisodeMarkedWatched(episode.url, progressMap, watchedUrls);
+                const watched = isEpisodeMarkedWatched(episode.url, progressMap, watchedUrls, {
+                  seriesTitle: episode.seriesTitle,
+                  seriesUrl: episode.seriesUrl,
+                  seasonNumber: episode.seasonNumber,
+                  episodeNumber: episode.episodeNumber,
+                  title: episode.title,
+                  numberLabel: episode.episodeLabel,
+                  kind: episode.isMovie ? 'movie' : 'episode',
+                });
                 return (
                   <button
                     type="button"
@@ -2311,8 +2392,17 @@ export function EpisodeWorkspace({
                       const bestStream =
                         [...resolved.streams].sort((a, b) => (b.height || 0) - (a.height || 0))[0] ||
                         resolved.streams[0];
-                      const savedResumeSec = getEpisodeResumeSeconds(episode.url);
-                      const savedEntry = getEpisodeProgress(episode.url);
+                      const epIdentityMeta = {
+                        seriesTitle: episode.seriesTitle,
+                        seriesUrl: episode.seriesUrl,
+                        seasonNumber: episode.seasonNumber,
+                        episodeNumber: episode.episodeNumber,
+                        title: episode.title,
+                        numberLabel: episode.episodeLabel,
+                        kind: episode.isMovie ? ('movie' as const) : ('episode' as const),
+                      };
+                      const savedResumeSec = getEpisodeResumeSeconds(episode.url, epIdentityMeta);
+                      const savedEntry = getEpisodeProgress(episode.url, epIdentityMeta);
                       const livePosMs = liveHelpers?.getCurrentTimeMs() || 0;
                       const liveDurMs = liveHelpers?.getDurationMs() || 0;
                       const audioLabel =

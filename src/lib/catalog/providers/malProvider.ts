@@ -319,7 +319,8 @@ export async function resolveMyAnimeListRating(
   }
 
   const targetYear = extractTargetYear(details);
-  const titleCandidates: string[] = [];
+  const latinCandidates: string[] = [];
+  const nonLatinCandidates: string[] = [];
   const seenTitles = new Set<string>();
   const pushTitle = (raw?: string) => {
     if (!raw) return;
@@ -328,15 +329,21 @@ export async function resolveMyAnimeListRating(
     const norm = normalizeTitleForMatch(cleaned);
     if (!norm || seenTitles.has(norm)) return;
     seenTitles.add(norm);
-    titleCandidates.push(cleaned);
+    // MAL prefix search indexes Romaji & English much better than pure CJK kanji/kana
+    if (/[A-Za-z]/.test(cleaned)) {
+      latinCandidates.push(cleaned);
+    } else {
+      nonLatinCandidates.push(cleaned);
+    }
   };
 
-  pushTitle(details.originalTitle);
-  pushTitle(details.title);
+  pushTitle(details.alternativeTitle);
   if (Array.isArray(details.alternativeTitles)) {
     for (const alt of details.alternativeTitles) pushTitle(alt);
   }
-  pushTitle(details.alternativeTitle);
+  pushTitle(details.title);
+  pushTitle(details.originalTitle);
+  const titleCandidates = [...latinCandidates, ...nonLatinCandidates];
 
   const cacheKey = knownMalId
     ? `id:${knownMalId}`
@@ -363,7 +370,7 @@ export async function resolveMyAnimeListRating(
 
       // 2. Lightweight JSON search on myanimelist.net/search/prefix.json
       const isMovie = details.kind === 'movie';
-      const searchQueries = titleCandidates.slice(0, 2);
+      const searchQueries = titleCandidates.slice(0, 3);
       for (const query of searchQueries) {
         const searchUrl = `${MAL_PREFIX_SEARCH_URL}?type=anime&keyword=${encodeURIComponent(query.slice(0, 80))}`;
         try {
@@ -447,3 +454,288 @@ export async function enrichDetailsWithMyAnimeListRating(
     externalLinks: buildExternalDatabaseLinks(mergedIds, { mediaType }),
   };
 }
+
+export interface MyAnimeListFallbackDetails {
+  malId: number;
+  url: string;
+  title?: string;
+  poster?: string;
+  synopsis?: string;
+  genres: string[];
+  rating?: string;
+  year?: string;
+  status?: string;
+  studio?: string;
+  episodesTotalCount?: string;
+}
+
+const MAL_GENRE_PT_MAP: Record<string, string> = {
+  action: 'Ação',
+  adventure: 'Aventura',
+  comedy: 'Comédia',
+  drama: 'Drama',
+  ecchi: 'Ecchi',
+  fantasy: 'Fantasia',
+  horror: 'Terror',
+  'mahou shoujo': 'Garotas Mágicas',
+  mecha: 'Mecha',
+  music: 'Música',
+  mystery: 'Mistério',
+  psychological: 'Psicológico',
+  romance: 'Romance',
+  'sci-fi': 'Ficção Científica',
+  'slice of life': 'Cotidiano',
+  sports: 'Esportes',
+  supernatural: 'Sobrenatural',
+  suspense: 'Suspense',
+  thriller: 'Suspense',
+  'avant garde': 'Vanguarda',
+  gourmet: 'Gastronomia',
+  'award winning': 'Premiado',
+  'boys love': 'Boys Love',
+  'girls love': 'Girls Love',
+};
+
+function decodeHtmlEntitiesBasic(input: string): string {
+  return input
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function translateMalGenreToPt(raw: string): string {
+  const clean = decodeHtmlEntitiesBasic(raw);
+  if (!clean) return '';
+  return MAL_GENRE_PT_MAP[clean.toLowerCase()] || clean;
+}
+
+/**
+ * Parses metadata fields from a MyAnimeList anime page HTML for fallback use
+ * when TheTVDB and AniList do not have an entry (or when genres are missing).
+ */
+export function parseMalAnimePageMetadata(
+  html: string,
+  malId: number,
+  pageUrl: string
+): MyAnimeListFallbackDetails | null {
+  if (!html) return null;
+
+  const titleMatch =
+    html.match(/<h1[^>]*class=["'][^"']*title-name[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i) ||
+    html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i);
+  const title = titleMatch?.[1]
+    ? decodeHtmlEntitiesBasic(titleMatch[1].replace(/<[^>]+>/g, ''))
+        .replace(/\s*-\s*MyAnimeList\.net$/i, '')
+        .trim()
+    : undefined;
+
+  const posterMatch =
+    html.match(/<meta[^>]*property=["']og:image["'][^>]*content=["']([^"']+)["']/i) ||
+    html.match(/<img[^>]*data-src=["'](https:\/\/cdn\.myanimelist\.net\/images\/anime\/[^"']+)["']/i);
+  const poster = posterMatch?.[1]?.trim() || undefined;
+
+  const synopsisMatch = html.match(
+    /<p[^>]*itemprop=["']description["'][^>]*>([\s\S]*?)<\/p>/i
+  );
+  const rawSynopsis = synopsisMatch?.[1]
+    ? decodeHtmlEntitiesBasic(
+        synopsisMatch[1]
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<[^>]+>/g, '')
+          .replace(/\[Written by MAL Rewrite\]/gi, '')
+      )
+    : '';
+  const synopsis =
+    rawSynopsis && !/^No synopsis information has been added/i.test(rawSynopsis)
+      ? rawSynopsis
+      : undefined;
+
+  const genres: string[] = [];
+  const seenGenres = new Set<string>();
+  const genreRe = /<span[^>]*itemprop=["']genre["'][^>]*>([^<]+)<\/span>/gi;
+  let gm: RegExpExecArray | null;
+  while ((gm = genreRe.exec(html)) !== null) {
+    const translated = translateMalGenreToPt(gm[1] || '');
+    if (!translated) continue;
+    const key = translated.toLowerCase();
+    if (seenGenres.has(key)) continue;
+    seenGenres.add(key);
+    genres.push(translated);
+  }
+
+  const score = parseMalAnimePageScore(html) || undefined;
+
+  const airedMatch = html.match(/Aired:<\/span>\s*[^<]*\b((?:19|20)\d{2})\b/i);
+  const year = airedMatch?.[1] || undefined;
+
+  const statusMatch = html.match(/Status:<\/span>\s*([^<\n]+)/i);
+  const rawStatus = statusMatch?.[1]?.trim().toLowerCase() || '';
+  const status = rawStatus.includes('currently airing')
+    ? 'Em exibição'
+    : rawStatus.includes('finished airing')
+      ? 'Finalizado'
+      : rawStatus.includes('not yet aired')
+        ? 'Em breve'
+        : undefined;
+
+  const episodesMatch = html.match(/Episodes:<\/span>\s*(\d+)/i);
+  const episodesTotalCount = episodesMatch?.[1] || undefined;
+
+  const studioMatch = html.match(
+    /Studios?:<\/span>[\s\S]{0,240}?<a[^>]*>([^<]+)<\/a>/i
+  );
+  const studioRaw = studioMatch?.[1] ? decodeHtmlEntitiesBasic(studioMatch[1]) : '';
+  const studio = studioRaw && !/none found|add some/i.test(studioRaw) ? studioRaw : undefined;
+
+  if (!title && !poster && !synopsis && genres.length === 0 && !score) {
+    return null;
+  }
+
+  return {
+    malId,
+    url: pageUrl,
+    title,
+    poster,
+    synopsis,
+    genres,
+    rating: score,
+    year,
+    status,
+    studio,
+    episodesTotalCount,
+  };
+}
+
+/**
+ * Fetches MyAnimeList metadata as the 3rd fallback layer (`TVDB > AniList > MyAnimeList > Providers`)
+ * and 3rd genre fallback (`AniList > TVDB > MyAnimeList > Providers`).
+ */
+export async function fetchMyAnimeListFallbackDetails(
+  fetchHttp: HttpFetcher,
+  lookup: Pick<
+    AnimeDetails,
+    | 'title'
+    | 'originalTitle'
+    | 'alternativeTitle'
+    | 'alternativeTitles'
+    | 'year'
+    | 'firstAirDate'
+    | 'kind'
+    | 'externalIds'
+    | 'myAnimeListUrl'
+  >
+): Promise<MyAnimeListFallbackDetails | null> {
+  const knownMalId =
+    (lookup.externalIds?.malId && lookup.externalIds.malId > 0
+      ? lookup.externalIds.malId
+      : null) ?? parseMalIdFromUrl(lookup.myAnimeListUrl);
+
+  let malId = knownMalId;
+  let pageUrl = malId ? `${MAL_SITE_BASE_URL}/anime/${malId}` : '';
+
+  if (!malId) {
+    const resolved = await resolveMyAnimeListRating(fetchHttp, lookup).catch(() => null);
+    if (!resolved) return null;
+    malId = resolved.malId;
+    pageUrl = resolved.url || `${MAL_SITE_BASE_URL}/anime/${malId}`;
+  }
+
+  try {
+    const res = await fetchHttp(pageUrl, {
+      accept: 'text/html,application/xhtml+xml,*/*;q=0.9',
+      timeoutMs: MAL_PAGE_TIMEOUT_MS,
+    });
+    if (!res.ok || !res.body) return null;
+    const finalUrl =
+      res.finalUrl && /myanimelist\.net\/anime\/\d+/i.test(res.finalUrl) ? res.finalUrl : pageUrl;
+    return parseMalAnimePageMetadata(res.body, malId, finalUrl);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Applies MyAnimeList metadata strictly as fallback for missing fields (`TVDB > AniList > MyAnimeList > Providers`)
+ * and for genres when neither AniList nor TheTVDB provided them (`AniList > TVDB > MyAnimeList > Providers`).
+ */
+export async function enrichDetailsWithMyAnimeListFallback(
+  fetchHttp: HttpFetcher,
+  details: AnimeDetails,
+  options: { forceWhenMissingCoreInfo?: boolean } = {}
+): Promise<AnimeDetails> {
+  if (details.kind === 'series' && !details.externalIds?.malId && !details.myAnimeListUrl) {
+    return details;
+  }
+
+  const hasAuthoritativeGenres =
+    details.genres.length > 0 &&
+    (details.genresSource === 'anilist' || details.genresSource === 'thetvdb');
+  const hasTvdbOrAniList = Boolean(
+    details.enrichmentSources?.includes('thetvdb') ||
+      details.enrichmentSources?.includes('anilist')
+  );
+  const needsFallback =
+    options.forceWhenMissingCoreInfo ||
+    !hasTvdbOrAniList ||
+    !hasAuthoritativeGenres ||
+    !details.poster ||
+    !details.synopsis;
+
+  if (!needsFallback) {
+    return details;
+  }
+
+  const malMeta = await fetchMyAnimeListFallbackDetails(fetchHttp, details).catch(() => null);
+  if (!malMeta) return details;
+
+  const mergedIds = {
+    ...(details.externalIds || {}),
+    malId: details.externalIds?.malId || malMeta.malId,
+  };
+  const mediaType: CanonicalMediaType =
+    details.kind === 'movie' ? 'movie' : details.kind === 'series' ? 'series' : 'anime';
+
+  const useMalGenres = !hasAuthoritativeGenres && malMeta.genres.length > 0;
+  const nextEnrichmentSources = Array.from(
+    new Set([...(details.enrichmentSources || []), 'myanimelist' as const])
+  );
+
+  return {
+    ...details,
+    title: hasTvdbOrAniList ? details.title : malMeta.title || details.title,
+    poster: hasTvdbOrAniList ? details.poster || malMeta.poster || '' : malMeta.poster || details.poster,
+    fallbackPoster:
+      !hasTvdbOrAniList && malMeta.poster && details.poster && details.poster !== malMeta.poster
+        ? details.fallbackPoster || details.poster
+        : details.fallbackPoster,
+    backdrop:
+      details.backdrop ||
+      (hasTvdbOrAniList ? malMeta.poster || '' : malMeta.poster || details.poster),
+    synopsis: hasTvdbOrAniList
+      ? details.synopsis || malMeta.synopsis || ''
+      : malMeta.synopsis || details.synopsis,
+    year: details.year || malMeta.year,
+    status: details.status || malMeta.status,
+    studio: details.studio || malMeta.studio,
+    episodesTotalCount: details.episodesTotalCount || malMeta.episodesTotalCount,
+    genres: useMalGenres ? malMeta.genres : details.genres,
+    genresSource: useMalGenres ? 'myanimelist' : details.genresSource,
+    rating: details.ratingSource === 'myanimelist' ? details.rating : malMeta.rating || details.rating,
+    ratingSource:
+      details.ratingSource === 'myanimelist'
+        ? details.ratingSource
+        : malMeta.rating
+          ? 'myanimelist'
+          : details.ratingSource,
+    myAnimeListUrl: details.myAnimeListUrl || malMeta.url,
+    enrichmentSources: nextEnrichmentSources,
+    externalIds: mergedIds,
+    externalLinks: buildExternalDatabaseLinks(mergedIds, { mediaType }),
+  };
+}
+

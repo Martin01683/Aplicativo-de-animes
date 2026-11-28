@@ -18,6 +18,7 @@ import type {
   AnimeAudioTrackData,
   AnimeDetails,
   AnimeEpisodeLink,
+  AudioType,
   CatalogSourceCredentials,
   EpisodeSynopsisSource,
   ExternalMediaIds,
@@ -2292,6 +2293,69 @@ export async function preloadTheTvdbProfileFromHints(
 }
 
 /**
+ * Builds an immediate metadata-only AnimeDetails snapshot strictly from a preloaded
+ * TheTVDB profile (0 slow provider scraping requests). Episodes are marked
+ * `availableOnServer: false` until the parallel provider sync attaches playable URLs,
+ * DUB/LEG audio tracks, and provider-only tags (such as `uncensored`).
+ */
+export function buildFastMetadataDetailsFromTvdbProfile(
+  profile: PreloadedTvdbProfile,
+  targetUrl: string,
+  options: { audioType?: AudioType; kind?: CanonicalMediaType; titleHint?: string } = {}
+): AnimeDetails {
+  const { bestMatch, fullTvdb } = profile;
+  const base = fullTvdb || buildAnimeDetailsFromTvdbRichMatch(bestMatch, targetUrl);
+  const resolvedKind: CanonicalMediaType =
+    options.kind === 'movie' || base.kind === 'movie' || bestMatch.mediaType === 'movie'
+      ? 'movie'
+      : options.kind === 'anime'
+        ? 'anime'
+        : options.kind === 'series'
+          ? 'series'
+          : (base.kind as CanonicalMediaType) || bestMatch.mediaType || 'anime';
+
+  const metadataEpisodes: AnimeEpisodeLink[] =
+    resolvedKind === 'movie'
+      ? []
+      : (base.episodes || []).map((ep) => ({
+          ...ep,
+          availableOnServer: false,
+        }));
+
+  const mergedIds: ExternalMediaIds = {
+    ...bestMatch.externalIds,
+    ...base.externalIds,
+    tvdbId: bestMatch.tvdbId,
+    ...(bestMatch.slug ? { tvdbSlug: bestMatch.slug } : {}),
+  };
+
+  const mergedAltTitles = Array.from(
+    new Set(
+      [
+        ...(base.alternativeTitles || []),
+        ...(bestMatch.alternativeTitles || []),
+        bestMatch.englishTitle,
+        options.titleHint,
+      ].filter((t): t is string => Boolean(t && t.trim()))
+    )
+  );
+
+  return {
+    ...base,
+    alternativeTitles: mergedAltTitles.length > 0 ? mergedAltTitles : base.alternativeTitles,
+    url: targetUrl,
+    kind: resolvedKind,
+    audioType: options.audioType ?? base.audioType ?? null,
+    catalogSource: 'thetvdb',
+    enrichmentSources: ['thetvdb'],
+    genresSource: base.genres && base.genres.length > 0 ? 'thetvdb' : undefined,
+    externalIds: mergedIds,
+    externalLinks: buildExternalDatabaseLinks(mergedIds, { mediaType: resolvedKind }),
+    episodes: metadataEpisodes,
+  };
+}
+
+/**
  * Builds the anime/movie/series profile & official episode schedule directly from TheTVDB
  * (+ LiveChart.me airing schedule) and attaches playable streaming links from the integrated
  * providers (TopAnimes / Hinata Soul).
@@ -2494,7 +2558,11 @@ export async function enrichServerDetailsWithTheTvdb(
       : {}),
   };
 
-  const resolvedTitle = unifiedSeasons?.unifiedTitle || serverDetails.title;
+  const resolvedTitle =
+    cleanText(tvdb?.title) ||
+    cleanText(bestMatch.title) ||
+    unifiedSeasons?.unifiedTitle ||
+    serverDetails.title;
 
   const altTitles = Array.from(
     new Set(
@@ -2668,6 +2736,12 @@ export async function enrichServerDetailsWithTheTvdb(
     originalCountry: tvdb?.originalCountry || bestMatch.originalCountry,
     originalLanguage: tvdb?.originalLanguage || bestMatch.originalLanguage,
     genres: tvdbGenres.length > 0 ? tvdbGenres : serverDetails.genres,
+    genresSource:
+      tvdbGenres.length > 0
+        ? 'thetvdb'
+        : serverDetails.genres.length > 0
+          ? 'provider'
+          : undefined,
     episodes: finalMergedEpisodes,
     ...(audioTracks ? { audioTracks } : {}),
   };

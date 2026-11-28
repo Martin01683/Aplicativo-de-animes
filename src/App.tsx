@@ -130,9 +130,12 @@ import {
 } from './lib/offlineDownloads';
 import {
   canonicalEpisodeProgressKey,
-  countAnimeEpisodesInHistory,
+  countAnimeTrackedEpisodes,
+  getEpisodeIdentityKeys,
   getHistoryEntrySeriesName,
+  getUnifiedEpisodeKeys,
   sanitizeVideoScaleMode,
+  stripAudioTagsFromText,
   type EpisodeProgressMap,
 } from './lib/playbackProgress';
 import {
@@ -147,6 +150,7 @@ import {
   clearPrefetchCaches,
   deleteCachedEpisodeDetails,
   fetchAnimeDetailsFull,
+  fetchAnimeDetailsMetadata,
   fetchAnimeDetailsQuick,
   fetchArchivePageCached,
   fetchCalendarCached,
@@ -515,7 +519,13 @@ export default function App() {
   const [history, setHistory] = useState<WatchHistoryEntry[]>(() => loadHistory());
   const [pendingHistoryRemoval, setPendingHistoryRemoval] = useState<
     | { kind: 'all'; count: number }
-    | { kind: 'anime'; entry: WatchHistoryEntry; animeName: string; count: number }
+    | {
+        kind: 'anime';
+        entry: WatchHistoryEntry;
+        animeName: string;
+        count: number;
+        historyCount: number;
+      }
     | null
   >(null);
   const [progressMap, setProgressMap] = useState<EpisodeProgressMap>(() =>
@@ -1993,12 +2003,31 @@ export default function App() {
             }
           : undefined;
 
+      let fullResolved = false;
+
+      // Stage 1 (fast): render official TheTVDB + MAL metadata immediately (~400ms)
+      // without waiting on slow video providers (TopAnimes / HinataSoul).
+      const metadataPromise = fetchAnimeDetailsMetadata(url, { hints })
+        .then((metaDetails) => {
+          if (!metaDetails || fullResolved || navRequestGenRef.current !== reqGen) return;
+          setAnimeDetails(metaDetails);
+          setAnimeDetailStage('quick');
+          setLoadingDetail(false);
+        })
+        .catch(() => {
+          // Silently fall through to Stage 2 full resolution
+        });
+
+      // Stage 2 (parallel): resolve playable episodes, DUB/LEG tracks, and provider-only
+      // tags (e.g. Sem Censura) while reusing the already-coalesced TheTVDB profile.
       try {
         const fullDetails = await fetchAnimeDetailsFull(url, { hints });
+        fullResolved = true;
         if (navRequestGenRef.current !== reqGen) return;
         setAnimeDetails(fullDetails);
         setAnimeDetailStage('ready');
       } catch (err) {
+        fullResolved = true;
         if (navRequestGenRef.current !== reqGen) return;
         // Fallback strictly to the provider page if the primary TVDB-enriched request fails
         if (!isAnisyncUri(url)) {
@@ -2012,6 +2041,8 @@ export default function App() {
             // Fall through and surface original error below
           }
         }
+        await metadataPromise;
+        if (navRequestGenRef.current !== reqGen) return;
         setDetailError(
           err instanceof Error ? err.message : 'Falha ao carregar detalhes do título.'
         );
@@ -3007,12 +3038,18 @@ export default function App() {
       urls.add(entry.url);
       const norm = normalizeTopAnimesUrl(entry.url);
       if (norm) urls.add(norm);
+      for (const unifiedKey of getUnifiedEpisodeKeys(entry)) {
+        urls.add(unifiedKey);
+      }
     }
     for (const item of history) {
       if (!item.completed || !item.url) continue;
       urls.add(item.url);
       const norm = normalizeTopAnimesUrl(item.url);
       if (norm) urls.add(norm);
+      for (const unifiedKey of getUnifiedEpisodeKeys(item)) {
+        urls.add(unifiedKey);
+      }
     }
     return urls;
   }, [history, progressMap]);
@@ -3020,6 +3057,10 @@ export default function App() {
   const watchedEpisodeKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const url of watchedUrls) {
+      if (url.startsWith('ep:')) {
+        keys.add(url);
+        continue;
+      }
       const key = canonicalEpisodeProgressKey(url);
       if (key) keys.add(key);
     }
@@ -3033,29 +3074,80 @@ export default function App() {
       episodes: Array<{
         url: string;
         episodeNumber?: number | null;
+        seasonNumber?: number;
         title?: string;
         numberLabel?: string;
+        thumb?: string;
+        fallbackThumb?: string;
+        poster?: string;
       }>,
       watched: boolean,
-      options?: { animeUrl?: string; toastMessage?: string }
+      options?: {
+        animeUrl?: string;
+        animeTitle?: string;
+        animePoster?: string;
+        isMovie?: boolean;
+        toastMessage?: string;
+      }
     ) => {
       const urls = episodes.map((ep) => ep.url).filter(Boolean);
       if (urls.length === 0) return;
 
-      const { map: nextMap, history: nextHistory } = setEpisodesWatched(urls, watched);
+      const { map: nextMap, history: nextHistory } = setEpisodesWatched(urls, watched, {
+        seriesUrl: options?.animeUrl,
+        seriesTitle: options?.animeTitle,
+        episodes: episodes
+          .filter((ep) => Boolean(ep.url))
+          .map((ep) => ({
+            url: ep.url,
+            title: ep.title,
+            numberLabel: ep.numberLabel,
+            seasonNumber: ep.seasonNumber,
+            episodeNumber: ep.episodeNumber,
+            poster: ep.poster || ep.thumb || ep.fallbackThumb || options?.animePoster || '',
+            seriesTitle: options?.animeTitle,
+            seriesUrl: options?.animeUrl,
+            kind: options?.isMovie ? 'movie' : 'episode',
+          })),
+      });
       setProgressMap(nextMap);
-      if (nextHistory) {
-        setHistory(nextHistory);
-      }
+      setHistory(nextHistory);
 
       if (watched) {
-        const keySet = new Set(urls.map((u) => canonicalEpisodeKey(u)).filter(Boolean));
+        const keySet = new Set<string>();
+        for (const ep of episodes) {
+          if (!ep.url) continue;
+          const exact = canonicalEpisodeKey(ep.url);
+          if (exact) keySet.add(exact);
+          for (const idKey of getEpisodeIdentityKeys({
+            url: ep.url,
+            seriesUrl: options?.animeUrl,
+            seriesTitle: options?.animeTitle,
+            title: ep.title,
+            numberLabel: ep.numberLabel,
+            seasonNumber: ep.seasonNumber,
+            episodeNumber: ep.episodeNumber,
+            kind: options?.isMovie ? 'movie' : 'episode',
+          })) {
+            keySet.add(idKey);
+          }
+        }
+        const alertMatchesWatched = (a: FavoriteAlertEntry) => {
+          if (keySet.has(canonicalEpisodeKey(a.episodeUrl))) return true;
+          return getEpisodeIdentityKeys({
+            url: a.episodeUrl,
+            seriesUrl: a.animeUrl,
+            seriesTitle: a.animeTitle,
+            title: a.episodeTitle,
+            numberLabel: a.episodeLabel,
+          }).some((k) => keySet.has(k));
+        };
         const hasMatchingUnreadAlert = alertsRef.current.some(
-          (a) => !a.read && keySet.has(canonicalEpisodeKey(a.episodeUrl))
+          (a) => !a.read && alertMatchesWatched(a)
         );
         if (hasMatchingUnreadAlert) {
           const nextAlerts = alertsRef.current.map((a) =>
-            keySet.has(canonicalEpisodeKey(a.episodeUrl)) ? { ...a, read: true } : a
+            alertMatchesWatched(a) ? { ...a, read: true } : a
           );
           setAlerts(nextAlerts);
           saveFavoriteAlerts(nextAlerts);
@@ -4341,16 +4433,17 @@ export default function App() {
 
   const requestRemoveHistoryAnime = useCallback(
     (entry: WatchHistoryEntry) => {
-      const count = countAnimeEpisodesInHistory(history, entry);
+      const { historyCount, totalCount } = countAnimeTrackedEpisodes(history, progressMap, entry);
       const animeName = getHistoryEntrySeriesName(entry);
       setPendingHistoryRemoval({
         kind: 'anime',
         entry,
         animeName,
-        count: Math.max(1, count),
+        count: Math.max(1, totalCount),
+        historyCount: Math.max(1, historyCount),
       });
     },
-    [history]
+    [history, progressMap]
   );
 
   const confirmPendingHistoryRemoval = useCallback(() => {
@@ -4360,15 +4453,15 @@ export default function App() {
       clearAllEpisodeProgress();
       setHistory([]);
       setProgressMap({});
-      showToast('Histórico limpo.');
+      showToast('Histórico limpo e episódios desmarcados.');
     } else {
       const res = removeHistoryAnime(pendingHistoryRemoval.entry);
       setHistory(res.history);
       setProgressMap(res.progressMap);
       showToast(
-        res.removedCount > 1
-          ? `${res.removedCount} episódios de ${pendingHistoryRemoval.animeName} removidos do histórico.`
-          : `Episódio de ${pendingHistoryRemoval.animeName} removido do histórico.`
+        res.totalClearedCount > 1
+          ? `${res.totalClearedCount} episódios de ${pendingHistoryRemoval.animeName} removidos do histórico e desmarcados.`
+          : `Episódio de ${pendingHistoryRemoval.animeName} removido do histórico e desmarcado.`
       );
     }
     setPendingHistoryRemoval(null);
@@ -4650,7 +4743,7 @@ export default function App() {
             onOpenNotificationSettings={() => openSettingsModal('notifications')}
             onClearHistory={requestClearAllHistory}
             onRemoveHistoryEntry={(entry) => {
-              const res = removeHistoryEpisode(entry.url);
+              const res = removeHistoryEpisode(entry.url, entry);
               setHistory(res.history);
               setProgressMap(res.progressMap);
               showToast('Episódio removido do histórico.');
@@ -4659,6 +4752,7 @@ export default function App() {
             onSelectSection={handleSelectSection}
             defaultAudioFilter={settings.defaultAudioFilter}
             watchedEpisodeKeys={watchedEpisodeKeys}
+            progressMap={progressMap}
           />
         </div>
 
@@ -4757,6 +4851,9 @@ export default function App() {
                   onToggleEpisodesWatched={(eps, watched, label) =>
                     handleToggleEpisodesWatched(eps, watched, {
                       animeUrl: animeDetails.url,
+                      animeTitle: stripAudioTagsFromText(animeDetails.title),
+                      animePoster: animeDetails.backdrop || animeDetails.poster || '',
+                      isMovie: animeDetails.kind === 'movie',
                       toastMessage: label,
                     })
                   }
@@ -4850,6 +4947,9 @@ export default function App() {
                       initialSeriesGenres={
                         matchesLoadedAnime ? animeDetails?.genres : undefined
                       }
+                      initialSeriesMediaTags={
+                        matchesLoadedAnime ? animeDetails?.mediaTags : undefined
+                      }
                       initialSeriesKind={
                         matchesLoadedAnime ? animeDetails?.kind : undefined
                       }
@@ -4876,11 +4976,17 @@ export default function App() {
                           url: ep.url,
                           title: ep.title,
                           numberLabel: ep.episodeLabel || '',
+                          seasonNumber: ep.seasonNumber,
+                          episodeNumber: ep.episodeNumber,
+                          poster: ep.backdrop || ep.poster || '',
                         },
                       ],
                       watched,
                       {
                         animeUrl: ep.seriesUrl || ep.url,
+                        animeTitle: ep.seriesTitle || undefined,
+                        animePoster: ep.backdrop || ep.poster || '',
+                        isMovie: ep.isMovie,
                       }
                     )
                   }
@@ -5103,10 +5209,10 @@ export default function App() {
                   {pendingHistoryRemoval.kind === 'all'
                     ? `Isso vai remover ${pendingHistoryRemoval.count} ${
                         pendingHistoryRemoval.count === 1 ? 'item' : 'itens'
-                      } do histórico e apagar o progresso salvo dos episódios.`
+                      } do histórico, apagar o progresso salvo e desmarcar todos os episódios vistos.`
                     : pendingHistoryRemoval.count > 1
-                      ? `Isso vai remover todos os ${pendingHistoryRemoval.count} episódios de "${pendingHistoryRemoval.animeName}" do histórico e apagar o progresso salvo deles.`
-                      : `Isso vai remover todos os registros de "${pendingHistoryRemoval.animeName}" do histórico e apagar o progresso salvo.`}
+                      ? `Isso vai remover "${pendingHistoryRemoval.animeName}" do histórico, apagar o progresso salvo e desmarcar todos os ${pendingHistoryRemoval.count} episódios desse anime como vistos.`
+                      : `Isso vai remover "${pendingHistoryRemoval.animeName}" do histórico, apagar o progresso salvo e desmarcar o episódio como visto.`}
                 </p>
               </div>
             </div>

@@ -409,7 +409,7 @@ test('enrichServerDetailsWithTheTvdb unifies split Season 1 and Season 2 provide
   };
 
   const unifiedFromS2 = await enrichServerDetailsWithTheTvdb(mockFetcher, openedS2);
-  assert.equal(unifiedFromS2.title, 'Sousou no Frieren');
+  assert.equal(unifiedFromS2.title, 'Frieren e a Jornada para o Além');
   assert.equal(unifiedFromS2.seasonsCount, '2');
   assert.equal(unifiedFromS2.episodes.length, 4);
 
@@ -977,7 +977,7 @@ test('enrichServerDetailsWithTheTvdb unifies all 5 Kimetsu no Yaiba seasons acro
   };
 
   const unifiedFromS1 = await enrichServerDetailsWithTheTvdb(mockFetcher, openedS1);
-  assert.equal(unifiedFromS1.title, 'Kimetsu no Yaiba');
+  assert.equal(unifiedFromS1.title, 'Demon Slayer: Kimetsu no Yaiba');
   assertAllFiveSeasonsPlayable(unifiedFromS1);
 
   // Entry Point 2: Open "Kimetsu no Yaiba 3: Katanakaji no Sato-hen" directly!
@@ -1002,7 +1002,7 @@ test('enrichServerDetailsWithTheTvdb unifies all 5 Kimetsu no Yaiba seasons acro
   };
 
   const unifiedFromKatanakaji = await enrichServerDetailsWithTheTvdb(mockFetcher, openedKatanakaji);
-  assert.equal(unifiedFromKatanakaji.title, 'Kimetsu no Yaiba');
+  assert.equal(unifiedFromKatanakaji.title, 'Demon Slayer: Kimetsu no Yaiba');
   assertAllFiveSeasonsPlayable(unifiedFromKatanakaji);
 });
 

@@ -46,6 +46,7 @@ import {
   splitAlternativeTitleString,
   stripSeasonFromTitle,
 } from './idCodec.ts';
+import { registerProviderIndexItems } from './providerIndex.ts';
 
 export type SnapshotAssetReader = (assetFileName: string) => Promise<string | null>;
 
@@ -260,6 +261,23 @@ export async function getServerHomeCatalog(
   ]);
 
   if (topParsed || hsParsed) {
+    const mergedAnimes = mergeCatalogItemsByUrl(
+      topParsed?.animes || [],
+      hsParsed?.animes || [],
+      true
+    );
+    const mergedMovies = mergeCatalogItemsByUrl(
+      topParsed?.movies || [],
+      hsParsed?.movies || [],
+      true
+    );
+    const mergedSeries = mergeCatalogItemsByUrl(
+      topParsed?.series || [],
+      hsParsed?.series || [],
+      true
+    );
+    registerProviderIndexItems([...mergedAnimes, ...mergedMovies, ...mergedSeries]);
+
     return {
       calendar: topParsed?.calendar || [],
       releases: mergeCatalogItemsByUrl(
@@ -267,21 +285,9 @@ export async function getServerHomeCatalog(
         hsParsed?.releases || [],
         true
       ),
-      animes: mergeCatalogItemsByUrl(
-        topParsed?.animes || [],
-        hsParsed?.animes || [],
-        true
-      ),
-      movies: mergeCatalogItemsByUrl(
-        topParsed?.movies || [],
-        hsParsed?.movies || [],
-        true
-      ),
-      series: mergeCatalogItemsByUrl(
-        topParsed?.series || [],
-        hsParsed?.series || [],
-        true
-      ),
+      animes: mergedAnimes,
+      movies: mergedMovies,
+      series: mergedSeries,
       sourcesUsed: ['server'],
       sourceMode: 'live',
       fetchedAt: topParsed?.fetchedAt || hsParsed?.fetchedAt || new Date().toISOString(),
@@ -512,6 +518,7 @@ export async function getServerCatalogPage(
     const topItems = topParsed ? tagServerItems(topParsed.items, topSource.name) : [];
     const hsItems = hsParsed ? tagServerItems(hsParsed.items, hsSource.name) : [];
     const mergedItems = mergeCatalogItemsByUrl(topItems, hsItems, false);
+    registerProviderIndexItems(mergedItems);
     const fallbackFilters =
       topParsed && topParsed.filters.genres.length > 0
         ? topParsed.filters
@@ -643,6 +650,7 @@ export async function getServerGlossary(
 
   if (topItems !== null || hsItems !== null) {
     const merged = mergeCatalogItemsByUrl(topItems || [], hsItems || [], false);
+    registerProviderIndexItems(merged);
     return { term: displayTerm, type, items: merged, sourceMode: 'live' };
   }
 
@@ -803,6 +811,7 @@ export async function getServerSearchSuggest(
   ]);
 
   const combined = dedupeSearchResults([...topResults, ...hsSearch.results]).slice(0, 12);
+  registerProviderIndexItems(combined);
 
   return {
     query,
@@ -854,6 +863,7 @@ export async function getServerSearch(
   ]);
 
   const combined = dedupeSearchResults([...topSearch.results, ...hsSearch.results]);
+  registerProviderIndexItems(combined);
   const totalPages = Math.max(1, topSearch.totalPages, hsSearch.totalPages);
 
   return {

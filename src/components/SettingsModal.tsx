@@ -196,6 +196,8 @@ export function SettingsModal({
   const [showCredsPanel, setShowCredsPanel] = useState(false);
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, SourceTestResult>>({});
+  const [testingCatalogId, setTestingCatalogId] = useState<string | null>(null);
+  const [catalogTestResults, setCatalogTestResults] = useState<Record<string, SourceTestResult>>({});
   const [exportingBackup, setExportingBackup] = useState<'downloads' | 'share' | null>(null);
   const [backupError, setBackupError] = useState('');
   const [confirmClearAllOffline, setConfirmClearAllOffline] = useState(false);
@@ -380,6 +382,35 @@ export function SettingsModal({
     }
   };
 
+  const handleTestCatalogService = async (serviceId: string, serviceName: string) => {
+    setTestingCatalogId(serviceId);
+    try {
+      const res = await apiFetch('/api/catalog/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serviceId,
+          credentials: serviceId === 'thetvdb' ? settings.catalogCredentials : undefined,
+        }),
+      });
+      const data = (await res.json()) as SourceTestResult;
+      setCatalogTestResults((prev) => ({ ...prev, [serviceId]: data }));
+    } catch (err) {
+      setCatalogTestResults((prev) => ({
+        ...prev,
+        [serviceId]: {
+          ok: false,
+          sourceId: serviceId,
+          sourceName: serviceName,
+          message: err instanceof Error ? err.message : 'Falha ao testar serviço.',
+          latencyMs: 0,
+        },
+      }));
+    } finally {
+      setTestingCatalogId(null);
+    }
+  };
+
   const updateCredentialField = (key: keyof CatalogSourceCredentials, value: string) => {
     onUpdateSettings({
       catalogCredentials: {
@@ -408,7 +439,7 @@ export function SettingsModal({
               Configurações do Anisync
             </h2>
             <p className="mt-0.5 text-xs text-slate-400">
-              Provedores de episódios, metadados TheTVDB, notas MyAnimeList, calendário LiveChart.me e player
+              Provedores de episódios, metadados TheTVDB e AniList, notas MyAnimeList, calendário LiveChart.me e player
             </p>
           </div>
           <button
@@ -524,39 +555,72 @@ export function SettingsModal({
             </div>
 
             <div className="divide-y divide-white/8 rounded-xl border border-white/10 bg-[#0d0f12]/70">
-              <div className="flex items-center justify-between gap-4 px-4 py-3">
-                <div className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium text-slate-200">TheTVDB</span>
-                  <span className="mt-0.5 block text-xs text-slate-400">
-                    Sinopses, títulos de episódios, capas, estúdios, redes, classificação, gêneros, temporadas e datas oficiais.
-                  </span>
-                </div>
-                <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
-                  Ativo
-                </span>
-              </div>
-              <div className="flex items-center justify-between gap-4 px-4 py-3">
-                <div className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium text-slate-200">MyAnimeList</span>
-                  <span className="mt-0.5 block text-xs text-slate-400">
-                    Notas e avaliações da comunidade para os animes.
-                  </span>
-                </div>
-                <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
-                  Ativo
-                </span>
-              </div>
-              <div className="flex items-center justify-between gap-4 px-4 py-3">
-                <div className="min-w-0 flex-1">
-                  <span className="block text-sm font-medium text-slate-200">LiveChart.me</span>
-                  <span className="mt-0.5 block text-xs text-slate-400">
-                    Calendário semanal, horários oficiais de estreia, contagem regressiva, Dub/Sub e plataformas de streaming.
-                  </span>
-                </div>
-                <span className="rounded-md border border-[#f97316]/35 bg-[#f97316]/12 px-2 py-0.5 text-[11px] font-semibold text-[#fb923c]">
-                  Ativo
-                </span>
-              </div>
+              {[
+                {
+                  id: 'thetvdb',
+                  name: 'TheTVDB',
+                  description:
+                    'Prioridade para sinopses em PT-BR, títulos de episódios, capas, estúdios, redes, classificação, temporadas e datas oficiais (2º fallback de gêneros).',
+                },
+                {
+                  id: 'anilist',
+                  name: 'AniList',
+                  description:
+                    'Catálogo de descoberta (rankings e filtros), prioridade para gêneros de animes, tags com relevância/spoilers e 2º fallback de informações.',
+                },
+                {
+                  id: 'myanimelist',
+                  name: 'MyAnimeList',
+                  description:
+                    'Prioridade para notas da comunidade nos animes e 3º fallback de informações e gêneros.',
+                },
+                {
+                  id: 'livechart',
+                  name: 'LiveChart.me',
+                  description:
+                    'Calendário semanal, horários oficiais de estreia, contagem regressiva, Dub/Sub e plataformas de streaming.',
+                },
+              ].map((svc) => {
+                const testResult = catalogTestResults[svc.id];
+                const isTesting = testingCatalogId === svc.id;
+                return (
+                  <div key={svc.id} className="space-y-2 px-4 py-3">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1">
+                        <span className="block text-sm font-medium text-slate-200">
+                          {svc.name}
+                        </span>
+                        <span className="mt-0.5 block text-xs leading-relaxed text-slate-400">
+                          {svc.description}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        data-test-catalog-service={svc.id}
+                        disabled={isTesting}
+                        onClick={() => void handleTestCatalogService(svc.id, svc.name)}
+                        className="shrink-0 rounded-md border border-white/10 bg-[#151921] px-2.5 py-1 text-[11px] font-medium text-slate-300 transition-colors hover:border-[#f97316]/50 hover:text-white disabled:opacity-50"
+                      >
+                        {isTesting ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-[#f97316]" />
+                        ) : (
+                          'Testar'
+                        )}
+                      </button>
+                    </div>
+                    {testResult && (
+                      <p
+                        data-catalog-test-result={svc.id}
+                        className={`text-[11px] font-medium ${
+                          testResult.ok ? 'text-emerald-300' : 'text-amber-300'
+                        }`}
+                      >
+                        {testResult.message}
+                      </p>
+                    )}
+                  </div>
+                );
+              })}
             </div>
 
             {showCredsPanel && (

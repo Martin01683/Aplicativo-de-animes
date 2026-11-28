@@ -62,7 +62,7 @@ import {
   type OfflineDownloadRecord,
 } from '../lib/offlineDownloads';
 import {
-  canonicalEpisodeProgressKey,
+  findEpisodeProgressInMap,
   formatPlaybackTimestamp,
   getResumePositionSec,
   groupEpisodesBySeason,
@@ -85,6 +85,7 @@ import type {
   FavoriteLatestInfo,
 } from '../lib/types';
 import { MediaPoster } from './MediaPoster';
+import { MediaTagsSection } from './MediaTagsSection';
 
 export type AnimeDetailLoadingStage = 'idle' | 'seed' | 'quick' | 'ready';
 
@@ -611,7 +612,20 @@ export function AnimeDetailView({
   }, [activeSeasonTab, baseSeasonGroups, episodeFilter, hydratedTitlesById, sortDesc]);
 
   const isWatchedEpisode = (ep: AnimeEpisodeLink) =>
-    isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls);
+    isEpisodeMarkedWatched(ep.url, progressMap, watchedUrls, {
+      seriesTitle: displayTitle,
+      seriesUrl: anime.url,
+      seasonNumber: ep.seasonNumber,
+      episodeNumber: ep.episodeNumber,
+      title: ep.title,
+      numberLabel: ep.numberLabel,
+      kind: isMovie ? 'movie' : 'episode',
+    });
+
+  const withDisplayTitle = (ep: AnimeEpisodeLink): AnimeEpisodeLink => {
+    const localized = ep.tvdbEpisodeId ? hydratedTitlesById[ep.tvdbEpisodeId] : undefined;
+    return localized ? { ...ep, title: localized } : ep;
+  };
 
   const hasActiveEpisodeSearch = episodeFilter.trim().length > 0;
   const isSeasonExpanded = (seasonNumber: number): boolean => {
@@ -1263,6 +1277,11 @@ export function AnimeDetailView({
               </div>
             )}
 
+            {/* AniList Tags (spoiler tags hidden by default with reveal toggle) */}
+            {anime.mediaTags && anime.mediaTags.length > 0 && (
+              <MediaTagsSection tags={anime.mediaTags} resetKey={anime.url} />
+            )}
+
             {/* Action Buttons after Info Panel */}
             <div data-anime-actions="true" className="space-y-2.5 pt-0.5">
               <div className="flex flex-wrap items-center gap-2 sm:gap-2.5">
@@ -1395,7 +1414,7 @@ export function AnimeDetailView({
                 {playableEpisodes.length > 0
                   ? `${totalWatchedCount}/${playableEpisodes.length} vistos`
                   : `${activeEpisodes.length} episódio${activeEpisodes.length === 1 ? '' : 's'}`}
-                {unavailableCount > 0 && (
+                {loadingStage !== 'quick' && unavailableCount > 0 && (
                   <span className="text-[#fb923c]">
                     {' '}
                     · {unavailableCount} {unavailableCount === 1 ? 'indisponível' : 'indisponíveis'}
@@ -1404,8 +1423,12 @@ export function AnimeDetailView({
               </span>
             )}
             {loadingStage === 'quick' && (
-              <span className="text-[11px] font-medium text-slate-500">
-                Sincronizando metadados e temporadas...
+              <span
+                data-providers-syncing="true"
+                className="inline-flex items-center gap-1.5 text-[11px] font-medium text-slate-400"
+              >
+                <Loader2 className="h-3 w-3 animate-spin text-[#f97316]" />
+                <span>Verificando servidores e episódios disponíveis...</span>
               </span>
             )}
           </div>
@@ -1477,7 +1500,7 @@ export function AnimeDetailView({
                 type="button"
                 onClick={() =>
                   onToggleEpisodesWatched(
-                    playableEpisodes,
+                    playableEpisodes.map(withDisplayTitle),
                     !allEpisodesWatched,
                     allEpisodesWatched
                       ? 'Todas as temporadas desmarcadas'
@@ -1634,7 +1657,7 @@ export function AnimeDetailView({
           </div>
         )}
 
-        {!isMovie && unavailableCount > 0 && (
+        {!isMovie && loadingStage !== 'quick' && unavailableCount > 0 && (
           <div
             role="note"
             data-schedule-disclaimer="true"
@@ -1931,7 +1954,7 @@ export function AnimeDetailView({
                           data-season-mark-desktop={group.seasonNumber}
                           onClick={() =>
                             onToggleEpisodesWatched(
-                              seasonPlayableEpisodes,
+                              seasonPlayableEpisodes.map(withDisplayTitle),
                               !seasonAllWatched,
                               seasonAllWatched
                                 ? `${group.label} desmarcada`
@@ -2029,7 +2052,7 @@ export function AnimeDetailView({
                           data-season-mark-mobile={group.seasonNumber}
                           onClick={() =>
                             onToggleEpisodesWatched(
-                              seasonPlayableEpisodes,
+                              seasonPlayableEpisodes.map(withDisplayTitle),
                               !seasonAllWatched,
                               seasonAllWatched
                                 ? `${group.label} desmarcada`
@@ -2073,19 +2096,27 @@ export function AnimeDetailView({
                       const finaleBadge = !isMovie ? formatEpisodeFinaleBadge(ep.finaleType) : null;
 
                       if (!available) {
+                        const isCheckingProviders = loadingStage === 'quick';
                         const countdown = formatEpisodeCountdown(ep.airingAt, nowMs, ep.date);
                         const isMissingDubOnly =
+                          !isCheckingProviders &&
                           hasBothAudioTracks &&
                           activeAudioTab === 'DUB' &&
                           countdown.state === 'pending' &&
                           ep.episodeNumber !== null &&
                           legPlayableKeys.has(`${ep.seasonNumber || 1}:${ep.episodeNumber}`);
-                        const badgeLabel = isMissingDubOnly ? 'Sem dublagem' : countdown.label;
-                        const badgeTitle = isMissingDubOnly
-                          ? 'Ainda sem dublagem; disponível na aba Legendado.'
-                          : countdown.state === 'pending'
-                            ? 'Episódio já exibido, mas ainda não publicado nos provedores.'
-                            : undefined;
+                        const badgeLabel = isCheckingProviders
+                          ? 'Verificando...'
+                          : isMissingDubOnly
+                            ? 'Sem dublagem'
+                            : countdown.label;
+                        const badgeTitle = isCheckingProviders
+                          ? 'Verificando disponibilidade deste episódio nos provedores...'
+                          : isMissingDubOnly
+                            ? 'Ainda sem dublagem; disponível na aba Legendado.'
+                            : countdown.state === 'pending'
+                              ? 'Episódio já exibido, mas ainda não publicado nos provedores.'
+                              : undefined;
 
                         return (
                           <div
@@ -2131,16 +2162,20 @@ export function AnimeDetailView({
                                   <span
                                     title={badgeTitle}
                                     className={`inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-bold leading-tight tabular-nums shadow-sm shadow-black/60 backdrop-blur-md ${
-                                      countdown.state === 'now'
-                                        ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
-                                        : countdown.state === 'future'
-                                          ? 'border-[#f97316]/85 bg-[#1b0e05]/92 text-[#ffedd5]'
-                                          : countdown.state === 'pending'
-                                            ? 'border-white/20 bg-[#0d0f12]/92 text-slate-300'
-                                            : 'border-white/20 bg-[#0d0f12]/90 text-slate-300'
+                                      isCheckingProviders
+                                        ? 'border-white/15 bg-[#0d0f12]/90 text-slate-400'
+                                        : countdown.state === 'now'
+                                          ? 'border-emerald-400/80 bg-[#052e22]/92 text-emerald-100'
+                                          : countdown.state === 'future'
+                                            ? 'border-[#f97316]/85 bg-[#1b0e05]/92 text-[#ffedd5]'
+                                            : countdown.state === 'pending'
+                                              ? 'border-white/20 bg-[#0d0f12]/92 text-slate-300'
+                                              : 'border-white/20 bg-[#0d0f12]/90 text-slate-300'
                                     }`}
                                   >
-                                    {countdown.state === 'pending' ? (
+                                    {isCheckingProviders ? (
+                                      <Loader2 className="h-3 w-3 shrink-0 animate-spin text-[#f97316]" />
+                                    ) : countdown.state === 'pending' ? (
                                       <CloudOff className="h-3 w-3 shrink-0 text-slate-400" />
                                     ) : (
                                       <Clock
@@ -2190,8 +2225,15 @@ export function AnimeDetailView({
                         );
                       }
 
-                      const epKey = canonicalEpisodeProgressKey(ep.url);
-                      const epProgress = epKey ? progressMap?.[epKey] : undefined;
+                      const epProgress = findEpisodeProgressInMap(progressMap, ep.url, {
+                        seriesTitle: displayTitle,
+                        seriesUrl: anime.url,
+                        seasonNumber: ep.seasonNumber,
+                        episodeNumber: ep.episodeNumber,
+                        title: ep.title,
+                        numberLabel: ep.numberLabel,
+                        kind: isMovie ? 'movie' : 'episode',
+                      });
                       const resumeSec = getResumePositionSec(epProgress);
                       const progressPct =
                         resumeSec >= 2 && epProgress && epProgress.durationSec > 0
@@ -2478,7 +2520,7 @@ export function AnimeDetailView({
 
                                   <button
                                     type="button"
-                                    onClick={() => onToggleEpisodesWatched([ep], !watched)}
+                                    onClick={() => onToggleEpisodesWatched([withDisplayTitle(ep)], !watched)}
                                     aria-pressed={watched}
                                     aria-label={
                                       watched

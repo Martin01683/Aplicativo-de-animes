@@ -320,6 +320,8 @@ async function createAppServer(): Promise<void> {
   app.get('/api/calendar', handleAggregatedRoute);
   app.get('/api/episodes', handleAggregatedRoute);
   app.get('/api/catalog', handleAggregatedRoute);
+  app.get('/api/discover', handleAggregatedRoute);
+  app.get('/api/discover/meta', handleAggregatedRoute);
   app.get('/api/glossary', handleAggregatedRoute);
   app.get('/api/search-suggest', handleAggregatedRoute);
   app.get('/api/search', handleAggregatedRoute);
@@ -334,6 +336,7 @@ async function createAppServer(): Promise<void> {
   app.get('/api/anime-synopsis', handleAggregatedRoute);
   app.post('/api/sources/resolve', handleAggregatedRoute);
   app.post('/api/sources/test', handleAggregatedRoute);
+  app.post('/api/catalog/test', handleAggregatedRoute);
   app.get('/api/resolve-embed', handleAggregatedRoute);
   app.post('/api/resolve-embed', handleAggregatedRoute);
 

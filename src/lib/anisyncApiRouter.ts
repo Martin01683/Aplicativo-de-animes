@@ -14,6 +14,8 @@ import {
 import {
   enrichServerDetailsWithTheTvdb,
   getAggregatedCatalogPage,
+  getAggregatedDiscoverCatalog,
+  getAggregatedDiscoverTaxonomy,
   getAggregatedGlossary,
   getAggregatedHomeCatalog,
   getAggregatedMediaDetails,
@@ -25,18 +27,41 @@ import {
   type MediaDetailsResolveOptions,
 } from './catalog/catalogAggregator.ts';
 import {
+  buildFastMetadataDetailsFromAniList,
+  enrichDetailsWithAniListMetadata,
+  fetchAniListMediaById,
+  fetchAniListMetadataForAnime,
+  sanitizeAniListTagName,
+  VALID_ANILIST_COUNTRIES,
+  VALID_ANILIST_FORMATS,
+  VALID_ANILIST_GENRES,
+  VALID_ANILIST_SEASONS,
+  VALID_ANILIST_SORTS,
+  VALID_ANILIST_STATUSES,
+  type AniListMediaLookupDetails,
+} from './catalog/providers/anilistProvider.ts';
+import {
   buildEpisodeUri,
+  buildExternalDatabaseLinks,
   buildMediaUri,
   isAnisyncUri,
+  parseAniListExternalId,
   parseAnisyncUri,
+  parseLiveChartExternalId,
   splitAlternativeTitleString,
 } from './catalog/idCodec.ts';
 import {
+  buildFastMetadataDetailsFromTvdbProfile,
   findBestTheTvdbMatch,
   preloadTheTvdbProfileFromHints,
   resolveLocalizedEpisodeTitlesByIds,
+  type PreloadedTvdbProfile,
 } from './catalog/providers/thetvdbProvider.ts';
-import { enrichDetailsWithMyAnimeListRating } from './catalog/providers/malProvider.ts';
+import {
+  enrichDetailsWithMyAnimeListFallback,
+  enrichDetailsWithMyAnimeListRating,
+  fetchMyAnimeListFallbackDetails,
+} from './catalog/providers/malProvider.ts';
 import type { SnapshotAssetReader } from './catalog/serverCatalog.ts';
 import {
   extractEpisodeNumber,
@@ -82,9 +107,18 @@ import {
   type CachedEmbedEntry,
 } from './embedCache.ts';
 import type {
+  AniListCountry,
+  AniListDiscoverFilters,
+  AniListFormat,
+  AniListSeason,
+  AniListSortOption,
+  AniListStatus,
   AnimeDetails,
   CatalogArchiveCategory,
   CatalogPreferences,
+  DiscoverAudioFilter,
+  DiscoverCatalogResponse,
+  DiscoverTaxonomyResponse,
   EpisodeDetails,
   EpisodeSourceReportSummary,
   FavoriteLatestInfo,
@@ -212,11 +246,14 @@ const EPISODE_DETAILS_TTL_MS = 3 * 60 * 1000;
 const homeCache = new CoalescedTtlCache<HomeCatalog>(HOME_TTL_MS, 8);
 const episodesFeedCache = new CoalescedTtlCache<PaginatedCatalogResponse>(EPISODES_FEED_TTL_MS, 20);
 const catalogPageCache = new CoalescedTtlCache<PaginatedCatalogResponse>(CATALOG_TTL_MS, 50);
+const discoverCache = new CoalescedTtlCache<DiscoverCatalogResponse>(CATALOG_TTL_MS, 60);
+const discoverTaxonomyCache = new CoalescedTtlCache<DiscoverTaxonomyResponse>(24 * 60 * 60 * 1000, 4);
 const glossaryCache = new CoalescedTtlCache<GlossaryResponse>(GLOSSARY_TTL_MS, 40);
 const searchSuggestCache = new CoalescedTtlCache<SearchSuggestResponse>(SEARCH_TTL_MS, 60);
 const searchPageCache = new CoalescedTtlCache<PaginatedSearchResponse>(SEARCH_TTL_MS, 40);
 const calendarCache = new CoalescedTtlCache<WeeklyCalendarResponse>(CALENDAR_TTL_MS, 12);
 const mediaDetailsCache = new CoalescedTtlCache<AnimeDetails | null>(DETAILS_TTL_MS, 60);
+const tvdbPreloadCache = new CoalescedTtlCache<PreloadedTvdbProfile | null>(DETAILS_TTL_MS, 80);
 const rawServerDetailsCache = new CoalescedTtlCache<AnimeDetails>(RAW_SERVER_DETAILS_TTL_MS, 50);
 const episodeDetailsRouterCache = new CoalescedTtlCache<EpisodeDetails>(EPISODE_DETAILS_TTL_MS, 50);
 
@@ -232,15 +269,52 @@ export function clearAnisyncRouterCaches(): void {
   homeCache.clear();
   episodesFeedCache.clear();
   catalogPageCache.clear();
+  discoverCache.clear();
+  discoverTaxonomyCache.clear();
   glossaryCache.clear();
   searchSuggestCache.clear();
   searchPageCache.clear();
   calendarCache.clear();
   mediaDetailsCache.clear();
+  tvdbPreloadCache.clear();
   rawServerDetailsCache.clear();
   episodeDetailsRouterCache.clear();
   resolvedEmbedCache.clear();
   resolvedEmbedInFlight.clear();
+}
+
+function deriveTitleHintFromMediaTarget(target: string): string | undefined {
+  if (isAnisyncUri(target)) {
+    const parsed = parseAnisyncUri(target);
+    if (parsed.kind !== 'media') return undefined;
+    if (parsed.source === 'anilist') {
+      const al = parseAniListExternalId(parsed.externalId);
+      return al.title || al.englishTitle || undefined;
+    }
+    if (parsed.source === 'livechart') {
+      const lc = parseLiveChartExternalId(parsed.externalId);
+      return lc.title || undefined;
+    }
+    if (!/^\d+$/.test(parsed.externalId)) {
+      return parsed.externalId.replace(/[-_]+/g, ' ').trim() || undefined;
+    }
+    return undefined;
+  }
+
+  try {
+    const u = new URL(target);
+    const segments = u.pathname.split('/').filter(Boolean);
+    const rawSlug = segments[segments.length - 1] || '';
+    if (!rawSlug) return undefined;
+    const cleaned = rawSlug
+      .replace(/-(?:dublado|legendado|online|hd|fhd|sub|dub)$/i, '')
+      .replace(/[-_]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return cleaned.length >= 2 ? cleaned : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 const VALID_CATEGORIES = new Set<CatalogArchiveCategory>([
@@ -279,6 +353,29 @@ function findBuiltinSourceFromBody(rawBody: unknown): EpisodeSourceConfig {
   return TOPANIMES_BUILTIN_SOURCE;
 }
 
+/**
+ * Applies the unified AniList + MyAnimeList metadata chain:
+ * - General info: TVDB > AniList > MyAnimeList > Providers
+ * - Genres (anime): AniList > TVDB > MyAnimeList > Providers
+ * - Rating: MyAnimeList > AniList > Providers
+ * - Tags (with spoiler flags): AniList
+ */
+async function applyAniListAndMalMetadataEnrichment(
+  fetchHttp: HttpFetcher,
+  details: AnimeDetails,
+  options: { preloadedAniList?: AniListMediaLookupDetails | null } = {}
+): Promise<AnimeDetails> {
+  const withAniList = await enrichDetailsWithAniListMetadata(fetchHttp, details, options).catch(
+    () => details
+  );
+  const withMalRating = await enrichDetailsWithMyAnimeListRating(fetchHttp, withAniList).catch(
+    () => withAniList
+  );
+  return enrichDetailsWithMyAnimeListFallback(fetchHttp, withMalRating).catch(
+    () => withMalRating
+  );
+}
+
 async function getCachedMediaDetails(
   fetchHttp: HttpFetcher,
   uri: string,
@@ -295,7 +392,7 @@ async function getCachedMediaDetails(
         ...hints,
       });
       if (!details) return null;
-      return enrichDetailsWithMyAnimeListRating(fetchHttp, details).catch(() => details);
+      return applyAniListAndMalMetadataEnrichment(fetchHttp, details);
     },
     {
       useCache,
@@ -900,6 +997,140 @@ export async function dispatchAnisyncApiRequest(
     }
   }
 
+  if (pathname === '/api/discover/meta') {
+    const forceRefresh = url.searchParams.get('refresh') === '1';
+    try {
+      const taxonomy = await discoverTaxonomyCache.getOrLoad(
+        'anilist-taxonomy',
+        () => getAggregatedDiscoverTaxonomy(fetchHttp, { forceRefresh }),
+        {
+          useCache,
+          forceRefresh,
+          shouldCache: (val) => val.sourceMode === 'live' && val.tags.length > 0,
+        }
+      );
+      return { status: 200, body: taxonomy };
+    } catch (err) {
+      return {
+        status: 502,
+        body: {
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível carregar os gêneros e tags do AniList.',
+        },
+      };
+    }
+  }
+
+  if (pathname === '/api/discover') {
+    const rawSort = (url.searchParams.get('sort') || 'TRENDING_DESC').trim().toUpperCase() as AniListSortOption;
+    const sort: AniListSortOption = VALID_ANILIST_SORTS.has(rawSort) ? rawSort : 'TRENDING_DESC';
+
+    const rawGenresList = [
+      ...(url.searchParams.get('genres') || '').split(','),
+      url.searchParams.get('genre') || '',
+    ]
+      .map((g) => g.trim())
+      .filter((g) => VALID_ANILIST_GENRES.has(g));
+    const genres = Array.from(new Set(rawGenresList)).slice(0, 6);
+
+    const includedGenreSet = new Set(genres);
+    const rawExcludeGenresList = (url.searchParams.get('excludeGenres') || '')
+      .split(',')
+      .map((g) => g.trim())
+      .filter((g) => VALID_ANILIST_GENRES.has(g) && !includedGenreSet.has(g));
+    const excludeGenres = Array.from(new Set(rawExcludeGenresList)).slice(0, 12);
+
+    const rawTagsList = [
+      ...(url.searchParams.get('tags') || '').split(','),
+      url.searchParams.get('tag') || '',
+    ]
+      .map((t) => sanitizeAniListTagName(t))
+      .filter((t): t is string => Boolean(t));
+    const tags = Array.from(new Set(rawTagsList)).slice(0, 6);
+
+    const includedTagSet = new Set(tags.map((t) => t.toLowerCase()));
+    const rawExcludeTagsList = (url.searchParams.get('excludeTags') || '')
+      .split(',')
+      .map((t) => sanitizeAniListTagName(t))
+      .filter((t): t is string => t !== null && t.length > 0 && !includedTagSet.has(t.toLowerCase()));
+    const excludeTags = Array.from(new Set(rawExcludeTagsList)).slice(0, 12);
+
+    const rawMinTagRank = (
+      url.searchParams.get('minTagRank') ??
+      url.searchParams.get('minimumTagRank') ??
+      ''
+    ).trim();
+    const parsedMinTagRank =
+      rawMinTagRank !== '' && /^\d{1,3}$/.test(rawMinTagRank)
+        ? Math.min(100, Math.max(0, Number.parseInt(rawMinTagRank, 10)))
+        : undefined;
+
+    const rawSeason = (url.searchParams.get('season') || '').trim().toUpperCase() as AniListSeason;
+    const season: AniListSeason | '' = VALID_ANILIST_SEASONS.has(rawSeason) ? rawSeason : '';
+    const rawYear = (url.searchParams.get('year') || '').trim();
+    const yearNum = /^\d{4}$/.test(rawYear) ? Number.parseInt(rawYear, 10) : NaN;
+    const year = Number.isFinite(yearNum) && yearNum >= 1960 && yearNum <= 2030 ? rawYear : '';
+    const rawFormat = (url.searchParams.get('format') || '').trim().toUpperCase() as AniListFormat;
+    const format: AniListFormat | '' = VALID_ANILIST_FORMATS.has(rawFormat) ? rawFormat : '';
+    const rawStatus = (url.searchParams.get('status') || '').trim().toUpperCase() as AniListStatus;
+    const status: AniListStatus | '' = VALID_ANILIST_STATUSES.has(rawStatus) ? rawStatus : '';
+    const rawCountry = (url.searchParams.get('country') || '').trim().toUpperCase() as AniListCountry;
+    const country: AniListCountry | '' = VALID_ANILIST_COUNTRIES.has(rawCountry) ? rawCountry : '';
+    const rawAudio = (url.searchParams.get('audio') || 'ALL').trim().toUpperCase();
+    const audio: DiscoverAudioFilter =
+      rawAudio === 'DUB' || rawAudio === 'LEG' ? rawAudio : 'ALL';
+    const rawOnlyAvail = (url.searchParams.get('onlyAvailable') ?? '1').trim().toLowerCase();
+    const onlyAvailable = rawOnlyAvail !== '0' && rawOnlyAvail !== 'false';
+    const search = (url.searchParams.get('search') || '').trim().slice(0, 120) || undefined;
+    const rawPage = Number.parseInt(url.searchParams.get('page') || '1', 10);
+    const page = Number.isFinite(rawPage) && rawPage > 0 ? Math.min(200, rawPage) : 1;
+    const forceRefresh = url.searchParams.get('refresh') === '1';
+
+    const filters: AniListDiscoverFilters = {
+      sort,
+      genres: genres.length > 0 ? genres : undefined,
+      excludeGenres: excludeGenres.length > 0 ? excludeGenres : undefined,
+      tags: tags.length > 0 ? tags : undefined,
+      excludeTags: excludeTags.length > 0 ? excludeTags : undefined,
+      minimumTagRank: parsedMinTagRank,
+      season,
+      year,
+      format,
+      status,
+      country,
+      audio,
+      onlyAvailable,
+      search,
+      page,
+    };
+
+    try {
+      const ck = JSON.stringify(filters);
+      const result = await discoverCache.getOrLoad(
+        ck,
+        () => getAggregatedDiscoverCatalog(fetchHttp, filters),
+        {
+          useCache,
+          forceRefresh,
+          shouldCache: (val) => val.items.length > 0 || val.indexedTitlesCount > 0,
+        }
+      );
+      return { status: 200, body: result };
+    } catch (err) {
+      return {
+        status: 502,
+        body: {
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Não foi possível consultar o catálogo de descoberta do AniList agora.',
+        },
+      };
+    }
+  }
+
   if (pathname === '/api/glossary') {
     const rawTerm = (url.searchParams.get('term') || '').trim();
     const lower = rawTerm.toLowerCase();
@@ -1017,6 +1248,175 @@ export async function dispatchAnisyncApiRequest(
         : undefined;
     const hintYear = (url.searchParams.get('year') || '').trim() || undefined;
 
+    const inferredKind = !isAnisyncUri(target) ? inferMediaKindFromUrl(target) : undefined;
+    const hintMediaType =
+      explicitHintMediaType ||
+      (inferredKind === 'movie' || inferredKind === 'anime' ? inferredKind : undefined);
+    const effectiveTitleHint = hintTitle || deriveTitleHintFromMediaTarget(target);
+
+    const buildTvdbPreloadKey = () => {
+      if (hintTvdbId) return `tvdb:${hintTvdbId}:${hintMediaType || 'anime'}:${fastMode ? 1 : 0}`;
+      if (effectiveTitleHint) {
+        return `title:${effectiveTitleHint.toLowerCase()}:${hintMediaType || 'anime'}:${hintYear || ''}:${fastMode ? 1 : 0}`;
+      }
+      return '';
+    };
+
+    const loadCoalescedTvdbPreload = (): Promise<PreloadedTvdbProfile | null> => {
+      const preloadKey = buildTvdbPreloadKey();
+      if (!preloadKey) return Promise.resolve(null);
+      return tvdbPreloadCache
+        .getOrLoad(
+          preloadKey,
+          () =>
+            preloadTheTvdbProfileFromHints(
+              fetchHttp,
+              {
+                tvdbId: hintTvdbId,
+                tvdbSlug: hintTvdbSlug,
+                title: effectiveTitleHint,
+                mediaType: hintMediaType,
+                year: hintYear,
+              },
+              catalogPrefs?.credentials,
+              { skipEpisodePageHydration: fastMode }
+            ).catch(() => null),
+          {
+            useCache,
+            shouldCache: (val) => Boolean(val),
+          }
+        )
+        .catch(() => null);
+    };
+
+    // Fast metadata-only stage: resolves strictly from TVDB > AniList > MyAnimeList
+    // (genres: AniList > TVDB > MyAnimeList) WITHOUT touching slow video providers,
+    // so the anime page renders immediately. Returns 404 if all 3 miss so Stage 2
+    // uses the video providers as the last fallback.
+    if (stage === 'metadata') {
+      const cacheKey = isAnisyncUri(target)
+        ? target
+        : isHinataSoulUrl(target)
+          ? normalizeHinataSoulUrl(target) || target
+          : normalizeTopAnimesUrl(target) || target;
+      if (useCache) {
+        const cachedFull = mediaDetailsCache.get(cacheKey);
+        if (cachedFull) {
+          return { status: 200, body: cachedFull };
+        }
+      }
+
+      try {
+        let explicitAniListId: number | undefined;
+        let anilistUriTitles: string[] = [];
+        if (isAnisyncUri(target)) {
+          const parsed = parseAnisyncUri(target);
+          if (parsed.kind === 'media' && parsed.source === 'anilist') {
+            const al = parseAniListExternalId(parsed.externalId);
+            if (al.aniListId > 0) explicitAniListId = al.aniListId;
+            anilistUriTitles = [al.title, al.englishTitle].filter((t): t is string => Boolean(t));
+          }
+        }
+
+        const [preloadedTvdb, preloadedAniList] = await Promise.all([
+          loadCoalescedTvdbPreload(),
+          hintMediaType === 'series' && !explicitAniListId
+            ? Promise.resolve(null)
+            : fetchAniListMetadataForAnime(fetchHttp, {
+                aniListId: explicitAniListId,
+                titles: [effectiveTitleHint, ...anilistUriTitles],
+                year: hintYear,
+                kind: hintMediaType || 'anime',
+              }).catch(() => null),
+        ]);
+
+        // 1. TheTVDB primary (+ AniList genres/tags/fallback + MAL rating/fallback)
+        if (preloadedTvdb) {
+          const baseMeta = buildFastMetadataDetailsFromTvdbProfile(preloadedTvdb, target, {
+            kind: hintMediaType,
+            titleHint: effectiveTitleHint,
+          });
+          const enrichedMeta = await applyAniListAndMalMetadataEnrichment(fetchHttp, baseMeta, {
+            preloadedAniList: preloadedAniList || undefined,
+          });
+          return { status: 200, body: enrichedMeta };
+        }
+
+        // 2. AniList 2nd priority fallback (+ MAL rating)
+        if (preloadedAniList) {
+          const baseAl = buildFastMetadataDetailsFromAniList(preloadedAniList, target, {
+            kind: hintMediaType,
+          });
+          const withMal = await enrichDetailsWithMyAnimeListRating(fetchHttp, baseAl).catch(
+            () => baseAl
+          );
+          return { status: 200, body: withMal };
+        }
+
+        // Explicit anisync://anime/anilist/<id> direct retry if search returned null
+        if (explicitAniListId) {
+          const alInfo = await fetchAniListMediaById(fetchHttp, explicitAniListId).catch(() => null);
+          if (alInfo) {
+            const baseAl = buildFastMetadataDetailsFromAniList(alInfo, target, {
+              kind: hintMediaType,
+            });
+            const withMal = await enrichDetailsWithMyAnimeListRating(fetchHttp, baseAl).catch(
+              () => baseAl
+            );
+            return { status: 200, body: withMal };
+          }
+        }
+
+        // 3. MyAnimeList 3rd priority fallback (before letting Stage 2 fall back to providers)
+        if (effectiveTitleHint && hintMediaType !== 'series') {
+          const malMeta = await fetchMyAnimeListFallbackDetails(fetchHttp, {
+            title: effectiveTitleHint,
+            year: hintYear,
+            kind: hintMediaType || 'anime',
+          }).catch(() => null);
+          if (malMeta) {
+            const resolvedKind = hintMediaType || 'anime';
+            const extIds = { malId: malMeta.malId };
+            const baseMal: AnimeDetails = {
+              title: malMeta.title || effectiveTitleHint,
+              url: target,
+              kind: resolvedKind,
+              enrichmentSources: ['myanimelist'],
+              externalIds: extIds,
+              externalLinks: buildExternalDatabaseLinks(extIds, { mediaType: resolvedKind }),
+              poster: malMeta.poster || '',
+              backdrop: malMeta.poster || '',
+              synopsis: malMeta.synopsis || '',
+              year: malMeta.year,
+              rating: malMeta.rating,
+              ratingSource: malMeta.rating ? 'myanimelist' : undefined,
+              myAnimeListUrl: malMeta.url,
+              genres: malMeta.genres,
+              genresSource: malMeta.genres.length > 0 ? 'myanimelist' : undefined,
+              studio: malMeta.studio,
+              status: malMeta.status,
+              episodesTotalCount: malMeta.episodesTotalCount,
+              audioType: null,
+              episodes: [],
+            };
+            return { status: 200, body: baseMal };
+          }
+        }
+
+        return {
+          status: 404,
+          body: { error: 'Metadados rápidos não encontrados no TheTVDB/AniList/MAL.' },
+        };
+      } catch (err) {
+        return {
+          status: 502,
+          body: {
+            error: err instanceof Error ? err.message : 'Falha ao carregar metadados rápidos.',
+          },
+        };
+      }
+    }
+
     if (isAnisyncUri(target)) {
       try {
         const details = await getCachedMediaDetails(
@@ -1083,32 +1483,11 @@ export async function dispatchAnisyncApiRequest(
       }
     }
 
-    const inferredKind = inferMediaKindFromUrl(target);
-    const hintMediaType =
-      explicitHintMediaType ||
-      (inferredKind === 'movie' || inferredKind === 'anime' ? inferredKind : undefined);
-
     try {
       const enriched = await mediaDetailsCache.getOrLoad(
         normKey,
         async () => {
-          const tvdbPreloadPromise =
-            hintTvdbId || hintTitle
-              ? preloadTheTvdbProfileFromHints(
-                  fetchHttp,
-                  {
-                    tvdbId: hintTvdbId,
-                    tvdbSlug: hintTvdbSlug,
-                    title: hintTitle,
-                    mediaType: hintMediaType,
-                    year: hintYear,
-                  },
-                  catalogPrefs?.credentials,
-                  { skipEpisodePageHydration: fastMode }
-                ).catch(() => null)
-              : Promise.resolve(null);
-
-          const [baseDetails, preloadedTvdb] = await Promise.all([
+          const [baseDetails, preloadedTvdb, preloadedAniList] = await Promise.all([
             fetchRawServerAnimeDetailsCoalesced(
               fetchHttp,
               target,
@@ -1116,7 +1495,14 @@ export async function dispatchAnisyncApiRequest(
               isHinataSoul,
               useCache
             ),
-            tvdbPreloadPromise,
+            loadCoalescedTvdbPreload(),
+            hintMediaType === 'series'
+              ? Promise.resolve(null)
+              : fetchAniListMetadataForAnime(fetchHttp, {
+                  titles: [effectiveTitleHint],
+                  year: hintYear,
+                  kind: hintMediaType || 'anime',
+                }).catch(() => null),
           ]);
 
           const tvdbEnriched = await enrichServerDetailsWithTheTvdb(
@@ -1129,9 +1515,9 @@ export async function dispatchAnisyncApiRequest(
             }
           ).catch(() => baseDetails);
 
-          return enrichDetailsWithMyAnimeListRating(fetchHttp, tvdbEnriched).catch(
-            () => tvdbEnriched
-          );
+          return applyAniListAndMalMetadataEnrichment(fetchHttp, tvdbEnriched, {
+            preloadedAniList: preloadedAniList || undefined,
+          });
         },
         {
           useCache,
@@ -1778,6 +2164,174 @@ export async function dispatchAnisyncApiRequest(
     const targetSource = findBuiltinSourceFromBody(options.jsonBody);
     const result = await testEpisodeSource(fetchHttp, targetSource);
     return { status: 200, body: result };
+  }
+
+  if (pathname === '/api/catalog/test' && method === 'POST') {
+    const bodyObj = (
+      options.jsonBody && typeof options.jsonBody === 'object' ? options.jsonBody : {}
+    ) as { serviceId?: string; credentials?: { tvdbApiKey?: string; tvdbPin?: string } };
+    const serviceId = (bodyObj.serviceId || '').trim().toLowerCase();
+    const startedAt = Date.now();
+
+    const serviceNames: Record<string, string> = {
+      thetvdb: 'TheTVDB',
+      anilist: 'AniList',
+      myanimelist: 'MyAnimeList',
+      livechart: 'LiveChart.me',
+    };
+    const sourceName = serviceNames[serviceId];
+    if (!sourceName) {
+      return {
+        status: 400,
+        body: {
+          ok: false,
+          sourceId: serviceId || 'unknown',
+          sourceName: 'Desconhecido',
+          message: 'Serviço de catálogo inválido.',
+          latencyMs: 0,
+        },
+      };
+    }
+
+    try {
+      if (serviceId === 'thetvdb') {
+        const apiKey = bodyObj.credentials?.tvdbApiKey?.trim();
+        const pin = bodyObj.credentials?.tvdbPin?.trim();
+        if (apiKey) {
+          const res = await fetchHttp('https://api4.thetvdb.com/v4/login', {
+            method: 'POST',
+            contentType: 'application/json',
+            accept: 'application/json',
+            body: JSON.stringify(pin ? { apikey: apiKey, pin } : { apikey: apiKey }),
+            timeoutMs: 8000,
+          });
+          const latencyMs = Date.now() - startedAt;
+          if (res.ok) {
+            return {
+              status: 200,
+              body: {
+                ok: true,
+                sourceId: serviceId,
+                sourceName,
+                statusCode: res.status,
+                message: `Conexão autenticada OK (API v4, ${latencyMs} ms).`,
+                latencyMs,
+              },
+            };
+          }
+          return {
+            status: 200,
+            body: {
+              ok: false,
+              sourceId: serviceId,
+              sourceName,
+              statusCode: res.status,
+              message: `Falha na autenticação da API v4 (HTTP ${res.status}).`,
+              latencyMs,
+            },
+          };
+        }
+
+        const res = await fetchHttp('https://www.thetvdb.com', {
+          method: 'GET',
+          timeoutMs: 8000,
+        });
+        const latencyMs = Date.now() - startedAt;
+        return {
+          status: 200,
+          body: {
+            ok: res.ok,
+            sourceId: serviceId,
+            sourceName,
+            statusCode: res.status,
+            message: res.ok
+              ? `Conexão OK (HTTP ${res.status}, ${latencyMs} ms).`
+              : `Servidor respondeu com HTTP ${res.status}.`,
+            latencyMs,
+          },
+        };
+      }
+
+      if (serviceId === 'anilist') {
+        const res = await fetchHttp('https://graphql.anilist.co', {
+          method: 'POST',
+          contentType: 'application/json',
+          accept: 'application/json',
+          body: JSON.stringify({ query: '{ GenreCollection }' }),
+          timeoutMs: 8000,
+        });
+        const latencyMs = Date.now() - startedAt;
+        return {
+          status: 200,
+          body: {
+            ok: res.ok,
+            sourceId: serviceId,
+            sourceName,
+            statusCode: res.status,
+            message: res.ok
+              ? `Conexão OK (GraphQL, ${latencyMs} ms).`
+              : `Servidor respondeu com HTTP ${res.status}.`,
+            latencyMs,
+          },
+        };
+      }
+
+      if (serviceId === 'myanimelist') {
+        const res = await fetchHttp(
+          'https://myanimelist.net/search/prefix.json?type=anime&keyword=frieren',
+          {
+            method: 'GET',
+            accept: 'application/json',
+            timeoutMs: 8000,
+          }
+        );
+        const latencyMs = Date.now() - startedAt;
+        return {
+          status: 200,
+          body: {
+            ok: res.ok,
+            sourceId: serviceId,
+            sourceName,
+            statusCode: res.status,
+            message: res.ok
+              ? `Conexão OK (HTTP ${res.status}, ${latencyMs} ms).`
+              : `Servidor respondeu com HTTP ${res.status}.`,
+            latencyMs,
+          },
+        };
+      }
+
+      // livechart
+      const res = await fetchHttp('https://www.livechart.me/schedule', {
+        method: 'GET',
+        timeoutMs: 8000,
+      });
+      const latencyMs = Date.now() - startedAt;
+      return {
+        status: 200,
+        body: {
+          ok: res.ok,
+          sourceId: serviceId,
+          sourceName,
+          statusCode: res.status,
+          message: res.ok
+            ? `Conexão OK (HTTP ${res.status}, ${latencyMs} ms).`
+            : `Servidor respondeu com HTTP ${res.status}.`,
+          latencyMs,
+        },
+      };
+    } catch (err) {
+      return {
+        status: 200,
+        body: {
+          ok: false,
+          sourceId: serviceId,
+          sourceName,
+          message: err instanceof Error ? err.message : 'Falha de conexão ao testar serviço.',
+          latencyMs: Date.now() - startedAt,
+        },
+      };
+    }
   }
 
   if (pathname === '/api/resolve-embed') {

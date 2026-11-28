@@ -21,6 +21,8 @@ import {
   Tv,
   ArrowRight,
   SlidersHorizontal,
+  Compass,
+  Server,
 } from 'lucide-react';
 import { isItemFavorited } from '../lib/favoriteAlerts';
 import {
@@ -29,11 +31,14 @@ import {
   type NotificationPermissionStatus,
 } from '../lib/notifications';
 import {
-  canonicalEpisodeProgressKey,
-  countAnimeEpisodesInHistory,
+  countAnimeTrackedEpisodes,
+  formatHistoryWatchedDate,
+  formatHistoryWatchedDateTime,
   formatPlaybackTimestamp,
   getHistoryEntrySeriesName,
   isEpisodeCompleted,
+  isEpisodeMarkedWatched,
+  type EpisodeProgressMap,
 } from '../lib/playbackProgress';
 import {
   fetchSearchSuggestCached,
@@ -56,6 +61,7 @@ import type {
   WatchHistoryEntry,
 } from '../lib/types';
 import type { NavSection } from './Header';
+import { AniListDiscoverPanel } from './AniListDiscoverPanel';
 import { LiveChartCalendar } from './LiveChartCalendar';
 import { MediaPoster } from './MediaPoster';
 
@@ -178,6 +184,7 @@ interface CatalogViewProps {
   onSelectSection: (section: NavSection) => void;
   defaultAudioFilter: 'ALL' | 'DUB' | 'LEG';
   watchedEpisodeKeys?: Set<string>;
+  progressMap?: EpisodeProgressMap;
 }
 
 function buildSeedFromCatalogItem(item: CatalogMediaItem): MediaNavigationSeed {
@@ -314,11 +321,13 @@ export function CatalogView({
   onSelectSection,
   defaultAudioFilter,
   watchedEpisodeKeys,
+  progressMap,
 }: CatalogViewProps) {
   const [searchInput, setSearchInput] = useState(searchQuery);
   const [audioFilter, setAudioFilter] = useState<'ALL' | 'DUB' | 'LEG'>(defaultAudioFilter);
   const [libraryAlertFilter, setLibraryAlertFilter] = useState<'all' | 'unread'>('all');
   const [glossaryExpanded, setGlossaryExpanded] = useState(false);
+  const [catalogMode, setCatalogMode] = useState<'discover' | 'providers'>('discover');
   const [suggestions, setSuggestions] = useState<SearchResultItem[]>([]);
   const [loadingSuggestions, setLoadingSuggestions] = useState(false);
   const [suggestOpen, setSuggestOpen] = useState(false);
@@ -559,7 +568,7 @@ export function CatalogView({
   const renderCard = (
     item: CatalogMediaItem,
     aspect: 'portrait' | 'landscape',
-    progressMeta?: { label?: string; pct?: number },
+    progressMeta?: { label?: string; pct?: number; dateLabel?: string; dateTitle?: string },
     historyMenu?: {
       menuKey: string;
       entry: WatchHistoryEntry;
@@ -584,9 +593,16 @@ export function CatalogView({
       metaParts.push(progressMeta.label);
     } else if (
       item.kind === 'episode' &&
-      watchedEpisodeKeys?.has(canonicalEpisodeProgressKey(item.url))
+      isEpisodeMarkedWatched(item.url, progressMap, watchedEpisodeKeys, {
+        title: item.title,
+        numberLabel: item.episodeLabel,
+        kind: item.kind,
+      })
     ) {
       metaParts.push('Visto');
+    }
+    if (progressMeta?.dateLabel) {
+      metaParts.push(progressMeta.dateLabel);
     }
     if (item.episodeLabel) metaParts.push(item.episodeLabel);
     if (item.year) metaParts.push(item.year);
@@ -648,7 +664,10 @@ export function CatalogView({
               {item.title}
             </h3>
             {metaParts.length > 0 && (
-              <p className="mt-1.5 truncate text-xs tabular-nums text-slate-400">
+              <p
+                title={progressMeta?.dateTitle}
+                className="mt-1.5 truncate text-xs tabular-nums text-slate-400"
+              >
                 {metaParts.join(' · ')}
               </p>
             )}
@@ -1443,6 +1462,8 @@ export function CatalogView({
                       : undefined;
                   const progressPct =
                     hasIncompleteResume && dur > 0 ? Math.min(99, (pos / dur) * 100) : undefined;
+                  const watchedDateLabel = formatHistoryWatchedDate(entry.watchedAt) || undefined;
+                  const watchedDateTitle = formatHistoryWatchedDateTime(entry.watchedAt) || undefined;
                   return renderCard(
                     {
                       id: entry.url,
@@ -1453,11 +1474,16 @@ export function CatalogView({
                       audioType: null,
                     },
                     'landscape',
-                    { label: progressLabel, pct: progressPct },
+                    {
+                      label: progressLabel,
+                      pct: progressPct,
+                      dateLabel: watchedDateLabel,
+                      dateTitle: watchedDateTitle,
+                    },
                     {
                       menuKey: `hist-${entry.url}`,
                       entry,
-                      animeEpisodeCount: countAnimeEpisodesInHistory(history, entry),
+                      animeEpisodeCount: countAnimeTrackedEpisodes(history, progressMap, entry).totalCount,
                       animeName: getHistoryEntrySeriesName(entry),
                     },
                     false,
@@ -1522,6 +1548,8 @@ export function CatalogView({
                       const pos = entry.positionSec ?? 0;
                       const dur = entry.durationSec ?? 0;
                       const pct = dur > 0 ? Math.min(99, (pos / dur) * 100) : 15;
+                      const watchedDateLabel = formatHistoryWatchedDate(entry.watchedAt) || undefined;
+                      const watchedDateTitle = formatHistoryWatchedDateTime(entry.watchedAt) || undefined;
                       return renderCard(
                         {
                           id: `cw-${entry.url}`,
@@ -1532,11 +1560,16 @@ export function CatalogView({
                           audioType: null,
                         },
                         'landscape',
-                        { label: `Parou em ${formatPlaybackTimestamp(pos)}`, pct },
+                        {
+                          label: `Parou em ${formatPlaybackTimestamp(pos)}`,
+                          pct,
+                          dateLabel: watchedDateLabel,
+                          dateTitle: watchedDateTitle,
+                        },
                         {
                           menuKey: `cw-${entry.url}`,
                           entry,
-                          animeEpisodeCount: countAnimeEpisodesInHistory(history, entry),
+                          animeEpisodeCount: countAnimeTrackedEpisodes(history, progressMap, entry).totalCount,
                           animeName: getHistoryEntrySeriesName(entry),
                         },
                         false,
@@ -1644,6 +1677,7 @@ export function CatalogView({
                       onFocus={() => onPrefetchArchiveCategory?.('animes')}
                       onTouchStart={() => onPrefetchArchiveCategory?.('animes')}
                       onClick={() => {
+                        setCatalogMode('providers');
                         onSelectArchiveCategory('animes');
                         onSelectSection('catalog');
                       }}
@@ -1673,6 +1707,7 @@ export function CatalogView({
                       onFocus={() => onPrefetchArchiveCategory?.('movies')}
                       onTouchStart={() => onPrefetchArchiveCategory?.('movies')}
                       onClick={() => {
+                        setCatalogMode('providers');
                         onSelectArchiveCategory('movies');
                         onSelectSection('catalog');
                       }}
@@ -1702,6 +1737,7 @@ export function CatalogView({
                       onFocus={() => onPrefetchArchiveCategory?.('series')}
                       onTouchStart={() => onPrefetchArchiveCategory?.('series')}
                       onClick={() => {
+                        setCatalogMode('providers');
                         onSelectArchiveCategory('series');
                         onSelectSection('catalog');
                       }}
@@ -1719,31 +1755,88 @@ export function CatalogView({
             </div>
           )}
 
-          {/* Catalog View: Clean Server Archive (like main branch, uncluttered) */}
+          {/* Catalog View: AniList Discovery (availability-filtered) + Provider Archives */}
           {activeSection === 'catalog' && (
-            <section className="space-y-7">
-              <div className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <h1 className="text-xl font-bold text-white">Catálogo</h1>
-                    <p className="mt-0.5 text-xs tabular-nums text-slate-400">
-                      {hasActiveFilter
-                        ? `${
-                            selectedGlossary
-                              ? `Índice A–Z: ${selectedGlossary}`
-                              : selectedGenre
-                                ? `Gênero: ${activeGenreLabel || selectedGenre}`
-                                : `Ano: ${selectedYear}`
-                          } · ${displayedArchive.items.length} título(s)${
-                            displayedArchive.totalPages > 1
-                              ? ` · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
-                              : ''
-                          }`
-                        : displayedArchive.totalPages > 1
-                          ? `Disponíveis nos provedores · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
-                          : 'Animes disponíveis nos provedores integrados'}
-                    </p>
-                  </div>
+            <section className="space-y-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h1 className="text-2xl font-bold tracking-tight text-white">Catálogo</h1>
+                  <p className="mt-0.5 text-xs text-slate-400">
+                    {catalogMode === 'discover'
+                      ? 'Explore rankings, gêneros e temas do AniList filtrados pela disponibilidade real'
+                      : 'Navegue diretamente pelas categorias e índice A–Z dos servidores integrados'}
+                  </p>
+                </div>
+
+                <div
+                  role="tablist"
+                  aria-label="Modo do catálogo"
+                  className="inline-flex rounded-xl border border-white/10 bg-[#151921] p-1"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={catalogMode === 'discover'}
+                    onClick={() => setCatalogMode('discover')}
+                    className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors ${
+                      catalogMode === 'discover'
+                        ? 'bg-[#f97316] text-[#0d0f12]'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    <Compass className="h-3.5 w-3.5" />
+                    <span>Descobrir (AniList)</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={catalogMode === 'providers'}
+                    onClick={() => setCatalogMode('providers')}
+                    className={`inline-flex items-center gap-1.5 rounded-lg px-3.5 py-1.5 text-xs font-semibold transition-colors ${
+                      catalogMode === 'providers'
+                        ? 'bg-[#f97316] text-[#0d0f12]'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    <Server className="h-3.5 w-3.5" />
+                    <span>Nos Provedores</span>
+                  </button>
+                </div>
+              </div>
+
+              {catalogMode === 'discover' ? (
+                <AniListDiscoverPanel
+                  active={activeSection === 'catalog' && catalogMode === 'discover'}
+                  isHidden={isHidden}
+                  favorites={favorites}
+                  onOpenItem={onOpenItem}
+                  onPrefetchItem={onPrefetchItem}
+                  onToggleFavorite={onToggleFavorite}
+                />
+              ) : (
+                <div className="space-y-7">
+                  <div className="rounded-xl border border-white/10 bg-[#151921] p-4 sm:p-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <h2 className="text-lg font-bold text-white">Acervo dos Provedores</h2>
+                        <p className="mt-0.5 text-xs tabular-nums text-slate-400">
+                          {hasActiveFilter
+                            ? `${
+                                selectedGlossary
+                                  ? `Índice A–Z: ${selectedGlossary}`
+                                  : selectedGenre
+                                    ? `Gênero: ${activeGenreLabel || selectedGenre}`
+                                    : `Ano: ${selectedYear}`
+                              } · ${displayedArchive.items.length} título(s)${
+                                displayedArchive.totalPages > 1
+                                  ? ` · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
+                                  : ''
+                              }`
+                            : displayedArchive.totalPages > 1
+                              ? `Disponíveis nos provedores · Página ${displayedArchive.currentPage} de ${displayedArchive.totalPages}`
+                              : 'Animes disponíveis nos provedores integrados'}
+                        </p>
+                      </div>
 
                   {/* Category Tabs */}
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -2044,6 +2137,8 @@ export function CatalogView({
                       </button>
                     </div>
                   )}
+                </div>
+              )}
                 </div>
               )}
             </section>

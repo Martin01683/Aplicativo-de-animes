@@ -3,14 +3,20 @@ import {
   buildWatchedProgressMap,
   canonicalEpisodeProgressKey,
   computeProgressSnapshot,
+  findEpisodeProgressInMap,
   formatHistoryEpisodeTitle,
   getResumePositionSec,
+  isSameUnifiedEpisode,
+  removeAnimeProgressFromMap,
   removeHistoryAnimeFromList,
   removeHistoryEpisodeFromList,
   sanitizeEpisodeProgressMap,
+  syncWatchedEpisodesInHistory,
   upsertEpisodeProgressMap,
+  type EpisodeIdentityInput,
   type EpisodePlaybackProgress,
   type EpisodeProgressMap,
+  type WatchedEpisodeHistoryItem,
 } from './playbackProgress';
 import {
   DEFAULT_APP_SETTINGS,
@@ -80,8 +86,7 @@ export function loadHistory(): WatchHistoryEntry[] {
     return parsed
       .filter((item): item is WatchHistoryEntry => Boolean(item && typeof item.url === 'string' && item.url.trim()))
       .map((item) => {
-        const key = canonicalEpisodeProgressKey(item.url);
-        const savedProgress = key ? progressMap[key] : undefined;
+        const savedProgress = findEpisodeProgressInMap(progressMap, item.url, item);
         const completed = Boolean(savedProgress ? savedProgress.completed : item.completed);
         const positionSec = completed
           ? 0
@@ -104,16 +109,22 @@ export function loadHistory(): WatchHistoryEntry[] {
 }
 
 export function pushHistoryEntry(entry: WatchHistoryEntry): WatchHistoryEntry[] {
-  const entryKey = canonicalEpisodeProgressKey(entry.url);
   const previousAll = loadHistory();
-  const prevMatch = previousAll.find(
-    (item) => canonicalEpisodeProgressKey(item.url) === entryKey || item.url === entry.url
-  );
+  const prevMatch = previousAll.find((item) => isSameUnifiedEpisode(item, entry));
   const progressMap = loadEpisodeProgressMap();
-  const savedProgress = entryKey ? progressMap[entryKey] : undefined;
+  const savedProgress = findEpisodeProgressInMap(progressMap, entry.url, {
+    seriesTitle: entry.seriesTitle || prevMatch?.seriesTitle,
+    seriesUrl: entry.seriesUrl || prevMatch?.seriesUrl,
+    title: entry.title || prevMatch?.title,
+    seasonNumber: entry.seasonNumber ?? prevMatch?.seasonNumber,
+    episodeNumber: entry.episodeNumber ?? prevMatch?.episodeNumber,
+    kind: entry.kind || prevMatch?.kind,
+  });
 
   const seriesTitle = (entry.seriesTitle || prevMatch?.seriesTitle || '').trim() || undefined;
   const seriesUrl = (entry.seriesUrl || prevMatch?.seriesUrl || '').trim() || undefined;
+  const seasonNumber = entry.seasonNumber ?? prevMatch?.seasonNumber;
+  const episodeNumber = entry.episodeNumber ?? prevMatch?.episodeNumber;
   const poster = (entry.poster || prevMatch?.poster || '').trim();
   const completed = Boolean(
     entry.completed ?? savedProgress?.completed ?? prevMatch?.completed
@@ -133,14 +144,14 @@ export function pushHistoryEntry(entry: WatchHistoryEntry): WatchHistoryEntry[] 
     poster,
     seriesTitle,
     seriesUrl,
+    ...(typeof seasonNumber === 'number' ? { seasonNumber } : {}),
+    ...(typeof episodeNumber === 'number' ? { episodeNumber } : {}),
     positionSec,
     durationSec,
     completed,
   };
 
-  const existing = previousAll.filter(
-    (item) => canonicalEpisodeProgressKey(item.url) !== entryKey && item.url !== entry.url
-  );
+  const existing = previousAll.filter((item) => !isSameUnifiedEpisode(item, mergedEntry));
   const next = [mergedEntry, ...existing].slice(0, 30);
   try {
     localStorage.setItem(HISTORY_KEY, JSON.stringify(next));
@@ -172,16 +183,23 @@ function persistHistoryList(items: WatchHistoryEntry[]): void {
   }
 }
 
-function clearEpisodesProgressUrls(urls: string[]): EpisodeProgressMap {
+function clearEpisodesProgressTargets(targets: EpisodeIdentityInput[]): EpisodeProgressMap {
   const currentMap = loadEpisodeProgressMap();
-  if (urls.length === 0) return currentMap;
+  if (targets.length === 0) return currentMap;
   let changed = false;
   const next = { ...currentMap };
-  for (const url of urls) {
-    const key = canonicalEpisodeProgressKey(url);
+  for (const target of targets) {
+    const key = canonicalEpisodeProgressKey(target.url);
     if (key && next[key]) {
       delete next[key];
       changed = true;
+    }
+    for (const [entryKey, entry] of Object.entries(next)) {
+      if (!entry) continue;
+      if (isSameUnifiedEpisode(entry, target)) {
+        delete next[entryKey];
+        changed = true;
+      }
     }
   }
   if (changed) {
@@ -190,16 +208,35 @@ function clearEpisodesProgressUrls(urls: string[]): EpisodeProgressMap {
   return changed ? next : currentMap;
 }
 
-export function removeHistoryEpisode(url: string): {
+export function removeHistoryEpisode(
+  url: string,
+  meta?: Omit<EpisodeIdentityInput, 'url'>
+): {
   history: WatchHistoryEntry[];
   progressMap: EpisodeProgressMap;
   removedCount: number;
 } {
-  const { nextHistory, removedUrls } = removeHistoryEpisodeFromList(loadHistory(), url);
-  persistHistoryList(nextHistory);
-  const progressMap = clearEpisodesProgressUrls(
-    removedUrls.length > 0 ? removedUrls : [url]
+  const currentHistory = loadHistory();
+  const matchedEntry = currentHistory.find((item) =>
+    isSameUnifiedEpisode(item, { url, ...meta })
   );
+  const effectiveMeta: Omit<EpisodeIdentityInput, 'url'> = {
+    seriesTitle: meta?.seriesTitle || matchedEntry?.seriesTitle,
+    seriesUrl: meta?.seriesUrl || matchedEntry?.seriesUrl,
+    title: meta?.title || matchedEntry?.title,
+    seasonNumber: meta?.seasonNumber ?? matchedEntry?.seasonNumber,
+    episodeNumber: meta?.episodeNumber ?? matchedEntry?.episodeNumber,
+    kind: meta?.kind || matchedEntry?.kind,
+  };
+  const { nextHistory, removedUrls, removedEntries } = removeHistoryEpisodeFromList(
+    currentHistory,
+    url,
+    effectiveMeta
+  );
+  persistHistoryList(nextHistory);
+  const progressTargets: EpisodeIdentityInput[] =
+    removedEntries.length > 0 ? removedEntries : [{ url, ...effectiveMeta }];
+  const progressMap = clearEpisodesProgressTargets(progressTargets);
   return {
     history: nextHistory,
     progressMap,
@@ -211,16 +248,45 @@ export function removeHistoryAnime(entry: WatchHistoryEntry): {
   history: WatchHistoryEntry[];
   progressMap: EpisodeProgressMap;
   removedCount: number;
+  removedProgressCount: number;
+  totalClearedCount: number;
 } {
-  const { nextHistory, removedUrls } = removeHistoryAnimeFromList(loadHistory(), entry);
-  persistHistoryList(nextHistory);
-  const progressMap = clearEpisodesProgressUrls(
-    removedUrls.length > 0 ? removedUrls : [entry.url]
+  const { nextHistory, removedUrls, removedEntries } = removeHistoryAnimeFromList(
+    loadHistory(),
+    entry
   );
+  persistHistoryList(nextHistory);
+
+  const currentProgressMap = loadEpisodeProgressMap();
+  const { nextProgressMap, removedKeys } = removeAnimeProgressFromMap(
+    currentProgressMap,
+    entry,
+    removedEntries
+  );
+  if (removedKeys.length > 0) {
+    saveEpisodeProgressMap(nextProgressMap);
+  }
+
+  const uniqueCleared: EpisodeIdentityInput[] = [];
+  const addCleared = (item: EpisodeIdentityInput) => {
+    if (!uniqueCleared.some((existing) => isSameUnifiedEpisode(existing, item))) {
+      uniqueCleared.push(item);
+    }
+  };
+  for (const removedEntry of removedEntries) {
+    addCleared(removedEntry);
+  }
+  for (const key of removedKeys) {
+    const prevProgress = currentProgressMap[key];
+    if (prevProgress) addCleared(prevProgress);
+  }
+
   return {
     history: nextHistory,
-    progressMap,
+    progressMap: nextProgressMap,
     removedCount: removedUrls.length,
+    removedProgressCount: removedKeys.length,
+    totalClearedCount: Math.max(removedUrls.length, uniqueCleared.length),
   };
 }
 
@@ -242,21 +308,29 @@ export function saveEpisodeProgressMap(map: EpisodeProgressMap): void {
   }
 }
 
-export function getEpisodeProgress(url: string): EpisodePlaybackProgress | null {
+export function getEpisodeProgress(
+  url: string,
+  meta?: Omit<EpisodeIdentityInput, 'url'>
+): EpisodePlaybackProgress | null {
   const key = canonicalEpisodeProgressKey(url);
   if (!key) return null;
   const map = loadEpisodeProgressMap();
-  return map[key] || null;
+  return findEpisodeProgressInMap(map, url, meta) || null;
 }
 
-export function getEpisodeResumeSeconds(url: string): number {
-  return getResumePositionSec(getEpisodeProgress(url));
+export function getEpisodeResumeSeconds(
+  url: string,
+  meta?: Omit<EpisodeIdentityInput, 'url'>
+): number {
+  return getResumePositionSec(getEpisodeProgress(url, meta));
 }
 
 export interface EpisodeHistoryMeta {
   title?: string;
   seriesTitle?: string;
   seriesUrl?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
   poster?: string;
   kind?: 'episode' | 'movie';
   watchedAt?: string;
@@ -271,7 +345,14 @@ export function saveEpisodeProgress(params: {
   forceReset?: boolean;
   meta?: EpisodeHistoryMeta;
 }): { map: EpisodeProgressMap; history: WatchHistoryEntry[] | null } {
-  const snapshot = computeProgressSnapshot(params);
+  const snapshot = computeProgressSnapshot({
+    ...params,
+    seriesUrl: params.meta?.seriesUrl,
+    seriesTitle: params.meta?.seriesTitle,
+    seasonNumber: params.meta?.seasonNumber,
+    episodeNumber: params.meta?.episodeNumber,
+    title: params.meta?.title,
+  });
   const currentMap = loadEpisodeProgressMap();
   if (!snapshot) {
     return { map: currentMap, history: null };
@@ -283,22 +364,37 @@ export function saveEpisodeProgress(params: {
   const key = canonicalEpisodeProgressKey(params.url);
   const currentHistory = loadHistory();
   let updatedHistory: WatchHistoryEntry[] | null = null;
+  const targetIdentity: EpisodeIdentityInput = {
+    url: params.url,
+    seriesTitle: params.meta?.seriesTitle ?? snapshot.seriesTitle,
+    seriesUrl: params.meta?.seriesUrl ?? snapshot.seriesUrl,
+    title: params.meta?.title,
+    seasonNumber: params.meta?.seasonNumber ?? snapshot.seasonNumber,
+    episodeNumber: params.meta?.episodeNumber ?? snapshot.episodeNumber,
+    kind: params.meta?.kind,
+  };
   const existingIdx = key
-    ? currentHistory.findIndex((item) => canonicalEpisodeProgressKey(item.url) === key)
+    ? currentHistory.findIndex((item) => isSameUnifiedEpisode(item, targetIdentity))
     : -1;
 
   if (existingIdx >= 0) {
     const item = currentHistory[existingIdx];
     const seriesTitle = (params.meta?.seriesTitle || item.seriesTitle || '').trim() || undefined;
     const seriesUrl = (params.meta?.seriesUrl || item.seriesUrl || '').trim() || undefined;
+    const seasonNumber = params.meta?.seasonNumber ?? snapshot.seasonNumber ?? item.seasonNumber;
+    const episodeNumber =
+      params.meta?.episodeNumber ?? snapshot.episodeNumber ?? item.episodeNumber;
     const poster = (params.meta?.poster || item.poster || '').trim();
     const rawTitle = (params.meta?.title || item.title || 'Episódio').trim();
     const updatedItem: WatchHistoryEntry = {
       ...item,
+      url: params.url,
       title: formatHistoryEpisodeTitle(rawTitle, seriesTitle),
       poster,
       seriesTitle,
       seriesUrl,
+      ...(typeof seasonNumber === 'number' ? { seasonNumber } : {}),
+      ...(typeof episodeNumber === 'number' ? { episodeNumber } : {}),
       kind: params.meta?.kind || item.kind,
       watchedAt: params.meta?.watchedAt || item.watchedAt,
       positionSec: snapshot.positionSec,
@@ -306,13 +402,15 @@ export function saveEpisodeProgress(params: {
       completed: snapshot.completed,
     };
 
+    const rest = currentHistory.filter(
+      (entry, idx) => idx !== existingIdx && !isSameUnifiedEpisode(entry, updatedItem)
+    );
     if (params.meta?.promoteInHistory) {
-      const rest = currentHistory.filter((_, idx) => idx !== existingIdx);
       updatedHistory = [updatedItem, ...rest].slice(0, 30);
     } else {
-      updatedHistory = currentHistory.map((entry, idx) =>
-        idx === existingIdx ? updatedItem : entry
-      );
+      updatedHistory = currentHistory
+        .map((entry, idx) => (idx === existingIdx ? updatedItem : entry))
+        .filter((entry, idx) => idx === existingIdx || !isSameUnifiedEpisode(entry, updatedItem));
     }
     try {
       localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
@@ -322,6 +420,8 @@ export function saveEpisodeProgress(params: {
   } else if (key && params.meta?.title) {
     const seriesTitle = (params.meta.seriesTitle || '').trim() || undefined;
     const seriesUrl = (params.meta.seriesUrl || '').trim() || undefined;
+    const seasonNumber = params.meta.seasonNumber ?? snapshot.seasonNumber;
+    const episodeNumber = params.meta.episodeNumber ?? snapshot.episodeNumber;
     const newItem: WatchHistoryEntry = {
       title: formatHistoryEpisodeTitle(params.meta.title, seriesTitle),
       url: params.url,
@@ -330,6 +430,8 @@ export function saveEpisodeProgress(params: {
       watchedAt: params.meta.watchedAt || new Date().toISOString(),
       seriesUrl,
       seriesTitle,
+      ...(typeof seasonNumber === 'number' ? { seasonNumber } : {}),
+      ...(typeof episodeNumber === 'number' ? { episodeNumber } : {}),
       positionSec: snapshot.positionSec,
       durationSec: snapshot.durationSec,
       completed: snapshot.completed,
@@ -345,47 +447,56 @@ export function saveEpisodeProgress(params: {
   return { map: nextMap, history: updatedHistory };
 }
 
-export function clearEpisodeProgress(url: string): EpisodeProgressMap {
-  const key = canonicalEpisodeProgressKey(url);
-  const currentMap = loadEpisodeProgressMap();
-  if (!key || !currentMap[key]) return currentMap;
-  const next = { ...currentMap };
-  delete next[key];
-  saveEpisodeProgressMap(next);
-  return next;
+export function clearEpisodeProgress(
+  url: string,
+  meta?: Omit<EpisodeIdentityInput, 'url'>
+): EpisodeProgressMap {
+  return clearEpisodesProgressTargets([{ url, ...meta }]);
 }
 
 export function setEpisodesWatched(
   urls: string[],
-  watched: boolean
-): { map: EpisodeProgressMap; history: WatchHistoryEntry[] | null } {
+  watched: boolean,
+  meta?: {
+    seriesUrl?: string;
+    seriesTitle?: string;
+    episodes?: WatchedEpisodeHistoryItem[];
+  }
+): { map: EpisodeProgressMap; history: WatchHistoryEntry[] } {
+  const nowIso = new Date().toISOString();
   const currentMap = loadEpisodeProgressMap();
-  const nextMap = buildWatchedProgressMap(currentMap, urls, watched);
+  const nextMap = buildWatchedProgressMap(
+    currentMap,
+    urls,
+    watched,
+    nowIso,
+    1500,
+    meta
+  );
   saveEpisodeProgressMap(nextMap);
 
-  const keySet = new Set(urls.map((u) => canonicalEpisodeProgressKey(u)).filter(Boolean));
-  const currentHistory = loadHistory();
-  let updatedHistory: WatchHistoryEntry[] | null = null;
+  const historyItems: WatchedEpisodeHistoryItem[] =
+    meta?.episodes && meta.episodes.length > 0
+      ? meta.episodes.map((ep) => ({
+          ...ep,
+          seriesUrl: ep.seriesUrl || meta.seriesUrl,
+          seriesTitle: ep.seriesTitle || meta.seriesTitle,
+        }))
+      : urls.map((url) => ({
+          url,
+          seriesUrl: meta?.seriesUrl,
+          seriesTitle: meta?.seriesTitle,
+        }));
 
-  if (
-    keySet.size > 0 &&
-    currentHistory.some((item) => keySet.has(canonicalEpisodeProgressKey(item.url)))
-  ) {
-    updatedHistory = currentHistory.map((item) =>
-      keySet.has(canonicalEpisodeProgressKey(item.url))
-        ? {
-            ...item,
-            positionSec: 0,
-            completed: watched,
-          }
-        : item
-    );
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(updatedHistory));
-    } catch {
-      // ignore
-    }
-  }
+  const currentHistory = loadHistory();
+  const updatedHistory = syncWatchedEpisodesInHistory(
+    currentHistory,
+    historyItems,
+    watched,
+    nowIso,
+    30
+  );
+  persistHistoryList(updatedHistory);
 
   return { map: nextMap, history: updatedHistory };
 }

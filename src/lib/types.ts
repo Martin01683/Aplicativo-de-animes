@@ -1,8 +1,66 @@
 export type AudioType = 'DUB' | 'LEG' | null;
 export type MediaKind = 'episode' | 'anime' | 'series' | 'movie';
-export type CatalogSourceId = 'thetvdb' | 'livechart' | 'server';
+export type CatalogSourceId = 'thetvdb' | 'livechart' | 'anilist' | 'server';
 export type LiveChartScheduleMode = 'streams' | 'dub' | 'jp';
 export type CalendarLayout = 'grid' | 'timeline';
+
+export type AniListSortOption =
+  | 'TRENDING_DESC'
+  | 'POPULARITY_DESC'
+  | 'SCORE_DESC'
+  | 'FAVOURITES_DESC'
+  | 'START_DATE_DESC';
+
+export type AniListSeason = 'WINTER' | 'SPRING' | 'SUMMER' | 'FALL';
+export type AniListFormat = 'TV' | 'MOVIE' | 'OVA' | 'ONA' | 'SPECIAL';
+export type AniListStatus = 'RELEASING' | 'FINISHED' | 'NOT_YET_RELEASED';
+export type AniListCountry = 'JP' | 'CN' | 'KR';
+export type DiscoverAudioFilter = 'ALL' | 'DUB' | 'LEG';
+
+export interface ProviderAvailabilityInfo {
+  available: boolean;
+  hasLeg: boolean;
+  hasDub: boolean;
+  legUrl?: string;
+  dubUrl?: string;
+  providerNames: string[];
+  matchedTitle?: string;
+  unreleased?: boolean;
+}
+
+export interface AniListDiscoverFilters {
+  sort?: AniListSortOption;
+  genre?: string;
+  genres?: string[];
+  excludeGenres?: string[];
+  tag?: string;
+  tags?: string[];
+  excludeTags?: string[];
+  minimumTagRank?: number;
+  season?: AniListSeason | '';
+  year?: string;
+  format?: AniListFormat | '';
+  status?: AniListStatus | '';
+  country?: AniListCountry | '';
+  audio?: DiscoverAudioFilter;
+  onlyAvailable?: boolean;
+  search?: string;
+  page?: number;
+}
+
+export interface AniListTagItem {
+  name: string;
+  label: string;
+  category: string;
+  description?: string;
+}
+
+export interface DiscoverTaxonomyResponse {
+  genres: Array<{ value: string; label: string }>;
+  tags: AniListTagItem[];
+  sourceMode: 'live' | 'fallback';
+  fetchedAt: string;
+}
 
 export type CatalogArchiveCategory =
   | 'animes'
@@ -71,6 +129,23 @@ export interface CatalogMediaItem {
   genres?: string[];
   airingAt?: number;
   scheduleMeta?: ScheduleReleaseInfo;
+  englishTitle?: string;
+  alternativeTitles?: string[];
+  anilistStatus?: AniListStatus;
+  episodesCount?: number;
+  providerAvailability?: ProviderAvailabilityInfo;
+}
+
+export interface DiscoverCatalogResponse {
+  items: CatalogMediaItem[];
+  currentPage: number;
+  nextAniListPage: number | null;
+  hasNextPage: boolean;
+  totalAniListItems?: number;
+  indexedTitlesCount: number;
+  indexSourceMode: 'live' | 'cache' | 'passive';
+  onlyAvailable: boolean;
+  fetchedAt: string;
 }
 
 export interface CalendarDaySection {
@@ -213,7 +288,18 @@ export interface ExternalDatabaseLinkItem {
   url: string;
 }
 
-export type MediaRatingSource = 'myanimelist' | 'provider' | 'thetvdb';
+export type MediaRatingSource = 'myanimelist' | 'anilist' | 'provider' | 'thetvdb';
+
+export type MediaGenresSource = 'anilist' | 'thetvdb' | 'myanimelist' | 'provider';
+
+export interface AnimeMediaTag {
+  name: string;
+  label: string;
+  description?: string;
+  category?: string;
+  rank?: number;
+  isSpoiler: boolean;
+}
 
 export interface AnimeDetails {
   title: string;
@@ -225,7 +311,7 @@ export interface AnimeDetails {
   catalogSource?: CatalogSourceId;
   sourceServerName?: string;
   externalIds?: ExternalMediaIds;
-  enrichmentSources?: CatalogSourceId[];
+  enrichmentSources?: Array<CatalogSourceId | 'myanimelist'>;
   externalLinks?: ExternalDatabaseLinkItem[];
   poster: string;
   fallbackPoster?: string;
@@ -255,6 +341,8 @@ export interface AnimeDetails {
   myAnimeListUrl?: string;
   allSeasonsUrl?: string;
   genres: string[];
+  genresSource?: MediaGenresSource;
+  mediaTags?: AnimeMediaTag[];
   audioType: AudioType;
   episodes: AnimeEpisodeLink[];
   audioTracks?: Partial<Record<'DUB' | 'LEG', AnimeAudioTrackData>>;
@@ -346,6 +434,7 @@ export interface EpisodeDetails {
   backdrop: string;
   synopsis: string;
   genres: string[];
+  mediaTags?: AnimeMediaTag[];
   prevUrl?: string;
   nextUrl?: string;
   options: PlayerOption[];
@@ -394,6 +483,8 @@ export interface WatchHistoryEntry {
   title: string;
   seriesTitle?: string;
   seriesUrl?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
   poster: string;
   kind: MediaKind;
   watchedAt: string;

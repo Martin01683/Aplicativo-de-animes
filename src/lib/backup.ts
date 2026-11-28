@@ -135,6 +135,16 @@ function sanitizeHistoryList(raw: unknown): WatchHistoryEntry[] {
       ...(typeof obj.seriesTitle === 'string' && obj.seriesTitle.trim()
         ? { seriesTitle: obj.seriesTitle.trim() }
         : {}),
+      ...(typeof obj.seasonNumber === 'number' &&
+      Number.isFinite(obj.seasonNumber) &&
+      obj.seasonNumber >= 0
+        ? { seasonNumber: Math.floor(obj.seasonNumber) }
+        : {}),
+      ...(typeof obj.episodeNumber === 'number' &&
+      Number.isFinite(obj.episodeNumber) &&
+      obj.episodeNumber > 0
+        ? { episodeNumber: obj.episodeNumber }
+        : {}),
       ...(typeof obj.positionSec === 'number' && Number.isFinite(obj.positionSec) && obj.positionSec >= 0
         ? { positionSec: Math.round(obj.positionSec) }
         : {}),

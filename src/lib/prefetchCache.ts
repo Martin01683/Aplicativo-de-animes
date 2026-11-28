@@ -9,6 +9,7 @@ import {
 import { normalizeTopAnimesUrl } from './favoriteAlerts.ts';
 import type { EpisodeSourceConfig } from './sources/types.ts';
 import type {
+  AniListDiscoverFilters,
   AnimeDetails,
   AnimeEpisodeLink,
   AnimeSynopsisResult,
@@ -18,6 +19,8 @@ import type {
   CatalogFilters,
   CatalogMediaItem,
   CatalogSourceId,
+  DiscoverCatalogResponse,
+  DiscoverTaxonomyResponse,
   EpisodeDetails,
   EpisodeSynopsisResult,
   ExternalMediaIds,
@@ -201,6 +204,8 @@ const episodeSynopsisCache = new ClientCoalescedCache<EpisodeSynopsisResult | nu
 const calendarCache = new ClientCoalescedCache<WeeklyCalendarResponse>(CALENDAR_TTL_MS, 12);
 const archivePageCache = new ClientCoalescedCache<PaginatedCatalogResponse>(ARCHIVE_TTL_MS, 40);
 const filteredCatalogCache = new ClientCoalescedCache<PaginatedCatalogResponse>(ARCHIVE_TTL_MS, 40);
+const discoverCatalogCache = new ClientCoalescedCache<DiscoverCatalogResponse>(ARCHIVE_TTL_MS, 50);
+const discoverTaxonomyCache = new ClientCoalescedCache<DiscoverTaxonomyResponse>(24 * 60 * 60 * 1000, 4);
 const glossaryCache = new ClientCoalescedCache<GlossaryResponse>(GLOSSARY_TTL_MS, 40);
 const releasesPageCache = new ClientCoalescedCache<PaginatedCatalogResponse>(RELEASES_TTL_MS, 15);
 const searchPageCache = new ClientCoalescedCache<PaginatedSearchResponse>(SEARCH_TTL_MS, 30);
@@ -579,6 +584,55 @@ export interface AnimeDetailsLookupHints {
   year?: string;
 }
 
+const animeDetailsMetadataCache = new ClientCoalescedCache<AnimeDetails>(5 * 60 * 1000, 60);
+
+function buildAnimeDetailsParams(
+  url: string,
+  hints?: AnimeDetailsLookupHints,
+  extraParams?: Record<string, string>
+): URLSearchParams {
+  const params = new URLSearchParams({ url, fast: '1', ...(extraParams || {}) });
+  const hintTitle = hints?.title?.trim();
+  if (hintTitle) params.set('title', hintTitle);
+  if (
+    typeof hints?.tvdbId === 'number' &&
+    Number.isFinite(hints.tvdbId) &&
+    hints.tvdbId > 0
+  ) {
+    params.set('tvdbId', String(Math.trunc(hints.tvdbId)));
+  }
+  const hintTvdbSlug = hints?.tvdbSlug?.trim();
+  if (hintTvdbSlug) params.set('tvdbSlug', hintTvdbSlug);
+  if (hints?.kind === 'anime' || hints?.kind === 'movie' || hints?.kind === 'series') {
+    params.set('kind', hints.kind);
+  }
+  const hintYear = hints?.year?.trim();
+  if (hintYear) params.set('year', hintYear);
+  return params;
+}
+
+export async function fetchAnimeDetailsMetadata(
+  url: string,
+  options: { hints?: AnimeDetailsLookupHints } = {}
+): Promise<AnimeDetails | null> {
+  const key = normalizeMediaCacheKey(url);
+  const fullHit = animeDetailsFullCache.get(key);
+  if (fullHit) return fullHit;
+
+  try {
+    return await animeDetailsMetadataCache.getOrLoad(key, async () => {
+      const params = buildAnimeDetailsParams(url, options.hints, { stage: 'metadata' });
+      const res = await apiFetch(`/api/media?${params.toString()}`);
+      if (!res.ok) {
+        throw new Error('Metadata not found');
+      }
+      return (await res.json()) as AnimeDetails;
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function fetchAnimeDetailsFull(
   url: string,
   options: { forceRefresh?: boolean; hints?: AnimeDetailsLookupHints } = {}
@@ -587,28 +641,7 @@ export async function fetchAnimeDetailsFull(
   return animeDetailsFullCache.getOrLoad(
     key,
     async () => {
-      const params = new URLSearchParams({ url, fast: '1' });
-      const hintTitle = options.hints?.title?.trim();
-      if (hintTitle) params.set('title', hintTitle);
-      if (
-        typeof options.hints?.tvdbId === 'number' &&
-        Number.isFinite(options.hints.tvdbId) &&
-        options.hints.tvdbId > 0
-      ) {
-        params.set('tvdbId', String(Math.trunc(options.hints.tvdbId)));
-      }
-      const hintTvdbSlug = options.hints?.tvdbSlug?.trim();
-      if (hintTvdbSlug) params.set('tvdbSlug', hintTvdbSlug);
-      if (
-        options.hints?.kind === 'anime' ||
-        options.hints?.kind === 'movie' ||
-        options.hints?.kind === 'series'
-      ) {
-        params.set('kind', options.hints.kind);
-      }
-      const hintYear = options.hints?.year?.trim();
-      if (hintYear) params.set('year', hintYear);
-
+      const params = buildAnimeDetailsParams(url, options.hints);
       const res = await apiFetch(`/api/media?${params.toString()}`);
       const data = (await res.json()) as AnimeDetails & { error?: string };
       if (!res.ok) throw new Error(data.error || 'Erro ao carregar detalhes do título');
@@ -908,6 +941,87 @@ export async function fetchFilteredCatalogCached(params: {
   );
 }
 
+export async function fetchDiscoverCatalogCached(
+  filters: AniListDiscoverFilters,
+  options: { forceRefresh?: boolean } = {}
+): Promise<DiscoverCatalogResponse> {
+  const qs = new URLSearchParams();
+  if (filters.sort) qs.set('sort', filters.sort);
+  const genres = Array.from(
+    new Set([
+      ...(filters.genres || []),
+      ...(filters.genre ? [filters.genre] : []),
+    ].filter(Boolean))
+  );
+  if (genres.length > 0) qs.set('genres', genres.join(','));
+  const excludeGenres = Array.from(
+    new Set((filters.excludeGenres || []).filter((g) => Boolean(g) && !genres.includes(g)))
+  );
+  if (excludeGenres.length > 0) qs.set('excludeGenres', excludeGenres.join(','));
+  const tags = Array.from(
+    new Set([
+      ...(filters.tags || []),
+      ...(filters.tag ? [filters.tag] : []),
+    ].filter(Boolean))
+  );
+  if (tags.length > 0) qs.set('tags', tags.join(','));
+  const includedTagLower = new Set(tags.map((t) => t.toLowerCase()));
+  const excludeTags = Array.from(
+    new Set(
+      (filters.excludeTags || []).filter(
+        (t) => Boolean(t) && !includedTagLower.has(t.toLowerCase())
+      )
+    )
+  );
+  if (excludeTags.length > 0) qs.set('excludeTags', excludeTags.join(','));
+  if (
+    typeof filters.minimumTagRank === 'number' &&
+    Number.isFinite(filters.minimumTagRank)
+  ) {
+    qs.set('minTagRank', String(Math.min(100, Math.max(0, Math.round(filters.minimumTagRank)))));
+  }
+  if (filters.season) qs.set('season', filters.season);
+  if (filters.year) qs.set('year', filters.year);
+  if (filters.format) qs.set('format', filters.format);
+  if (filters.status) qs.set('status', filters.status);
+  if (filters.country) qs.set('country', filters.country);
+  if (filters.audio && filters.audio !== 'ALL') qs.set('audio', filters.audio);
+  qs.set('onlyAvailable', filters.onlyAvailable === false ? '0' : '1');
+  if (filters.search?.trim()) qs.set('search', filters.search.trim());
+  qs.set('page', String(Math.max(1, filters.page || 1)));
+  if (options.forceRefresh) qs.set('refresh', '1');
+
+  const key = qs.toString();
+  return discoverCatalogCache.getOrLoad(
+    key,
+    async () => {
+      const res = await apiFetch(`/api/discover?${qs.toString()}`);
+      const data = (await res.json()) as DiscoverCatalogResponse & { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Erro ao carregar descoberta no AniList');
+      return data;
+    },
+    {
+      forceRefresh: options.forceRefresh,
+      shouldCache: (val) => val.items.length > 0 || val.indexedTitlesCount > 0,
+    }
+  );
+}
+
+export async function fetchDiscoverTaxonomyCached(): Promise<DiscoverTaxonomyResponse> {
+  return discoverTaxonomyCache.getOrLoad(
+    'meta',
+    async () => {
+      const res = await apiFetch('/api/discover/meta');
+      const data = (await res.json()) as DiscoverTaxonomyResponse & { error?: string };
+      if (!res.ok) throw new Error(data.error || 'Erro ao carregar gêneros e tags do AniList');
+      return data;
+    },
+    {
+      shouldCache: (val) => val.sourceMode === 'live' && val.tags.length > 0,
+    }
+  );
+}
+
 export async function fetchGlossaryCached(
   term: string,
   type: 'movies' | 'tvshows' | 'all'
@@ -991,8 +1105,10 @@ export function clearPrefetchCaches(scope: 'all' | 'episodes' | 'catalog' = 'all
   if (scope === 'catalog' || scope === 'all') {
     animeDetailsFullCache.clear();
     animeDetailsQuickCache.clear();
+    animeDetailsMetadataCache.clear();
     archivePageCache.clear();
     filteredCatalogCache.clear();
+    discoverCatalogCache.clear();
     glossaryCache.clear();
     releasesPageCache.clear();
     searchPageCache.clear();

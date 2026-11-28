@@ -1,8 +1,11 @@
 import type { HttpFetcher } from '../httpTypes.ts';
 import type {
+  AniListDiscoverFilters,
   AnimeDetails,
   CatalogArchiveCategory,
   CatalogPreferences,
+  DiscoverCatalogResponse,
+  DiscoverTaxonomyResponse,
   GlossaryResponse,
   HomeCatalog,
   LiveChartScheduleMode,
@@ -16,11 +19,17 @@ import { mergeServerAndCatalogEpisodes } from '../episodeAvailability.ts';
 import {
   buildExternalDatabaseLinks,
   isAnisyncUri,
+  parseAniListExternalId,
   parseAnisyncUri,
   parseDirectTvdbIdQuery,
   parseLiveChartExternalId,
   type CanonicalMediaType,
 } from './idCodec.ts';
+import {
+  discoverAniListCatalog,
+  fetchAniListMediaById,
+  fetchAniListTaxonomy,
+} from './providers/anilistProvider.ts';
 import {
   fetchLiveChartWeeklySchedule,
   findLiveChartScheduleHint,
@@ -102,6 +111,23 @@ export async function getAggregatedCatalogPage(
   } = {}
 ): Promise<PaginatedCatalogResponse> {
   return getServerCatalogPage(fetchHttp, params, options.snapshotReader);
+}
+
+/**
+ * AniList-powered anime discovery filtered/annotated by the local provider availability index.
+ */
+export async function getAggregatedDiscoverCatalog(
+  fetchHttp: HttpFetcher,
+  filters: AniListDiscoverFilters = {}
+): Promise<DiscoverCatalogResponse> {
+  return discoverAniListCatalog(fetchHttp, filters);
+}
+
+export async function getAggregatedDiscoverTaxonomy(
+  fetchHttp: HttpFetcher,
+  options: { forceRefresh?: boolean } = {}
+): Promise<DiscoverTaxonomyResponse> {
+  return fetchAniListTaxonomy(fetchHttp, options);
 }
 
 /**
@@ -443,6 +469,131 @@ export async function getAggregatedMediaDetails(
       genres: [],
       audioType: null,
       episodes: fallbackEpisodes,
+    };
+  }
+
+  // 2b. AniList discovery anime clicked (typically unavailable or future title) -> resolve synonyms + TheTVDB + server check
+  if (knownTarget?.source === 'anilist') {
+    const parsedAl = parseAniListExternalId(knownTarget.externalId);
+    const alMedia =
+      parsedAl.aniListId > 0
+        ? await fetchAniListMediaById(fetchHttp, parsedAl.aniListId).catch(() => null)
+        : null;
+
+    const searchTerms = dedupeTitleCandidates([
+      alMedia?.title,
+      alMedia?.englishTitle,
+      ...(alMedia?.allTitles || []),
+      parsedAl.title,
+      parsedAl.englishTitle,
+      options?.hintTitle,
+    ]);
+    const resolvedMediaType: CanonicalMediaType =
+      alMedia?.kind || options?.hintMediaType || knownTarget.mediaType || 'anime';
+    const resolvedYear = alMedia?.year || options?.hintYear;
+
+    if (!searchTerms.length) return null;
+
+    const [serverMatch, tvdbMatch] = await Promise.all([
+      findServerAnimePageForTitles(fetchHttp, searchTerms.slice(0, 5)).catch(() => null),
+      findBestTheTvdbMatch(fetchHttp, searchTerms.slice(0, 5), {
+        mediaType: resolvedMediaType,
+        year: resolvedYear,
+      }).catch(() => null),
+    ]);
+
+    const extraIds = {
+      ...(parsedAl.aniListId > 0 ? { aniListId: parsedAl.aniListId } : {}),
+      ...(alMedia?.malId ? { malId: alMedia.malId } : {}),
+    };
+
+    if (serverMatch) {
+      const enriched = await enrichServerDetailsWithTheTvdb(
+        fetchHttp,
+        serverMatch.details,
+        prefs?.credentials,
+        {
+          skipEpisodePageHydration: options?.skipEpisodePageHydration,
+        }
+      ).catch(() => serverMatch.details);
+
+      const mergedIds = {
+        ...enriched.externalIds,
+        ...extraIds,
+      };
+      return {
+        ...enriched,
+        externalIds: mergedIds,
+        externalLinks: buildExternalDatabaseLinks(mergedIds, {
+          mediaType: (enriched.kind as CanonicalMediaType) || resolvedMediaType,
+        }),
+      };
+    }
+
+    if (tvdbMatch) {
+      const fullTvdb = await fetchTheTvdbDetails(fetchHttp, tvdbMatch.tvdbId, {
+        mediaType: tvdbMatch.mediaType,
+        credentials: prefs?.credentials,
+        slugHint: tvdbMatch.slug,
+        titleHint: searchTerms[0],
+        includeEpisodes: true,
+        skipEpisodePageHydration: options?.skipEpisodePageHydration,
+      }).catch(() => null);
+
+      const base = fullTvdb || buildAnimeDetailsFromTvdbRichMatch(tvdbMatch, targetUri);
+      const mergedIds = {
+        ...base.externalIds,
+        ...extraIds,
+      };
+      const unavailableEpisodes =
+        base.kind === 'movie'
+          ? base.episodes
+          : mergeServerAndCatalogEpisodes({
+              serverTitle: alMedia?.title || base.title,
+              serverUrl: targetUri,
+              serverEpisodes: [],
+              catalogEpisodes: base.episodes,
+              serverMatched: false,
+              tvdbId: tvdbMatch.tvdbId,
+              mediaType: (base.kind as CanonicalMediaType) || resolvedMediaType,
+              unifyAllSeasons: true,
+            });
+      return {
+        ...base,
+        poster: base.poster || alMedia?.poster || '',
+        backdrop: base.backdrop || alMedia?.backdrop || '',
+        episodes: unavailableEpisodes,
+        externalIds: mergedIds,
+        externalLinks: buildExternalDatabaseLinks(mergedIds, {
+          mediaType: (base.kind as CanonicalMediaType) || resolvedMediaType,
+        }),
+      };
+    }
+
+    const fallbackIds = Object.keys(extraIds).length > 0 ? extraIds : undefined;
+    return {
+      title: alMedia?.title || parsedAl.title || options?.hintTitle || 'Anime',
+      alternativeTitle:
+        alMedia?.englishTitle ||
+        (parsedAl.englishTitle && parsedAl.englishTitle !== parsedAl.title
+          ? parsedAl.englishTitle
+          : undefined),
+      alternativeTitles: alMedia?.allTitles,
+      url: targetUri,
+      kind: resolvedMediaType,
+      catalogSource: 'anilist',
+      externalIds: fallbackIds,
+      externalLinks: buildExternalDatabaseLinks(fallbackIds, { mediaType: resolvedMediaType }),
+      poster: alMedia?.poster || '',
+      backdrop: alMedia?.backdrop || '',
+      synopsis:
+        alMedia?.synopsis ||
+        'Este título ainda não está disponível nos provedores de streaming integrados.',
+      year: resolvedYear,
+      rating: alMedia?.rating,
+      genres: alMedia?.genres || [],
+      audioType: null,
+      episodes: [],
     };
   }
 

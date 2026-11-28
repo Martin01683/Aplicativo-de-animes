@@ -28,7 +28,7 @@ export type ParsedMediaTarget =
   | ParsedAnisyncEpisodeUri
   | ParsedLegacyUrl;
 
-const VALID_SOURCES = new Set<CatalogSourceId>(['thetvdb', 'livechart', 'server']);
+const VALID_SOURCES = new Set<CatalogSourceId>(['thetvdb', 'livechart', 'anilist', 'server']);
 const VALID_MEDIA_TYPES = new Set<CanonicalMediaType>(['anime', 'series', 'movie']);
 
 export function isAnisyncUri(raw: string): boolean {
@@ -64,6 +64,35 @@ export function parseLiveChartExternalId(externalId: string): {
   const livechartId = Number.parseInt(parts[0] || '', 10);
   return {
     livechartId: Number.isFinite(livechartId) && livechartId > 0 ? livechartId : 0,
+    title: parts[1]?.trim() || undefined,
+    englishTitle: parts[2]?.trim() || undefined,
+  };
+}
+
+export function buildAniListMediaUri(
+  aniListId: number,
+  title: string,
+  englishTitle?: string,
+  mediaType: CanonicalMediaType = 'anime'
+): string {
+  const cleanTitle = title.replace(/~/g, ' ').trim();
+  const cleanEnglish = englishTitle?.replace(/~/g, ' ').trim();
+  const payload =
+    cleanEnglish && cleanEnglish.toLowerCase() !== cleanTitle.toLowerCase()
+      ? `${aniListId}~${cleanTitle}~${cleanEnglish}`
+      : `${aniListId}~${cleanTitle}`;
+  return buildMediaUri(mediaType, 'anilist', payload);
+}
+
+export function parseAniListExternalId(externalId: string): {
+  aniListId: number;
+  title?: string;
+  englishTitle?: string;
+} {
+  const parts = String(externalId || '').split('~');
+  const aniListId = Number.parseInt(parts[0] || '', 10);
+  return {
+    aniListId: Number.isFinite(aniListId) && aniListId > 0 ? aniListId : 0,
     title: parts[1]?.trim() || undefined,
     englishTitle: parts[2]?.trim() || undefined,
   };
@@ -197,6 +226,14 @@ export function buildExternalDatabaseLinks(
       source: 'myanimelist',
       label: 'MyAnimeList',
       url: `https://myanimelist.net/anime/${ids.malId}`,
+    });
+  }
+
+  if (ids.aniListId && ids.aniListId > 0) {
+    links.push({
+      source: 'anilist',
+      label: 'AniList',
+      url: `https://anilist.co/anime/${ids.aniListId}`,
     });
   }
 

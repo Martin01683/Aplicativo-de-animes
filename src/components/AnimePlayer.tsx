@@ -117,6 +117,8 @@ interface AnimePlayerProps {
   episodeUrl?: string;
   seriesUrl?: string;
   seriesTitle?: string;
+  seasonNumber?: number;
+  episodeNumber?: number;
   isMovie?: boolean;
   seriesEpisodes?: AnimeEpisodeLink[];
   watchedUrls?: Set<string>;
@@ -262,6 +264,8 @@ export function AnimePlayer({
   episodeUrl,
   seriesUrl,
   seriesTitle,
+  seasonNumber,
+  episodeNumber,
   isMovie = false,
   seriesEpisodes = [],
   watchedUrls,
@@ -380,6 +384,8 @@ export function AnimePlayer({
     title,
     seriesTitle,
     seriesUrl,
+    seasonNumber,
+    episodeNumber,
     poster,
     isMovie,
     episodeUrl,
@@ -388,6 +394,8 @@ export function AnimePlayer({
     title,
     seriesTitle,
     seriesUrl,
+    seasonNumber,
+    episodeNumber,
     poster,
     isMovie,
     episodeUrl,
@@ -530,6 +538,8 @@ export function AnimePlayer({
       title: metaSnap.title,
       seriesTitle: metaSnap.seriesTitle,
       seriesUrl: metaSnap.seriesUrl,
+      seasonNumber: metaSnap.seasonNumber,
+      episodeNumber: metaSnap.episodeNumber,
       poster: metaSnap.poster || '',
       kind: metaSnap.isMovie ? 'movie' : 'episode',
       watchedAt: new Date().toISOString(),
@@ -569,6 +579,8 @@ export function AnimePlayer({
               title: metaSnap.title,
               seriesTitle: metaSnap.seriesTitle,
               seriesUrl: metaSnap.seriesUrl,
+              seasonNumber: metaSnap.seasonNumber,
+              episodeNumber: metaSnap.episodeNumber,
               poster: metaSnap.poster,
               kind: metaSnap.isMovie ? 'movie' : 'episode',
               watchedAt: new Date().toISOString(),
@@ -636,8 +648,17 @@ export function AnimePlayer({
     activeSeekGuardRef.current = null;
     streamPreparedWallRef.current = 0;
 
-    const savedEntry = episodeUrl ? getEpisodeProgress(episodeUrl) : null;
-    const savedResumeSec = episodeUrl ? getEpisodeResumeSeconds(episodeUrl) : 0;
+    const metaSnap = latestMetaRef.current;
+    const identityMeta = {
+      seriesTitle: metaSnap.seriesTitle,
+      seriesUrl: metaSnap.seriesUrl,
+      seasonNumber: metaSnap.seasonNumber,
+      episodeNumber: metaSnap.episodeNumber,
+      title: metaSnap.title,
+      kind: metaSnap.isMovie ? ('movie' as const) : ('episode' as const),
+    };
+    const savedEntry = episodeUrl ? getEpisodeProgress(episodeUrl, identityMeta) : null;
+    const savedResumeSec = episodeUrl ? getEpisodeResumeSeconds(episodeUrl, identityMeta) : 0;
 
     pendingSeekSecRef.current = savedResumeSec > 1 ? savedResumeSec : 0;
     setNativeResumeMs(savedResumeSec > 1 ? Math.round(savedResumeSec * 1000) : 0);
@@ -1232,6 +1253,28 @@ export function AnimePlayer({
         });
       }
       try {
+        const nativeWatchedUrlSet = new Set<string>();
+        if (watchedUrls) {
+          for (const u of watchedUrls) {
+            if (u && !u.startsWith('ep:')) nativeWatchedUrlSet.add(u);
+          }
+          for (const ep of playableSeriesEpisodes) {
+            if (
+              ep.url &&
+              isEpisodeMarkedWatched(ep.url, undefined, watchedUrls, {
+                seriesTitle,
+                seriesUrl,
+                seasonNumber: ep.seasonNumber,
+                episodeNumber: ep.episodeNumber,
+                title: ep.title,
+                numberLabel: ep.numberLabel,
+                kind: isMovie ? 'movie' : 'episode',
+              })
+            ) {
+              nativeWatchedUrlSet.add(ep.url);
+            }
+          }
+        }
         const res = await playWithNativeVlc({
           title,
           episodeUrl,
@@ -1242,7 +1285,7 @@ export function AnimePlayer({
           streams: sortedStreams,
           subtitles,
           episodes: playableSeriesEpisodes,
-          watchedUrls: watchedUrls ? Array.from(watchedUrls) : [],
+          watchedUrls: Array.from(nativeWatchedUrlSet),
           options: playerOptions,
           selectedServerNume,
           referer: referer || 'https://topanimes.net/',
@@ -1290,7 +1333,16 @@ export function AnimePlayer({
           });
           if (isSameEpisodeUrl(activeResultUrl, episodeUrl)) {
             setNativeResumeMs(
-              Math.round(getEpisodeResumeSeconds(activeResultUrl) * 1000)
+              Math.round(
+                getEpisodeResumeSeconds(activeResultUrl, {
+                  seriesTitle,
+                  seriesUrl,
+                  seasonNumber,
+                  episodeNumber,
+                  title,
+                  kind: isMovie ? 'movie' : 'episode',
+                }) * 1000
+              )
             );
             if (completedFlag && res?.action === 'closed' && !hasNext && upcomingNextEpisode) {
               showUpcomingBanner('ended');
@@ -1315,12 +1367,14 @@ export function AnimePlayer({
     [
       autoPlayNextEpisode,
       effectiveVideoScale,
+      episodeNumber,
       episodeUrl,
       hasNext,
       hasPrev,
       isMovie,
       nativeDurationMs,
       nativeResumeMs,
+      seasonNumber,
       nextUrl,
       onChangeVideoScale,
       onNativeSessionSync,
@@ -3598,7 +3652,15 @@ export function AnimePlayer({
                     );
                   }
 
-                  const isWatched = isEpisodeMarkedWatched(ep.url, undefined, watchedUrls);
+                  const isWatched = isEpisodeMarkedWatched(ep.url, undefined, watchedUrls, {
+                    seriesTitle,
+                    seriesUrl,
+                    seasonNumber: ep.seasonNumber,
+                    episodeNumber: ep.episodeNumber,
+                    title: ep.title,
+                    numberLabel: ep.numberLabel,
+                    kind: isMovie ? 'movie' : 'episode',
+                  });
                   return (
                     <button
                       key={ep.url}
